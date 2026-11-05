@@ -60,6 +60,8 @@ type Ctx = {
 	downloadTo?: (e: FsEntry) => void;
 	/** 이 폴더에서 새 터미널 */
 	newTerminal: (dir: string) => void;
+	/** 서버 로캘로 짐작한 터미널 인코딩 */
+	termEncoding?: string;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
 	onCwd: (path: string) => void;
 	completion: CompletionSource;
@@ -163,6 +165,8 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string }>) 
 				onCwd={ctx.onCwd}
 				onInput={(d) => ctx.broadcast(props.api.id, d)}
 				completion={ctx.completion}
+				defaultEncoding={ctx.termEncoding}
+				onOpenPath={(p) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 })}
 			/>
 		</div>
 	);
@@ -440,6 +444,17 @@ export function Workbench({
 	const sudoPw = useRef<string | null>(null);
 	const instance = useRef(`wb${Math.random().toString(36).slice(2, 8)}`);
 	const owner = ownerId ?? instance.current;
+	// 서버 로캘이 EUC-KR(CP949) 이면 터미널을 처음부터 EUC-KR 로
+	const [termEncoding, setTermEncoding] = useState<string | undefined>(undefined);
+	useEffect(() => {
+		if (fs.side !== "remote" || fs.conn == null) return;
+		void invoke<string>("ssh_exec", { conn: fs.conn, cmd: 'locale charmap 2>/dev/null; echo "$LANG $LC_ALL"' })
+			.then((out) => {
+				if (/euc-?kr|cp949|ksc5601|uhc/i.test(out)) setTermEncoding("EUC-KR");
+			})
+			.catch(() => undefined);
+	}, [fs]);
+	const [help, setHelp] = useState(false);
 	useEffect(() => () => forgetOwner(owner), [owner]);
 	const sudoFs = useMemo(
 		() => (fs.side === "remote" && fs.conn != null ? sshSudoFs(fs.conn, fs.label, fs.home, profileId) : null),
@@ -782,6 +797,7 @@ export function Workbench({
 			uploadPick: local && fs.side === "remote" ? uploadPick : undefined,
 			downloadTo: local && fs.side === "remote" ? downloadTo : undefined,
 			newTerminal: (dir: string) => addTerminalRef.current(dir),
+			termEncoding,
 			registerShell,
 			onCwd,
 			broadcast,
@@ -799,14 +815,41 @@ export function Workbench({
 			profileId,
 			sudoOn: sudoOn && !!sudoFs,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
 
 	return (
 		<WbCtx.Provider value={ctx}>
-			<div className="wb-dock-shell">
+			<div
+				className="wb-dock-shell"
+				onKeyDownCapture={(e) => {
+					const d = dock.current;
+					if (!d) return;
+					const focusPanel = (pred: (id: string) => boolean) => {
+						const p = d.panels.find((x) => pred(x.id) && x.api.isVisible) ?? d.panels.find((x) => pred(x.id));
+						if (p) {
+							p.api.setActive();
+							requestAnimationFrame(() => (p.view.content.element.querySelector("textarea, .tree-body, .cm-content, [tabindex]") as HTMLElement | null)?.focus());
+						}
+					};
+					if (e.ctrlKey && e.key === "`") {
+						// 터미널 칸 숨기기·보이기
+						e.preventDefault();
+						const t = d.panels.find((x) => x.id.startsWith("term-"));
+						if (t) t.group.api.setVisible(!t.group.api.isVisible);
+					} else if (e.altKey && !e.ctrlKey && (e.key === "1" || e.key === "2" || e.key === "3")) {
+						e.preventDefault();
+						if (e.key === "1") focusPanel((id) => id === "tree" || id === "localtree");
+						if (e.key === "2") focusPanel((id) => /^(edit|tail|diff):/.test(id) || id === "monitor");
+						if (e.key === "3") focusPanel((id) => id.startsWith("term-"));
+					} else if (e.key === "F1") {
+						e.preventDefault();
+						setHelp(true);
+					}
+				}}
+			>
 				<div className="wb-bar">
 					<button type="button" className="btn ghost" onClick={() => toggle("tree")} title="파일 트리 보이기/숨기기">
 						<FolderTree size={14} /> <span className="lbl">파일</span>
@@ -938,6 +981,65 @@ export function Workbench({
 					<DockviewReact theme={theme} components={components} watermarkComponent={Watermark} defaultTabComponent={GuardedTab} onReady={onReady} />
 				</div>
 			</div>
+			{help && <ShortcutHelp onClose={() => setHelp(false)} />}
 		</WbCtx.Provider>
+	);
+}
+
+/** F1 — 단축키 모음 */
+function ShortcutHelp({ onClose }: { onClose: () => void }) {
+	const rows: [string, string][] = [
+		["작업대", ""],
+		["Alt+1 · 2 · 3", "트리 · 문서 · 터미널로"],
+		["Ctrl+`", "터미널 칸 숨기기·보이기"],
+		["F1", "이 도움말"],
+		["파일 트리", ""],
+		["↑ ↓ ← → · Enter", "옮기기 · 접고 펴기 · 열기"],
+		["F2 · Del", "이름 바꾸기 · 지우기"],
+		["Alt+← · Alt+→ · Backspace", "뒤로 · 앞으로 · 위 폴더(마우스 옆 단추도)"],
+		["편집기", ""],
+		["Ctrl+S", "저장"],
+		["Ctrl+F · Ctrl+G", "찾기·바꾸기 · 줄로 가기"],
+		["Ctrl+/ · Ctrl+D", "주석 · 같은 낱말 더 고르기"],
+		["Alt+누르기 · Alt+끌기", "커서 더하기 · 사각 선택"],
+		["Ctrl+Space", "자동완성 열기"],
+		["터미널", ""],
+		["Tab · Shift+Tab · Enter · Esc", "자동완성 목록 다음 · 이전 · 넣기 · 닫기"],
+		["→", "흐린 제안 받기"],
+		["Ctrl+↑ · Ctrl+↓", "이전 · 다음 명령으로"],
+		["Ctrl+Shift+C · V · F", "복사 · 붙여넣기 · 찾기"],
+		["Ctrl+누르기", "출력의 경로를 편집기로 열기"],
+		["Ctrl+= · − · 0", "글자 크기"],
+		["Alt+P", "스니펫·명령어 사전"],
+	];
+	return (
+		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === "Escape" && onClose()}>
+			<div className="sheet" style={{ width: "min(560px, calc(100vw - 32px))" }}>
+				<h3>단축키</h3>
+				<table className="keys">
+					<tbody>
+						{rows.map(([k, v]) =>
+							v ? (
+								<tr key={k}>
+									<td>
+										<kbd>{k}</kbd>
+									</td>
+									<td>{v}</td>
+								</tr>
+							) : (
+								<tr key={k} className="sec">
+									<td colSpan={2}>{k}</td>
+								</tr>
+							),
+						)}
+					</tbody>
+				</table>
+				<div className="sheet-actions">
+					<button type="button" className="btn primary" autoFocus onClick={onClose}>
+						닫기
+					</button>
+				</div>
+			</div>
+		</div>
 	);
 }

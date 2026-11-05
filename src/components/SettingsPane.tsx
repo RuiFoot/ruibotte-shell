@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import iconUrl from "../../assets/icon.svg?url";
 import { type AppInfo, api } from "../lib/ipc";
 import { checkNow, installNow, RELEASES, setAuto, useUpdate } from "../lib/updater";
+import { Select } from "./Select";
 
 function ago(ms: number) {
 	const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -25,6 +26,21 @@ function Row({ label, sub, children }: { label: React.ReactNode; sub?: React.Rea
 	);
 }
 
+/** 앱 설정 한 칸 — 앱 DB(setting) 에 문자열로 둔다 */
+function useSetting(key: string, def: string): [string, (v: string) => void] {
+	const [v, setV] = useState(def);
+	useEffect(() => {
+		void api.settingGet(key).then((x) => x && setV(x));
+	}, [key]);
+	return [
+		v,
+		(x: string) => {
+			setV(x);
+			void api.settingSet(key, x);
+		},
+	];
+}
+
 function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boolean) => void; label: string }) {
 	return (
 		<button type="button" role="switch" aria-checked={on} aria-label={label} className="toggle" onClick={() => onChange(!on)}>
@@ -36,6 +52,9 @@ function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boolean) =
 /** 설정 › 정보 — 업데이트·자동 실행·문제 해결(ruibotte-deck 정보 화면과 같은 흐름) */
 export function SettingsPane({ info }: { info: AppInfo | null }) {
 	const u = useUpdate();
+	const [scrollback, setScrollback] = useSetting("term.scrollback", "10000");
+	const [copyOnSelect, setCopyOnSelect] = useSetting("term.copyOnSelect", "0");
+	const [completeMode, setCompleteMode] = useSetting("term.completeMode", "ghost");
 	const [autostart, setAutostart] = useState<boolean | null>(null);
 	const [msg, setMsg] = useState("");
 	const [autoSave, setAutoSave] = useState(false);
@@ -138,6 +157,34 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 							void api.settingSet("editor.autosave", v ? "1" : "0");
 						}}
 					/>
+				</Row>
+			</div>
+
+			<h4>터미널</h4>
+			<div className="set-group">
+				<Row label="자동완성 방식" sub="새로 여는 터미널부터 적용됩니다">
+					<Select
+						size="sm"
+						value={completeMode}
+						onChange={setCompleteMode}
+						options={[
+							{ value: "ghost", label: "흐린 제안 + Tab 목록", hint: "기본" },
+							{ value: "auto", label: "치다 멈추면 목록" },
+							{ value: "tab", label: "Tab 목록만" },
+							{ value: "off", label: "끔(셸 완성만)" },
+						]}
+					/>
+				</Row>
+				<Row label="스크롤백" sub="터미널마다 기억하는 줄 수 — 많을수록 메모리를 더 씁니다">
+					<Select
+						size="sm"
+						value={scrollback}
+						onChange={setScrollback}
+						options={["5000", "10000", "50000", "100000"].map((n) => ({ value: n, label: `${Number(n).toLocaleString()}줄` }))}
+					/>
+				</Row>
+				<Row label="고르면 바로 복사" sub="터미널에서 끌어 고른 글을 곧바로 클립보드로(리눅스 터미널처럼)">
+					<Toggle on={copyOnSelect === "1"} label="고르면 바로 복사" onChange={(v) => setCopyOnSelect(v ? "1" : "0")} />
 				</Row>
 			</div>
 
