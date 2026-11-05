@@ -1637,3 +1637,95 @@ html[data-os="macos"] .sidebar {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+
+/* ── 결과 편집 ───────────────────────── */
+.change-bar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 34px;
+	padding: 0 10px;
+	background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+	border-bottom: 0.5px solid var(--hairline);
+	font-size: 12.5px;
+	flex: none;
+}
+.change-bar .btn {
+	height: 24px;
+}
+.grid-row.edited .rn {
+	box-shadow: inset 3px 0 0 var(--accent);
+}
+.grid-row.added {
+	background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.grid-row.deleted > div:not(.rn) {
+	text-decoration: line-through;
+	color: var(--danger);
+	opacity: 0.7;
+}
+.grid-row.picked {
+	background: var(--accent-soft) !important;
+}
+.grid-row .edited {
+	background: color-mix(in srgb, #ff9f0a 22%, transparent);
+}
+.grid-row .rn {
+	cursor: default;
+}
+.cell-editing {
+	padding: 0 !important;
+	overflow: visible !important;
+	position: relative;
+	z-index: 3;
+}
+.cell-editor {
+	display: flex;
+	align-items: flex-start;
+	gap: 2px;
+}
+.cell-input {
+	width: 100%;
+	min-width: 140px;
+	height: 26px;
+	padding: 0 6px;
+	border: 2px solid var(--accent);
+	border-radius: 4px;
+	background: var(--surface);
+	color: var(--text);
+	font: inherit;
+	outline: none;
+}
+.cell-input.bad {
+	border-color: var(--danger);
+}
+.cell-multi {
+	height: 120px;
+	min-width: 280px;
+	padding: 4px 6px;
+	resize: both;
+	box-shadow: var(--shadow-pop);
+}
+.cell-null {
+	height: 26px;
+	padding: 0 6px;
+	border: 0;
+	border-radius: 4px;
+	background: var(--elevated);
+	box-shadow: var(--shadow-card);
+	font-size: 11px;
+	color: var(--text-2);
+	white-space: nowrap;
+}
+.cell-err {
+	position: absolute;
+	top: 28px;
+	left: 0;
+	padding: 2px 6px;
+	border-radius: 4px;
+	background: var(--danger);
+	color: #fff;
+	font-family: var(--font-ui);
+	font-size: 11px;
+	white-space: nowrap;
+}

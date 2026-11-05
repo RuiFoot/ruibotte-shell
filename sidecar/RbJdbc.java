@@ -86,6 +86,9 @@ public final class RbJdbc {
                 case "connect": connect(id, req); break;
                 case "query": query(id, req); break;
                 case "tree": tree(id, req); break;
+                case "meta": meta(id, req); break;
+                case "apply": apply(id, req); break;
+                case "tx": tx(id, req); break;
                 default: send(Map.of("id", id, "type", "error", "code", "OTHER", "message", "알 수 없는 요청"));
             }
         } catch (SQLException e) {
@@ -254,6 +257,83 @@ public final class RbJdbc {
             }
         }
         send(Map.of("id", id, "type", "ok", "nodes", nodes));
+    }
+
+    /** 표 열 정보 — 형식·NULL·기본값·PK */
+    private static void meta(Object id, Map<String, Object> req) throws SQLException {
+        Connection c = need();
+        DatabaseMetaData md = c.getMetaData();
+        String s = req.get("schema") == null || "(기본)".equals(req.get("schema")) ? null : (String) req.get("schema");
+        String t = (String) req.get("table");
+        boolean useCatalogs = !md.supportsSchemasInTableDefinitions() && md.supportsCatalogsInTableDefinitions();
+        java.util.Set<String> pks = new java.util.HashSet<>();
+        try (ResultSet rs = useCatalogs ? md.getPrimaryKeys(s, null, t) : md.getPrimaryKeys(null, s, t)) {
+            while (rs.next()) pks.add(rs.getString("COLUMN_NAME"));
+        }
+        List<Object> cols = new ArrayList<>();
+        try (ResultSet rs = useCatalogs ? md.getColumns(s, null, t, "%") : md.getColumns(null, s, t, "%")) {
+            while (rs.next()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                String name = rs.getString("COLUMN_NAME");
+                m.put("name", name);
+                m.put("dataType", rs.getString("TYPE_NAME"));
+                m.put("nullable", rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls);
+                m.put("default", rs.getString("COLUMN_DEF"));
+                m.put("pk", pks.contains(name));
+                cols.add(m);
+            }
+        }
+        send(Map.of("id", id, "type", "ok", "columns", cols));
+    }
+
+    /** 표 편집 반영 — 한 트랜잭션(수동 트랜잭션 중이면 세이브포인트), UPDATE·DELETE 는 정확히 1행 */
+    @SuppressWarnings("unchecked")
+    private static void apply(Object id, Map<String, Object> req) throws SQLException {
+        Connection c = need();
+        boolean inTx = Boolean.TRUE.equals(req.get("inTx"));
+        boolean auto = c.getAutoCommit();
+        java.sql.Savepoint sp = null;
+        if (inTx) sp = c.setSavepoint("rb_apply");
+        else c.setAutoCommit(false);
+        List<Object> affected = new ArrayList<>();
+        try {
+            int i = 0;
+            for (Object o : (List<Object>) req.get("stmts")) {
+                Map<String, Object> st = (Map<String, Object>) o;
+                try (java.sql.PreparedStatement ps = c.prepareStatement((String) st.get("sql"))) {
+                    int k = 1;
+                    for (Object p : (List<Object>) st.get("params")) {
+                        if (p == null) ps.setNull(k++, Types.VARCHAR);
+                        else ps.setString(k++, (String) p);
+                    }
+                    int n = ps.executeUpdate();
+                    affected.add(n);
+                    i++;
+                    if (Boolean.TRUE.equals(st.get("expectOne")) && n != 1) {
+                        throw new SQLException(i + "번째 문장이 " + n + "행에 닿았습니다(1행이어야 함) — 모두 되돌렸습니다", "RB001");
+                    }
+                }
+            }
+            if (inTx) c.releaseSavepoint(sp);
+            else c.commit();
+        } catch (SQLException e) {
+            if (inTx) c.rollback(sp);
+            else c.rollback();
+            throw e;
+        } finally {
+            if (!inTx) c.setAutoCommit(auto);
+        }
+        send(Map.of("id", id, "type", "ok", "affected", affected));
+    }
+
+    /** 수동 트랜잭션 */
+    private static void tx(Object id, Map<String, Object> req) throws SQLException {
+        Connection c = need();
+        String a = String.valueOf(req.get("action"));
+        if ("begin".equals(a)) c.setAutoCommit(false);
+        else if ("commit".equals(a)) { c.commit(); c.setAutoCommit(true); }
+        else if ("rollback".equals(a)) { c.rollback(); c.setAutoCommit(true); }
+        send(Map.of("id", id, "type", "ok"));
     }
 
     private static Map<String, Object> node(String name, String kind, String detail) {

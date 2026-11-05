@@ -126,6 +126,8 @@ pub(crate) struct DbConn {
     engine: Engine,
     read_only: bool,
     busy: tokio::sync::Mutex<()>,
+    /// 수동 트랜잭션이 열려 있는지
+    in_tx: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -328,7 +330,7 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
     }
     let features = engine.features();
     let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
-    dbs.map.lock().unwrap().insert(id, Arc::new(DbConn { engine, read_only: req.read_only, busy: Default::default() }));
+    dbs.map.lock().unwrap().insert(id, Arc::new(DbConn { engine, read_only: req.read_only, busy: Default::default(), in_tx: Default::default() }));
     Ok(DbConnectOk { conn_id: id, features, version, database: req.database, used_saved_secret: used_saved })
 }
 
@@ -844,6 +846,279 @@ pub(crate) async fn tree(dbs: &DbConns, conn: u32, path: Vec<String>) -> R<Vec<D
     }
 }
 
+// ── 표 편집·트랜잭션 ───────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColMeta {
+    name: String,
+    data_type: String,
+    nullable: bool,
+    default: Option<String>,
+    pk: bool,
+    enum_values: Option<Vec<String>>,
+}
+
+fn truthy(v: &Option<String>) -> bool {
+    matches!(v.as_deref(), Some("t" | "true" | "1" | "YES" | "TRUE"))
+}
+
+/// 표 열 정보 — 형식·NULL 허용·기본값·PK·enum 값(편집기와 SQL 만들기에 씀)
+#[tauri::command]
+pub async fn db_table_meta(dbs: State<'_, DbConns>, conn: u32, schema: Option<String>, table: String) -> R<Vec<ColMeta>> {
+    let c = dbs.get(conn)?;
+    if let Engine::Jdbc { side } = &c.engine {
+        let v = side.call(json!({"op": "meta", "schema": schema, "table": table})).await.map_err(|m| e("CLOSED", m))?;
+        if v["type"] == "error" {
+            return Err(jdbc_err(&v));
+        }
+        return Ok(v["columns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|x| ColMeta {
+                name: x["name"].as_str().unwrap_or("").into(),
+                data_type: x["dataType"].as_str().unwrap_or("").into(),
+                nullable: x["nullable"].as_bool().unwrap_or(true),
+                default: x["default"].as_str().map(String::from),
+                pk: x["pk"].as_bool().unwrap_or(false),
+                enum_values: None,
+            })
+            .collect());
+    }
+    let my = matches!(c.engine, Engine::My { .. });
+    let s = schema.unwrap_or_default();
+    let sql = match &c.engine {
+        Engine::Pg { .. } => format!(
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), (NOT a.attnotnull)::text, pg_get_expr(d.adbin, d.adrelid),
+                    coalesce(a.attnum = ANY(i.indkey), false)::text,
+                    (SELECT string_agg(enumlabel, chr(31) ORDER BY enumsortorder) FROM pg_enum WHERE enumtypid = a.atttypid)
+             FROM pg_attribute a JOIN pg_class cl ON cl.oid = a.attrelid JOIN pg_namespace n ON n.oid = cl.relnamespace
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+             LEFT JOIN pg_index i ON i.indrelid = cl.oid AND i.indisprimary
+             WHERE n.nspname = {} AND cl.relname = {} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+            lit(&s, false),
+            lit(&table, false)
+        ),
+        Engine::My { .. } => format!(
+            "SELECT column_name, column_type, IF(is_nullable = 'YES', '1', '0'), column_default, IF(column_key = 'PRI', '1', '0'), NULL
+             FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+            lit(&s, true),
+            lit(&table, true)
+        ),
+        _ => format!(
+            "SELECT c.COLUMN_NAME, c.DATA_TYPE + CASE WHEN c.CHARACTER_MAXIMUM_LENGTH IS NULL THEN '' WHEN c.CHARACTER_MAXIMUM_LENGTH = -1 THEN '(max)' ELSE '(' + CAST(c.CHARACTER_MAXIMUM_LENGTH AS varchar(10)) + ')' END,
+                    CASE c.IS_NULLABLE WHEN 'YES' THEN '1' ELSE '0' END, c.COLUMN_DEFAULT,
+                    CASE WHEN k.COLUMN_NAME IS NULL THEN '0' ELSE '1' END, NULL
+             FROM INFORMATION_SCHEMA.COLUMNS c
+             LEFT JOIN (SELECT ku.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku ON tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = ku.TABLE_SCHEMA
+                        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = {s} AND tc.TABLE_NAME = {t}) k ON k.COLUMN_NAME = c.COLUMN_NAME
+             WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {t} ORDER BY c.ORDINAL_POSITION",
+            s = lit(&s, false),
+            t = lit(&table, false)
+        ),
+    };
+    let rows = rows_of(&c, &sql).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let data_type = r.get(1).cloned().flatten().unwrap_or_default();
+            let enum_values = if my && data_type.starts_with("enum(") {
+                Some(data_type[5..data_type.len() - 1].split(',').map(|x| x.trim().trim_matches('\'').replace("''", "'")).collect())
+            } else {
+                r.get(5).cloned().flatten().map(|x| x.split('\u{1f}').map(String::from).collect())
+            };
+            ColMeta {
+                name: r.first().cloned().flatten().unwrap_or_default(),
+                data_type,
+                nullable: truthy(&r.get(2).cloned().flatten()),
+                default: r.get(3).cloned().flatten(),
+                pk: truthy(&r.get(4).cloned().flatten()),
+                enum_values,
+            }
+        })
+        .collect())
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditStmt {
+    sql: String,
+    params: Vec<Option<String>>,
+    /// UPDATE·DELETE 는 정확히 1행이어야 한다(아니면 전부 되돌림)
+    expect_one: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyOk {
+    affected: Vec<u64>,
+    in_tx: bool,
+}
+
+/// 표 편집 반영 — 한 트랜잭션(수동 트랜잭션이 열려 있으면 그 안의 세이브포인트)
+#[tauri::command]
+pub async fn db_apply(dbs: State<'_, DbConns>, conn: u32, stmts: Vec<EditStmt>) -> R<ApplyOk> {
+    apply(&dbs, conn, stmts).await
+}
+
+pub(crate) async fn apply(dbs: &DbConns, conn: u32, stmts: Vec<EditStmt>) -> R<ApplyOk> {
+    let c = dbs.get(conn)?;
+    if c.read_only {
+        return Err(e("READ_ONLY", "읽기 전용 연결이라 고칠 수 없습니다"));
+    }
+    let Ok(_busy) = c.busy.try_lock() else {
+        return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
+    };
+    let in_tx = c.in_tx.load(Ordering::Relaxed);
+    let mut affected = Vec::new();
+    let one = |n: u64, i: usize, st: &EditStmt| -> R<()> {
+        if st.expect_one && n != 1 {
+            return Err(e("SQL", format!("{}번째 문장이 {n}행에 닿았습니다(1행이어야 함) — 모두 되돌렸습니다", i + 1)));
+        }
+        Ok(())
+    };
+    match &c.engine {
+        Engine::Pg { client, .. } => {
+            client.batch_execute(if in_tx { "SAVEPOINT rb_apply" } else { "BEGIN" }).await.map_err(pg_err)?;
+            let mut res: R<()> = Ok(());
+            for (i, st) in stmts.iter().enumerate() {
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = st.params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+                match client.execute(st.sql.as_str(), &params).await {
+                    Ok(n) => {
+                        affected.push(n);
+                        if let Err(x) = one(n, i, st) {
+                            res = Err(x);
+                            break;
+                        }
+                    }
+                    Err(x) => {
+                        res = Err(pg_err(x));
+                        break;
+                    }
+                }
+            }
+            let end = match (&res, in_tx) {
+                (Ok(()), false) => "COMMIT",
+                (Ok(()), true) => "RELEASE SAVEPOINT rb_apply",
+                (Err(_), false) => "ROLLBACK",
+                (Err(_), true) => "ROLLBACK TO SAVEPOINT rb_apply",
+            };
+            client.batch_execute(end).await.map_err(pg_err)?;
+            res?;
+        }
+        Engine::My { conn, .. } => {
+            let mut g = conn.lock().await;
+            g.query_drop(if in_tx { "SAVEPOINT rb_apply" } else { "START TRANSACTION" }).await.map_err(my_err)?;
+            let mut res: R<()> = Ok(());
+            for (i, st) in stmts.iter().enumerate() {
+                let params: Vec<mysql_async::Value> = st.params.iter().map(|p| p.as_ref().map(|s| mysql_async::Value::Bytes(s.clone().into_bytes())).unwrap_or(mysql_async::Value::NULL)).collect();
+                match g.exec_iter(st.sql.as_str(), params).await {
+                    Ok(r) => {
+                        let n = r.affected_rows();
+                        let _ = r.drop_result().await;
+                        affected.push(n);
+                        if let Err(x) = one(n, i, st) {
+                            res = Err(x);
+                            break;
+                        }
+                    }
+                    Err(x) => {
+                        res = Err(my_err(x));
+                        break;
+                    }
+                }
+            }
+            let end = match (&res, in_tx) {
+                (Ok(()), false) => "COMMIT",
+                (Ok(()), true) => "RELEASE SAVEPOINT rb_apply",
+                (Err(_), false) => "ROLLBACK",
+                (Err(_), true) => "ROLLBACK TO SAVEPOINT rb_apply",
+            };
+            g.query_drop(end).await.map_err(my_err)?;
+            res?;
+        }
+        Engine::Ms { client } => {
+            let mut g = client.lock().await;
+            g.simple_query(if in_tx { "SAVE TRANSACTION rb_apply" } else { "BEGIN TRANSACTION" }).await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+            let mut res: R<()> = Ok(());
+            for (i, st) in stmts.iter().enumerate() {
+                let params: Vec<&dyn tiberius::ToSql> = st.params.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+                match g.execute(st.sql.as_str(), &params).await {
+                    Ok(r) => {
+                        let n = r.total();
+                        affected.push(n);
+                        if let Err(x) = one(n, i, st) {
+                            res = Err(x);
+                            break;
+                        }
+                    }
+                    Err(x) => {
+                        res = Err(ms_err(x));
+                        break;
+                    }
+                }
+            }
+            let end = match (&res, in_tx) {
+                (Ok(()), false) => "COMMIT TRANSACTION",
+                (Ok(()), true) => "SELECT 1",
+                (Err(_), false) => "ROLLBACK TRANSACTION",
+                (Err(_), true) => "ROLLBACK TRANSACTION rb_apply",
+            };
+            g.simple_query(end).await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+            res?;
+        }
+        Engine::Jdbc { side } => {
+            let v = side.call(json!({"op": "apply", "stmts": stmts, "inTx": in_tx})).await.map_err(|m| e("CLOSED", m))?;
+            if v["type"] == "error" {
+                return Err(jdbc_err(&v));
+            }
+            affected = v["affected"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
+        }
+    }
+    Ok(ApplyOk { affected, in_tx })
+}
+
+/// 수동 트랜잭션 — begin | commit | rollback
+#[tauri::command]
+pub async fn db_tx(dbs: State<'_, DbConns>, conn: u32, op: String) -> R<bool> {
+    tx(&dbs, conn, op).await
+}
+
+pub(crate) async fn tx(dbs: &DbConns, conn: u32, op: String) -> R<bool> {
+    let c = dbs.get(conn)?;
+    let Ok(_busy) = c.busy.try_lock() else {
+        return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
+    };
+    let sql = match (op.as_str(), &c.engine) {
+        ("begin", Engine::Ms { .. }) => "BEGIN TRANSACTION",
+        ("begin", Engine::My { .. }) => "START TRANSACTION",
+        ("begin", _) => "BEGIN",
+        ("commit", Engine::Ms { .. }) => "IF @@TRANCOUNT > 0 COMMIT TRANSACTION",
+        ("commit", _) => "COMMIT",
+        ("rollback", Engine::Ms { .. }) => "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+        ("rollback", _) => "ROLLBACK",
+        _ => return Err(e("OTHER", "알 수 없는 작업")),
+    };
+    match &c.engine {
+        Engine::Pg { client, .. } => client.batch_execute(sql).await.map_err(pg_err)?,
+        Engine::My { conn, .. } => conn.lock().await.query_drop(sql).await.map_err(my_err)?,
+        Engine::Ms { client } => {
+            client.lock().await.simple_query(sql).await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+        }
+        Engine::Jdbc { side } => {
+            let v = side.call(json!({"op": "tx", "action": op})).await.map_err(|m| e("CLOSED", m))?;
+            if v["type"] == "error" {
+                return Err(jdbc_err(&v));
+            }
+        }
+    }
+    let open = op == "begin";
+    c.in_tx.store(open, Ordering::Relaxed);
+    Ok(open)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1286,64 @@ mod live_mssql {
         let ro = connect(&store, &dbs, req(true), None).await.unwrap();
         assert_eq!(query(&dbs, ro.conn_id, "DELETE FROM dbo.rb_t".into(), None).await.err().unwrap().code, "READ_ONLY");
         query(&dbs, c, "DROP TABLE dbo.rb_t".into(), None).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod live_edit {
+    use super::*;
+
+    fn st(sql: &str, p: &[Option<&str>], one: bool) -> EditStmt {
+        EditStmt { sql: sql.into(), params: p.iter().map(|x| x.map(String::from)).collect(), expect_one: one }
+    }
+
+    /// RB_DB_TEST_PW + Docker(pg 25432·maria 23306·mssql 21433) — 반영·1행 보장·롤백·수동 트랜잭션
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_apply_all_engines() {
+        let pw = std::env::var("RB_DB_TEST_PW").expect("RB_DB_TEST_PW");
+        let dir = std::env::temp_dir().join(format!("rbshell-edit-{}", std::process::id()));
+        let store = Store::open(dir.clone(), false).unwrap();
+        let dbs = DbConns::default();
+        let engines = [("postgres", 25432u16, "postgres", pw.clone(), "postgres"), ("mariadb", 23306, "root", pw.clone(), "shop"), ("mssql", 21433, "sa", format!("Rb!{pw}9a"), "master")];
+        for (engine, port, user, p, db) in engines {
+            let ok = connect(&store, &dbs, DbConnectReq { profile_id: None, engine: engine.into(), host: "127.0.0.1".into(), port, username: user.into(), password: Some(p), database: Some(db.into()), read_only: false, save_secret: false, legacy: false }, None).await.unwrap();
+            let c = ok.conn_id;
+            let (ph, cast) = match engine { "postgres" => ("$", true), "mssql" => ("@P", false), _ => ("?", false) };
+            let a = |n: usize, ty: &str| if ph == "?" { "?".to_string() } else if cast { format!("$" ) + &n.to_string() + "::text::" + ty } else { format!("@P{n}") };
+            let _ = query(&dbs, c, "DROP TABLE rb_e".into(), None).await;
+            let vc = if engine == "mssql" { "nvarchar" } else { "varchar" };
+            query(&dbs, c, format!("CREATE TABLE rb_e (id int PRIMARY KEY, name {vc}(20), amt decimal(8,2), memo {vc}(20))"), None).await.unwrap();
+            query(&dbs, c, "INSERT INTO rb_e VALUES (1, 'a', 1.5, NULL), (2, 'b', 2.5, NULL)".into(), None).await.unwrap();
+            // 1) 고치기·NULL·새 행·지우기 — 한 번에
+            let r = apply(&dbs, c, vec![
+                st(&format!("UPDATE rb_e SET name = {}, memo = {} WHERE id = {}", a(1, "varchar"), a(2, "varchar"), a(3, "integer")), &[Some("가나다"), None, Some("1")], true),
+                st(&format!("INSERT INTO rb_e (id, name, amt) VALUES ({}, {}, {})", a(1, "integer"), a(2, "varchar"), a(3, "numeric")), &[Some("3"), Some("c"), Some("3.25")], false),
+                st(&format!("DELETE FROM rb_e WHERE id = {}", a(1, "integer")), &[Some("2")], true),
+            ]).await.unwrap();
+            println!("{engine}: 반영 {:?}", r.affected);
+            // 2) 1행이 아니면 전부 되돌림
+            let bad = apply(&dbs, c, vec![
+                st(&format!("UPDATE rb_e SET name = {} WHERE id = {}", a(1, "varchar"), a(2, "integer")), &[Some("x"), Some("1")], true),
+                st(&format!("UPDATE rb_e SET name = {} WHERE id > {}", a(1, "varchar"), a(2, "integer")), &[Some("y"), Some("0")], true),
+            ]).await.err().unwrap();
+            println!("  1행 아님 → {}", bad.message);
+            let q = query(&dbs, c, "SELECT id, name, amt, memo FROM rb_e ORDER BY id".into(), None).await.unwrap();
+            let rows = db_rows_core(&dbs, q.result_id.unwrap(), 0, 10);
+            println!("  지금 표 {rows:?}");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][1].as_deref(), Some("가나다"));
+            // 3) 수동 트랜잭션 안에서 반영 → 되돌리기
+            tx(&dbs, c, "begin".into()).await.unwrap();
+            apply(&dbs, c, vec![st(&format!("DELETE FROM rb_e WHERE id = {}", a(1, "integer")), &[Some("1")], true)]).await.unwrap();
+            tx(&dbs, c, "rollback".into()).await.unwrap();
+            let q = query(&dbs, c, "SELECT count(*) FROM rb_e".into(), None).await.unwrap();
+            let n = db_rows_core(&dbs, q.result_id.unwrap(), 0, 1);
+            println!("  수동 트랜잭션 되돌린 뒤 행 수 {n:?}");
+            assert_eq!(n[0][0].as_deref(), Some("2"));
+            query(&dbs, c, "DROP TABLE rb_e".into(), None).await.unwrap();
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

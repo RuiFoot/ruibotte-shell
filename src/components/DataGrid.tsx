@@ -1,10 +1,28 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 
 const PAGE = 200;
 const ROW_H = 26;
 
 export type GridCol = { name: string; kind: string };
+export type Cell = string | null;
+
+/** 편집 덧씌우기 — 바뀐 값·행 상태(편집됨/지울 것/새 행) */
+export type GridOverlay = {
+	cell: (r: number, c: number) => Cell | undefined;
+	rowState: (r: number) => "edited" | "deleted" | "added" | undefined;
+	cellEdited: (r: number, c: number) => boolean;
+	/** 새 행(rowCount 뒤에 붙음) */
+	added: Cell[][];
+};
+
+export type GridApi = {
+	/** 덧씌우기까지 반영한 행(받아 둔 쪽에 있을 때만) */
+	row: (r: number) => Cell[] | undefined;
+	selectedRows: () => number[];
+	selectedCell: () => { r: number; c: number } | null;
+	refresh: () => void;
+};
 
 function widthOf(c: GridCol) {
 	if (c.kind === "int") return 100;
@@ -16,30 +34,51 @@ function widthOf(c: GridCol) {
 
 /**
  * 큰 결과 표 — 행은 Rust 에 두고, 보이는 쪽(200행 묶음)만 받아 그린다.
- * NULL 은 흐린 글씨, 숫자 열은 오른쪽 정렬. 칸을 누르면 고르고 Ctrl+C 로 값 복사.
+ * NULL 흐림·숫자 오른쪽 정렬, 칸 고르기(방향키)·Ctrl+C, 행 번호 누르기로 행 고르기(Shift·Ctrl 여러 행).
+ * 편집: 두 번 누르기·F2·Enter 로 renderEditor(형식별 입력기), Delete 로 NULL(허용 열), 덧씌우기로 바뀐 칸 표시.
  */
 export function DataGrid({
 	columns,
 	rowCount,
 	fetchRows,
 	resetKey,
+	overlay,
+	editable,
+	renderEditor,
+	onCellNull,
+	onContextMenu,
+	apiRef,
 }: {
 	columns: GridCol[];
 	rowCount: number;
-	fetchRows: (from: number, to: number) => Promise<(string | null)[][]>;
+	fetchRows: (from: number, to: number) => Promise<Cell[][]>;
 	resetKey: string | number;
+	overlay?: GridOverlay;
+	/** 이 칸을 고칠 수 있는지 */
+	editable?: (r: number, c: number) => boolean;
+	renderEditor?: (r: number, c: number, value: Cell, done: (v: Cell | undefined, move?: "next" | "down") => void) => ReactNode;
+	onCellNull?: (r: number, c: number) => void;
+	onContextMenu?: (e: React.MouseEvent, r: number, c: number) => void;
+	apiRef?: React.Ref<GridApi>;
 }) {
 	const scroller = useRef<HTMLDivElement>(null);
-	const pages = useRef(new Map<number, (string | null)[][]>());
+	const pages = useRef(new Map<number, Cell[][]>());
 	const loading = useRef(new Set<number>());
 	const [, force] = useState(0);
 	const [sel, setSel] = useState<{ r: number; c: number } | null>(null);
+	const [rows, setRows] = useState<Set<number>>(new Set());
+	const anchor = useRef<number | null>(null);
+	const [editing, setEditing] = useState<{ r: number; c: number } | null>(null);
+	const added = overlay?.added ?? [];
+	const count = rowCount + added.length;
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: resetKey 가 바뀌면 받은 쪽을 버린다
 	useEffect(() => {
 		pages.current.clear();
 		loading.current.clear();
 		setSel(null);
+		setRows(new Set());
+		setEditing(null);
 		force((n) => n + 1);
 	}, [resetKey]);
 
@@ -47,14 +86,14 @@ export function DataGrid({
 	const tpl = useMemo(() => ["64px", ...widths.map((w) => `${w}px`)].join(" "), [widths]);
 	const total = 64 + widths.reduce((a, b) => a + b, 0);
 
-	const v = useVirtualizer({ count: rowCount, getScrollElement: () => scroller.current, estimateSize: () => ROW_H, overscan: 24 });
+	const v = useVirtualizer({ count, getScrollElement: () => scroller.current, estimateSize: () => ROW_H, overscan: 24 });
 
 	const ensure = useCallback(
 		(page: number) => {
-			if (pages.current.has(page) || loading.current.has(page)) return;
+			if (page * PAGE >= rowCount || pages.current.has(page) || loading.current.has(page)) return;
 			loading.current.add(page);
-			void fetchRows(page * PAGE, page * PAGE + PAGE).then((rows) => {
-				pages.current.set(page, rows);
+			void fetchRows(page * PAGE, page * PAGE + PAGE).then((r) => {
+				pages.current.set(page, r);
 				loading.current.delete(page);
 				if (pages.current.size > 60) {
 					const first = pages.current.keys().next().value;
@@ -63,16 +102,40 @@ export function DataGrid({
 				force((n) => n + 1);
 			});
 		},
-		[fetchRows],
+		[fetchRows, rowCount],
+	);
+
+	const baseRow = (r: number): Cell[] | undefined => (r >= rowCount ? added[r - rowCount] : pages.current.get(Math.floor(r / PAGE))?.[r % PAGE]);
+	const cellAt = (r: number, c: number): Cell | undefined => {
+		const o = overlay?.cell(r, c);
+		if (o !== undefined) return o;
+		return baseRow(r)?.[c];
+	};
+
+	useImperativeHandle(
+		apiRef,
+		() => ({
+			row: (r) => {
+				const b = baseRow(r);
+				return b ? b.map((_, c) => cellAt(r, c) ?? null) : undefined;
+			},
+			selectedRows: () => (rows.size ? [...rows].sort((a, b) => a - b) : sel ? [sel.r] : []),
+			selectedCell: () => sel,
+			refresh: () => force((n) => n + 1),
+		}),
+		// biome-ignore lint/correctness/useExhaustiveDependencies: 고른 상태만 따라가면 된다
+		[rows, sel, overlay],
 	);
 
 	const items = v.getVirtualItems();
 	if (items.length) {
 		ensure(Math.floor(items[0].index / PAGE));
-		ensure(Math.floor(items[items.length - 1].index / PAGE));
+		ensure(Math.floor(Math.min(items[items.length - 1].index, rowCount - 1) / PAGE));
 	}
 
-	const cellAt = (r: number, c: number) => pages.current.get(Math.floor(r / PAGE))?.[r % PAGE]?.[c];
+	const startEdit = (r: number, c: number) => {
+		if (editable?.(r, c) && renderEditor) setEditing({ r, c });
+	};
 
 	return (
 		<div
@@ -80,20 +143,30 @@ export function DataGrid({
 			ref={scroller}
 			tabIndex={0}
 			onKeyDown={(e) => {
-				if (!sel) return;
-				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+				if (editing || !sel) return;
+				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && !rows.size) {
 					e.preventDefault();
-					const val = cellAt(sel.r, sel.c);
-					void navigator.clipboard.writeText(val ?? "");
+					void navigator.clipboard.writeText(cellAt(sel.r, sel.c) ?? "");
 					return;
 				}
-				const mv: Record<string, [number, number]> = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
+				if (e.key === "F2" || e.key === "Enter") {
+					e.preventDefault();
+					startEdit(sel.r, sel.c);
+					return;
+				}
+				if (e.key === "Delete" && onCellNull && editable?.(sel.r, sel.c)) {
+					e.preventDefault();
+					onCellNull(sel.r, sel.c);
+					return;
+				}
+				const mv: Record<string, [number, number]> = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], Tab: [0, 1] };
 				const d = mv[e.key];
 				if (d) {
 					e.preventDefault();
-					const r = Math.min(rowCount - 1, Math.max(0, sel.r + d[0]));
-					const c = Math.min(columns.length - 1, Math.max(0, sel.c + d[1]));
+					const r = Math.min(count - 1, Math.max(0, sel.r + d[0]));
+					const c = Math.min(columns.length - 1, Math.max(0, sel.c + (e.shiftKey && e.key === "Tab" ? -1 : d[1])));
 					setSel({ r, c });
+					setRows(new Set());
 					v.scrollToIndex(r);
 				}
 			}}
@@ -110,22 +183,74 @@ export function DataGrid({
 				</div>
 				<div style={{ height: v.getTotalSize(), position: "relative" }}>
 					{items.map((it) => {
-						const row = pages.current.get(Math.floor(it.index / PAGE))?.[it.index % PAGE];
+						const r = it.index;
+						const row = baseRow(r);
+						const st = overlay?.rowState(r);
 						return (
-							<div key={it.key} className="grid-row" style={{ transform: `translateY(${it.start}px)`, gridTemplateColumns: tpl, width: total }}>
-								<div className="rn">{it.index + 1}</div>
+							<div
+								key={it.key}
+								className={`grid-row${rows.has(r) ? " picked" : ""}${st ? ` ${st}` : ""}`}
+								style={{ transform: `translateY(${it.start}px)`, gridTemplateColumns: tpl, width: total }}
+							>
+								<div
+									className="rn"
+									onMouseDown={(e) => {
+										const n = new Set(e.ctrlKey || e.metaKey ? rows : []);
+										if (e.shiftKey && anchor.current != null) {
+											for (let i = Math.min(anchor.current, r); i <= Math.max(anchor.current, r); i++) n.add(i);
+										} else if (n.has(r) && (e.ctrlKey || e.metaKey)) n.delete(r);
+										else n.add(r);
+										if (!e.shiftKey) anchor.current = r;
+										setRows(n);
+										setSel({ r, c: 0 });
+									}}
+									onContextMenu={(e) => {
+										e.preventDefault();
+										if (!rows.has(r)) {
+											setRows(new Set([r]));
+											anchor.current = r;
+										}
+										onContextMenu?.(e, r, -1);
+									}}
+								>
+									{st === "added" ? "+" : r + 1}
+								</div>
 								{columns.map((c, ci) => {
-									const val = row?.[ci];
-									const isSel = sel?.r === it.index && sel?.c === ci;
+									const val = cellAt(r, ci);
+									const isSel = sel?.r === r && sel?.c === ci;
+									const edited = overlay?.cellEdited(r, ci);
+									if (editing && editing.r === r && editing.c === ci && renderEditor) {
+										return (
+											// biome-ignore lint/suspicious/noArrayIndexKey: 열 순서가 곧 정체
+											<div key={ci} className="cell-editing">
+												{renderEditor(r, ci, val ?? null, (nv, move) => {
+													setEditing(null);
+													scroller.current?.focus();
+													if (move === "next") setSel({ r, c: Math.min(columns.length - 1, ci + 1) });
+													if (move === "down") setSel({ r: Math.min(count - 1, r + 1), c: ci });
+													void nv;
+												})}
+											</div>
+										);
+									}
 									return (
 										<div
 											// biome-ignore lint/suspicious/noArrayIndexKey: 열 순서가 곧 정체
 											key={ci}
-											className={`${val === null ? "null" : c.kind === "int" || c.kind === "numeric" ? "num" : ""}${isSel ? " sel" : ""}`}
-											onMouseDown={() => setSel({ r: it.index, c: ci })}
+											className={`${val === null ? "null" : c.kind === "int" || c.kind === "numeric" ? "num" : ""}${isSel ? " sel" : ""}${edited ? " edited" : ""}`}
+											onMouseDown={() => {
+												setSel({ r, c: ci });
+												setRows(new Set());
+											}}
+											onDoubleClick={() => startEdit(r, ci)}
+											onContextMenu={(e) => {
+												e.preventDefault();
+												setSel({ r, c: ci });
+												onContextMenu?.(e, r, ci);
+											}}
 											title={val && val.length > 40 ? val.slice(0, 2000) : undefined}
 										>
-											{row ? (val === null ? "NULL" : val) : ""}
+											{row || st === "added" ? (val === null ? "NULL" : (val ?? "")) : ""}
 										</div>
 									);
 								})}

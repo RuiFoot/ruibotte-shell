@@ -11,10 +11,13 @@ import "dockview-react/dist/styles/dockview.css";
 import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, LayoutTemplate, Lock, Play, PlayCircle, Square, Table } from "lucide-react";
 import { createContext, type ReactElement, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/ipc";
+import { type Cell, type ColMeta, type EditStmt, buildDelete, buildInsert, buildUpdate, formatRows, previewSql, qualified } from "../lib/edits";
 import { quoteIdentFor, selectTop } from "../lib/engines";
 import { splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
-import { DataGrid, type GridCol } from "./DataGrid";
+import { CellEditor } from "./CellEditor";
+import { DataGrid, type GridApi, type GridCol, type GridOverlay } from "./DataGrid";
+import { SnippetPalette } from "./SnippetPalette";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
@@ -28,7 +31,8 @@ type QueryOk = {
 	firstRowMs?: number | null;
 };
 type DbError = { code: string; message: string };
-type ResultParams = { sql: string; state: "running" | "ok" | "error"; ok?: QueryOk; error?: DbError; at: number };
+type Source = { schema: string | null; table: string };
+type ResultParams = { sql: string; state: "running" | "ok" | "error"; ok?: QueryOk; error?: DbError; at: number; source?: Source };
 
 type Node = { name: string; kind: "schema" | "table" | "view" | "column"; detail?: string | null };
 
@@ -37,7 +41,8 @@ type Ctx = {
 	engine: string;
 	mysql: boolean;
 	readOnly: boolean;
-	run: (stmts: string[]) => void;
+	run: (stmts: string[], source?: Source) => void;
+	inTx: boolean;
 	insertText: (s: string) => void;
 	registerEditor: (id: string, v: EditorView | null) => void;
 	draftKey: string;
@@ -52,7 +57,19 @@ const db = {
 	export: (result: number, format: string, path: string) => invoke<number>("db_export", { result, format, path }),
 	tree: (conn: number, path: string[]) => invoke<Node[]>("db_tree", { conn, path }),
 	closeResult: (result: number) => invoke<void>("db_result_close", { result }),
+	meta: (conn: number, schema: string | null, table: string) => invoke<ColMeta[]>("db_table_meta", { conn, schema, table }),
+	apply: (conn: number, stmts: EditStmt[]) => invoke<{ affected: number[]; inTx: boolean }>("db_apply", { conn, stmts }),
+	tx: (conn: number, op: "begin" | "commit" | "rollback") => invoke<boolean>("db_tx", { conn, op }),
 };
+
+/** 문자열·주석을 비운 SQL(판정용) */
+function bare(sql: string) {
+	return sql
+		.replace(/'(?:[^']|'')*'/g, "''")
+		.replace(/"(?:[^"]|"")*"/g, '""')
+		.replace(/--[^\n]*/g, "")
+		.replace(/\/\*[\s\S]*?\*\//g, "");
+}
 
 const sqlTheme = EditorView.theme({
 	"&": { height: "100%", fontSize: "13px", backgroundColor: "var(--surface)", color: "var(--text)" },
@@ -134,16 +151,31 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number }>) {
 function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const ctx = useDb();
 	const p = props.params;
-	const [exportMsg, setExportMsg] = useState("");
-	const fetchRows = useCallback((from: number, to: number) => (p.ok?.resultId ? db.rows(p.ok.resultId, from, to) : Promise.resolve([])), [p.ok?.resultId]);
+	const [msg, setMsg] = useState("");
+	const grid = useRef<GridApi>(null);
+	const [metas, setMetas] = useState<ColMeta[] | null>(null);
+	const [edits, setEdits] = useState<Map<number, Map<number, Cell>>>(new Map());
+	const [deleted, setDeleted] = useState<Set<number>>(new Set());
+	const [added, setAdded] = useState<Cell[][]>([]);
+	const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+	const [preview, setPreview] = useState<string | null>(null);
+	const [busy, setBusy] = useState(false);
+	const ok = p.ok;
+	const rid = ok?.resultId ?? null;
+	const fetchRows = useCallback((from: number, to: number) => (rid ? db.rows(rid, from, to) : Promise.resolve([])), [rid]);
 
-	async function doExport(format: "csv" | "tsv" | "json") {
-		if (!p.ok?.resultId) return;
-		const path = await saveDialog({ defaultPath: `result.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
-		if (!path) return;
-		const n = await db.export(p.ok.resultId, format, path);
-		setExportMsg(`${n.toLocaleString()}행을 저장했습니다`);
-	}
+	// 표 보기면 열 정보를 받아 편집을 켠다(PK 가 결과에 다 있을 때만)
+	useEffect(() => {
+		setEdits(new Map());
+		setDeleted(new Set());
+		setAdded([]);
+		setMetas(null);
+		if (!p.source || !rid || ctx.readOnly) return;
+		void db
+			.meta(ctx.conn, p.source.schema, p.source.table)
+			.then(setMetas)
+			.catch(() => setMetas([]));
+	}, [rid, p.source, ctx.conn, ctx.readOnly]);
 
 	if (p.state === "running")
 		return (
@@ -167,11 +199,232 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				</details>
 			</div>
 		);
-	const ok = p.ok as QueryOk;
+	if (!ok) return null;
+
+	const cols = ok.columns;
+	const metaOf = (ci: number) => metas?.find((m) => m.name.toLowerCase() === cols[ci]?.name.toLowerCase());
+	const pkIdx = metas ? metas.filter((m) => m.pk).map((m) => cols.findIndex((c) => c.name.toLowerCase() === m.name.toLowerCase())) : [];
+	const canEdit = !!metas && pkIdx.length > 0 && pkIdx.every((i) => i >= 0);
+	const why = ctx.readOnly
+		? "읽기 전용 연결이라 고칠 수 없습니다"
+		: !p.source
+			? "표 보기(객체 트리 › 데이터 보기)에서만 고칠 수 있습니다"
+			: metas && !pkIdx.length
+				? "PK 가 없는 표라 고칠 수 없습니다"
+				: metas && pkIdx.some((i) => i < 0)
+					? "결과에 PK 열이 다 있어야 고칠 수 있습니다"
+					: null;
+	const table = p.source ? qualified(ctx.engine, p.source.schema, p.source.table) : "";
+	const changeCount = [...edits.keys()].filter((r) => !deleted.has(r)).length + deleted.size + added.length;
+
+	const overlay: GridOverlay = {
+		added,
+		cell: (r, c) => (r >= ok.rowCount ? undefined : edits.get(r)?.get(c)),
+		cellEdited: (r, c) => r < ok.rowCount && !!edits.get(r)?.has(c),
+		rowState: (r) => (r >= ok.rowCount ? "added" : deleted.has(r) ? "deleted" : edits.has(r) ? "edited" : undefined),
+	};
+
+	const setCell = async (r: number, c: number, v: Cell) => {
+		if (r >= ok.rowCount) {
+			const n = added.map((row) => row.slice());
+			n[r - ok.rowCount][c] = v;
+			setAdded(n);
+			return;
+		}
+		const base = (await db.rows(rid as number, r, r + 1))[0]?.[c];
+		const m = new Map(edits);
+		const row = new Map(m.get(r) ?? []);
+		if (base === v) row.delete(c);
+		else row.set(c, v);
+		if (row.size) m.set(r, row);
+		else m.delete(r);
+		setEdits(m);
+	};
+
+	const statements = async (): Promise<EditStmt[]> => {
+		const out: EditStmt[] = [];
+		const ms = metas ?? [];
+		for (const [r, ch] of edits) {
+			if (deleted.has(r)) continue;
+			const base = (await db.rows(rid as number, r, r + 1))[0];
+			out.push(
+				buildUpdate(
+					ctx.engine,
+					table,
+					ms,
+					pkIdx.map((i) => ({ name: cols[i].name, value: base[i] })),
+					[...ch].map(([c, v]) => ({ name: cols[c].name, value: v })),
+				),
+			);
+		}
+		for (const r of deleted) {
+			const base = (await db.rows(rid as number, r, r + 1))[0];
+			out.push(buildDelete(ctx.engine, table, ms, pkIdx.map((i) => ({ name: cols[i].name, value: base[i] }))));
+		}
+		for (const row of added) {
+			out.push(
+				buildInsert(
+					ctx.engine,
+					table,
+					ms,
+					row.map((v, i) => ({ name: cols[i].name, value: v, touched: v !== undefined })).filter((x) => x.touched) as { name: string; value: Cell }[],
+				),
+			);
+		}
+		return out;
+	};
+
+	const applyAll = async () => {
+		setBusy(true);
+		try {
+			const st = await statements();
+			const r = await db.apply(ctx.conn, st);
+			setMsg(`${r.affected.length}문장 반영${r.inTx ? "(트랜잭션 안 — 커밋해야 남습니다)" : ""}`);
+			ctx.run([p.sql], p.source);
+		} catch (e) {
+			setMsg((e as DbError).message ?? String(e));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const rowsFor = async (rs: number[]) => {
+		const out: Cell[][] = [];
+		for (const r of rs) {
+			const g = grid.current?.row(r);
+			out.push(g ?? (r < ok.rowCount ? (await db.rows(rid as number, r, r + 1))[0] : added[r - ok.rowCount]));
+		}
+		return out;
+	};
+
+	const openMenu = (e: React.MouseEvent, r: number, c: number) => {
+		const picked = grid.current?.selectedRows().length ? (grid.current?.selectedRows() ?? [r]) : [r];
+		const copy = (kind: "csv" | "tsv" | "json" | "markdown" | "insert") => async () => {
+			const rs = await rowsFor(picked);
+			await navigator.clipboard.writeText(formatRows(kind, cols.map((x) => x.name), rs, ctx.engine, table || undefined));
+			setMsg(`${rs.length}행 복사함`);
+		};
+		const items: MenuItem[] = [];
+		if (c >= 0) {
+			const val = grid.current?.row(r)?.[c] ?? null;
+			items.push({ label: "값 복사", run: () => void navigator.clipboard.writeText(val ?? "") });
+			if (p.source) {
+				const col = quoteIdentFor(ctx.engine, cols[c].name);
+				const litv = val === null ? null : /^-?\d+(\.\d+)?$/.test(val) && cols[c].kind !== "text" ? val : `'${val.replace(/'/g, "''")}'`;
+				const base = `SELECT * FROM ${table}`;
+				items.push(
+					{ label: "이 값으로 거르기", run: () => ctx.run([`${base} WHERE ${col} ${litv === null ? "IS NULL" : `= ${litv}`}`], p.source) },
+					{ label: "이 값 빼고", run: () => ctx.run([`${base} WHERE ${col} ${litv === null ? "IS NOT NULL" : `<> ${litv}`}`], p.source) },
+				);
+			}
+			if (canEdit && metaOf(c)?.nullable !== false) items.push({ label: "NULL 로", run: () => void setCell(r, c, null) });
+			items.push({ sep: true });
+		}
+		items.push(
+			{ label: `복사 — CSV(${picked.length}행)`, run: () => void copy("csv")() },
+			{ label: "복사 — TSV(엑셀 붙여넣기)", run: () => void copy("tsv")() },
+			{ label: "복사 — JSON", run: () => void copy("json")() },
+			{ label: "복사 — Markdown 표", run: () => void copy("markdown")() },
+			{ label: "복사 — INSERT 문", run: () => void copy("insert")() },
+		);
+		if (canEdit) {
+			items.push(
+				{ sep: true },
+				{
+					label: "행 복제",
+					run: async () => {
+						const rs = await rowsFor(picked);
+						setAdded([...added, ...rs.map((row) => row.map((v, i) => (pkIdx.includes(i) && metaOf(i)?.default ? undefined : v)) as Cell[])]);
+					},
+				},
+				{
+					label: "새 행",
+					run: () => setAdded([...added, cols.map(() => undefined) as unknown as Cell[]]),
+				},
+				{
+					label: picked.every((x) => deleted.has(x)) ? "지우기 취소" : `행 지우기(${picked.length})`,
+					danger: true,
+					run: () => {
+						const n = new Set(deleted);
+						const undo = picked.every((x) => n.has(x));
+						for (const x of picked) {
+							if (x >= ok.rowCount) continue;
+							if (undo) n.delete(x);
+							else n.add(x);
+						}
+						setAdded(added.filter((_, i) => !picked.includes(ok.rowCount + i)));
+						setDeleted(n);
+					},
+				},
+			);
+		}
+		setMenu({ x: e.clientX, y: e.clientY, items });
+	};
+
+	async function doExport(format: "csv" | "tsv" | "json") {
+		if (!rid) return;
+		const path = await saveDialog({ defaultPath: `result.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+		if (!path) return;
+		const n = await db.export(rid, format, path);
+		setMsg(`${n.toLocaleString()}행을 저장했습니다`);
+	}
+
 	return (
 		<div className="panel-fill">
-			{ok.resultId ? (
-				<DataGrid columns={ok.columns} rowCount={ok.rowCount} fetchRows={fetchRows} resetKey={ok.resultId} />
+			{changeCount > 0 && (
+				<div className="change-bar">
+					<span>
+						변경 <b>{changeCount}</b>건 — 바뀐 칸 {[...edits.values()].reduce((a, m) => a + m.size, 0)} · 새 행 {added.length} · 지울 행 {deleted.size}
+					</span>
+					<span style={{ flex: 1 }} />
+					<button
+						type="button"
+						className="btn ghost"
+						onClick={async () => {
+							const st = await statements();
+							setPreview(st.map((s) => `${previewSql(ctx.engine, s)};`).join("\n"));
+						}}
+					>
+						SQL 보기
+					</button>
+					<button
+						type="button"
+						className="btn ghost"
+						onClick={() => {
+							setEdits(new Map());
+							setDeleted(new Set());
+							setAdded([]);
+						}}
+					>
+						되돌리기
+					</button>
+					<button type="button" className="btn primary" disabled={busy} onClick={() => void applyAll()}>
+						{busy ? "반영 중…" : ctx.inTx ? "반영(트랜잭션 안)" : "반영(커밋)"}
+					</button>
+				</div>
+			)}
+			{rid ? (
+				<DataGrid
+					apiRef={grid}
+					columns={cols}
+					rowCount={ok.rowCount}
+					fetchRows={fetchRows}
+					resetKey={rid}
+					overlay={overlay}
+					editable={() => canEdit}
+					onCellNull={(r, c) => metaOf(c)?.nullable !== false && void setCell(r, c, null)}
+					renderEditor={(r, c, value, done) => (
+						<CellEditor
+							meta={metaOf(c)}
+							value={value}
+							onDone={(v, move) => {
+								if (v !== undefined) void setCell(r, c, v);
+								done(v, move);
+							}}
+						/>
+					)}
+					onContextMenu={openMenu}
+				/>
 			) : (
 				<div className="dock-watermark">
 					<p style={{ color: "var(--text)" }}>{ok.affected != null ? `${ok.affected.toLocaleString()}행 반영` : "완료"}</p>
@@ -179,14 +432,15 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 			)}
 			<div className="statusbar">
 				<span className="ok">
-					{ok.resultId ? `${ok.rowCount.toLocaleString()}행` : "완료"}
+					{rid ? `${ok.rowCount.toLocaleString()}행` : "완료"}
 					{ok.truncated ? " (상한에서 멈춤)" : ""}
 				</span>
 				<span>{ok.ms.toLocaleString()} ms</span>
 				{ok.firstRowMs != null && <span>첫 행 {ok.firstRowMs} ms</span>}
-				{exportMsg && <span>{exportMsg}</span>}
+				{rid && p.source && <span title={why ?? "두 번 누르기·F2 로 고치기, Delete 로 NULL, 우클릭으로 행 추가·지우기"}>{why ? `🔒 ${why}` : canEdit ? "✎ 고칠 수 있음" : ""}</span>}
+				{msg && <span>{msg}</span>}
 				<span style={{ marginLeft: "auto" }} />
-				{ok.resultId ? (
+				{rid ? (
 					<>
 						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void doExport("csv")}>
 							<Download size={12} /> CSV
@@ -200,6 +454,24 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					</>
 				) : null}
 			</div>
+			{menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+			{preview !== null && (
+				<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && setPreview(null)}>
+					<div className="sheet" style={{ width: "min(760px, calc(100vw - 32px))" }}>
+						<h3>반영할 SQL</h3>
+						<p style={{ color: "var(--text-2)", marginTop: -8, fontSize: 12.5 }}>보여 주기용으로 값을 끼웠습니다. 실제로는 값을 매개변수로 묶어 한 트랜잭션에서 실행하고, UPDATE·DELETE 가 정확히 1행이 아니면 모두 되돌립니다.</p>
+						<textarea className="fp" readOnly value={preview} style={{ width: "100%", height: 260, border: 0, color: "var(--text)", resize: "vertical" }} />
+						<div className="sheet-actions">
+							<button type="button" className="btn" onClick={() => void navigator.clipboard.writeText(preview)}>
+								복사
+							</button>
+							<button type="button" className="btn primary" onClick={() => setPreview(null)}>
+								닫기
+							</button>
+						</div>
+					</div>
+				</div>
+			)}
 		</div>
 	);
 }
@@ -269,14 +541,14 @@ function ObjectsPanel() {
 					className="tree-row"
 					style={{ paddingLeft: 6 + depth * 14 }}
 					onClick={() => expandable && toggle(p)}
-					onDoubleClick={() => (n.kind === "table" || n.kind === "view") && ctx.run([`SELECT * FROM ${qname(path[0], n.name)}`])}
+					onDoubleClick={() => (n.kind === "table" || n.kind === "view") && ctx.run([`SELECT * FROM ${qname(path[0], n.name)}`], { schema: path[0] === "(기본)" ? null : path[0], table: n.name })}
 					onContextMenu={(e) => {
 						e.preventDefault();
 						const items: MenuItem[] = [];
 						if (n.kind === "table" || n.kind === "view") {
 							const q = qname(path[0], n.name);
 							items.push(
-								{ label: "데이터 보기", run: () => ctx.run([`SELECT * FROM ${q}`]) },
+								{ label: "데이터 보기(고치기)", run: () => ctx.run([`SELECT * FROM ${q}`], { schema: path[0] === "(기본)" ? null : path[0], table: n.name }) },
 								{ label: "행 수 세기", run: () => ctx.run([`SELECT count(*) AS row_count FROM ${q}`]) },
 								{ label: "SELECT 문 넣기", run: () => ctx.insertText(`${selectTop(ctx.engine, q, 100)};\n`) },
 								{ sep: true },
@@ -340,6 +612,15 @@ export function DbWorkbench({
 	const lastEditor = useRef<string | null>(null);
 	const [maxRows, setMaxRows] = useState(10_000);
 	const [running, setRunning] = useState(false);
+	const [inTx, setInTx] = useState(false);
+	const [snip, setSnip] = useState(false);
+	const txOp = async (op: "begin" | "commit" | "rollback") => {
+		try {
+			setInTx(await db.tx(conn, op));
+		} catch (e) {
+			alert((e as DbError).message ?? String(e));
+		}
+	};
 	const sqlSeq = useRef(1);
 	const saveTimer = useRef<number | undefined>(undefined);
 	const mysql = engine !== "postgres";
@@ -360,9 +641,29 @@ export function DbWorkbench({
 	};
 
 	const run = useCallback(
-		async (stmts: string[]) => {
+		async (input: string[], source?: Source) => {
 			const d = dock.current;
-			if (!d || !stmts.length) return;
+			if (!d || !input.length) return;
+			// :이름 파라미터 — 문자열·주석 밖, ::형변환 제외
+			const names = [...new Set(input.flatMap((x) => [...bare(x).matchAll(/(?<![:\w]):([A-Za-z_][\w]*)/g)].map((m) => m[1])))];
+			const values: Record<string, string> = {};
+			for (const n of names) {
+				const v = prompt(`파라미터 :${n} 값(문자는 그대로, 숫자는 숫자로, 비우면 NULL)`);
+				if (v === null) return;
+				values[n] = v;
+			}
+			const stmts = input.map((x) =>
+				names.length
+					? x.replace(/(?<![:\w]):([A-Za-z_][\w]*)/g, (m, n) => (n in values ? (values[n] === "" ? "NULL" : /^-?\d+(\.\d+)?$/.test(values[n]) ? values[n] : `'${values[n].replace(/'/g, "''")}'`) : m))
+					: x,
+			);
+			// 쓰기 확인 — DDL, WHERE 없는 UPDATE·DELETE
+			const risky = stmts.filter((x) => {
+				const b = bare(x).trim().toLowerCase();
+				const w = b.match(/^[a-z]+/)?.[0] ?? "";
+				return ["drop", "truncate", "alter", "create", "rename"].includes(w) || ((w === "update" || w === "delete") && !/\bwhere\b/.test(b));
+			});
+			if (risky.length && !confirm(`되돌리기 어려운 문장이 있습니다. 실행할까요?\n\n${risky.map((x) => x.slice(0, 200)).join("\n\n")}`)) return;
 			setRunning(true);
 			// 문장마다 결과 탭 하나(결과 1, 2…) — 남는 예전 탭은 닫는다
 			const existing = d.panels.filter((p) => p.id.startsWith("res-"));
@@ -373,7 +674,7 @@ export function DbWorkbench({
 			}
 			for (let i = 0; i < stmts.length; i++) {
 				const id = `res-${i + 1}`;
-				const params: ResultParams = { sql: stmts[i], state: "running", at: Date.now() };
+				const params: ResultParams = { sql: stmts[i], state: "running", at: Date.now(), source: stmts.length === 1 ? source : undefined };
 				let panel = d.getPanel(id);
 				const oldRid = (panel?.params as ResultParams | undefined)?.ok?.resultId;
 				if (oldRid) void db.closeResult(oldRid);
@@ -469,8 +770,8 @@ export function DbWorkbench({
 	}, [active]);
 
 	const ctx = useMemo<Ctx>(
-		() => ({ conn, engine, mysql, readOnly, run: (s) => void run(s), insertText, registerEditor, draftKey: `sql.draft.${profileId ?? "adhoc"}` }),
-		[conn, engine, mysql, readOnly, run, insertText, registerEditor, profileId],
+		() => ({ conn, engine, mysql, readOnly, inTx, run: (s, src) => void run(s, src), insertText, registerEditor, draftKey: `sql.draft.${profileId ?? "adhoc"}` }),
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, profileId],
 	);
 
 	return (
@@ -488,6 +789,26 @@ export function DbWorkbench({
 							<Square size={12} /> 취소
 						</button>
 					)}
+					<span className="sep" />
+					{!readOnly &&
+						(inTx ? (
+							<>
+								<span className="badge warn">트랜잭션 열림</span>
+								<button type="button" className="btn ghost" onClick={() => void txOp("commit")}>
+									커밋
+								</button>
+								<button type="button" className="btn ghost" onClick={() => void txOp("rollback")}>
+									되돌리기
+								</button>
+							</>
+						) : (
+							<button type="button" className="btn ghost" onClick={() => void txOp("begin")} title="수동 트랜잭션 — 커밋·되돌리기 전까지 반영 안 됨">
+								자동 커밋
+							</button>
+						))}
+					<button type="button" className="btn ghost" onClick={() => setSnip(true)} title="즐겨찾는 SQL(스니펫)">
+						★ SQL
+					</button>
 					<span className="sep" />
 					<select className="status-select" value={maxRows} onChange={(e) => setMaxRows(Number(e.target.value))} title="결과 행 상한">
 						{[1000, 10_000, 100_000, 1_000_000].map((n) => (
@@ -516,6 +837,23 @@ export function DbWorkbench({
 				<div className="wb-dock">
 					<DockviewReact theme={theme} components={components} onReady={onReady} />
 				</div>
+				{snip && (
+					<SnippetPalette
+						kind="sql"
+						onClose={() => setSnip(false)}
+						onPick={(body, go) => {
+							setSnip(false);
+							if (go) void run(splitSql(body).map((x) => x.text));
+							else insertText(body);
+						}}
+						currentLine={() => {
+							const v = currentEditor();
+							if (!v) return "";
+							const sel = v.state.selection.main;
+							return sel.empty ? v.state.doc.toString() : v.state.sliceDoc(sel.from, sel.to);
+						}}
+					/>
+				)}
 			</div>
 		</DbCtx.Provider>
 	);
