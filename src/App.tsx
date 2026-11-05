@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, Database, Download, FileDown, FileUp, House, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, Database, Download, Settings as SettingsIcon, FileDown, FileUp, House, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
@@ -9,15 +9,16 @@ import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog"
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
 import { type AppInfo, api, type ConnectOk, localFs, localTerm, type Profile, sshFs, sshTerm } from "./lib/ipc";
-import { useUpdater } from "./lib/updater";
+import { installNow, startUpdater, useUpdate } from "./lib/updater";
 
 // 무거운 칸(xterm·편집기·표·사전)은 처음 열 때 받는다 — 첫 화면(홈)은 가볍게
 const Workbench = lazy(() => import("./components/Workbench").then((m) => ({ default: m.Workbench })));
 const ResultGridPane = lazy(() => import("./components/ResultGrid").then((m) => ({ default: m.ResultGridPane })));
+const SettingsPane = lazy(() => import("./components/SettingsPane").then((m) => ({ default: m.SettingsPane })));
 const DbWorkbench = lazy(() => import("./components/DbWorkbench").then((m) => ({ default: m.DbWorkbench })));
 const CommandDictionaryPane = lazy(() => import("./components/CommandDictionary").then((m) => ({ default: m.CommandDictionaryPane })));
 
-type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict";
+type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict" | "settings";
 type DbInfo = { ok: DbConnectOk; profile: Profile; readOnly: boolean };
 type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean };
 type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; db?: DbInfo; color?: string | null };
@@ -29,6 +30,7 @@ const TAB_ICON: Record<TabKind, ReactNode> = {
 	db: <Database size={14} />,
 	grid: <Table2 size={14} />,
 	dict: <BookOpen size={14} />,
+	settings: <SettingsIcon size={14} />,
 };
 const LEVEL_BADGE: Record<string, string> = { rsa: "구형 SSH · RSA", sha1: "구형 SSH · SHA-1", weakest: "구형 SSH · 최후" };
 
@@ -55,7 +57,7 @@ export function App() {
 	const [importing, setImporting] = useState(false);
 	const [exporting, setExporting] = useState(false);
 	const [q, setQ] = useState("");
-	const { state: upd, install } = useUpdater();
+	const upd = useUpdate();
 
 	const reload = useCallback(() => {
 		void api.profilesList().then(setProfiles);
@@ -66,6 +68,7 @@ export function App() {
 			setInfo(i);
 			document.documentElement.dataset.os = i.os;
 			document.documentElement.dataset.backdrop = i.osBackdrop ? "os" : "solid";
+			startUpdater(i.version, i.portable);
 		});
 		void api.localHome().then(setLocalHome);
 		reload();
@@ -231,13 +234,16 @@ export function App() {
 
 				<div className="sb-foot">
 					{upd.phase === "available" && (
-						<button type="button" className="update-pill" onClick={() => void install()}>
-							<Download size={14} /> {upd.version} 업데이트 설치
+						<button type="button" className="update-pill" onClick={() => void installNow()} title={upd.portable ? "포터블판 — 릴리스 페이지에서 새 파일 받기" : "받아서 설치하고 다시 켭니다"}>
+							<Download size={14} /> {upd.latest} {upd.portable ? "새 파일 받기" : "업데이트 설치"}
 						</button>
 					)}
-					{upd.phase === "installing" && <span className="update-pill">설치 중… {upd.pct}%</span>}
-					{upd.phase === "error" && <span className="err">업데이트 실패: {upd.message}</span>}
-					<span>{info ? `v${info.version}${info.portable ? " · 포터블" : ""}` : ""}</span>
+					{(upd.phase === "downloading" || upd.phase === "installing") && (
+						<span className="update-pill">{upd.phase === "installing" ? "설치 중…" : `받는 중… ${upd.pct ?? 0}%`}</span>
+					)}
+					<button type="button" className="sb-item" aria-current={activeKind === "settings"} onClick={() => open("settings", "설정", true)}>
+						<SettingsIcon size={16} /> 설정 <span style={{ marginLeft: "auto", color: "var(--text-3)", fontSize: 11 }}>{info ? `v${info.version}${info.portable ? " · 포터블" : ""}` : ""}</span>
+					</button>
 				</div>
 			</aside>
 
@@ -294,7 +300,7 @@ export function App() {
 
 				<div className="content">
 					{tabs.map((t) => (
-						<section key={t.id} className={`pane${t.kind === "home" ? " home" : ""}`} hidden={t.id !== active}>
+						<section key={t.id} className={`pane${t.kind === "home" || t.kind === "settings" ? " home" : ""}`} hidden={t.id !== active}>
 							{t.kind === "home" && (
 								<div className="home-inner">
 									<h1>{greeting()}</h1>
@@ -418,6 +424,7 @@ export function App() {
 									/>
 								)}
 								{t.kind === "grid" && <ResultGridPane />}
+								{t.kind === "settings" && <SettingsPane info={info} />}
 								{t.kind === "dict" && <CommandDictionaryPane />}
 							</Suspense>
 						</section>
