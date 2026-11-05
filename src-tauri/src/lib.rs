@@ -11,6 +11,7 @@ mod secrets;
 mod ssh;
 mod store;
 mod sudo;
+mod sync;
 mod textcodec;
 mod transfer;
 mod viewer;
@@ -82,6 +83,7 @@ pub fn run() {
         .manage(transfer::Transfers::default())
         .manage(db::DbConns::default())
         .manage(viewer::Tails::default())
+        .manage(sync::Watches::default())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
@@ -153,11 +155,19 @@ pub fn run() {
             jdbc::jdbc_install_driver,
             jdbc::jdbc_add_driver_file,
             importer::export_ssh_config,
+            importer::export_profiles,
+            importer::import_db_file,
             sudo::sudo_list,
             sudo::sudo_read_text,
             sudo::sudo_write_text,
             sudo::sudo_op,
             transfer::transfer_cancel,
+            transfer::relay_start,
+            sync::sync_plan,
+            sync::sync_run,
+            sync::sync_rsync_command,
+            sync::watch_start,
+            sync::watch_stop,
             viewer::sftp_read_bytes,
             viewer::local_read_bytes,
             viewer::ssh_tail_open,

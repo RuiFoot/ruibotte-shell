@@ -169,6 +169,8 @@ impl client::Handler for Client {
 
 pub(crate) struct Conn {
     handle: Handle<Client>,
+    /// 점프 호스트 연결 — 대상 연결이 살아 있는 동안 함께 둔다
+    _jump: Option<Handle<Client>>,
     pub(crate) sftp: SftpSession,
     shells: tokio::sync::Mutex<HashMap<u32, ChannelWriteHalf<Msg>>>,
     next_shell: AtomicU32,
@@ -209,6 +211,9 @@ pub struct ConnectReq {
     trust_fingerprint: Option<String>,
     #[serde(default)]
     save_secret: bool,
+    /// 거쳐 갈 SSH 프로필(점프 호스트) — 그 프로필의 호스트 키가 고정돼 있고 비밀이 저장돼 있어야 한다
+    #[serde(default)]
+    jump_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -261,9 +266,22 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
         ..Default::default()
     });
 
-    let connected = tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, (req.host.as_str(), req.port), handler))
-        .await
-        .map_err(|_| err("NETWORK", format!("{}:{} 에 {}초 안에 닿지 못했습니다", req.host, req.port, CONNECT_TIMEOUT.as_secs())))?;
+    // 점프 호스트를 거치면: 점프 서버에 붙어 인증하고, 그 안에서 대상으로 TCP 채널을 열어 그 위에 SSH 를 다시 연다
+    let jump = match req.jump_id {
+        Some(jid) => Some(connect_jump(store, jid).await?),
+        None => None,
+    };
+    let connected = match &jump {
+        Some(j) => {
+            let ch = j
+                .channel_open_direct_tcpip(req.host.clone(), req.port as u32, "127.0.0.1", 0)
+                .await
+                .map_err(|e| err("NETWORK", format!("점프 호스트에서 {}:{} 로 가는 길을 열지 못했습니다: {e}", req.host, req.port)))?;
+            tokio::time::timeout(CONNECT_TIMEOUT, client::connect_stream(config, ch.into_stream(), handler)).await
+        }
+        None => tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, (req.host.as_str(), req.port), handler)).await,
+    }
+    .map_err(|_| err("NETWORK", format!("{}:{} 에 {}초 안에 닿지 못했습니다", req.host, req.port, CONNECT_TIMEOUT.as_secs())))?;
     let mut handle = match connected {
         Ok(h) => h,
         Err(e) => {
@@ -359,7 +377,7 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
     let id = conns.next.fetch_add(1, Ordering::Relaxed) + 1;
     conns.map.lock().unwrap().insert(
         id,
-        Arc::new(Conn { handle, sftp, shells: Default::default(), next_shell: AtomicU32::new(0) }),
+        Arc::new(Conn { handle, _jump: jump, sftp, shells: Default::default(), next_shell: AtomicU32::new(0) }),
     );
     Ok(ConnectOk {
         conn_id: id,
@@ -369,6 +387,48 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
         newly_pinned,
         used_saved_secret: used_saved,
     })
+}
+
+/// 점프 호스트 접속 — 고정된 호스트 키·저장된 비밀만 쓴다(여기서는 묻지 않는다)
+async fn connect_jump(store: &Store, jid: i64) -> R<Handle<Client>> {
+    let p = store.profile(jid).map_err(|e| err("OTHER", format!("점프 호스트 프로필: {e}")))?;
+    let pinned = store
+        .host_key(&p.host, p.port)
+        .ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 호스트 키가 아직 고정되지 않았습니다. 그 프로필로 한 번 직접 접속해 지문을 확인하세요.", p.name)))?;
+    let handler = Client { pinned: Some(pinned), trust: None, seen: Arc::new(Mutex::new(None)) };
+    let config = Arc::new(client::Config {
+        preferred: preferred(&p.legacy),
+        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_max: 4,
+        nodelay: true,
+        ..Default::default()
+    });
+    let mut h = tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, (p.host.as_str(), p.port), handler))
+        .await
+        .map_err(|_| err("NETWORK", format!("점프 호스트 {} 에 닿지 못했습니다", p.name)))?
+        .map_err(|e| {
+            let mut x = map_russh(e);
+            x.message = format!("점프 호스트 {}: {}", p.name, x.message);
+            x
+        })?;
+    let secret = secrets::get(&format!("profile:{jid}"));
+    let ok = if p.auth == "key" {
+        let path = p.key_path.clone().unwrap_or_default();
+        let key = load_secret_key(&path, secret.as_deref()).map_err(|e| err("AUTH_FAILED", format!("점프 호스트 개인키: {e}")))?;
+        let hash = h.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
+        h.authenticate_publickey(&p.username, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(map_russh)?.success()
+    } else {
+        let pw = secret.ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 암호가 저장돼 있지 않습니다. 그 프로필로 접속하며 \"암호 저장\"을 켜 주세요.", p.name)))?;
+        let mut ok = h.authenticate_password(&p.username, &pw).await.map_err(map_russh)?.success();
+        if !ok {
+            ok = keyboard_interactive(&mut h, &p.username, &pw).await.unwrap_or(false);
+        }
+        ok
+    };
+    if !ok {
+        return Err(err("AUTH_FAILED", format!("점프 호스트 {} 인증에 실패했습니다", p.name)));
+    }
+    Ok(h)
 }
 
 async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, pw: &str) -> Result<bool, russh::Error> {
@@ -737,6 +797,7 @@ pub(crate) async fn test_connect(store: &Store, conns: &SshConns, host: &str, po
         legacy: "off".into(),
         trust_fingerprint: trust,
         save_secret: false,
+        jump_id: None,
     };
     match connect(store, conns, req(None)).await {
         Ok(ok) => ok.conn_id,
@@ -782,6 +843,7 @@ mod tests {
             legacy: level.into(),
             trust_fingerprint: trust,
             save_secret: false,
+            jump_id: None,
         };
 
         // 1) 처음 → 지문 확인 요구
@@ -844,5 +906,55 @@ mod tests {
         assert!(!preferred("sha1").kex.contains(&kex::DH_G1_SHA1));
         assert!(preferred("weakest").key.contains(&Algorithm::Dsa));
         assert!(preferred("weakest").cipher.contains(&cipher::TRIPLE_DES_CBC));
+    }
+}
+
+#[cfg(test)]
+mod live_jump {
+    use super::*;
+
+    /// RB_SSH_TEST(점프=최신 sshd)·RB_JUMP_TARGET(점프 서버에서 본 대상 IP:포트)·RB_SSH_TEST_PW
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_connect_through_jump() {
+        let spec = std::env::var("RB_SSH_TEST").unwrap();
+        let target = std::env::var("RB_JUMP_TARGET").unwrap();
+        let pw = std::env::var("RB_SSH_TEST_PW").unwrap();
+        let mut it = spec.split(':');
+        let host = it.next().unwrap().to_string();
+        let port: u16 = it.next().unwrap().parse().unwrap();
+        let (th, tp) = target.split_once(':').unwrap();
+        let dir = std::env::temp_dir().join(format!("rbshell-jump-{}", std::process::id()));
+        let store = Store::open(dir.clone(), false).unwrap();
+        let conns = SshConns::default();
+        test_connect(&store, &conns, &host, port, "rbtest", &pw).await; // 점프 서버 키 고정
+        let jid = crate::store::profile_save_core(&store, &host, port, "rbtest");
+        secrets::set(&format!("profile:{jid}"), &pw).unwrap();
+        let req = |trust: Option<String>| ConnectReq {
+            profile_id: None,
+            host: th.into(),
+            port: tp.parse().unwrap(),
+            username: "rbtest".into(),
+            auth: "password".into(),
+            key_path: None,
+            secret: Some(pw.clone()),
+            legacy: "sha1".into(),
+            trust_fingerprint: trust,
+            save_secret: false,
+            jump_id: Some(jid),
+        };
+        let t = std::time::Instant::now();
+        let ok = match connect(&store, &conns, req(None)).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                println!("대상 지문 확인 요구 → {} {:?}", e.code, e.fingerprint);
+                connect(&store, &conns, req(e.fingerprint)).await.unwrap()
+            }
+        };
+        println!("점프 거쳐 접속 {} ms, 대상 키 {} home {}", t.elapsed().as_millis(), ok.algorithm, ok.home);
+        let l = list(&conns, ok.conn_id, ok.home.clone()).await.unwrap();
+        assert!(l.iter().any(|e| e.name == "app"));
+        secrets::forget(&format!("profile:{jid}"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

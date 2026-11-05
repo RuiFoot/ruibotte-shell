@@ -50,6 +50,7 @@ time = "0.3"
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [profile.release]
 # 설치 크기·기동 우선

@@ -1,7 +1,7 @@
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, ShieldAlert, SquareTerminal, X } from "lucide-react";
+import { ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -22,6 +22,7 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
+import { SyncPanel } from "./SyncPanel";
 import { TailView } from "./TailView";
 import { invoke } from "@tauri-apps/api/core";
 import type { CompletionSource } from "../lib/termComplete";
@@ -55,6 +56,10 @@ type Ctx = {
 	compare: (which: Which, e: FsEntry) => void;
 	compareLabel: (which: Which, e: FsEntry) => string;
 	archive: (e: FsEntry) => void;
+	relay: (e: FsEntry) => void;
+	hasPeers: boolean;
+	showTransfers: () => void;
+	syncInfo?: { user: string; host: string; port: number };
 	/** 동시 입력: 한 터미널에 친 것을 다른 터미널에도 */
 	broadcast: (fromPanel: string, data: string) => void;
 	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
@@ -90,6 +95,7 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 				onCompare={(e) => ctx.compare(props.params.which, e)}
 				compareLabel={(e) => ctx.compareLabel(props.params.which, e)}
 				onArchive={props.params.which === "remote" && fs.side === "remote" ? ctx.archive : undefined}
+				onRelay={props.params.which === "remote" && ctx.hasPeers ? ctx.relay : undefined}
 			/>
 		</div>
 	);
@@ -148,6 +154,12 @@ function DiffPanel(props: IDockviewPanelProps<{ a: { which: Which; path: string 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 열 때 한 번
 	const sides = useMemo(() => [side(props.params.a), side(props.params.b)] as const, []);
 	return <DiffView a={sides[0]} b={sides[1]} />;
+}
+
+function SyncDock() {
+	const ctx = useWb();
+	if (ctx.fs.conn == null || !ctx.syncInfo) return null;
+	return <SyncPanel conn={ctx.fs.conn} remoteHome={ctx.fs.home} user={ctx.syncInfo.user} host={ctx.syncInfo.host} port={ctx.syncInfo.port} onRun={ctx.showTransfers} />;
 }
 
 function Watermark() {
@@ -219,7 +231,7 @@ function TransfersPanel() {
 				return (
 					<div key={p.id} className="xfer-row">
 						<span>
-							{p.direction === "up" ? "↑ 올리기" : "↓ 받기"} <b>{p.name}</b>
+							{p.direction === "up" ? "↑ 올리기" : p.direction === "relay" ? "⇄ 중계" : "↓ 받기"} <b>{p.name}</b>
 						</span>
 						{p.state === "running" ? (
 							<button type="button" className="btn ghost icon" style={{ height: 20, width: 20 }} title="취소" onClick={() => void transfers.cancel(p.id)}>
@@ -246,7 +258,7 @@ function TransfersPanel() {
 	);
 }
 
-const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel };
+const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel, sync: SyncDock };
 const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
 
 /** 기본 배치: 트리 왼쪽 · 편집기 가운데 · 터미널 오른쪽 */
@@ -308,6 +320,8 @@ export function Workbench({
 	badge,
 	layoutKey,
 	profileId,
+	peers = [],
+	syncInfo,
 }: {
 	fs: FsBackend;
 	/** 원격 작업대일 때 내 PC 트리(전송용) */
@@ -321,6 +335,9 @@ export function Workbench({
 	layoutKey: string;
 	/** 원격 프로필(저장한 sudo 암호용) */
 	profileId?: number;
+	/** 열려 있는 다른 SSH 연결(중계 대상) */
+	peers?: { conn: number; label: string; home: string }[];
+	syncInfo?: { user: string; host: string; port: number };
 }) {
 	const [sudoOn, setSudoOn] = useState(false);
 	const [sudoMode, setSudoMode] = useState<"together" | "apart">("together");
@@ -551,6 +568,34 @@ export function Workbench({
 		[fs],
 	);
 
+	const relay = useCallback(
+		async (e: FsEntry) => {
+			if (fs.conn == null || !peers.length) return;
+			const pick =
+				peers.length === 1
+					? peers[0]
+					: peers[Number(prompt(`보낼 서버 번호\n${peers.map((p, i) => `${i + 1}. ${p.label}`).join("\n")}`, "1")) - 1];
+			if (!pick) return;
+			const dest = prompt(`${pick.label} 의 어느 폴더로 보낼까요?`, pick.home);
+			if (!dest) return;
+			showTransfers();
+			try {
+				await invoke("relay_start", { fromConn: fs.conn, src: e.path, toConn: pick.conn, destDir: dest, overwrite: confirm("같은 이름이 있으면 덮어쓸까요? (취소 = 건너뛰기)") });
+			} catch (x) {
+				alert(asSshError(x).message);
+			}
+		},
+		[fs, peers],
+	);
+
+	const openSync = () => {
+		const d = dock.current;
+		if (!d) return;
+		if (d.getPanel("sync")) return void d.getPanel("sync")?.api.setActive();
+		const ref = d.getPanel("tree");
+		d.addPanel({ id: "sync", component: "sync", title: "동기화", renderer: "always", position: ref ? { referencePanel: ref.id, direction: "below" } : undefined });
+	};
+
 	const addTerminal = () => {
 		const d = dock.current;
 		if (!d) return;
@@ -632,9 +677,13 @@ export function Workbench({
 			compare,
 			compareLabel,
 			archive: (e: FsEntry) => void archive(e),
+			relay: (e: FsEntry) => void relay(e),
+			hasPeers: peers.length > 0,
+			showTransfers,
+			syncInfo,
 			treeKey: instance.current,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -654,6 +703,11 @@ export function Workbench({
 					{local && (
 						<button type="button" className="btn ghost" onClick={showTransfers} title="전송 목록">
 							<ArrowDownUp size={14} /> 전송
+						</button>
+					)}
+					{local && syncInfo && (
+						<button type="button" className="btn ghost" onClick={openSync} title="폴더 동기화(rsync 모드)·자동 반영">
+							<RefreshCcw size={14} /> 동기화
 						</button>
 					)}
 					<button

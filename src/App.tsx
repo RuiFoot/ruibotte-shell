@@ -396,6 +396,10 @@ export function App() {
 										term={backendFor(t).term}
 										layoutKey="layout.ssh"
 										profileId={t.ssh.profile.id}
+										peers={tabs
+											.filter((x) => x.ssh && x.id !== t.id && !x.ssh.closed)
+											.map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.ssh?.profile.name ?? "", home: x.ssh?.ok.home ?? "/" }))}
+										syncInfo={{ user: t.ssh.profile.username, host: t.ssh.profile.host, port: t.ssh.profile.port }}
 										active={t.id === active}
 										label={`${t.ssh.profile.username}@${t.ssh.profile.host}`}
 										startPath={t.ssh.profile.defaultPath ?? undefined}
@@ -434,6 +438,7 @@ export function App() {
 
 			{sheet && (
 				<ProfileSheet
+					others={profiles}
 					initial={sheet}
 					onClose={() => setSheet(null)}
 					onSaved={() => {

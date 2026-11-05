@@ -64,6 +64,8 @@ const MIGRATIONS: &[&str] = &[
         at INTEGER NOT NULL
      );
      CREATE INDEX query_history_scope ON query_history(scope, at DESC);",
+    // 5: 점프 호스트(다른 SSH 프로필을 거쳐 접속)
+    "ALTER TABLE profile ADD COLUMN jump_id INTEGER;",
 ];
 
 pub struct Store {
@@ -105,6 +107,14 @@ impl Store {
         }
         tx.commit()?;
         Ok(Self { conn: Mutex::new(conn), path, portable })
+    }
+
+    pub fn profile(&self, id: i64) -> Result<Profile, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(&format!("SELECT {PROFILE_COLS} FROM profile WHERE id=?1"), [id], profile_row)
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "프로필이 없습니다".into())
     }
 
     pub fn mark_used(&self, id: i64, secret_saved: Option<bool>) {
@@ -187,6 +197,9 @@ pub struct Profile {
     /// 읽기 전용 — OS 저장소에 비밀(암호·키 암호)이 저장돼 있는지
     #[serde(default)]
     pub secret_saved: bool,
+    /// 이 SSH 프로필을 거쳐 접속(점프 호스트)
+    #[serde(default)]
+    pub jump_id: Option<i64>,
 }
 
 fn default_auth() -> String {
@@ -197,7 +210,7 @@ fn default_legacy() -> String {
 }
 
 const PROFILE_COLS: &str = "id, kind, name, host, port, username, engine, color, favorite, last_used_at,
-    auth, key_path, legacy, default_path, database, secret_saved_at";
+    auth, key_path, legacy, default_path, database, secret_saved_at, jump_id";
 
 fn profile_row(r: &Row) -> rusqlite::Result<Profile> {
     Ok(Profile {
@@ -217,6 +230,7 @@ fn profile_row(r: &Row) -> rusqlite::Result<Profile> {
         default_path: r.get(13)?,
         database: r.get(14)?,
         secret_saved: r.get::<_, Option<i64>>(15)?.is_some(),
+        jump_id: r.get(16)?,
     })
 }
 
@@ -250,9 +264,9 @@ pub fn profile_save(store: State<'_, Store>, p: Profile) -> Result<i64, String> 
         Some(id) => {
             conn.execute(
                 "UPDATE profile SET kind=?1, name=?2, host=?3, port=?4, username=?5, engine=?6, color=?7,
-                 favorite=?8, updated_at=?9, auth=?10, key_path=?11, legacy=?12, default_path=?13, database=?14 WHERE id=?15",
+                 favorite=?8, updated_at=?9, auth=?10, key_path=?11, legacy=?12, default_path=?13, database=?14, jump_id=?16 WHERE id=?15",
                 params![p.kind, p.name.trim(), host, p.port, p.username, p.engine, p.color, p.favorite as i64, t,
-                    p.auth, p.key_path, p.legacy, p.default_path, p.database, id],
+                    p.auth, p.key_path, p.legacy, p.default_path, p.database, id, p.jump_id.filter(|j| *j != id)],
             )
             .map_err(|e| e.to_string())?;
             Ok(id)
@@ -260,10 +274,10 @@ pub fn profile_save(store: State<'_, Store>, p: Profile) -> Result<i64, String> 
         None => {
             conn.execute(
                 "INSERT INTO profile (kind, name, host, port, username, engine, color, favorite, created_at, updated_at,
-                  auth, key_path, legacy, default_path, database)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  auth, key_path, legacy, default_path, database, jump_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![p.kind, p.name.trim(), host, p.port, p.username, p.engine, p.color, p.favorite as i64, t,
-                    p.auth, p.key_path, p.legacy, p.default_path, p.database],
+                    p.auth, p.key_path, p.legacy, p.default_path, p.database, p.jump_id],
             )
             .map_err(|e| e.to_string())?;
             Ok(conn.last_insert_rowid())
@@ -391,4 +405,16 @@ pub fn history_list(store: State<'_, Store>, scope: String, q: Option<String>) -
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+}
+
+/// 시험용 — SSH 프로필 하나 만들기
+#[cfg(test)]
+pub(crate) fn profile_save_core(store: &Store, host: &str, port: u16, user: &str) -> i64 {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO profile (kind, name, host, port, username, created_at, updated_at) VALUES ('ssh', 'jump', ?1, ?2, ?3, 0, 0)",
+        params![host, port, user],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
 }

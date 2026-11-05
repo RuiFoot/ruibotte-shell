@@ -53,6 +53,7 @@ export function ConnectDialog({
 					legacy: prof.legacy,
 					trustFingerprint: trust.current,
 					saveSecret: save,
+					jumpId: prof.jumpId ?? null,
 				});
 				onConnected(ok, prof);
 			} catch (raw) {

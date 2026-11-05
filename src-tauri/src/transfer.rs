@@ -19,13 +19,13 @@ const CHUNK: usize = 256 * 1024;
 
 #[derive(Default)]
 pub struct Transfers {
-    next: AtomicU32,
-    cancel: Arc<Mutex<HashSet<u32>>>,
+    pub(crate) next: AtomicU32,
+    pub(crate) cancel: Arc<Mutex<HashSet<u32>>>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Progress {
+pub(crate) struct Progress {
     id: u32,
     direction: &'static str,
     name: String,
@@ -45,11 +45,11 @@ struct Progress {
     ms: u64,
 }
 
-struct Item {
-    src: String,
-    dest: String,
-    size: u64,
-    dir: bool,
+pub(crate) struct Item {
+    pub(crate) src: String,
+    pub(crate) dest: String,
+    pub(crate) size: u64,
+    pub(crate) dir: bool,
 }
 
 fn rjoin(dir: &str, name: &str) -> String {
@@ -123,17 +123,36 @@ pub async fn transfer_start(
         walk_remote(&c, &src, Path::new(&dest_dir).join(&name), &mut v).await?;
         v
     };
+    spawn_items(app, transfers.cancel.clone(), c, id, if up { Mode::Up } else { Mode::Down }, name, items, overwrite);
+    Ok(id)
+}
+
+#[derive(Clone)]
+pub(crate) enum Mode {
+    Up,
+    Down,
+    /// 서버 A → 서버 B(같은 앱 안의 다른 연결)
+    Relay(Arc<Conn>),
+}
+
+/// 항목 목록을 뒤에서 옮긴다(진행률 transfer 이벤트) — 전송·동기화·중계 공용
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: Arc<Conn>, id: u32, mode: Mode, name: String, items: Vec<Item>, overwrite: bool) {
+    let up = matches!(mode, Mode::Up);
     let total: u64 = items.iter().map(|i| i.size).sum();
     let files_total = items.iter().filter(|i| !i.dir).count() as u32;
     let dest = items.first().map(|i| i.dest.clone()).unwrap_or_default();
-    let cancel = transfers.cancel.clone();
     let app2 = app.clone();
     let c2: Arc<Conn> = c.clone();
     tauri::async_runtime::spawn(async move {
         let started = Instant::now();
         let prog = Arc::new(Mutex::new(Progress {
             id,
-            direction: if up { "up" } else { "down" },
+            direction: match mode {
+                Mode::Up => "up",
+                Mode::Down => "down",
+                Mode::Relay(_) => "relay",
+            },
             name,
             dest,
             bytes_done: 0,
@@ -169,7 +188,11 @@ pub async fn transfer_start(
         let result: Result<(), String> = async {
             // 폴더 먼저(순서대로)
             for it in items.iter().filter(|i| i.dir) {
-                if up {
+                if let Mode::Relay(b) = &mode {
+                    if b.sftp.metadata(it.dest.clone()).await.is_err() {
+                        b.sftp.create_dir(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+                    }
+                } else if up {
                     if c2.sftp.metadata(it.dest.clone()).await.is_err() {
                         c2.sftp.create_dir(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
                     }
@@ -184,18 +207,26 @@ pub async fn transfer_start(
                     let c2 = c2.clone();
                     let prog = prog.clone();
                     let cancel = cancel.clone();
+                    let mode = mode.clone();
                     async move {
                         if cancel.lock().unwrap().contains(&id) {
                             return Err("cancelled".to_string());
                         }
-                        let exists = if up { c2.sftp.try_exists(it.dest.clone()).await.unwrap_or(false) } else { Path::new(&it.dest).exists() };
+                        let exists = match &mode {
+                            Mode::Up => c2.sftp.try_exists(it.dest.clone()).await.unwrap_or(false),
+                            Mode::Down => Path::new(&it.dest).exists(),
+                            Mode::Relay(b) => b.sftp.try_exists(it.dest.clone()).await.unwrap_or(false),
+                        };
                         if exists && !overwrite {
                             let mut p = prog.lock().unwrap();
                             p.skipped += 1;
                             p.bytes_done += it.size;
                             return Ok(());
                         }
-                        let outcome = copy_one(&c2, it, up, &prog, &cancel, id).await?;
+                        let outcome = match &mode {
+                            Mode::Relay(b) => relay_one(&c2, b, it, &prog, &cancel, id).await?,
+                            _ => copy_one(&c2, it, up, &prog, &cancel, id).await?,
+                        };
                         let mut p = prog.lock().unwrap();
                         p.files_done += 1;
                         if outcome.verified {
@@ -224,16 +255,78 @@ pub async fn transfer_start(
         }
         let _ = app2.emit("transfer", p);
     });
+}
+
+pub(crate) struct Outcome {
+    pub(crate) verified: bool,
+    pub(crate) resumed: bool,
+}
+
+/// 서버 A 의 파일을 서버 B 로 — 내 PC 를 거쳐 흘려 보낸다(디스크에 남기지 않음). 양쪽 sha256 을 맞춰 본다
+async fn relay_one(a: &Conn, b: &Conn, it: &Item, prog: &Arc<Mutex<Progress>>, cancel: &Arc<Mutex<HashSet<u32>>>, id: u32) -> Result<Outcome, String> {
+    use sha2::Digest;
+    let part = format!("{}.rbpart", it.dest);
+    let mut src = a.sftp.open(it.src.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    let mut dst = b.sftp.create(part.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        if cancel.lock().unwrap().contains(&id) {
+            return Err("cancelled".into());
+        }
+        let n = src.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        dst.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
+        prog.lock().unwrap().bytes_done += n as u64;
+    }
+    dst.shutdown().await.map_err(|e| e.to_string())?;
+    let mine = hex::encode(hasher.finalize());
+    let (ha, hb) = (remote_sha256(a, &it.src).await, remote_sha256(b, &part).await);
+    for h in [&ha, &hb].into_iter().flatten() {
+        if *h != mine {
+            let _ = b.sftp.remove_file(part.clone()).await;
+            return Err(format!("{} — sha256 이 맞지 않아 지웠습니다", base_name(&it.dest)));
+        }
+    }
+    if b.sftp.try_exists(it.dest.clone()).await.unwrap_or(false) {
+        b.sftp.remove_file(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    }
+    b.sftp.rename(part, it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    Ok(Outcome { verified: ha.is_some() && hb.is_some(), resumed: false })
+}
+
+/// 서버 A → 서버 B 중계 시작
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn relay_start(
+    app: AppHandle,
+    conns: State<'_, SshConns>,
+    transfers: State<'_, Transfers>,
+    from_conn: u32,
+    src: String,
+    to_conn: u32,
+    dest_dir: String,
+    overwrite: bool,
+) -> R<u32> {
+    let a = conns.get(from_conn)?;
+    let b = conns.get(to_conn)?;
+    let id = transfers.next.fetch_add(1, Ordering::Relaxed) + 1;
+    let name = base_name(&src);
+    let mut items = Vec::new();
+    walk_remote(&a, &src, Path::new(&dest_dir).join(&name), &mut items).await?;
+    // 원격 경로는 늘 / — Windows 의 PathBuf 가 \ 로 이은 것을 바로잡는다
+    for it in &mut items {
+        it.dest = it.dest.replace('\\', "/");
+    }
+    spawn_items(app, transfers.cancel.clone(), a, id, Mode::Relay(b), name, items, overwrite);
     Ok(id)
 }
 
-struct Outcome {
-    verified: bool,
-    resumed: bool,
-}
-
 /// 원격 sha256 — 서버에 sha256sum 이 없으면 None(확인 건너뜀)
-async fn remote_sha256(c: &Conn, path: &str) -> Option<String> {
+pub(crate) async fn remote_sha256(c: &Conn, path: &str) -> Option<String> {
     let mut ch = c.handle_ref().channel_open_session().await.ok()?;
     let q = format!("sha256sum -- '{}' 2>/dev/null", path.replace('\'', "'\\''"));
     ch.exec(true, q.as_str()).await.ok()?;
@@ -249,7 +342,7 @@ async fn remote_sha256(c: &Conn, path: &str) -> Option<String> {
 }
 
 /// 파일 하나 — `<이름>.rbpart` 에 쓰고(있으면 이어서), sha256 이 맞으면 최종 이름으로
-async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Progress>>, cancel: &Arc<Mutex<HashSet<u32>>>, id: u32) -> Result<Outcome, String> {
+pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Progress>>, cancel: &Arc<Mutex<HashSet<u32>>>, id: u32) -> Result<Outcome, String> {
     use sha2::Digest;
     use tokio::io::AsyncSeekExt;
     let part = format!("{}.rbpart", it.dest);
@@ -366,6 +459,27 @@ async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Progress>>, ca
 pub fn transfer_cancel(transfers: State<'_, Transfers>, id: u32) {
     transfers.cancel.lock().unwrap().insert(id);
 }
+
+/// 진행률을 따로 보이지 않는 한 파일 전송용(경로 매핑 자동 반영)
+pub(crate) fn dummy_progress() -> Arc<Mutex<Progress>> {
+    Arc::new(Mutex::new(Progress {
+        id: 0,
+        direction: "up",
+        name: String::new(),
+        dest: String::new(),
+        bytes_done: 0,
+        bytes_total: 0,
+        files_done: 0,
+        files_total: 0,
+        skipped: 0,
+        verified: 0,
+        resumed: 0,
+        state: "running",
+        error: None,
+        ms: 0,
+    }))
+}
+
 
 #[cfg(test)]
 mod live {

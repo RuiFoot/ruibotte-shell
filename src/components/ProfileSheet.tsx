@@ -30,14 +30,17 @@ export function ProfileSheet({
 	initial,
 	onClose,
 	onSaved,
+	others = [],
 }: {
+	/** 점프 호스트로 고를 수 있는 다른 SSH 프로필 */
+	others?: Profile[];
 	initial: Profile;
 	onClose: () => void;
 	onSaved: (id: number) => void;
 }) {
 	const [p, setP] = useState<Profile>(initial);
 	const [err, setErr] = useState("");
-	const [advanced, setAdvanced] = useState(initial.legacy !== "off");
+	const [advanced, setAdvanced] = useState(initial.legacy !== "off" || !!initial.jumpId);
 	const set = (patch: Partial<Profile>) => setP((x) => ({ ...x, ...patch }));
 	const editing = initial.id != null;
 
@@ -181,6 +184,21 @@ export function ProfileSheet({
 							{advanced ? "▾" : "▸"} 고급
 						</button>
 						{advanced && (
+							<>
+							<div className="field" style={{ marginTop: 8 }}>
+								<label htmlFor="pf-jump">점프 호스트(이 서버를 거쳐 접속)</label>
+								<select id="pf-jump" value={p.jumpId ?? ""} onChange={(e) => set({ jumpId: e.target.value ? Number(e.target.value) : null })}>
+									<option value="">거치지 않음</option>
+									{others
+										.filter((o) => o.kind === "ssh" && o.id !== p.id)
+										.map((o) => (
+											<option key={o.id} value={o.id}>
+												{o.name} ({o.username}@{o.host})
+											</option>
+										))}
+								</select>
+								<small style={{ color: "var(--text-3)" }}>점프 호스트는 한 번 직접 접속해 지문을 고정하고 암호를 저장해 두어야 합니다</small>
+							</div>
 							<div className="field" style={{ marginTop: 8 }}>
 								<label htmlFor="pf-legacy">구형 SSH 호환(이 서버에만)</label>
 								<select id="pf-legacy" value={p.legacy} onChange={(e) => set({ legacy: e.target.value as LegacyLevel })}>
@@ -190,6 +208,7 @@ export function ProfileSheet({
 									<option value="weakest">최후 — ssh-dss·group1·3des 까지</option>
 								</select>
 							</div>
+							</>
 						)}
 					</>
 				)}

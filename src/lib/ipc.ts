@@ -30,6 +30,8 @@ export type Profile = {
 	database?: string | null;
 	/** 읽기 전용 — OS 저장소에 비밀이 있는지 */
 	secretSaved?: boolean;
+	/** 거쳐 갈 SSH 프로필(점프 호스트) */
+	jumpId?: number | null;
 };
 
 export type SshError = {
@@ -65,6 +67,7 @@ export type ConnectReq = {
 	legacy: LegacyLevel;
 	trustFingerprint?: string | null;
 	saveSecret?: boolean;
+	jumpId?: number | null;
 };
 
 export type ConnectOk = {
@@ -116,7 +119,7 @@ export type FsBackend = {
 
 export type TransferProgress = {
 	id: number;
-	direction: "up" | "down";
+	direction: "up" | "down" | "relay";
 	name: string;
 	dest: string;
 	bytesDone: number;
