@@ -19,7 +19,7 @@ import {
 	type TransferProgress,
 	transfers,
 } from "../lib/ipc";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
@@ -52,6 +52,14 @@ type Ctx = {
 	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string) => void;
 	sendTo: (from: Which, e: FsEntry) => void;
 	cd: (dir: string) => void;
+	/** 트리↔터미널 같이(따라가기) */
+	follow: boolean;
+	/** 올리기(파일·폴더 고르기) — 원격 작업대만 */
+	uploadPick?: (dir: string, folder: boolean) => void;
+	/** 받을 곳 골라 받기 — 원격 작업대만 */
+	downloadTo?: (e: FsEntry) => void;
+	/** 이 폴더에서 새 터미널 */
+	newTerminal: (dir: string) => void;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
 	onCwd: (path: string) => void;
 	completion: CompletionSource;
@@ -80,6 +88,12 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 	const ctx = useWb();
 	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
 	const [root, setRoot] = useState(props.params.which === "remote" ? ctx.startPath || fs.home : fs.home);
+	const follows = props.params.which === "remote" || !ctx.local;
+	// 트리에서 폴더를 바꾸면(같이 켜짐) 터미널도 그 폴더로 — 터미널에서 온 변경은 되돌려 보내지 않는다
+	const goRoot = (p: string) => {
+		setRoot(p);
+		if (ctx.follow && follows && p !== root) ctx.cd(p);
+	};
 	// 터미널을 따라가기: 원격 트리(또는 내 PC 작업대의 트리)만
 	useEffect(() => {
 		const follows = props.params.which === "remote" || !ctx.local;
@@ -93,7 +107,7 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 			<FileTree
 				fs={fs}
 				root={root}
-				onRoot={setRoot}
+				onRoot={goRoot}
 				onOpen={(e) => ctx.openFile(props.params.which, e)}
 				onDrop={(src, dir) => ctx.drop(src, fs.side, dir)}
 				onSend={ctx.local ? (e) => ctx.sendTo(props.params.which, e) : undefined}
@@ -104,6 +118,9 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 				compareLabel={(e) => ctx.compareLabel(props.params.which, e)}
 				onArchive={props.params.which === "remote" && fs.side === "remote" ? ctx.archive : undefined}
 				onRelay={props.params.which === "remote" && ctx.hasPeers ? ctx.relay : undefined}
+				onUploadPick={props.params.which === "remote" ? ctx.uploadPick : undefined}
+				onDownloadTo={props.params.which === "remote" ? ctx.downloadTo : undefined}
+				onNewTerminal={follows ? ctx.newTerminal : undefined}
 			/>
 		</div>
 	);
@@ -132,14 +149,14 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 	);
 }
 
-function TerminalPanel(props: IDockviewPanelProps<{ n: number }>) {
+function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string }>) {
 	const ctx = useWb();
 	return (
 		<div className="panel-fill">
 			<TerminalView
 				backend={ctx.term}
 				active={ctx.activePanel === props.api.id}
-				cwd={ctx.startPath}
+				cwd={props.params.cwd ?? ctx.startPath}
 				label={ctx.label}
 				toolbar={false}
 				onShell={(h) => ctx.registerShell(props.api.id, h)}
@@ -580,6 +597,28 @@ export function Workbench({
 		[drop, fs, local],
 	);
 
+	/** 올리기 — 내 PC 에서 파일(여러 개)이나 폴더를 골라 이 서버 폴더로 */
+	const uploadPick = useCallback(
+		async (dir: string, folder: boolean) => {
+			const picked = await openDialog({ multiple: !folder, directory: folder, title: folder ? "올릴 폴더 고르기" : "올릴 파일 고르기" });
+			const paths = (Array.isArray(picked) ? picked : picked ? [picked] : []) as string[];
+			for (const p of paths) {
+				const name = p.replace(/\\/g, "/").split("/").pop() ?? p;
+				await drop({ side: "local", path: p.replace(/\\/g, "/"), name, kind: folder ? "dir" : "file" }, "remote", dir);
+			}
+		},
+		[drop],
+	);
+	/** 받을 곳을 골라 받기 */
+	const downloadTo = useCallback(
+		async (e: FsEntry) => {
+			const dest = await openDialog({ directory: true, multiple: false, title: `${e.name} 을(를) 받을 폴더` });
+			if (typeof dest !== "string") return;
+			await drop({ side: "remote", conn: fs.conn, path: e.path, name: e.name, kind: e.kind }, "local", dest.replace(/\\/g, "/"));
+		},
+		[drop, fs],
+	);
+
 	/** 편집기들이 있는 칸 옆에(없으면 트리 오른쪽) */
 	const addBeside = (opts: { id: string; component: string; title: string; params: object }) => {
 		const d = dock.current;
@@ -660,7 +699,8 @@ export function Workbench({
 		addDoc(d, { id: "monitor", component: "monitor", title: "자원" });
 	};
 
-	const addTerminal = () => {
+	const addTerminalRef = useRef<(cwd?: string) => void>(() => {});
+	const addTerminal = (cwd?: string) => {
 		const d = dock.current;
 		if (!d) return;
 		termSeq.current += 1;
@@ -669,12 +709,13 @@ export function Workbench({
 		d.addPanel({
 			id: `term-${n}`,
 			component: "terminal",
-			title: `터미널 ${n}`,
-			params: { n },
+			title: cwd ? `터미널 ${n} · ${cwd.split("/").filter(Boolean).pop() ?? "/"}` : `터미널 ${n}`,
+			params: { n, cwd },
 			renderer: "always",
 			position: ref ? { referencePanel: ref.id, direction: "within" } : undefined,
 		});
 	};
+	addTerminalRef.current = addTerminal;
 
 	const toggle = (id: "tree" | "localtree") => {
 		const d = dock.current;
@@ -737,6 +778,10 @@ export function Workbench({
 			drop: (src: DragEntry, side: "remote" | "local", dir: string) => void drop(src, side, dir),
 			sendTo,
 			cd,
+			follow,
+			uploadPick: local && fs.side === "remote" ? uploadPick : undefined,
+			downloadTo: local && fs.side === "remote" ? downloadTo : undefined,
+			newTerminal: (dir: string) => addTerminalRef.current(dir),
 			registerShell,
 			onCwd,
 			broadcast,
@@ -754,7 +799,7 @@ export function Workbench({
 			profileId,
 			sudoOn: sudoOn && !!sudoFs,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -795,7 +840,7 @@ export function Workbench({
 					>
 						<Radio size={14} /> <span className="lbl">동시 입력{broadcastOn ? " 켜짐" : ""}</span>
 					</button>
-					<button type="button" className="btn ghost" onClick={addTerminal} title="터미널 하나 더(같은 연결 위 새 채널)">
+					<button type="button" className="btn ghost" onClick={() => addTerminal()} title="터미널 하나 더(같은 연결 위 새 채널)">
 						<SquareTerminal size={14} /> <span className="lbl">터미널 +</span>
 					</button>
 					<span className="sep" />

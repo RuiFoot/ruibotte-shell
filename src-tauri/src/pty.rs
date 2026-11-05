@@ -66,6 +66,7 @@ pub fn pty_open(
     cols: u16,
     rows: u16,
     on_data: Channel<InvokeResponseBody>,
+    cwd: Option<String>,
 ) -> Result<u32, String> {
     let pair = native_pty_system()
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -73,8 +74,14 @@ pub fn pty_open(
     let mut cmd = default_shell();
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
-        cmd.cwd(home);
+    // 시작 폴더: 트리에서 "여기서 터미널" 로 열면 그 폴더, 아니면 홈
+    match cwd.filter(|c| std::path::Path::new(c).is_dir()) {
+        Some(c) => cmd.cwd(c),
+        None => {
+            if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
+                cmd.cwd(home);
+            }
+        }
     }
     let program = cmd.get_argv().first().map(|a| a.to_string_lossy().to_lowercase()).unwrap_or_default();
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;

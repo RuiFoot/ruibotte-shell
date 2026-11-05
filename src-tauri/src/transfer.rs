@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use futures_util::TryStreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::ssh::{err, sftp_err, Conn, SshConns, R};
 
@@ -344,7 +344,6 @@ pub(crate) async fn remote_sha256(c: &Conn, path: &str) -> Option<String> {
 /// 파일 하나 — `<이름>.rbpart` 에 쓰고(있으면 이어서), sha256 이 맞으면 최종 이름으로
 pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Progress>>, cancel: &Arc<Mutex<HashSet<u32>>>, id: u32) -> Result<Outcome, String> {
     use sha2::Digest;
-    use tokio::io::AsyncSeekExt;
     let part = format!("{}.rbpart", it.dest);
     let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; CHUNK];
@@ -537,6 +536,143 @@ mod live {
         println!("깨진 이어받기 → {e}");
         assert!(e.contains("sha256"));
         let _ = c.sftp.remove_file("/home/rbtest/big.bin".to_string()).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// 탐색기에서 끌어 놓은 파일 올리기 — 화면이 파일을 조각(몇 MB)으로 보내면 차례대로 쓴다.
+/// 본문은 바이너리 그대로, 머리에 x-conn·x-path(URI 인코딩)·x-offset. offset 0 이면 새로 만들기(덮어쓰기)
+#[tauri::command]
+pub async fn sftp_put_chunk(conns: State<'_, SshConns>, request: tauri::ipc::Request<'_>) -> R<()> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err(err("OTHER", "본문이 없습니다"));
+    };
+    let h = request.headers();
+    let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let conn: u32 = get("x-conn").and_then(|v| v.parse().ok()).ok_or_else(|| err("OTHER", "연결 번호가 없습니다"))?;
+    let path = get("x-path").map(|p| percent_decode(&p)).ok_or_else(|| err("OTHER", "경로가 없습니다"))?;
+    let offset: u64 = get("x-offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    put_chunk(&*conns.get(conn)?, path, offset, data).await
+}
+
+pub(crate) async fn put_chunk(c: &Conn, path: String, offset: u64, data: &[u8]) -> R<()> {
+    let mut f = if offset == 0 {
+        c.sftp.create(path).await.map_err(sftp_err)?
+    } else {
+        let mut f = c.sftp.open_with_flags(path, russh_sftp::protocol::OpenFlags::WRITE).await.map_err(sftp_err)?;
+        f.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| err("SFTP", e.to_string()))?;
+        f
+    };
+    f.write_all(data).await.map_err(|e| err("SFTP", e.to_string()))?;
+    f.shutdown().await.map_err(|e| err("SFTP", e.to_string()))?;
+    Ok(())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 서버 안 복사(cp -a, 같은 이름이 있으면 거절)
+#[tauri::command]
+pub async fn ssh_copy(conns: State<'_, SshConns>, conn: u32, from: String, to: String) -> R<()> {
+    let c = conns.get(conn)?;
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\''"));
+    let cmd = format!("[ -e {t} ] && {{ echo '같은 이름이 이미 있습니다' >&2; exit 1; }}; cp -a -- {f} {t}", f = q(&from), t = q(&to));
+    let o = crate::sudo::exec(&c, &cmd, None).await?;
+    if o.code != Some(0) {
+        return Err(err("SFTP", o.stderr.trim().lines().last().unwrap_or("복사하지 못했습니다").to_string()));
+    }
+    Ok(())
+}
+
+/// 내 PC 안 복사(폴더는 안까지, 같은 이름이 있으면 거절)
+#[tauri::command]
+pub fn local_copy(from: String, to: String) -> Result<(), String> {
+    fn copy(a: &Path, b: &Path) -> std::io::Result<()> {
+        if a.is_dir() {
+            std::fs::create_dir(b)?;
+            for e in std::fs::read_dir(a)? {
+                let e = e?;
+                copy(&e.path(), &b.join(e.file_name()))?;
+            }
+            Ok(())
+        } else {
+            std::fs::copy(a, b).map(|_| ())
+        }
+    }
+    let (a, b) = (PathBuf::from(&from), PathBuf::from(&to));
+    if b.exists() {
+        return Err("같은 이름이 이미 있습니다".into());
+    }
+    if b.starts_with(&a) {
+        return Err("폴더를 자기 안으로 복사할 수 없습니다".into());
+    }
+    copy(&a, &b).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    #[test]
+    fn decode_and_local_copy() {
+        assert_eq!(percent_decode("%2Fhome%2F%ED%95%9C%EA%B8%80%20a.txt"), "/home/한글 a.txt");
+        let d = std::env::temp_dir().join(format!("rbshell-copy-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("src/sub")).unwrap();
+        std::fs::write(d.join("src/sub/x.txt"), "x").unwrap();
+        local_copy(d.join("src").to_string_lossy().into(), d.join("dst").to_string_lossy().into()).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("dst/sub/x.txt")).unwrap(), "x");
+        assert!(local_copy(d.join("src").to_string_lossy().into(), d.join("dst").to_string_lossy().into()).is_err());
+        assert!(local_copy(d.join("src").to_string_lossy().into(), d.join("src/sub/in").to_string_lossy().into()).is_err());
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(test)]
+mod live_put {
+    use super::*;
+
+    /// RB_SSH_TEST·RB_SSH_TEST_PW — 조각 올리기(한글 이름) 뒤 서버 sha256 이 같은지
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_put_chunks() {
+        let spec = std::env::var("RB_SSH_TEST").unwrap();
+        let pw = std::env::var("RB_SSH_TEST_PW").unwrap();
+        let mut it = spec.split(':');
+        let host = it.next().unwrap().to_string();
+        let port: u16 = it.next().unwrap().parse().unwrap();
+        let dir = std::env::temp_dir().join(format!("rbshell-put-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::store::Store::open(dir.join("db"), false).unwrap();
+        let conns = SshConns::default();
+        let cid = crate::ssh::test_connect(&store, &conns, &host, port, "rbtest", &pw).await;
+        let c = conns.get(cid).unwrap();
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let path = "/home/rbtest/올림 시험.bin".to_string();
+        let mut off = 0usize;
+        for chunk in data.chunks(1 << 20) {
+            put_chunk(&c, path.clone(), off as u64, chunk).await.unwrap();
+            off += chunk.len();
+        }
+        use sha2::Digest;
+        let want = format!("{:x}", sha2::Sha256::digest(&data));
+        let o = crate::sudo::exec(&c, "sha256sum '/home/rbtest/올림 시험.bin'; rm -f '/home/rbtest/올림 시험.bin'", None).await.unwrap();
+        let got = String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string();
+        assert_eq!(got, want);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

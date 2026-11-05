@@ -1,5 +1,6 @@
 import { ArrowLeft, ArrowRight, ChevronRight, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw } from "lucide-react";
 import { memo, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { asSshError, type FsBackend, type FsEntry, joinPath, notifyFsChanged, parentDir } from "../lib/ipc";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 
@@ -25,6 +26,13 @@ function fmtSize(n: number) {
 
 type Node = { entries?: FsEntry[]; error?: string };
 
+/** 지우면 안 되는 최상위 폴더(실수 방지) */
+const PROTECTED = /^(\/|\/(bin|boot|dev|etc|home|lib|lib32|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|tmp|usr|var)\/?|[A-Za-z]:\/?|[A-Za-z]:\/(Windows|Program Files|Program Files \(x86\)|ProgramData|Users)\/?)$/i;
+/** 큰 폴더는 이만큼씩 그린다 */
+const PAGE = 500;
+/** 탐색기에서 끌어 놓은 파일을 보내는 조각 크기 */
+const CHUNK = 4 * 1024 * 1024;
+
 /**
  * 파일 트리 — 펼칠 때만 그 폴더를 읽는다(원격·내 PC 공용).
  * 우클릭 메뉴(새 폴더·새 파일·이름 바꾸기·지우기·경로 복사·주고받기), 끌어 놓기(옮기기·주고받기).
@@ -44,6 +52,9 @@ export const FileTree = memo(function FileTree({
 	onArchive,
 	onRelay,
 	selected,
+	onUploadPick,
+	onDownloadTo,
+	onNewTerminal,
 }: {
 	fs: FsBackend;
 	root: string;
@@ -66,6 +77,12 @@ export const FileTree = memo(function FileTree({
 	/** 다른 서버로 보내기(중계) */
 	onRelay?: (e: FsEntry) => void;
 	selected?: string;
+	/** 올리기 — 내 PC 에서 파일(또는 폴더) 고르기 */
+	onUploadPick?: (dir: string, folder: boolean) => void;
+	/** 받을 곳 골라 받기 */
+	onDownloadTo?: (e: FsEntry) => void;
+	/** 이 폴더에서 새 터미널 */
+	onNewTerminal?: (dir: string) => void;
 }) {
 	const [nodes, setNodes] = useState<Record<string, Node>>({});
 	const [open, setOpen] = useState<Set<string>>(() => new Set([root]));
@@ -75,6 +92,13 @@ export const FileTree = memo(function FileTree({
 	const [msg, setMsg] = useState<string | null>(null);
 	const openRef = useRef(open);
 	openRef.current = open;
+	/** 키보드 커서(경로) */
+	const [cur, setCur] = useState<string | null>(null);
+	/** 큰 폴더에서 그린 개수 */
+	const [shown, setShown] = useState<Record<string, number>>({});
+	/** 탐색기에서 끌어 놓아 올리는 중 */
+	const [upload, setUpload] = useState<{ done: number; total: number; name: string } | null>(null);
+	const bodyRef = useRef<HTMLDivElement>(null);
 
 	// 폴더 이동 기록 — 뒤로·앞으로(단추·마우스 옆 단추·Alt+←/→). 터미널 따라가기로 바뀐 것도 기록한다
 	const hist = useRef({ back: [] as string[], fwd: [] as string[], prev: root, nav: false });
@@ -166,6 +190,98 @@ export const FileTree = memo(function FileTree({
 		}
 	};
 
+	const renameEntry = (e: FsEntry) => {
+		const name = prompt("새 이름", e.name);
+		if (name && name !== e.name) void act(() => fs.rename(e.path, joinPath(parentDir(e.path), name)), parentDir(e.path));
+	};
+	const removeEntry = (e: FsEntry) => {
+		if (PROTECTED.test(e.path)) {
+			flash(`${e.path} 는 지울 수 없게 막아 두었습니다`);
+			return;
+		}
+		const what = e.kind === "dir" ? `폴더 ${e.name} 와 안의 모든 것` : e.name;
+		const ok =
+			fs.side === "local"
+				? confirm(`${what}을(를) 휴지통으로 보낼까요?`)
+				: prompt(`서버에서 ${what}을(를) 지웁니다. 되살릴 수 없습니다.\n지우려면 이름을 그대로 치세요: ${e.name}`) === e.name;
+		if (ok) void act(() => fs.remove(e.path), parentDir(e.path));
+	};
+	const copyEntry = (e: FsEntry) => {
+		if (!fs.copy) return;
+		const dot = e.kind === "file" ? e.name.lastIndexOf(".") : -1;
+		const def = dot > 0 ? `${e.name.slice(0, dot)} 복사본${e.name.slice(dot)}` : `${e.name} 복사본`;
+		const to = prompt("복사해 둘 경로(같은 폴더면 이름만)", def);
+		if (!to) return;
+		const dest = to.includes("/") ? to : joinPath(parentDir(e.path), to);
+		void act(() => fs.copy?.(e.path, dest) ?? Promise.resolve(), parentDir(dest));
+	};
+	const moveEntry = (e: FsEntry) => {
+		const to = prompt("옮길 폴더", parentDir(e.path));
+		if (!to || to === parentDir(e.path)) return;
+		void act(async () => {
+			await fs.rename(e.path, joinPath(to, e.name));
+			notifyFsChanged(fs.side, parentDir(e.path), fs.conn);
+		}, to);
+	};
+
+	/** 탐색기에서 끌어 놓은 파일·폴더 올리기(원격 트리) — 폴더는 안까지 만들고, 파일은 조각으로 보낸다 */
+	const uploadDropped = async (items: DataTransferItemList, dir: string) => {
+		if (fs.side !== "remote" || fs.conn == null) return;
+		type Job = { file: File; dest: string };
+		const jobs: Job[] = [];
+		const dirs: string[] = [];
+		const readAll = (r: FileSystemDirectoryReader) =>
+			new Promise<FileSystemEntry[]>((res) => {
+				const out: FileSystemEntry[] = [];
+				const next = () =>
+					r.readEntries((batch) => {
+						if (!batch.length) return res(out);
+						out.push(...batch);
+						next();
+					}, () => res(out));
+				next();
+			});
+		const walkEntry = async (en: FileSystemEntry, into: string) => {
+			if (en.isFile) {
+				const file = await new Promise<File>((res, rej) => (en as FileSystemFileEntry).file(res, rej));
+				jobs.push({ file, dest: joinPath(into, en.name) });
+			} else if (en.isDirectory) {
+				const d = joinPath(into, en.name);
+				dirs.push(d);
+				for (const c of await readAll((en as FileSystemDirectoryEntry).createReader())) await walkEntry(c, d);
+			}
+		};
+		const entries = [...items].map((it) => it.webkitGetAsEntry()).filter((x): x is FileSystemEntry => !!x);
+		for (const en of entries) await walkEntry(en, dir);
+		if (!jobs.length && !dirs.length) return;
+		const existing = new Set((nodes[dir]?.entries ?? []).map((x) => x.name));
+		const clash = entries.filter((en) => existing.has(en.name)).map((en) => en.name);
+		if (clash.length && !confirm(`${dir} 에 같은 이름이 있습니다: ${clash.slice(0, 5).join(", ")}${clash.length > 5 ? " …" : ""}\n덮어쓸까요?`)) return;
+		const total = jobs.reduce((a, j) => a + j.file.size, 0);
+		let done = 0;
+		try {
+			for (const d of dirs) await fs.mkdir(d).catch(() => undefined);
+			for (const j of jobs) {
+				setUpload({ done, total, name: j.file.name });
+				let off = 0;
+				do {
+					const part = new Uint8Array(await j.file.slice(off, off + CHUNK).arrayBuffer());
+					await invoke("sftp_put_chunk", part, { headers: { "x-conn": String(fs.conn), "x-path": encodeURIComponent(j.dest), "x-offset": String(off) } });
+					off += part.length;
+					done += part.length;
+					setUpload({ done, total, name: j.file.name });
+				} while (off < j.file.size);
+			}
+			flash(`올렸습니다 — 파일 ${jobs.length}개${dirs.length ? ` · 폴더 ${dirs.length}개` : ""}`);
+		} catch (e) {
+			flash(asSshError(e).message);
+		} finally {
+			setUpload(null);
+			notifyFsChanged(fs.side, dir, fs.conn);
+			if (!open.has(dir)) toggle(dir);
+		}
+	};
+
 	const menuFor = (e: FsEntry | null, dir: string): MenuItem[] => {
 		const items: MenuItem[] = [
 			{
@@ -191,31 +307,23 @@ export const FileTree = memo(function FileTree({
 			if (e.kind === "dir" && onArchive) items.push({ label: "폴더째 받기(.tar.gz)…", run: () => onArchive(e) });
 			if (onRelay) items.push({ label: "다른 서버로 보내기…", run: () => onRelay(e) });
 			if (onSend) items.push({ label: sendLabel ?? "보내기", run: () => onSend(e) });
+			if (onDownloadTo) items.push({ label: "다른 곳에 받기…", run: () => onDownloadTo(e) });
 			if (e.kind === "dir" && onCd) items.push({ label: "터미널에서 이 폴더로", run: () => onCd(e.path) });
+			if (onNewTerminal) items.push({ label: "여기서 새 터미널", run: () => onNewTerminal(e.kind === "dir" ? e.path : parentDir(e.path)) });
 			if (e.kind === "dir") items.push({ label: "여기를 맨 위로", run: () => onRoot(e.path) });
 			items.push(
 				{ sep: true },
-				{
-					label: "이름 바꾸기…",
-					run: () => {
-						const name = prompt("새 이름", e.name);
-						if (name && name !== e.name) void act(() => fs.rename(e.path, joinPath(parentDir(e.path), name)), parentDir(e.path));
-					},
-				},
+				{ label: "이름 바꾸기…  F2", run: () => renameEntry(e) },
+				...(fs.copy ? [{ label: "복사…", run: () => copyEntry(e) }] : []),
+				{ label: "옮기기…", run: () => moveEntry(e) },
 				{ label: "경로 복사", run: () => void navigator.clipboard.writeText(e.path) },
 				{ label: "이름 복사", run: () => void navigator.clipboard.writeText(e.name) },
 				{ sep: true },
-				{
-					label: fs.side === "local" ? "휴지통으로" : "지우기…",
-					danger: true,
-					run: () => {
-						const what = e.kind === "dir" ? `폴더 ${e.name} 와 안의 모든 것` : e.name;
-						const ok = fs.side === "local" ? confirm(`${what}을(를) 휴지통으로 보낼까요?`) : prompt(`서버에서 ${what}을(를) 지웁니다. 되살릴 수 없습니다.\n지우려면 이름을 그대로 치세요: ${e.name}`) === e.name;
-						if (ok) void act(() => fs.remove(e.path), parentDir(e.path));
-					},
-				},
+				{ label: fs.side === "local" ? "휴지통으로  Del" : "지우기…  Del", danger: true, disabled: PROTECTED.test(e.path), run: () => removeEntry(e) },
 			);
 		} else {
+			if (onUploadPick) items.push({ sep: true }, { label: "파일 올리기…", run: () => onUploadPick(dir, false) }, { label: "폴더 올리기…", run: () => onUploadPick(dir, true) });
+			if (onNewTerminal) items.push({ label: "여기서 새 터미널", run: () => onNewTerminal(dir) });
 			items.push({ sep: true }, { label: "새로 읽기", run: refresh }, { label: "경로 복사", run: () => void navigator.clipboard.writeText(dir) });
 		}
 		return items;
@@ -223,6 +331,14 @@ export const FileTree = memo(function FileTree({
 
 	const dropProps = (dir: string) => ({
 		onDragOver: (ev: React.DragEvent) => {
+			const osFiles = ev.dataTransfer.types.includes("Files") && fs.side === "remote" && fs.conn != null;
+			if (osFiles) {
+				ev.preventDefault();
+				ev.stopPropagation();
+				ev.dataTransfer.dropEffect = "copy";
+				setDropOn(dir);
+				return;
+			}
 			if (!onDrop || !ev.dataTransfer.types.includes(DRAG_MIME)) return;
 			ev.preventDefault();
 			ev.stopPropagation();
@@ -233,6 +349,12 @@ export const FileTree = memo(function FileTree({
 		onDrop: (ev: React.DragEvent) => {
 			const raw = ev.dataTransfer.getData(DRAG_MIME);
 			setDropOn(null);
+			if (!raw && ev.dataTransfer.files.length && fs.side === "remote") {
+				ev.preventDefault();
+				ev.stopPropagation();
+				void uploadDropped(ev.dataTransfer.items, dir);
+				return;
+			}
 			if (!raw || !onDrop) return;
 			ev.preventDefault();
 			ev.stopPropagation();
@@ -267,7 +389,9 @@ export const FileTree = memo(function FileTree({
 				</div>,
 			);
 		}
-		for (const e of node.entries) {
+		const limit = shown[path] ?? PAGE;
+		for (const e of node.entries.slice(0, limit)) {
+			flat.push(e);
 			const isOpen = open.has(e.path);
 			const dir = e.kind === "dir" ? e.path : path;
 			rows.push(
@@ -277,6 +401,8 @@ export const FileTree = memo(function FileTree({
 					className="tree-row"
 					data-drop={dropOn === e.path && e.kind === "dir" ? "on" : undefined}
 					aria-current={selected === e.path}
+					data-cur={cur === e.path ? "on" : undefined}
+					data-path={e.path}
 					style={{ paddingLeft: 6 + depth * 14 }}
 					title={`${e.path}${e.kind === "file" ? ` · ${fmtSize(e.size)}` : ""}`}
 					draggable
@@ -285,7 +411,11 @@ export const FileTree = memo(function FileTree({
 						ev.dataTransfer.setData(DRAG_MIME, JSON.stringify(d));
 						ev.dataTransfer.effectAllowed = "copyMove";
 					}}
-					onClick={() => (e.kind === "dir" ? toggle(e.path) : onOpen(e))}
+					onClick={() => {
+						setCur(e.path);
+						if (e.kind === "dir") toggle(e.path);
+						else onOpen(e);
+					}}
 					onDoubleClick={() => e.kind === "dir" && onRoot(e.path)}
 					onContextMenu={(ev) => {
 						ev.preventDefault();
@@ -301,7 +431,15 @@ export const FileTree = memo(function FileTree({
 			);
 			if (e.kind === "dir" && isOpen) walk(e.path, depth + 1);
 		}
+		if (node.entries.length > limit) {
+			rows.push(
+				<button key={`${path}#more`} type="button" className="tree-msg tree-more" style={{ paddingLeft: pad }} onClick={() => setShown((s) => ({ ...s, [path]: limit + PAGE }))}>
+					{(node.entries.length - limit).toLocaleString()}개 더 보기
+				</button>,
+			);
+		}
 	};
+	const flat: FsEntry[] = [];
 	walk(root, 0);
 
 	const atTop = root === "/" || /^[A-Za-z]:\/?$/.test(root);
@@ -356,7 +494,47 @@ export const FileTree = memo(function FileTree({
 					<RefreshCw size={13} />
 				</button>
 			</div>
+			{upload && (
+				<div className="tree-upload">
+					올리는 중 {Math.round((upload.done / Math.max(1, upload.total)) * 100)}% · {upload.name}
+					<div className="mon-bar">
+						<div style={{ width: `${(upload.done / Math.max(1, upload.total)) * 100}%` }} />
+					</div>
+				</div>
+			)}
 			<div
+				ref={bodyRef}
+				tabIndex={0}
+				onKeyDown={(ev) => {
+					if ((ev.target as HTMLElement).closest("input, textarea") || ev.altKey) return;
+					const i = flat.findIndex((x) => x.path === cur);
+					const at = i >= 0 ? flat[i] : null;
+					const go = (j: number) => {
+						const t = flat[Math.max(0, Math.min(flat.length - 1, j))];
+						if (!t) return;
+						setCur(t.path);
+						bodyRef.current?.querySelector<HTMLElement>(`[data-path="${CSS.escape(t.path)}"]`)?.scrollIntoView({ block: "nearest" });
+					};
+					const k = ev.key;
+					if (k === "ArrowDown") go(i + 1);
+					else if (k === "ArrowUp") go(i < 0 ? 0 : i - 1);
+					else if (k === "Home") go(0);
+					else if (k === "End") go(flat.length - 1);
+					else if (k === "ArrowRight" && at?.kind === "dir") {
+						if (!open.has(at.path)) toggle(at.path);
+						else go(i + 1);
+					} else if (k === "ArrowLeft" && at) {
+						if (at.kind === "dir" && open.has(at.path)) toggle(at.path);
+						else go(flat.findIndex((x) => x.path === parentDir(at.path)));
+					} else if (k === "Enter" && at) {
+						if (at.kind === "dir") toggle(at.path);
+						else onOpen(at);
+					} else if (k === "F2" && at) renameEntry(at);
+					else if (k === "Delete" && at) removeEntry(at);
+					else return;
+					ev.preventDefault();
+					ev.stopPropagation();
+				}}
 				className="tree-body"
 				data-drop={dropOn === root ? "on" : undefined}
 				onContextMenu={(ev) => {

@@ -117,6 +117,8 @@ export type FsBackend = {
 	rename(from: string, to: string): Promise<void>;
 	/** 원격은 바로 지우고(폴더는 안까지), 내 PC 는 휴지통으로 */
 	remove(path: string): Promise<unknown>;
+	/** 같은 쪽 안에서 복사(폴더는 안까지, 같은 이름이면 거절) */
+	copy?(from: string, to: string): Promise<unknown>;
 };
 
 export type TransferProgress = {
@@ -184,11 +186,12 @@ export function localFs(home: string): FsBackend {
 		touch: (path) => invoke("local_touch", { path }),
 		rename: (from, to) => invoke("local_rename", { from, to }),
 		remove: (path) => invoke("local_trash", { path }),
+		copy: (from, to) => invoke("local_copy", { from, to }),
 	};
 }
 
 export const localTerm: TermBackend = {
-	open: (cols, rows, onData) => invoke<number>("pty_open", { cols, rows, onData }),
+	open: (cols, rows, onData, cwd) => invoke<number>("pty_open", { cols, rows, onData, cwd }),
 	write: (id, data) => invoke("pty_write", { id, data }),
 	resize: (id, cols, rows) => invoke("pty_resize", { id, cols, rows }),
 	close: (id) => invoke("pty_close", { id }),
@@ -210,6 +213,7 @@ export function sshFs(conn: number, label: string, home: string): FsBackend {
 		touch: (path) => invoke("sftp_touch", { conn, path }),
 		rename: (from, to) => invoke("sftp_rename", { conn, from, to }),
 		remove: (path) => invoke("sftp_remove", { conn, path }),
+		copy: (from, to) => invoke("ssh_copy", { conn, from, to }),
 	};
 }
 
