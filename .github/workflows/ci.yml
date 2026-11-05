@@ -30,6 +30,9 @@ jobs:
       - name: Version
         run: node scripts/check-version.mjs
 
+      - name: CSS
+        run: node scripts/check-css.mjs
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

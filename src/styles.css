@@ -65,6 +65,28 @@
 * {
 	box-sizing: border-box;
 }
+/* 스크롤 막대 — OS 기본(화살표·회색 홈) 대신 얇은 둥근 막대. 홈은 투명 */
+::-webkit-scrollbar {
+	width: 11px;
+	height: 11px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+	background: transparent;
+}
+::-webkit-scrollbar-button {
+	display: none;
+	width: 0;
+	height: 0;
+}
+::-webkit-scrollbar-thumb {
+	border: 3px solid transparent;
+	border-radius: 11px;
+	background: rgb(128 128 128 / 0.32) content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+	background-color: rgb(128 128 128 / 0.55);
+}
 html,
 body,
 #root {
@@ -313,6 +335,7 @@ html[data-os="macos"] .sidebar {
 	padding: 40px 48px 48px;
 }
 .home-inner {
+	width: 100%;
 	max-width: 920px;
 	margin: 0 auto;
 }
@@ -517,7 +540,7 @@ html[data-os="macos"] .sidebar {
 	height: 100%;
 }
 .term-host .xterm-viewport {
-	scrollbar-width: thin;
+	background: transparent !important;
 }
 
 /* ── 결과 표 ───────────────────────────── */
@@ -687,16 +710,19 @@ html[data-os="macos"] .sidebar {
 .scrim {
 	position: fixed;
 	inset: 0;
-	background: rgb(0 0 0 / 0.18);
+	background: rgb(0 0 0 / 0.28);
 	display: grid;
-	place-items: start center;
-	padding-top: 12vh;
+	place-items: center;
+	padding: 24px 16px;
 	z-index: 50;
 	animation: fade 120ms ease;
 }
 .sheet {
-	width: min(440px, calc(100vw - 32px));
-	padding: 22px;
+	width: min(460px, calc(100vw - 32px));
+	max-height: calc(100vh - 48px);
+	overflow: auto;
+	overscroll-behavior: contain;
+	padding: 22px 22px 0;
 	border-radius: var(--r-xl);
 	background: var(--elevated);
 	backdrop-filter: blur(30px) saturate(180%);
@@ -735,8 +761,13 @@ html[data-os="macos"] .sidebar {
 	font-size: 12px;
 	color: var(--text-2);
 }
+.field > * {
+	min-width: 0;
+}
 .field input,
 .field select {
+	width: 100%;
+	min-width: 0;
 	height: 32px;
 	padding: 0 10px;
 	border: 0.5px solid var(--hairline-strong);
@@ -753,14 +784,21 @@ html[data-os="macos"] .sidebar {
 }
 .row2 {
 	display: grid;
-	grid-template-columns: 1fr 96px;
+	grid-template-columns: minmax(0, 1fr) 96px;
 	gap: 10px;
 }
+.row2 > * {
+	min-width: 0;
+}
 .sheet-actions {
+	position: sticky;
+	bottom: 0;
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
-	margin-top: 18px;
+	margin: 18px -22px 0;
+	padding: 12px 22px 18px;
+	background: linear-gradient(to bottom, transparent, var(--elevated) 30%);
 }
 .err {
 	color: var(--danger);
@@ -1076,8 +1114,6 @@ html[data-os="macos"] .sidebar {
   --dv-tab-group-chip-font-size: 11px;
   --dv-tab-group-line-height: 2px;
   --dv-tab-group-line-opacity: 0.6;
-.dockview-theme-light .dv-drop-target-container .dv-drop-target-anchor.dv-drop-target-anchor-container-changed {
-  opacity: 0;
 	--dv-group-view-background-color: var(--surface);
 	--dv-tabs-and-actions-container-background-color: var(--surface-2);
 	--dv-tabs-and-actions-container-height: 34px;
@@ -2116,4 +2152,346 @@ html[data-os="macos"] .sidebar {
 }
 .btn.ghost.danger {
 	color: var(--danger);
+}
+
+/* ── 드롭다운(앱 고유) ─────────────── */
+.rb-select {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	border: 0.5px solid var(--hairline-strong);
+	border-radius: var(--r-sm);
+	background: var(--surface);
+	color: var(--text);
+	font: inherit;
+	text-align: left;
+	outline: none;
+}
+.rb-select.md {
+	width: 100%;
+	height: 32px;
+	padding: 0 8px 0 10px;
+}
+.rb-select.sm {
+	height: 22px;
+	padding: 0 4px 0 7px;
+	border-color: transparent;
+	background: transparent;
+	color: var(--text-2);
+	font-size: 12px;
+}
+.rb-select.sm:hover:not(:disabled),
+.rb-select.sm[aria-expanded="true"] {
+	background: var(--fill);
+	color: var(--text);
+}
+.rb-select.md:focus-visible,
+.rb-select.md[aria-expanded="true"] {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 3px var(--accent-soft);
+	outline: none;
+}
+.rb-select:disabled {
+	opacity: 0.5;
+}
+.rb-select-label {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.rb-select-chev {
+	flex: none;
+	color: var(--text-3);
+}
+.rb-select-list {
+	position: fixed;
+	z-index: 200;
+	overflow: auto;
+	padding: 5px;
+	border-radius: var(--r-md);
+	background: var(--elevated);
+	backdrop-filter: blur(30px) saturate(180%);
+	box-shadow: var(--shadow-pop);
+	font-size: 13px;
+	animation: fade 90ms ease;
+}
+.rb-select-opt {
+	display: flex;
+	align-items: baseline;
+	gap: 7px;
+	padding: 5px 10px 5px 6px;
+	border-radius: 6px;
+	white-space: nowrap;
+}
+.rb-select-opt .rb-select-check {
+	flex: none;
+	align-self: center;
+}
+.rb-select-opt small {
+	margin-left: auto;
+	padding-left: 14px;
+	color: var(--text-3);
+	font-size: 11.5px;
+}
+.rb-select-opt.hi {
+	background: var(--accent);
+	color: #fff;
+}
+.rb-select-opt.hi small {
+	color: rgb(255 255 255 / 0.75);
+}
+.rb-select-opt.off {
+	opacity: 0.4;
+}
+.field .seg {
+	justify-self: start;
+}
+
+/* 연결 카드: 이름 옆 배지, 주소는 한 줄, 고치기·지우기는 올렸을 때만 */
+.pcard {
+	cursor: default;
+	transition: background 100ms ease;
+}
+.pcard:hover {
+	background: var(--fill);
+}
+.pcard .meta b {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.pcard .meta b .badge {
+	flex: none;
+	font-weight: 500;
+}
+.pcard .meta small {
+	display: block;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.pcard > .btn {
+	opacity: 0;
+	transition: opacity 100ms ease;
+}
+.pcard:hover > .btn,
+.pcard:focus-within > .btn {
+	opacity: 1;
+}
+.plist {
+	grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+/* 작업대 도구 막대 — 좁아지면 글자를 숨기고 아이콘만(이름은 title 로) */
+.wb-bar {
+	container-type: inline-size;
+	overflow: hidden;
+}
+.wb-bar > * {
+	flex: none;
+}
+.wb-bar .btn {
+	white-space: nowrap;
+	gap: 5px;
+	padding: 0 8px;
+}
+.wb-chip {
+	display: inline-flex;
+	gap: 4px;
+	min-width: 0;
+	white-space: nowrap;
+}
+@container (max-width: 1180px) {
+	.wb-chip {
+		display: none;
+	}
+}
+@container (max-width: 860px) {
+	.wb-bar .lbl:not(.keep) {
+		display: none;
+	}
+	.wb-bar .btn {
+		padding: 0 6px;
+	}
+}
+/* 상태 줄은 한 줄 — 넘치면 말줄임 */
+.statusbar {
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+}
+.statusbar > * {
+	flex: none;
+}
+.statusbar > :first-child {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+/* 자원 칸 — 칸 너비에 맞춰 덜 중요한 열을 숨긴다 */
+.mon {
+	container-type: inline-size;
+}
+.mon-title {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+.mon-title small {
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.mon-head {
+	align-items: flex-start;
+}
+.mon-ctl {
+	flex: none;
+}
+.mon-table {
+	table-layout: auto;
+}
+.mon-table .name {
+	min-width: 72px;
+	max-width: 340px;
+}
+.mon-table .barcell {
+	width: 30%;
+}
+@container (max-width: 640px) {
+	.mon-table .opt {
+		display: none;
+	}
+	.mon-table .barcell {
+		min-width: 80px;
+		width: 28%;
+	}
+}
+@container (max-width: 460px) {
+	.mon-table .opt2 {
+		display: none;
+	}
+	.mon-cards {
+		grid-template-columns: 1fr 1fr;
+	}
+}
+
+/* 코드 색(라이트) — Xcode 풍 */
+:root {
+	--syn-keyword: #ad3da4;
+	--syn-string: #c41a16;
+	--syn-number: #1c00cf;
+	--syn-comment: #707f8c;
+	--syn-prop: #3e8087;
+	--syn-type: #0b4f79;
+	--syn-func: #326d74;
+	--syn-var: var(--text);
+	--syn-punct: var(--text-2);
+	--syn-meta: #643820;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--syn-keyword: #ff7ab2;
+		--syn-string: #ff8170;
+		--syn-number: #d9c97c;
+		--syn-comment: #7f8c98;
+		--syn-prop: #78c2b3;
+		--syn-type: #6bdfff;
+		--syn-func: #67b7a4;
+		--syn-var: var(--text);
+		--syn-punct: var(--text-2);
+		--syn-meta: #fd8f3f;
+	}
+}
+input[type="checkbox"],
+input[type="radio"] {
+	accent-color: var(--accent);
+}
+.panel-hint {
+	margin: auto;
+	max-width: 320px;
+	padding: 24px;
+	text-align: center;
+	color: var(--text-3);
+	font-size: 12.5px;
+	line-height: 1.6;
+}
+.sync-list {
+	display: flex;
+	flex-direction: column;
+}
+.slot {
+	padding: 0 3px;
+	border-radius: 4px;
+	background: var(--accent-soft);
+	color: var(--accent);
+	font-style: italic;
+}
+
+/* 결과 표 머리: 경계를 끌어 너비, 두 번 누르면 내용에 맞춤 */
+.grid-head > .gh {
+	position: relative;
+}
+.col-resize {
+	position: absolute;
+	top: 0;
+	right: -3px;
+	width: 7px;
+	height: 100%;
+	cursor: col-resize;
+	z-index: 2;
+}
+.col-resize:hover {
+	background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+/* 홈 시작 카드 — 가로형 4칸(좁으면 2칸) */
+.home-inner {
+	container-type: inline-size;
+}
+.quick {
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 10px;
+	margin-bottom: 28px;
+}
+@container (max-width: 700px) {
+	.quick {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+.qcard {
+	flex-direction: row;
+	align-items: center;
+	gap: 12px;
+	padding: 12px 14px;
+	min-width: 0;
+}
+.qcard .ic {
+	flex: none;
+}
+.qtext {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+}
+.qtext b,
+.qtext small {
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.rb-select.cell-select {
+	width: 100%;
+	height: 100%;
+	border-radius: 0;
+	background: var(--surface);
+	color: var(--text);
+	box-shadow: inset 0 0 0 2px var(--accent);
 }

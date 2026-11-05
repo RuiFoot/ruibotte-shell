@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { type Cell, type ColMeta, type FieldKind, fieldKind, validate } from "../lib/edits";
+import { Select } from "./Select";
+
+/** 참/거짓 고르기에서 NULL 을 나타내는 값 */
+const NULL_KEY = "\u0000";
 
 /**
  * 칸 안 형식별 입력기 — 날짜·날짜시각·시각, 참/거짓(3상태), enum, 숫자(검사), JSON·긴 글(여러 줄), UUID(새로 만들기).
@@ -58,20 +62,33 @@ export function CellEditor({ meta, value, onDone }: { meta?: ColMeta; value: Cel
 
 	let input: React.ReactNode;
 	if (kind === "bool") {
+		const word = /^(t|true|f|false)$/i.test(value ?? "");
 		input = (
-			<select {...common} ref={ref} value={v ?? "\u0000"} onChange={(e) => commit(e.target.value === "\u0000" ? null : e.target.value)} onKeyDown={(e) => keys(e)}>
-				<option value={/^(t|true|f|false)$/i.test(value ?? "") ? "true" : "1"}>참</option>
-				<option value={/^(t|true|f|false)$/i.test(value ?? "") ? "false" : "0"}>거짓</option>
-				{meta?.nullable !== false && <option value={"\u0000"}>NULL</option>}
-			</select>
+			<Select
+				size="sm"
+				className="cell-select"
+				autoOpen
+				value={v ?? NULL_KEY}
+				onChange={(x) => commit(x === NULL_KEY ? null : x)}
+				onClose={() => onDone(undefined)}
+				options={[
+					{ value: word ? "true" : "1", label: "참" },
+					{ value: word ? "false" : "0", label: "거짓" },
+					...(meta?.nullable !== false ? [{ value: NULL_KEY, label: "NULL" }] : []),
+				]}
+			/>
 		);
 	} else if (kind === "enum") {
 		input = (
-			<select {...common} ref={ref} value={v ?? ""} onChange={(e) => commit(e.target.value)} onKeyDown={(e) => keys(e)}>
-				{(meta?.enumValues ?? []).map((x) => (
-					<option key={x}>{x}</option>
-				))}
-			</select>
+			<Select
+				size="sm"
+				className="cell-select"
+				autoOpen
+				value={v ?? ""}
+				onChange={(x) => commit(x)}
+				onClose={() => onDone(undefined)}
+				options={(meta?.enumValues ?? []).map((x) => ({ value: x, label: x }))}
+			/>
 		);
 	} else if (kind === "json" || kind === "longtext") {
 		input = (

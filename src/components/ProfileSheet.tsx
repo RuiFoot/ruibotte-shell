@@ -3,6 +3,7 @@ import { FolderOpen } from "lucide-react";
 import { useState } from "react";
 import { ENGINES, engineOf } from "../lib/engines";
 import { api, type LegacyLevel, type Profile } from "../lib/ipc";
+import { Select } from "./Select";
 
 const COLORS = ["#0a84ff", "#30d158", "#ff9f0a", "#ff453a", "#bf5af2", "#8e8e93"];
 const DB_PORT: Record<string, number> = Object.fromEntries(ENGINES.map((e) => [e.key, e.port]));
@@ -96,14 +97,12 @@ export function ProfileSheet({
 				{p.kind === "db" && (
 					<div className="field">
 						<label htmlFor="pf-engine">엔진</label>
-						<select id="pf-engine" value={p.engine ?? "postgres"} onChange={(e) => set({ engine: e.target.value, port: DB_PORT[e.target.value] })}>
-							{ENGINES.map((e) => (
-								<option key={e.key} value={e.key}>
-									{e.label}
-									{e.jdbc ? " (JDBC — 처음 쓸 때 받기)" : ""}
-								</option>
-							))}
-						</select>
+						<Select
+							id="pf-engine"
+							value={p.engine ?? "postgres"}
+							onChange={(v) => set({ engine: v, port: DB_PORT[v] })}
+							options={ENGINES.map((e) => ({ value: e.key, label: e.label, hint: e.jdbc ? "JDBC · 처음 쓸 때 받기" : undefined }))}
+						/>
 					</div>
 				)}
 				<div className="row2">
@@ -187,26 +186,30 @@ export function ProfileSheet({
 							<>
 							<div className="field" style={{ marginTop: 8 }}>
 								<label htmlFor="pf-jump">점프 호스트(이 서버를 거쳐 접속)</label>
-								<select id="pf-jump" value={p.jumpId ?? ""} onChange={(e) => set({ jumpId: e.target.value ? Number(e.target.value) : null })}>
-									<option value="">거치지 않음</option>
-									{others
-										.filter((o) => o.kind === "ssh" && o.id !== p.id)
-										.map((o) => (
-											<option key={o.id} value={o.id}>
-												{o.name} ({o.username}@{o.host})
-											</option>
-										))}
-								</select>
+								<Select
+									id="pf-jump"
+									value={p.jumpId ?? 0}
+									onChange={(v) => set({ jumpId: v || null })}
+									options={[
+										{ value: 0, label: "거치지 않음" },
+										...others.filter((o) => o.kind === "ssh" && o.id !== p.id).map((o) => ({ value: o.id as number, label: o.name, hint: `${o.username}@${o.host}` })),
+									]}
+								/>
 								<small style={{ color: "var(--text-3)" }}>점프 호스트는 한 번 직접 접속해 지문을 고정하고 암호를 저장해 두어야 합니다</small>
 							</div>
 							<div className="field" style={{ marginTop: 8 }}>
 								<label htmlFor="pf-legacy">구형 SSH 호환(이 서버에만)</label>
-								<select id="pf-legacy" value={p.legacy} onChange={(e) => set({ legacy: e.target.value as LegacyLevel })}>
-									<option value="off">끔(권장)</option>
-									<option value="rsa">RSA — ssh-rsa(SHA-1) 호스트 키</option>
-									<option value="sha1">SHA1 — SHA-1 키 교환·CBC 암호</option>
-									<option value="weakest">최후 — ssh-dss·group1·3des 까지</option>
-								</select>
+								<Select<LegacyLevel>
+									id="pf-legacy"
+									value={p.legacy}
+									onChange={(v) => set({ legacy: v })}
+									options={[
+										{ value: "off", label: "끔", hint: "권장" },
+										{ value: "rsa", label: "RSA", hint: "ssh-rsa(SHA-1) 호스트 키" },
+										{ value: "sha1", label: "SHA1", hint: "SHA-1 키 교환·CBC 암호" },
+										{ value: "weakest", label: "최후", hint: "ssh-dss·group1·3des 까지" },
+									]}
+								/>
 							</div>
 							</>
 						)}

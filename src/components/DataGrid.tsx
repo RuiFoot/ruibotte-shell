@@ -25,11 +25,28 @@ export type GridApi = {
 };
 
 function widthOf(c: GridCol) {
-	if (c.kind === "int") return 100;
-	if (c.kind === "numeric") return 130;
-	if (c.kind === "date") return 190;
-	if (c.kind === "bool") return 70;
-	return Math.min(320, Math.max(140, c.name.length * 9 + 40));
+	const head = c.name.length * 8 + 34;
+	if (c.kind === "int") return Math.max(90, head);
+	if (c.kind === "numeric") return Math.max(120, head);
+	if (c.kind === "date") return Math.max(110, head);
+	if (c.kind === "datetime") return Math.max(180, head);
+	if (c.kind === "time") return Math.max(100, head);
+	if (c.kind === "bool") return Math.max(70, head);
+	if (c.kind === "uuid") return 300;
+	return Math.min(320, Math.max(120, head));
+}
+
+/** 받은 첫 묶음의 글자 길이로 너비 맞추기(고정폭 글꼴 기준, 60~480px) */
+function fitWidths(columns: GridCol[], rows: Cell[][]) {
+	return columns.map((c, i) => {
+		let n = 0;
+		for (let r = 0; r < Math.min(rows.length, 200); r++) {
+			const v = rows[r]?.[i];
+			const len = v == null ? 4 : [...v].reduce((a, ch) => a + (ch.charCodeAt(0) > 0x2e80 ? 2 : 1), 0);
+			if (len > n) n = len;
+		}
+		return Math.round(Math.min(480, Math.max(60, c.name.length * 8 + 34, n * 7.3 + 24)));
+	});
 }
 
 /**
@@ -82,7 +99,16 @@ export function DataGrid({
 		force((n) => n + 1);
 	}, [resetKey]);
 
-	const widths = useMemo(() => columns.map(widthOf), [columns]);
+	// 열 너비: 처음엔 형식으로 짐작, 첫 묶음이 오면 내용에 맞추고, 머리 경계를 끌면 그 값으로
+	const [widths, setWidths] = useState<number[]>(() => columns.map(widthOf));
+	const fitted = useRef(false);
+	const userSized = useRef(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 열이 바뀔 때만 다시 짐작
+	useEffect(() => {
+		setWidths(columns.map(widthOf));
+		fitted.current = false;
+		userSized.current = false;
+	}, [columns]);
 	const tpl = useMemo(() => ["64px", ...widths.map((w) => `${w}px`)].join(" "), [widths]);
 	const total = 64 + widths.reduce((a, b) => a + b, 0);
 
@@ -95,6 +121,10 @@ export function DataGrid({
 			void fetchRows(page * PAGE, page * PAGE + PAGE).then((r) => {
 				pages.current.set(page, r);
 				loading.current.delete(page);
+				if (page === 0 && !fitted.current && !userSized.current) {
+					fitted.current = true;
+					setWidths(fitWidths(columns, r));
+				}
 				if (pages.current.size > 60) {
 					const first = pages.current.keys().next().value;
 					if (first !== undefined) pages.current.delete(first);
@@ -102,7 +132,7 @@ export function DataGrid({
 				force((n) => n + 1);
 			});
 		},
-		[fetchRows, rowCount],
+		[fetchRows, rowCount, columns],
 	);
 
 	const baseRow = (r: number): Cell[] | undefined => (r >= rowCount ? added[r - rowCount] : pages.current.get(Math.floor(r / PAGE))?.[r % PAGE]);
@@ -176,8 +206,31 @@ export function DataGrid({
 					<div style={{ textAlign: "right", color: "var(--text-3)" }}>#</div>
 					{columns.map((c, i) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: 같은 이름 열이 있을 수 있다
-						<div key={`${c.name}-${i}`} title={c.kind}>
+						<div key={`${c.name}-${i}`} title={c.kind} className="gh">
 							{c.name}
+							<span
+								className="col-resize"
+								onMouseDown={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									const x0 = e.clientX;
+									const w0 = widths[i];
+									const move = (ev: MouseEvent) => {
+										userSized.current = true;
+										setWidths((ws) => ws.map((w, j) => (j === i ? Math.max(48, w0 + ev.clientX - x0) : w)));
+									};
+									const up = () => {
+										window.removeEventListener("mousemove", move);
+										window.removeEventListener("mouseup", up);
+									};
+									window.addEventListener("mousemove", move);
+									window.addEventListener("mouseup", up);
+								}}
+								onDoubleClick={() => {
+									const p = pages.current.get(0);
+									if (p) setWidths((ws) => ws.map((w, j) => (j === i ? fitWidths([columns[i]], p.map((row) => [row[i]]))[0] : w)));
+								}}
+							/>
 						</div>
 					))}
 				</div>

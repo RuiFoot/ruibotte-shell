@@ -168,6 +168,7 @@ export function SyncPanel({ conn, remoteHome, user, host, port, onRun }: { conn:
 				{msg && <p className="err" style={{ color: msg.includes("복사") || msg.includes("실행") ? "var(--text-2)" : undefined }}>{msg}</p>}
 			</div>
 			<div className="sync-list selectable">
+				{!plan && watchId == null && <div className="panel-hint">미리보기를 누르면 옮길 파일·지울 파일이 여기 나옵니다. 실행 전에는 아무것도 바꾸지 않습니다.</div>}
 				{plan && (
 					<div className="sync-sum">
 						옮길 것 {plan.actions.filter((a) => a.action === "copy").length}개({fmt(plan.bytes)}) · 지울 것 {plan.actions.filter((a) => a.action === "delete").length}개 · 같음 {plan.same}개 · {plan.ms} ms

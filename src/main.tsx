@@ -14,8 +14,16 @@ window.addEventListener(
 	{ capture: true },
 );
 
-createRoot(document.getElementById("root") as HTMLElement).render(
-	<StrictMode>
-		<App />
-	</StrictMode>,
-);
+async function boot() {
+	// 일반 브라우저로 개발 서버를 열면(화면 점검) 가짜 백엔드를 붙인다. 배포판에서는 이 분기가 통째로 빠진다
+	if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)) {
+		const { installMock } = await import("./dev/mock");
+		installMock();
+	}
+	createRoot(document.getElementById("root") as HTMLElement).render(
+		<StrictMode>
+			<App />
+		</StrictMode>,
+	);
+}
+void boot();

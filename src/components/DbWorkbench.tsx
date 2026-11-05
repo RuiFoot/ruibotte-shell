@@ -1,5 +1,5 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { bracketMatching } from "@codemirror/language";
 import { MSSQL, MySQL, PLSQL, PostgreSQL, StandardSQL, sql } from "@codemirror/lang-sql";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { EditorState } from "@codemirror/state";
@@ -21,7 +21,9 @@ import { splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { CellEditor } from "./CellEditor";
 import { DataGrid, type GridApi, type GridCol, type GridOverlay } from "./DataGrid";
+import { Select } from "./Select";
 import { SnippetPalette } from "./SnippetPalette";
+import { codeHighlight } from "../lib/cmTheme";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
@@ -119,7 +121,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					highlightActiveLine(),
 					highlightSelectionMatches(),
 					search({ top: true }),
-					syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+					codeHighlight,
 					sql({
 						dialect:
 							ctx.engine === "postgres" ? PostgreSQL : ctx.mysql ? MySQL : ctx.engine === "mssql" ? MSSQL : ctx.engine === "oracle" || ctx.engine === "tibero" ? PLSQL : StandardSQL,
@@ -947,13 +949,7 @@ export function DbWorkbench({
 						★ SQL
 					</button>
 					<span className="sep" />
-					<select className="status-select" value={maxRows} onChange={(e) => setMaxRows(Number(e.target.value))} title="결과 행 상한">
-						{[1000, 10_000, 100_000, 1_000_000].map((n) => (
-							<option key={n} value={n}>
-								최대 {n.toLocaleString()}행
-							</option>
-						))}
-					</select>
+					<Select size="sm" value={maxRows} onChange={setMaxRows} title="결과 행 상한" options={[1000, 10_000, 100_000, 1_000_000].map((n) => ({ value: n, label: `최대 ${n.toLocaleString()}행` }))} />
 					<button type="button" className="btn ghost" onClick={addSql} title="SQL 편집기 하나 더">
 						<FilePlus size={14} /> SQL +
 					</button>

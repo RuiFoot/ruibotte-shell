@@ -23,6 +23,7 @@ import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
 import { MonitorPanel } from "./MonitorPanel";
+import { Select } from "./Select";
 import { SyncPanel } from "./SyncPanel";
 import { TailView } from "./TailView";
 import { invoke } from "@tauri-apps/api/core";
@@ -277,6 +278,39 @@ const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPan
 const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
 
 /** 기본 배치: 트리 왼쪽 · 편집기 가운데 · 터미널 오른쪽 */
+/**
+ * 문서 칸(편집기·tail·비교·자원) 놓기 — 이미 문서 칸이 있으면 그 칸의 탭으로,
+ * 처음이면 IDE 처럼 터미널 위 넓은 자리(높이 60%), 터미널이 없으면 트리 오른쪽.
+ */
+function addDoc(d: DockviewApi, opts: { id: string; component: string; title: string; params?: object }) {
+	const anyDoc = d.panels.find((p) => /^(edit|tail|diff):/.test(p.id) || p.id === "monitor");
+	if (anyDoc) {
+		d.addPanel({ ...opts, renderer: "always", position: { referencePanel: anyDoc.id, direction: "within" } });
+		return;
+	}
+	const term = d.panels.find((p) => p.id.startsWith("term-"));
+	const p = d.addPanel({
+		...opts,
+		renderer: "always",
+		position: term ? { referencePanel: term.id, direction: "above" } : { referencePanel: d.getPanel("tree") ? "tree" : (d.panels[0]?.id ?? ""), direction: "right" },
+	});
+	if (term) {
+		const total = p.group.height + term.group.height;
+		if (total > 0) p.group.api.setSize({ height: Math.round(total * 0.62) });
+	}
+}
+
+/** 아래 칸(전송·동기화) — VS Code 의 아래 패널처럼 터미널 칸의 탭으로 */
+function addBottom(d: DockviewApi, opts: { id: string; component: string; title: string }, focus: boolean) {
+	const term = d.panels.find((p) => p.id.startsWith("term-"));
+	d.addPanel({
+		...opts,
+		renderer: "always",
+		position: term ? { referencePanel: term.id, direction: "within" } : { direction: "below" },
+		inactive: !focus,
+	});
+}
+
 function defaultLayout(d: DockviewApi, hasLocal: boolean) {
 	d.clear();
 	d.addPanel({ id: "tree", component: "tree", title: "파일", params: { which: "remote" }, renderer: "always" });
@@ -397,18 +431,7 @@ export function Workbench({
 			existing.api.setActive();
 			return;
 		}
-		// 편집기는 이미 열린 편집기 옆(같은 칸)에, 없으면 트리 오른쪽에
-		const anyEditor = d.panels.find((p) => p.id.startsWith("edit:"));
-		d.addPanel({
-			id,
-			component: "editor",
-			title: e.name,
-			params: { which, path: e.path, name: e.name },
-			renderer: "always",
-			position: anyEditor
-				? { referencePanel: anyEditor.id, direction: "within" }
-				: { referencePanel: d.getPanel("tree") ? "tree" : d.panels[0]?.id ?? "", direction: "right" },
-		});
+		addDoc(d, { id, component: "editor", title: e.name, params: { which, path: e.path, name: e.name } });
 	}, []);
 
 	const shells = useRef(new Map<string, ShellHandle>());
@@ -479,18 +502,16 @@ export function Workbench({
 		[local],
 	);
 
-	const showTransfers = () => {
+	/** 전송 칸 — 전송이 시작되면 조용히(포커스 없이) 붙고, 도구 막대에서 누르면 앞으로 */
+	const showTransfers = (focus = false) => {
 		const d = dock.current;
-		if (!d || d.getPanel("transfers")) return;
-		const ref = d.getPanel("localtree") ?? d.getPanel("tree");
-		d.addPanel({
-			id: "transfers",
-			component: "transfers",
-			title: "전송",
-			renderer: "always",
-			position: ref ? { referencePanel: ref.id, direction: "below" } : undefined,
-			inactive: true,
-		});
+		if (!d) return;
+		const ex = d.getPanel("transfers");
+		if (ex) {
+			if (focus) ex.api.setActive();
+			return;
+		}
+		addBottom(d, { id: "transfers", component: "transfers", title: "전송" }, focus);
 	};
 
 	const fsOf = useCallback((side: "remote" | "local") => (side === "local" && local ? local : fs), [fs, local]);
@@ -538,12 +559,7 @@ export function Workbench({
 		if (!d) return;
 		const ex = d.getPanel(opts.id);
 		if (ex) return void ex.api.setActive();
-		const anyEditor = d.panels.find((p) => p.id.startsWith("edit:") || p.id.startsWith("tail:") || p.id.startsWith("diff:"));
-		d.addPanel({
-			...opts,
-			renderer: "always",
-			position: anyEditor ? { referencePanel: anyEditor.id, direction: "within" } : { referencePanel: d.getPanel("tree") ? "tree" : (d.panels[0]?.id ?? ""), direction: "right" },
-		});
+		addDoc(d, opts);
 	};
 
 	const openTail = useCallback((which: Which, e: FsEntry) => {
@@ -607,16 +623,14 @@ export function Workbench({
 		const d = dock.current;
 		if (!d) return;
 		if (d.getPanel("sync")) return void d.getPanel("sync")?.api.setActive();
-		const ref = d.getPanel("tree");
-		d.addPanel({ id: "sync", component: "sync", title: "동기화", renderer: "always", position: ref ? { referencePanel: ref.id, direction: "below" } : undefined });
+		addBottom(d, { id: "sync", component: "sync", title: "동기화" }, true);
 	};
 
 	const openMonitor = () => {
 		const d = dock.current;
 		if (!d) return;
 		if (d.getPanel("monitor")) return void d.getPanel("monitor")?.api.setActive();
-		const ref = d.panels.find((p) => p.id.startsWith("edit:") || p.id.startsWith("tail:") || p.id.startsWith("diff:"));
-		d.addPanel({ id: "monitor", component: "monitor", title: "자원", position: ref ? { referencePanel: ref.id, direction: "within" } : { direction: "right" } });
+		addDoc(d, { id: "monitor", component: "monitor", title: "자원" });
 	};
 
 	const addTerminal = () => {
@@ -702,7 +716,7 @@ export function Workbench({
 			archive: (e: FsEntry) => void archive(e),
 			relay: (e: FsEntry) => void relay(e),
 			hasPeers: peers.length > 0,
-			showTransfers,
+			showTransfers: () => showTransfers(true),
 			syncInfo,
 			treeKey: instance.current,
 			profileId,
@@ -718,26 +732,26 @@ export function Workbench({
 			<div className="wb-dock-shell">
 				<div className="wb-bar">
 					<button type="button" className="btn ghost" onClick={() => toggle("tree")} title="파일 트리 보이기/숨기기">
-						<FolderTree size={14} /> 파일
+						<FolderTree size={14} /> <span className="lbl">파일</span>
 					</button>
 					{local && (
 						<button type="button" className="btn ghost" onClick={() => toggle("localtree")} title="내 PC 트리 — 끌어 놓아 주고받기">
-							<Monitor size={14} /> 내 PC
+							<Monitor size={14} /> <span className="lbl">내 PC</span>
 						</button>
 					)}
 					{local && (
-						<button type="button" className="btn ghost" onClick={showTransfers} title="전송 목록">
-							<ArrowDownUp size={14} /> 전송
+						<button type="button" className="btn ghost" onClick={() => showTransfers(true)} title="전송 목록">
+							<ArrowDownUp size={14} /> <span className="lbl">전송</span>
 						</button>
 					)}
 					{fs.side === "remote" && fs.conn != null && (
 						<button type="button" className="btn ghost" onClick={openMonitor} title="서버 자원 — CPU·메모리·디스크·네트워크·프로세스">
-							<Activity size={14} /> 자원
+							<Activity size={14} /> <span className="lbl">자원</span>
 						</button>
 					)}
 					{local && syncInfo && (
 						<button type="button" className="btn ghost" onClick={openSync} title="폴더 동기화(rsync 모드)·자동 반영">
-							<RefreshCcw size={14} /> 동기화
+							<RefreshCcw size={14} /> <span className="lbl">동기화</span>
 						</button>
 					)}
 					<button
@@ -747,10 +761,10 @@ export function Workbench({
 						title="동시 입력 — 한 터미널에 친 것을 이 작업대의 모든 터미널에"
 						onClick={() => setBroadcastOn((b) => !b)}
 					>
-						<Radio size={14} /> 동시 입력{broadcastOn ? " 켜짐" : ""}
+						<Radio size={14} /> <span className="lbl">동시 입력{broadcastOn ? " 켜짐" : ""}</span>
 					</button>
 					<button type="button" className="btn ghost" onClick={addTerminal} title="터미널 하나 더(같은 연결 위 새 채널)">
-						<SquareTerminal size={14} /> 터미널 +
+						<SquareTerminal size={14} /> <span className="lbl">터미널 +</span>
 					</button>
 					<span className="sep" />
 					<button
@@ -763,7 +777,7 @@ export function Workbench({
 							if (next && lastCwd.current) window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: lastCwd.current }));
 						}}
 					>
-						<Link size={14} /> {follow ? "같이" : "따로"}
+						<Link size={14} /> <span className="lbl">{follow ? "따라가기" : "따로"}</span>
 					</button>
 					{sudoFs && (
 						<>
@@ -774,18 +788,19 @@ export function Workbench({
 								title="root 권한으로 파일 보기·고치기"
 								onClick={() => (sudoOn ? disableSudo() : void enableSudo(null, false))}
 							>
-								<ShieldAlert size={14} /> sudo {sudoOn ? "켜짐" : ""}
+								<ShieldAlert size={14} /> <span className="lbl keep">sudo{sudoOn ? " 켜짐" : ""}</span>
 							</button>
-							<select
-								className="status-select"
+							<Select<"together" | "apart">
+								size="sm"
 								value={sudoMode}
-								onChange={(e) => setSudoMode(e.target.value as "together" | "apart")}
+								onChange={setSudoMode}
 								title="같이 = 터미널도 root 셸로, 따로 = 파일만"
 								disabled={sudoOn}
-							>
-								<option value="together">터미널도 같이</option>
-								<option value="apart">파일만</option>
-							</select>
+								options={[
+									{ value: "together", label: "터미널도 같이", hint: "root 셸" },
+									{ value: "apart", label: "파일만" },
+								]}
+							/>
 						</>
 					)}
 					<span className="sep" />
@@ -800,15 +815,15 @@ export function Workbench({
 							}
 						}}
 					>
-						<LayoutTemplate size={14} /> 기본 배치
+						<LayoutTemplate size={14} /> <span className="lbl">기본 배치</span>
 					</button>
 					<span style={{ flex: 1 }} />
 					{local && (
-						<span className="badge" title="트리끼리 끌어 놓거나 우클릭으로 주고받기">
+						<span className="badge wb-chip" title="트리끼리 끌어 놓거나 우클릭으로 주고받기">
 							<ArrowLeftRight size={12} /> {local.label} ↔ {fs.label}
 						</span>
 					)}
-					{badge}
+					<span className="wb-chip">{badge}</span>
 				</div>
 				{sudoAsk && (
 					<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && setSudoAsk(null)}>

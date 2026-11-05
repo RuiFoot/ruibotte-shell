@@ -16,6 +16,7 @@ import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ip
 import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { SnippetPalette } from "./SnippetPalette";
+import { Select } from "./Select";
 
 function themeFromCss() {
 	const s = getComputedStyle(document.documentElement);
@@ -479,10 +480,16 @@ export function TerminalView({
 				)}
 				{root && <span className="badge warn">root</span>}
 				<span style={{ marginLeft: "auto" }} />
-				<select className="status-select" value={encoding} onChange={(e) => changeEncoding(e.target.value)} title="터미널 인코딩(EUC-KR 서버의 한글)">
-					<option>UTF-8</option>
-					<option>EUC-KR</option>
-				</select>
+				<Select
+					size="sm"
+					value={encoding}
+					onChange={changeEncoding}
+					title="터미널 인코딩(EUC-KR 서버의 한글)"
+					options={[
+						{ value: "UTF-8", label: "UTF-8" },
+						{ value: "EUC-KR", label: "EUC-KR" },
+					]}
+				/>
 				{!toolbar && (
 					<button type="button" className="btn ghost icon" style={{ height: 20, width: 20 }} onClick={() => setGen((g) => g + 1)} title="셸 다시 열기">
 						<RotateCcw size={12} />

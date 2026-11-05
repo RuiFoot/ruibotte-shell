@@ -1,5 +1,5 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, foldGutter, indentOnInput, type LanguageSupport, StreamLanguage, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
+import { bracketMatching, foldGutter, indentOnInput, type LanguageSupport, StreamLanguage } from "@codemirror/language";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from "@codemirror/view";
@@ -8,6 +8,8 @@ import { api } from "../lib/ipc";
 import { altView, BinaryPreview, MarkdownView, TableView } from "./Preview";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { asSshError, type FileText, type FsBackend } from "../lib/ipc";
+import { Select } from "./Select";
+import { codeHighlight } from "../lib/cmTheme";
 
 const ENCODINGS = ["UTF-8", "EUC-KR", "UTF-16LE", "UTF-16BE", "Shift_JIS", "windows-1252"];
 
@@ -160,7 +162,7 @@ export function EditorView_({
 					highlightActiveLine(),
 					highlightSelectionMatches(),
 					search({ top: true }),
-					syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+					codeHighlight,
 					keymap.of([
 						{ key: "Mod-s", preventDefault: true, run: () => (saveRef.current(), true) },
 						indentWithTab,
@@ -258,16 +260,7 @@ export function EditorView_({
 				<span style={{ marginLeft: "auto" }} />
 				{file && !file.binary && !file.tooLarge && (
 					<>
-						<select
-							className="status-select"
-							value={file.meta.encoding}
-							onChange={(e) => setEncoding(e.target.value)}
-							title="다른 인코딩으로 다시 열기"
-						>
-							{[...new Set([file.meta.encoding, ...ENCODINGS])].map((x) => (
-								<option key={x}>{x}</option>
-							))}
-						</select>
+						<Select size="sm" value={file.meta.encoding} onChange={setEncoding} title="다른 인코딩으로 다시 열기" options={[...new Set([file.meta.encoding, ...ENCODINGS])].map((x) => ({ value: x, label: x }))} />
 						<span>
 							{file.meta.eol}
 							{file.meta.bom ? " · BOM" : ""}

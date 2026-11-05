@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronLeft, FolderSearch, Pause, Play, Search, Square, Zap } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Select } from "./Select";
 
 type Ticks = { busy: number; iowait: number; total: number };
 type Proc = { pid: number; user: string; ticks: number; rssK: number; state: string; name: string };
@@ -44,12 +45,13 @@ function Spark({ data, max = 1, color }: { data: number[]; max?: number; color: 
 	const w = 120;
 	const h = 32;
 	const m = Math.max(max, ...data, 1e-9);
-	const pts = data.map((v, i) => `${(i / (HIST - 1)) * w},${h - (v / m) * (h - 2) - 1}`).join(" ");
+	const span = Math.max(1, data.length - 1);
+	const pts = data.map((v, i) => `${(i / span) * w},${h - (v / m) * (h - 2) - 1}`).join(" ");
 	return (
 		<svg className="mon-spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" aria-hidden>
 			{data.length > 1 && (
 				<>
-					<polyline points={`0,${h} ${pts} ${((data.length - 1) / (HIST - 1)) * w},${h}`} fill={color} opacity={0.14} stroke="none" />
+					<polyline points={`0,${h} ${pts} ${w},${h}`} fill={color} opacity={0.14} stroke="none" />
 					<polyline points={pts} fill="none" stroke={color} strokeWidth={1.4} vectorEffect="non-scaling-stroke" />
 				</>
 			)}
@@ -182,7 +184,7 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 	return (
 		<div className="panel-fill mon selectable">
 			<header className="mon-head">
-				<div>
+				<div className="mon-title">
 					<b>{cur.host}</b>
 					<small>
 						{cur.kernel} · 코어 {cur.ncpu}개 · 켜진 지 {uptime(cur.uptimeS)}
@@ -190,13 +192,7 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 				</div>
 				<div className="mon-ctl">
 					{error && <span className="err" title={error}>⚠ 마지막 측정 실패</span>}
-					<select value={every} onChange={(e) => setEvery(Number(e.target.value))} title="측정 간격">
-						{[1, 2, 3, 5, 10, 30].map((s) => (
-							<option key={s} value={s}>
-								{s}초마다
-							</option>
-						))}
-					</select>
+					<Select size="sm" value={every} onChange={setEvery} title="측정 간격" options={[1, 2, 3, 5, 10, 30].map((s) => ({ value: s, label: `${s}초마다` }))} />
 					<button type="button" className="btn ghost" onClick={() => setPaused((x) => !x)} title={paused ? "다시 재기" : "멈추기"}>
 						{paused ? <Play size={14} /> : <Pause size={14} />}
 					</button>
@@ -293,10 +289,10 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 						<thead>
 							<tr>
 								<th>마운트</th>
-								<th>장치</th>
+								<th className="opt">장치</th>
 								<th className="num">사용</th>
 								<th className="num">남음</th>
-								<th className="num">전체</th>
+								<th className="num opt">전체</th>
 								<th className="barcell" />
 								<th />
 							</tr>
@@ -307,13 +303,13 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 								return (
 									<tr key={`${d.fs}:${d.mount}`}>
 										<td className="name">{d.mount}</td>
-										<td className="dim">
+										<td className="dim opt">
 											{d.fs}
 											{d.kind ? ` · ${d.kind}` : ""}
 										</td>
 										<td className="num">{kib(d.usedK)}</td>
 										<td className={`num ${level(r)}`}>{kib(d.availK)}</td>
-										<td className="num dim">{kib(d.sizeK)}</td>
+										<td className="num dim opt">{kib(d.sizeK)}</td>
 										<td className="barcell">
 											<Bar value={r} cls={level(r)} />
 											<span className={`mon-pct ${level(r)}`}>{pct(r)}</span>
@@ -352,7 +348,7 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 					<thead>
 						<tr>
 							<th className="num">PID</th>
-							<th>사용자</th>
+							<th className="opt2">사용자</th>
 							<th>이름</th>
 							<th className="num">CPU</th>
 							<th className="num">메모리</th>
@@ -363,7 +359,7 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 						{procs.map((p) => (
 							<tr key={p.pid}>
 								<td className="num dim">{p.pid}</td>
-								<td className={p.user === "root" ? "root" : ""}>{p.user}</td>
+								<td className={`opt2${p.user === "root" ? " root" : ""}`}>{p.user}</td>
 								<td className="name" title={`상태 ${p.state}`}>
 									{p.name}
 									{p.state === "Z" && <span className="mon-tag">좀비</span>}

@@ -1,9 +1,9 @@
-import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { MergeView } from "@codemirror/merge";
 import { EditorView, lineNumbers } from "@codemirror/view";
 import { Save } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { asSshError, type FileText, type FsBackend } from "../lib/ipc";
+import { codeHighlight } from "../lib/cmTheme";
 
 export type DiffSide = { fs: FsBackend; path: string; label: string };
 
@@ -33,7 +33,7 @@ export function DiffView({ a, b }: { a: DiffSide; b: DiffSide }) {
 					return;
 				}
 				files.current = [fa, fb];
-				const ext = [lineNumbers(), syntaxHighlighting(defaultHighlightStyle, { fallback: true }), theme];
+				const ext = [lineNumbers(), codeHighlight, theme];
 				mv.current = new MergeView({
 					parent: host.current,
 					a: { doc: (fa.text ?? "").replace(/\r\n?/g, "\n"), extensions: ext },

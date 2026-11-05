@@ -98,7 +98,7 @@ export function CommandDictionaryPane() {
 							{cmd.x?.map(([d, c]) => (
 								<div key={c} className="ex">
 									<p>{d}</p>
-									<code>{c}</code>
+									<code>{withSlots(c)}</code>
 								</div>
 							))}
 							{cmd.o?.slice(0, 60).map(([f, d]) => (
@@ -121,5 +121,19 @@ export function CommandDictionaryPane() {
 				</div>
 			</div>
 		</>
+	);
+}
+
+/** tldr 예시의 {{자리}} 를 괄호 없이 강조된 낱말로 */
+function withSlots(c: string) {
+	return c.split(/({{[^}]*}})/).map((part, i) =>
+		part.startsWith("{{") && part.endsWith("}}") ? (
+			// biome-ignore lint/suspicious/noArrayIndexKey: 고정 조각
+			<span key={i} className="slot">
+				{part.slice(2, -2)}
+			</span>
+		) : (
+			part
+		),
 	);
 }

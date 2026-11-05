@@ -227,10 +227,6 @@ export function App() {
 						<Plus size={14} /> DB 추가
 					</button>
 				)}
-				<div className="sb-section">실험</div>
-				<button type="button" className="sb-item" aria-current={activeKind === "grid"} onClick={() => open("grid", "결과 표 시제품", true)}>
-					<Table2 size={16} /> 결과 표 시제품
-				</button>
 
 				<div className="sb-foot">
 					{upd.phase === "available" && (
@@ -338,14 +334,16 @@ export function App() {
 												>
 													<span style={{ width: 10, height: 10, borderRadius: "50%", flex: "none", background: p.color ?? "var(--accent)" }} />
 													<div className="meta">
-														<b>{p.name}</b>
+														<b>
+															{p.name}
+															{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
+														</b>
 														<small>
 															{p.kind === "db" ? `${p.engine} · ` : ""}
 															{p.username ? `${p.username}@` : ""}
 															{p.host}:{p.port}
 														</small>
 													</div>
-													{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
 													<button
 														type="button"
 														className="btn ghost icon"
@@ -487,8 +485,10 @@ function QuickCard(props: { color: string; icon: ReactNode; title: string; desc:
 			<span className="ic" style={{ background: props.color }}>
 				{props.icon}
 			</span>
-			<b>{props.title}</b>
-			<small>{props.desc}</small>
+			<span className="qtext">
+				<b>{props.title}</b>
+				<small>{props.desc}</small>
+			</span>
 		</button>
 	);
 }

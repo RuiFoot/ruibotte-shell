@@ -7,6 +7,7 @@ import "@xterm/xterm/css/xterm.css";
 import { ChevronDown, ChevronUp, Pause, Play, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { bytesChannel, type FsBackend } from "../lib/ipc";
+import { Select } from "./Select";
 
 /**
  * 실시간 보기 — 원격은 `tail -n N -F`, 내 PC 는 늘어난 만큼 읽기. 화면은 읽기 전용 xterm 이라 로그 색(ANSI)이 그대로 보인다.
@@ -129,17 +130,18 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 					<ChevronDown size={13} />
 				</button>
 				<span style={{ flex: 1 }} />
-				<select
-					className="status-select"
+				<Select
+					size="sm"
 					value={enc}
-					onChange={(e) => {
-						setEnc(e.target.value);
-						decRef.current = e.target.value === "UTF-8" ? null : new TextDecoder("euc-kr");
+					onChange={(v) => {
+						setEnc(v);
+						decRef.current = v === "UTF-8" ? null : new TextDecoder("euc-kr");
 					}}
-				>
-					<option>UTF-8</option>
-					<option>EUC-KR</option>
-				</select>
+					options={[
+						{ value: "UTF-8", label: "UTF-8" },
+						{ value: "EUC-KR", label: "EUC-KR" },
+					]}
+				/>
 			</div>
 			<div className="term-host" ref={host} />
 			<div className="statusbar">
