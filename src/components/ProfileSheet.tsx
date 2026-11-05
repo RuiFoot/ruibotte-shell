@@ -82,7 +82,17 @@ export function ProfileSheet({
 		if (test.s !== "running") setTest({ s: "idle" });
 	};
 	const editing = initial.id != null;
-	const dirty = JSON.stringify(p) !== JSON.stringify(initial) || !!secret || forget;
+	// DB 읽기 전용 접속(연결마다 기억 — 접속 창의 체크와 같은 값)
+	const [ro, setRo] = useState(false);
+	const [roInit, setRoInit] = useState(false);
+	useEffect(() => {
+		if (initial.id == null) return;
+		void api.settingGet(`db.readonly.${initial.id}`).then((v) => {
+			setRo(v === "1");
+			setRoInit(v === "1");
+		});
+	}, [initial.id]);
+	const dirty = JSON.stringify(p) !== JSON.stringify(initial) || !!secret || forget || ro !== roInit;
 	useEffect(() => onDirty?.(dirty), [dirty, onDirty]);
 	const savedSecret = !!initial.secretSaved && !forget;
 	const groups = [...new Set([...others.map((o) => o.groupName), ...extraGroups].filter((g): g is string => !!g))].sort((a, b) => a.localeCompare(b, "ko"));
@@ -142,6 +152,7 @@ export function ProfileSheet({
 			const id = await api.profileSave(p);
 			if (secret) await invoke("secret_set", { profileId: id, secret });
 			else if (forget) await invoke("secret_set", { profileId: id, secret: "" });
+			if (p.kind === "db") await api.settingSet(`db.readonly.${id}`, ro ? "1" : "0");
 			onSaved(id);
 		} catch (e) {
 			setErr(String((e as { message?: string }).message ?? e));
@@ -254,6 +265,11 @@ export function ProfileSheet({
 							<label htmlFor="pf-db">{engineOf(p.engine).dbLabel}</label>
 							<input id="pf-db" value={p.database ?? ""} onChange={(e) => set({ database: e.target.value || null })} spellCheck={false} />
 						</div>
+					)}
+					{p.kind === "db" && (
+						<label className="check" title="켜면 이 연결은 늘 읽기 전용으로 접속합니다 — 쓰기 문장은 앱이 실행 전에 거절(접속 창에서 한 번씩 바꿀 수 있음)">
+							<input type="checkbox" checked={ro} onChange={(e) => setRo(e.target.checked)} /> 읽기 전용으로 접속(운영 DB 보호)
+						</label>
 					)}
 				</fieldset>
 
