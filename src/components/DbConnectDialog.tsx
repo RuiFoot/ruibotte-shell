@@ -29,7 +29,8 @@ export function DbConnectDialog({
 		return () => void un.then((f) => f());
 	}, []);
 	const [pw, setPw] = useState("");
-	const [save, setSave] = useState(false);
+	// 내 PC 전용 앱이라 기본은 저장(사용자가 끌 수 있음)
+	const [save, setSave] = useState(true);
 	const [readOnly, setReadOnly] = useState(false);
 	const [err, setErr] = useState("");
 	const started = useRef(false);

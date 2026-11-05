@@ -25,6 +25,20 @@ pub fn forget(key: &str) {
     }
 }
 
+/// 연결 설정에서 암호(또는 개인키 암호)를 저장·바꾸기 — 빈 값이면 지운다. 값은 다시 화면으로 돌려주지 않는다
+#[tauri::command]
+pub fn secret_set(profile_id: i64, secret: String, store: tauri::State<'_, crate::store::Store>) -> Result<(), String> {
+    let key = format!("profile:{profile_id}");
+    if secret.is_empty() {
+        forget(&key);
+        store.mark_used(profile_id, Some(false));
+        return Ok(());
+    }
+    set(&key, &secret)?;
+    store.mark_used(profile_id, Some(true));
+    Ok(())
+}
+
 #[tauri::command]
 pub fn secret_forget(profile_id: i64, store: tauri::State<'_, crate::store::Store>) {
     forget(&format!("profile:{profile_id}"));

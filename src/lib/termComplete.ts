@@ -1,5 +1,5 @@
 /**
- * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 로 받기)과 Tab 목록(↑↓·Tab/Enter·Esc).
+ * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 로 받기)과 Tab 목록(Tab·↓ 다음, Shift+Tab·↑ 이전, Enter·→ 받기, Esc 닫기).
  * 키 입력 경로를 막지 않도록 React 상태 없이 DOM 을 직접 그린다. 프롬프트(OSC 133 A) 뒤 입력에서만 켜진다.
  * 목록이 비면 Tab 은 원래대로 셸(bash 완성)에 넘긴다. 지난 명령은 서버별로 앱 DB 에 500개까지.
  */
@@ -135,7 +135,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		if (items.length > 12) {
 			const more = document.createElement("div");
 			more.className = "term-pop-more";
-			more.textContent = `… ${items.length - 12}개 더 — 더 쳐서 좁히기`;
+			more.textContent = `… ${items.length - 12}개 더 · Tab 다음 · Enter 넣기`;
 			pop.append(more);
 		}
 		pop.hidden = false;
@@ -242,12 +242,15 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		key: (e) => {
 			if (e.type !== "keydown" || !promptOn) return true;
 			if (!pop.hidden) {
-				if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-					sel = (sel + (e.key === "ArrowDown" ? 1 : -1) + Math.min(items.length, 12)) % Math.min(items.length, 12);
+				// 목록이 열려 있으면 Tab 은 셸처럼 다음 후보로(포커스가 다른 칸으로 넘어가지 않게 화면 쪽에서 기본 동작을 막는다)
+				const n = Math.min(items.length, 12);
+				if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Tab") {
+					const back = e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey);
+					sel = (sel + (back ? -1 : 1) + n) % n;
 					renderPop();
 					return false;
 				}
-				if (e.key === "Tab" || e.key === "Enter") {
+				if (e.key === "Enter" || e.key === "ArrowRight") {
 					accept();
 					return false;
 				}

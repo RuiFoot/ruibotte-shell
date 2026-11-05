@@ -277,12 +277,16 @@ function TransfersPanel() {
 const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel, sync: SyncDock, monitor: MonitorDock };
 const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
 
-/** 기본 배치: 트리 왼쪽 · 편집기 가운데 · 터미널 오른쪽 */
 /**
- * 문서 칸(편집기·tail·비교·자원) 놓기 — 이미 문서 칸이 있으면 그 칸의 탭으로,
- * 처음이면 IDE 처럼 터미널 위 넓은 자리(높이 60%), 터미널이 없으면 트리 오른쪽.
+ * 문서 칸(편집기·tail·비교·자원) 놓기 — 빈 문서 자리(기본 배치의 가운데)가 있으면 거기,
+ * 이미 문서가 있으면 그 칸의 탭으로, 둘 다 없으면 터미널 위 넓은 자리(높이 62%).
  */
 function addDoc(d: DockviewApi, opts: { id: string; component: string; title: string; params?: object }) {
+	const empty = d.groups.find((g) => g.panels.length === 0);
+	if (empty) {
+		d.addPanel({ ...opts, renderer: "always", position: { referenceGroup: empty.id } });
+		return;
+	}
 	const anyDoc = d.panels.find((p) => /^(edit|tail|diff):/.test(p.id) || p.id === "monitor");
 	if (anyDoc) {
 		d.addPanel({ ...opts, renderer: "always", position: { referencePanel: anyDoc.id, direction: "within" } });
@@ -311,10 +315,14 @@ function addBottom(d: DockviewApi, opts: { id: string; component: string; title:
 	});
 }
 
-function defaultLayout(d: DockviewApi, hasLocal: boolean) {
+/**
+ * 기본 배치(Orbit 작업대와 같은 틀): 왼쪽 트리 · 가운데 문서 자리(비어 있으면 안내) · 아래 터미널.
+ * 내 PC 트리는 기본으로 두지 않고, 주고받을 때 도구 막대의 "내 PC" 로 오른쪽에 연다.
+ */
+function defaultLayout(d: DockviewApi) {
 	d.clear();
 	d.addPanel({ id: "tree", component: "tree", title: "파일", params: { which: "remote" }, renderer: "always" });
-	d.addPanel({
+	const term = d.addPanel({
 		id: "term-1",
 		component: "terminal",
 		title: "터미널",
@@ -322,18 +330,11 @@ function defaultLayout(d: DockviewApi, hasLocal: boolean) {
 		renderer: "always",
 		position: { referencePanel: "tree", direction: "right" },
 	});
-	d.getPanel("tree")?.api.setSize({ width: 260 });
-	if (hasLocal) {
-		d.addPanel({
-			id: "localtree",
-			component: "tree",
-			title: "내 PC",
-			params: { which: "local" },
-			renderer: "always",
-			position: { referencePanel: "tree", direction: "below" },
-			inactive: true,
-		});
-	}
+	const docs = d.addGroup({ referencePanel: "term-1", direction: "above" });
+	d.getPanel("tree")?.api.setSize({ width: 280 });
+	const total = docs.height + term.group.height;
+	if (total > 0) docs.api.setSize({ height: Math.round(total * 0.6) });
+	term.api.setActive();
 }
 
 /** 저장용 배치 — 편집기 탭은 빼고 고정 칸만 */
@@ -663,13 +664,17 @@ export function Workbench({
 			title: id === "tree" ? "파일" : "내 PC",
 			params: { which: id === "tree" ? "remote" : "local" },
 			renderer: "always",
-			position: { direction: "left" },
+			// 원격 트리는 왼쪽 끝, 내 PC 트리는 오른쪽 끝(주고받을 때만 여는 칸)
+			position: { direction: id === "tree" ? "left" : "right" },
 		});
+		if (id === "localtree") d.getPanel(id)?.api.setSize({ width: 300 });
 	};
 
+	// 기본 배치가 바뀌면(v2: 트리·문서·아래 터미널) 옛 저장 배치는 쓰지 않는다
+	const savedKey = `${layoutKey}.v2`;
 	const onReady = (e: DockviewReadyEvent) => {
 		dock.current = e.api;
-		void api.settingGet(layoutKey).then((saved) => {
+		void api.settingGet(savedKey).then((saved) => {
 			let ok = false;
 			if (saved) {
 				try {
@@ -683,13 +688,13 @@ export function Workbench({
 					ok = false;
 				}
 			}
-			if (!ok) defaultLayout(e.api, !!local);
+			if (!ok) defaultLayout(e.api);
 		});
 		e.api.onDidActivePanelChange((ev) => setActivePanel(ev.panel?.id ?? null));
 		e.api.onDidLayoutChange(() => {
 			window.clearTimeout(saveTimer.current);
 			saveTimer.current = window.setTimeout(() => {
-				if (dock.current) void api.settingSet(layoutKey, JSON.stringify(stripEditors(dock.current.toJSON())));
+				if (dock.current) void api.settingSet(savedKey, JSON.stringify(stripEditors(dock.current.toJSON())));
 			}, 600);
 		});
 	};
@@ -811,7 +816,7 @@ export function Workbench({
 						onClick={() => {
 							if (dock.current) {
 								termSeq.current = 1;
-								defaultLayout(dock.current, !!local);
+								defaultLayout(dock.current);
 							}
 						}}
 					>

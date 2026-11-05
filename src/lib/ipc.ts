@@ -32,6 +32,8 @@ export type Profile = {
 	secretSaved?: boolean;
 	/** 거쳐 갈 SSH 프로필(점프 호스트) */
 	jumpId?: number | null;
+	/** 연결 묶음(폴더) */
+	groupName?: string | null;
 };
 
 export type SshError = {

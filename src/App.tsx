@@ -1,10 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, Database, Download, Settings as SettingsIcon, FileDown, FileUp, House, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
+import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
@@ -57,6 +58,10 @@ export function App() {
 	const [importing, setImporting] = useState(false);
 	const [exporting, setExporting] = useState(false);
 	const [q, setQ] = useState("");
+	/** 시트를 다시 열 때(복제 등) 새로 그리게 */
+	const [sheetKey, setSheetKey] = useState(0);
+	const [pmenu, setPmenu] = useState<{ x: number; y: number; p: Profile } | null>(null);
+	const [folded, setFolded] = useState<Set<string>>(new Set());
 	const upd = useUpdate();
 
 	const reload = useCallback(() => {
@@ -160,6 +165,62 @@ export function App() {
 	}, [profiles, q]);
 	const ssh = profiles.filter((p) => p.kind === "ssh");
 	const dbs = profiles.filter((p) => p.kind === "db");
+	const editProfile = (p: Profile) => {
+		setSheetKey((k) => k + 1);
+		setSheet(p);
+	};
+	const profileMenu = (p: Profile): MenuItem[] => [
+		{ label: "접속", run: () => connect(p) },
+		{ label: "설정…", run: () => editProfile(p) },
+		{ label: "복제", run: () => editProfile({ ...p, id: undefined, name: `${p.name} 복사본`, secretSaved: false }) },
+		...(p.secretSaved ? [{ label: "저장한 암호 지우기", run: () => void invoke("secret_forget", { profileId: p.id }).then(reload) }] : []),
+		{ sep: true as const },
+		{
+			label: "지우기",
+			danger: true,
+			run: () => {
+				if (p.id != null && confirm(`${p.name} 연결을 지울까요? 저장한 암호도 함께 지웁니다.`)) void api.profileDelete(p.id).then(reload);
+			},
+		},
+	];
+	/** 묶음별로 — 이름순, 묶지 않은 것은 맨 뒤 */
+	const grouped = (list: Profile[]) => {
+		const m = new Map<string, Profile[]>();
+		for (const p of list) {
+			const g = p.groupName?.trim() || "";
+			m.set(g, [...(m.get(g) ?? []), p]);
+		}
+		return [...m.entries()].sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "ko")));
+	};
+	const sbList = (list: Profile[], title: (p: Profile) => string) =>
+		grouped(list).map(([g, items]) => {
+			const key = `sb:${g}`;
+			return (
+				<div key={g || "-"}>
+					{g && (
+						<button type="button" className="sb-group" onClick={() => setFolded((f) => { const n = new Set(f); if (n.has(key)) n.delete(key); else n.add(key); return n; })}>
+							{folded.has(key) ? <ChevronRight size={12} /> : <ChevronDown size={12} />} {g}
+						</button>
+					)}
+					{!folded.has(key) &&
+						items.map((p) => (
+							<button
+								key={p.id}
+								type="button"
+								className={`sb-item${g ? " in-group" : ""}`}
+								title={title(p)}
+								onClick={() => connect(p)}
+								onContextMenu={(e) => {
+									e.preventDefault();
+									setPmenu({ x: e.clientX, y: e.clientY, p });
+								}}
+							>
+								<span className="dot" style={{ background: p.color ?? "var(--accent)" }} /> {p.name}
+							</button>
+						))}
+				</div>
+			);
+		});
 	const isWin = info?.os === "windows";
 	const mod = info?.os === "macos" ? "⌘" : "Ctrl+";
 	const win = getCurrentWindow();
@@ -205,11 +266,7 @@ export function App() {
 
 				<div className="sb-section">SSH 서버</div>
 				{ssh.length ? (
-					ssh.map((p) => (
-						<button key={p.id} type="button" className="sb-item" title={`${p.username ? `${p.username}@` : ""}${p.host}:${p.port}`} onClick={() => connect(p)}>
-							<span className="dot" style={{ background: p.color ?? "var(--accent)" }} /> {p.name}
-						</button>
-					))
+					sbList(ssh, (p) => `${p.username ? `${p.username}@` : ""}${p.host}:${p.port}`)
 				) : (
 					<button type="button" className="sb-item" style={{ color: "var(--text-3)" }} onClick={() => setSheet(blankProfile("ssh"))}>
 						<Plus size={14} /> 서버 추가
@@ -217,11 +274,7 @@ export function App() {
 				)}
 				<div className="sb-section">데이터베이스</div>
 				{dbs.length ? (
-					dbs.map((p) => (
-						<button key={p.id} type="button" className="sb-item" title={`${p.engine} ${p.host}:${p.port}`} onClick={() => connect(p)}>
-							<span className="dot" style={{ background: p.color ?? "var(--accent)" }} /> {p.name}
-						</button>
-					))
+					sbList(dbs, (p) => `${p.engine} ${p.host}:${p.port}`)
 				) : (
 					<button type="button" className="sb-item" style={{ color: "var(--text-3)" }} onClick={() => setSheet(blankProfile("db"))}>
 						<Plus size={14} /> DB 추가
@@ -322,53 +375,60 @@ export function App() {
 										</button>
 									</div>
 									{filtered.length ? (
-										<div className="plist">
-											{filtered.map((p) => (
-												<div
-													key={p.id}
-													className="pcard"
-													role="button"
-													tabIndex={0}
-													onClick={() => connect(p)}
-													onKeyDown={(e) => e.key === "Enter" && connect(p)}
-												>
-													<span style={{ width: 10, height: 10, borderRadius: "50%", flex: "none", background: p.color ?? "var(--accent)" }} />
-													<div className="meta">
-														<b>
-															{p.name}
-															{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
-														</b>
-														<small>
-															{p.kind === "db" ? `${p.engine} · ` : ""}
-															{p.username ? `${p.username}@` : ""}
-															{p.host}:{p.port}
-														</small>
+										grouped(filtered).map(([g, items]) => (
+											<section key={g || "-"} className="pgroup">
+												{(g || grouped(filtered).length > 1) && (
+													<button type="button" className="pgroup-head" onClick={() => setFolded((f) => { const n = new Set(f); if (n.has(g)) n.delete(g); else n.add(g); return n; })}>
+														{folded.has(g) ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+														<Folder size={13} /> {g || "묶지 않음"} <small>{items.length}</small>
+													</button>
+												)}
+												{!folded.has(g) && (
+													<div className="plist">
+														{items.map((p) => (
+															<div
+																key={p.id}
+																className="pcard"
+																role="button"
+																tabIndex={0}
+																onClick={() => connect(p)}
+																onKeyDown={(e) => e.key === "Enter" && connect(p)}
+																onContextMenu={(e) => {
+																	e.preventDefault();
+																	setPmenu({ x: e.clientX, y: e.clientY, p });
+																}}
+															>
+																<span style={{ width: 10, height: 10, borderRadius: "50%", flex: "none", background: p.color ?? "var(--accent)" }} />
+																<div className="meta">
+																	<b>
+																		<span className="nm">{p.name}</span>
+																		{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
+																	</b>
+																	<small>
+																		{p.secretSaved && <KeyRound size={10} style={{ marginRight: 4, verticalAlign: -1 }} />}
+																		{p.kind === "db" ? `${p.engine} · ` : ""}
+																		{p.username ? `${p.username}@` : ""}
+																		{p.host}:{p.port}
+																	</small>
+																</div>
+																<button
+																	type="button"
+																	className="btn ghost icon"
+																	aria-label="설정"
+																	title="설정(고치기·복제·지우기) — 우클릭 메뉴도 있습니다"
+																	onClick={(e) => {
+																		e.stopPropagation();
+																		editProfile(p);
+																	}}
+																>
+																	<Pencil size={13} />
+																</button>
+															</div>
+														))}
 													</div>
-													<button
-														type="button"
-														className="btn ghost icon"
-														aria-label="고치기"
-														onClick={(e) => {
-															e.stopPropagation();
-															setSheet(p);
-														}}
-													>
-														<Pencil size={13} />
-													</button>
-													<button
-														type="button"
-														className="btn ghost icon"
-														aria-label="지우기"
-														onClick={(e) => {
-															e.stopPropagation();
-															if (p.id != null && confirm(`${p.name} 연결을 지울까요? 저장한 암호도 함께 지웁니다.`)) void api.profileDelete(p.id).then(reload);
-														}}
-													>
-														<X size={14} />
-													</button>
-												</div>
-											))}
-										</div>
+												)}
+											</section>
+										))
 									) : (
 										<div className="empty">{q ? "맞는 연결이 없습니다." : "저장한 연결이 없습니다. 위에서 SSH 서버나 데이터베이스를 추가하세요."}</div>
 									)}
@@ -436,6 +496,7 @@ export function App() {
 
 			{sheet && (
 				<ProfileSheet
+					key={sheetKey}
 					others={profiles}
 					initial={sheet}
 					onClose={() => setSheet(null)}
@@ -443,8 +504,14 @@ export function App() {
 						setSheet(null);
 						reload();
 					}}
+					onDeleted={() => {
+						setSheet(null);
+						reload();
+					}}
+					onDuplicate={(p) => editProfile(p)}
 				/>
 			)}
+			{pmenu && <ContextMenu x={pmenu.x} y={pmenu.y} items={profileMenu(pmenu.p)} onClose={() => setPmenu(null)} />}
 			{connecting && (
 				<ConnectDialog
 					profile={connecting.p}

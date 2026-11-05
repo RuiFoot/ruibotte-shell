@@ -447,6 +447,33 @@ async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, pw: &str)
     Ok(false)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestOk {
+    ms: u64,
+    home: String,
+    fingerprint: String,
+    algorithm: String,
+    newly_pinned: bool,
+}
+
+/// 연결 테스트 — 붙어서 인증까지 해 보고 바로 끊는다. 처음 보는 호스트 키면 HOSTKEY_UNKNOWN 으로 지문을 돌려준다(화면이 확인 후 다시)
+#[tauri::command]
+pub async fn ssh_test(store: State<'_, Store>, conns: State<'_, SshConns>, req: ConnectReq) -> R<TestOk> {
+    let t = std::time::Instant::now();
+    let mut req = req;
+    req.save_secret = false;
+    let ok = connect(&store, &conns, req).await?;
+    let ms = t.elapsed().as_millis() as u64;
+    if let Some(c) = conns.map.lock().unwrap().remove(&ok.conn_id) {
+        tauri::async_runtime::spawn(async move {
+            let _ = c.sftp.close().await;
+            let _ = c.handle.disconnect(Disconnect::ByApplication, "", "ko").await;
+        });
+    }
+    Ok(TestOk { ms, home: ok.home, fingerprint: ok.fingerprint, algorithm: ok.algorithm, newly_pinned: ok.newly_pinned })
+}
+
 #[tauri::command]
 pub async fn ssh_disconnect(conns: State<'_, SshConns>, conn: u32) -> R<()> {
     let c = conns.map.lock().unwrap().remove(&conn);

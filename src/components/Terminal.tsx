@@ -260,7 +260,14 @@ export function TerminalView({
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
 		term.attachCustomKeyEventHandler((e) => {
-			if (completer && !completer.key(e)) return false;
+			if (completer && !completer.key(e)) {
+				// xterm 이 처리하지 않은 키는 브라우저 기본 동작(Tab = 다음 칸으로 포커스)이 남는다 — 막는다
+				e.preventDefault();
+				e.stopPropagation();
+				return false;
+			}
+			// 터미널 안에서 Tab·Shift+Tab 은 늘 셸 몫(포커스 이동 금지)
+			if (e.key === "Tab") e.preventDefault();
 			if (e.type !== "keydown") return true;
 			const mod = e.ctrlKey || e.metaKey;
 			if (mod && e.shiftKey && e.code === "KeyC") {

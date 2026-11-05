@@ -8,9 +8,9 @@ type Args = Record<string, unknown>;
 const now = Math.floor(Date.now() / 1000);
 
 const profiles = [
-	{ id: 1, kind: "ssh", name: "개발 서버", host: "dev.example.com", port: 22, username: "deploy", color: "#0a84ff", favorite: true, auth: "key", keyPath: "~/.ssh/id_ed25519", legacy: "off", defaultPath: null, database: null, secretSaved: true, lastUsedAt: now - 3600 },
-	{ id: 2, kind: "ssh", name: "구형 로그 서버", host: "10.0.0.6", port: 22, username: "root", color: "#ff9f0a", favorite: true, auth: "password", legacy: "sha1", defaultPath: "/var/log", database: null, secretSaved: false, lastUsedAt: now - 86400 * 3 },
-	{ id: 3, kind: "db", name: "운영 PostgreSQL", host: "db.example.com", port: 5432, username: "app", engine: "postgres", color: "#30d158", favorite: true, auth: "password", legacy: "off", database: "app", secretSaved: true, lastUsedAt: now - 7200 },
+	{ id: 1, kind: "ssh", name: "개발 서버", host: "dev.example.com", port: 22, username: "deploy", color: "#0a84ff", favorite: true, auth: "key", keyPath: "~/.ssh/id_ed25519", legacy: "off", defaultPath: null, database: null, secretSaved: true, lastUsedAt: now - 3600, groupName: "개발" },
+	{ id: 2, kind: "ssh", name: "구형 로그 서버", host: "10.0.0.6", port: 22, username: "root", color: "#ff9f0a", favorite: true, auth: "password", legacy: "sha1", defaultPath: "/var/log", database: null, secretSaved: false, lastUsedAt: now - 86400 * 3, groupName: "개발" },
+	{ id: 3, kind: "db", name: "운영 PostgreSQL", host: "db.example.com", port: 5432, username: "app", engine: "postgres", color: "#30d158", favorite: true, auth: "password", legacy: "off", database: "app", secretSaved: true, lastUsedAt: now - 7200, groupName: "운영" },
 	{ id: 4, kind: "db", name: "레거시 MariaDB", host: "10.0.0.9", port: 3306, username: "ro", engine: "mariadb", color: "#bf5af2", favorite: false, auth: "password", legacy: "off", database: "RSA", secretSaved: false },
 	{ id: 5, kind: "db", name: "Oracle 회계", host: "10.0.0.12", port: 1521, username: "acc", engine: "oracle", color: "#8e8e93", favorite: false, auth: "password", legacy: "off", database: "ORCL", secretSaved: false },
 ];
@@ -94,6 +94,10 @@ export function installMock() {
 				case "pty_open":
 					sendChannel(args.onData, banner);
 					return 1;
+				case "ssh_test":
+					return new Promise((r) => setTimeout(() => r({ ms: 142, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false }), 400));
+				case "db_test":
+					return { ms: 38, version: "PostgreSQL 18.6" };
 				case "ssh_stats":
 					return stats();
 				case "ssh_du":

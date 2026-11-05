@@ -334,8 +334,32 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
     Ok(DbConnectOk { conn_id: id, features, version, database: req.database, used_saved_secret: used_saved })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbTestOk {
+    ms: u64,
+    version: String,
+}
+
+/// 연결 테스트 — 접속·인증·버전 확인까지 하고 바로 닫는다(암호는 저장하지 않음)
+#[tauri::command]
+pub async fn db_test(app: AppHandle, store: State<'_, Store>, dbs: State<'_, DbConns>, req: DbConnectReq) -> R<DbTestOk> {
+    let t = std::time::Instant::now();
+    let mut req = req;
+    req.save_secret = false;
+    let ok = connect(&store, &dbs, req, Some(&app)).await?;
+    let ms = t.elapsed().as_millis() as u64;
+    close(&dbs, ok.conn_id).await;
+    Ok(DbTestOk { ms, version: ok.version })
+}
+
 #[tauri::command]
 pub async fn db_disconnect(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
+    close(&dbs, conn).await;
+    Ok(())
+}
+
+async fn close(dbs: &DbConns, conn: u32) {
     let c = dbs.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
         match &c.engine {
@@ -348,7 +372,6 @@ pub async fn db_disconnect(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
             _ => {}
         }
     }
-    Ok(())
 }
 
 // ── 문장 판정 ───────────────────────

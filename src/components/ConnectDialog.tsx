@@ -34,7 +34,8 @@ export function ConnectDialog({
 	const needsSecretFirst = p.auth === "password" && !p.secretSaved;
 	const [step, setStep] = useState<Step>(needsSecretFirst ? { s: "secret" } : { s: "connecting" });
 	const [secret, setSecret] = useState("");
-	const [save, setSave] = useState(false);
+	// 내 PC 전용 앱이라 기본은 저장(사용자가 끌 수 있음)
+	const [save, setSave] = useState(true);
 	const trust = useRef<string | null>(null);
 	const started = useRef(false);
 

@@ -66,6 +66,8 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX query_history_scope ON query_history(scope, at DESC);",
     // 5: 점프 호스트(다른 SSH 프로필을 거쳐 접속)
     "ALTER TABLE profile ADD COLUMN jump_id INTEGER;",
+    // 6: 연결 묶음(폴더) — 빈 값이면 묶지 않음
+    "ALTER TABLE profile ADD COLUMN group_name TEXT;",
 ];
 
 pub struct Store {
@@ -200,6 +202,9 @@ pub struct Profile {
     /// 이 SSH 프로필을 거쳐 접속(점프 호스트)
     #[serde(default)]
     pub jump_id: Option<i64>,
+    /// 연결 묶음(폴더) 이름 — 홈·사이드바에서 이 이름으로 묶는다
+    #[serde(default)]
+    pub group_name: Option<String>,
 }
 
 fn default_auth() -> String {
@@ -210,7 +215,7 @@ fn default_legacy() -> String {
 }
 
 const PROFILE_COLS: &str = "id, kind, name, host, port, username, engine, color, favorite, last_used_at,
-    auth, key_path, legacy, default_path, database, secret_saved_at, jump_id";
+    auth, key_path, legacy, default_path, database, secret_saved_at, jump_id, group_name";
 
 fn profile_row(r: &Row) -> rusqlite::Result<Profile> {
     Ok(Profile {
@@ -231,6 +236,7 @@ fn profile_row(r: &Row) -> rusqlite::Result<Profile> {
         database: r.get(14)?,
         secret_saved: r.get::<_, Option<i64>>(15)?.is_some(),
         jump_id: r.get(16)?,
+        group_name: r.get(17)?,
     })
 }
 
@@ -260,13 +266,14 @@ pub fn profile_save(store: State<'_, Store>, p: Profile) -> Result<i64, String> 
     let conn = store.conn.lock().unwrap();
     let t = now();
     let host = p.host.trim().to_string();
+    let group = p.group_name.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(str::to_string);
     match p.id {
         Some(id) => {
             conn.execute(
                 "UPDATE profile SET kind=?1, name=?2, host=?3, port=?4, username=?5, engine=?6, color=?7,
-                 favorite=?8, updated_at=?9, auth=?10, key_path=?11, legacy=?12, default_path=?13, database=?14, jump_id=?16 WHERE id=?15",
+                 favorite=?8, updated_at=?9, auth=?10, key_path=?11, legacy=?12, default_path=?13, database=?14, jump_id=?16, group_name=?17 WHERE id=?15",
                 params![p.kind, p.name.trim(), host, p.port, p.username, p.engine, p.color, p.favorite as i64, t,
-                    p.auth, p.key_path, p.legacy, p.default_path, p.database, id, p.jump_id.filter(|j| *j != id)],
+                    p.auth, p.key_path, p.legacy, p.default_path, p.database, id, p.jump_id.filter(|j| *j != id), group],
             )
             .map_err(|e| e.to_string())?;
             Ok(id)
@@ -274,10 +281,10 @@ pub fn profile_save(store: State<'_, Store>, p: Profile) -> Result<i64, String> 
         None => {
             conn.execute(
                 "INSERT INTO profile (kind, name, host, port, username, engine, color, favorite, created_at, updated_at,
-                  auth, key_path, legacy, default_path, database, jump_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  auth, key_path, legacy, default_path, database, jump_id, group_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![p.kind, p.name.trim(), host, p.port, p.username, p.engine, p.color, p.favorite as i64, t,
-                    p.auth, p.key_path, p.legacy, p.default_path, p.database, p.jump_id],
+                    p.auth, p.key_path, p.legacy, p.default_path, p.database, p.jump_id, group],
             )
             .map_err(|e| e.to_string())?;
             Ok(conn.last_insert_rowid())
@@ -417,4 +424,25 @@ pub(crate) fn profile_save_core(store: &Store, host: &str, port: u16, user: &str
     )
     .unwrap();
     conn.last_insert_rowid()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 새 DB 에 마이그레이션을 끝까지 올리고, 묶음 이름이 저장·읽기 되는지
+    #[test]
+    fn migrations_and_group() {
+        let dir = std::env::temp_dir().join(format!("rbshell-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("db"), false).unwrap();
+        let id = profile_save_core(&store, "h", 22, "u");
+        store.conn.lock().unwrap().execute("UPDATE profile SET group_name='운영' WHERE id=?1", [id]).unwrap();
+        let p = store.profile(id).unwrap();
+        assert_eq!(p.group_name.as_deref(), Some("운영"));
+        let v: i64 = store.conn.lock().unwrap().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
