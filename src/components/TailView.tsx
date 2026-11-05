@@ -4,15 +4,32 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ChevronDown, ChevronUp, Pause, Play, Trash2 } from "lucide-react";
+import { ArrowDownToLine, ChevronDown, ChevronUp, Palette, Pause, Play, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { bytesChannel, type FsBackend } from "../lib/ipc";
 import { Select } from "./Select";
 
 /**
  * 실시간 보기 — 원격은 `tail -n N -F`, 내 PC 는 늘어난 만큼 읽기. 화면은 읽기 전용 xterm 이라 로그 색(ANSI)이 그대로 보인다.
- * 멈춤(멈춘 동안 온 줄은 모아 두었다가 다시 켜면 한꺼번에)·찾기·인코딩·지우기.
+ * 멈춤(멈춘 동안 온 줄은 모아 두었다가 다시 켜면 한꺼번에)·찾기(일치 수)·인코딩·지우기·처음 줄 수·
+ * 수준 색(ERROR 빨강·WARN 노랑·INFO 하늘·DEBUG 흐림 — 이미 색이 있는 줄은 그대로)·맨 아래로.
  */
+const ESC = "\x1b";
+/** 색이 없는 로그 줄에 수준·시각 색을 입힌다 */
+function colorize(text: string): string {
+	return text
+		.split("\n")
+		.map((l) => {
+			if (!l || l.includes(ESC)) return l;
+			let s = l.replace(/^(\[?\d{4}[-/.]\d{2}[-/.]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]?)/, `${ESC}[2m$1${ESC}[22m`);
+			if (/\b(ERROR|FATAL|SEVERE|CRIT(ICAL)?|PANIC)\b|Exception\b/.test(s)) s = `${ESC}[31m${s}${ESC}[39m`;
+			else if (/\bWARN(ING)?\b/.test(s)) s = `${ESC}[33m${s}${ESC}[39m`;
+			else if (/\b(DEBUG|TRACE)\b/.test(s)) s = `${ESC}[2m${s}${ESC}[22m`;
+			else if (/^\s+at\s/.test(s)) s = `${ESC}[2m${s}${ESC}[22m`;
+			return s;
+		})
+		.join("\n");
+}
 export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 	const host = useRef<HTMLDivElement>(null);
 	const termRef = useRef<XTerm | null>(null);
@@ -24,6 +41,12 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 	const [q, setQ] = useState("");
 	const [enc, setEnc] = useState("UTF-8");
 	const decRef = useRef<TextDecoder | null>(null);
+	const [initLines, setInitLines] = useState(500);
+	const [color, setColor] = useState(true);
+	const colorRef = useRef(true);
+	colorRef.current = color;
+	const [found, setFound] = useState<{ i: number; n: number } | null>(null);
+	const utf8 = useRef(new TextDecoder());
 
 	useEffect(() => {
 		const el = host.current;
@@ -41,6 +64,7 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 		const search = new SearchAddon();
 		term.loadAddon(fit);
 		term.loadAddon(search);
+		const res = search.onDidChangeResults((r) => setFound({ i: r.resultIndex + 1, n: r.resultCount }));
 		term.open(el);
 		fit.fit();
 		termRef.current = term;
@@ -49,9 +73,9 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 		ro.observe(el);
 		let count = 0;
 		const write = (b: Uint8Array) => {
-			const d = decRef.current;
-			if (d) term.write(d.decode(b, { stream: true }));
-			else term.write(b);
+			const d = decRef.current ?? utf8.current;
+			const text = d.decode(b, { stream: true });
+			term.write(colorRef.current ? colorize(text) : text);
 			for (const x of b) if (x === 10) count++;
 			setLines(count);
 		};
@@ -63,8 +87,8 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 		let gone = false;
 		const open =
 			fs.side === "remote"
-				? invoke<number>("ssh_tail_open", { conn: fs.conn, path, lines: 500, onData: ch })
-				: invoke<number>("local_tail_open", { path, lines: 500, onData: ch });
+				? invoke<number>("ssh_tail_open", { conn: fs.conn, path, lines: initLines, onData: ch })
+				: invoke<number>("local_tail_open", { path, lines: initLines, onData: ch });
 		open
 			.then((x) => {
 				if (gone) return void invoke("tail_close", { id: x });
@@ -81,9 +105,10 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 			if (id != null) void invoke("tail_close", { id });
 			void un.then((f) => f());
 			ro.disconnect();
+			res.dispose();
 			term.dispose();
 		};
-	}, [fs, path]);
+	}, [fs, path, initLines]);
 
 	const toggle = () => {
 		if (paused.current) {
@@ -123,6 +148,7 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 						}
 					}}
 				/>
+				{q && found && <span className="find-count">{found.n ? `${found.i}/${found.n}` : "없음"}</span>}
 				<button type="button" className="btn ghost icon" onClick={() => searchRef.current?.findPrevious(q)}>
 					<ChevronUp size={13} />
 				</button>
@@ -130,6 +156,19 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 					<ChevronDown size={13} />
 				</button>
 				<span style={{ flex: 1 }} />
+				<button type="button" className="btn ghost" title="맨 아래로(새 줄 따라가기)" onClick={() => termRef.current?.scrollToBottom()}>
+					<ArrowDownToLine size={13} />
+				</button>
+				<button type="button" className={`btn ghost${color ? " on" : ""}`} title="수준 색 입히기(ERROR·WARN·INFO·DEBUG) — 이미 색이 있는 줄은 그대로" onClick={() => setColor((c) => !c)}>
+					<Palette size={13} />
+				</button>
+				<Select
+					size="sm"
+					value={initLines}
+					onChange={setInitLines}
+					title="처음 보일 줄 수(바꾸면 다시 연다)"
+					options={[100, 500, 2000, 10000].map((n) => ({ value: n, label: `끝 ${n.toLocaleString()}줄` }))}
+				/>
 				<Select
 					size="sm"
 					value={enc}

@@ -140,9 +140,17 @@ export type TransferProgress = {
 	ms: number;
 };
 
+/** 시작한 전송의 조건 — 실패·취소 뒤 "다시(이어서)" 에 쓴다 */
+export const transferArgs = new Map<number, { conn: number; direction: "up" | "down"; src: string; destDir: string }>();
+/** 지금 도는 전송(앱을 끌 때 묻기) */
+export const runningTransfers = new Set<number>();
+
 export const transfers = {
-	start: (conn: number, direction: "up" | "down", src: string, destDir: string, overwrite: boolean) =>
-		invoke<number>("transfer_start", { conn, direction, src, destDir, overwrite }),
+	start: async (conn: number, direction: "up" | "down", src: string, destDir: string, overwrite: boolean) => {
+		const id = await invoke<number>("transfer_start", { conn, direction, src, destDir, overwrite });
+		transferArgs.set(id, { conn, direction, src, destDir });
+		return id;
+	},
 	cancel: (id: number) => invoke<void>("transfer_cancel", { id }),
 };
 

@@ -20,6 +20,7 @@ import {
 	transfers,
 	localShells,
 	type ShellInfo,
+	transferArgs,
 } from "../lib/ipc";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
@@ -165,7 +166,13 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 			{kind ? (
 				<BinaryPreview fs={fs} path={props.params.path} kind={kind} />
 			) : (
-				<EditorView_ fs={fs} path={props.params.path} active={ctx.activePanel === props.api.id} onDirtyChange={onDirty} />
+				<EditorView_
+					fs={fs}
+					path={props.params.path}
+					active={ctx.activePanel === props.api.id}
+					onDirtyChange={onDirty}
+					onTail={() => ctx.openTail(props.params.which, { name: props.params.name, path: props.params.path, kind: "file", size: 0 })}
+				/>
 			)}
 		</div>
 	);
@@ -275,6 +282,15 @@ function fmtBytes(n: number) {
 }
 
 /** 전송 칸 — 진행률·속도·취소, 끝나면 받은 쪽 트리를 새로 읽는다 */
+/** 남은 시간 — 초 → 1시간 2분 · 3분 4초 · 5초 */
+function fmtEta(s: number) {
+	if (!Number.isFinite(s)) return "";
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	const sec = Math.round(s % 60);
+	return h ? `${h}시간 ${m}분` : m ? `${m}분 ${sec}초` : `${sec}초`;
+}
+
 function TransfersPanel() {
 	const ctx = useWb();
 	const [list, setList] = useState<TransferProgress[]>([]);
@@ -334,7 +350,23 @@ function TransfersPanel() {
 								<X size={12} />
 							</button>
 						) : (
-							<small>{p.state === "done" ? "완료" : p.state === "cancelled" ? "취소됨" : "실패"}</small>
+							<span className="xfer-end">
+								<small>{p.state === "done" ? "완료" : p.state === "cancelled" ? "취소됨" : "실패"}</small>
+								{(p.state === "error" || p.state === "cancelled") && transferArgs.has(p.id) && (
+									<button
+										type="button"
+										className="btn ghost"
+										style={{ height: 20 }}
+										title="다시 — 다 받은 파일은 건너뛰고, 받다 만 파일(.rbpart)은 이어서"
+										onClick={() => {
+											const a = transferArgs.get(p.id);
+											if (a) void transfers.start(a.conn, a.direction, a.src, a.destDir, false).catch((e) => alert(asSshError(e).message));
+										}}
+									>
+										다시(이어서)
+									</button>
+								)}
+							</span>
 						)}
 						<div className={`bar ${p.state}`}>
 							<i style={{ width: `${pct}%` }} />
@@ -346,7 +378,10 @@ function TransfersPanel() {
 							{p.resumed ? ` · 이어받음 ${p.resumed}` : ""}
 							{p.error ? ` · ${p.error}` : ""}
 						</small>
-						<small>{speed ? `${fmtBytes(speed)}/s` : ""}</small>
+						<small>
+							{speed ? `${fmtBytes(speed)}/s` : ""}
+							{p.state === "running" && speed > 0 && p.bytesTotal > p.bytesDone ? ` · 남은 ${fmtEta((p.bytesTotal - p.bytesDone) / speed)}` : ""}
+						</small>
 					</div>
 				);
 			})}

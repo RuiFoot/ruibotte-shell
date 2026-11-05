@@ -10,7 +10,7 @@ import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
-import { type AppInfo, api, type ConnectOk, localFs, localTerm, type Profile, sshFs, sshTerm } from "./lib/ipc";
+import { type AppInfo, api, type ConnectOk, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm } from "./lib/ipc";
 import { installNow, startUpdater, useUpdate } from "./lib/updater";
 
 // 무거운 칸(xterm·편집기·표·사전)은 처음 열 때 받는다 — 첫 화면(홈)은 가볍게
@@ -236,9 +236,21 @@ export function App() {
 	// 앱을 끌 때: 저장 안 한 편집기가 있으면 묻는다(창 단추·Alt+F4·작업 표시줄 모두)
 	useEffect(() => {
 		const un = win.onCloseRequested((e) => {
+			if (runningTransfers.size && !confirm(`전송 ${runningTransfers.size}개가 아직 돌고 있습니다. 끄면 멈춥니다(나중에 "다시(이어서)" 로 이어 받을 수 있음). 끌까요?`)) {
+				e.preventDefault();
+				return;
+			}
 			if (!confirmDiscard(dirtyTitles(), "앱을 끄면")) e.preventDefault();
 		});
-		return () => void un.then((f) => f());
+		// 도는 전송 세기
+		const unT = listen<{ id: number; state: string }>("transfer", (ev) => {
+			if (ev.payload.state === "running") runningTransfers.add(ev.payload.id);
+			else runningTransfers.delete(ev.payload.id);
+		});
+		return () => {
+			void un.then((f) => f());
+			void unT.then((f) => f());
+		};
 	}, [win]);
 	const activeKind = tabs.find((t) => t.id === active)?.kind;
 

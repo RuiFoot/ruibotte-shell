@@ -3195,3 +3195,8 @@ input[type="radio"] {
 	font: inherit;
 	font-size: 12px;
 }
+.xfer-end {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}

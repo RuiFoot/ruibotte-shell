@@ -53,11 +53,14 @@ export function EditorView_({
 	path,
 	active,
 	onDirtyChange,
+	onTail,
 }: {
 	fs: FsBackend;
 	path: string;
 	active: boolean;
 	onDirtyChange: (dirty: boolean) => void;
+	/** 실시간 보기(tail -F) 칸 열기 */
+	onTail?: () => void;
 }) {
 	const host = useRef<HTMLDivElement>(null);
 	const view = useRef<EditorView | null>(null);
@@ -476,6 +479,11 @@ export function EditorView_({
 								title={altKind === "markdown" ? "미리보기" : "표로 보기"}
 							>
 								{altKind === "markdown" ? <Eye size={12} /> : <Table2 size={12} />} {alt ? "편집" : altKind === "markdown" ? "미리보기" : "표"}
+							</button>
+						)}
+						{onTail && (langId === "log" || autoLang === "log") && (
+							<button type="button" className="btn ghost" style={{ height: 20 }} onClick={onTail} title="실시간 보기(tail -F) — 새 줄을 따라간다">
+								⟳ 실시간
 							</button>
 						)}
 						{canTidy && !readOnly && (
