@@ -315,6 +315,13 @@ export function ProfileSheet({
 
 				<fieldset className="sheet-sec">
 					<legend>표시·고급</legend>
+					<div className="field">
+						<label htmlFor="pf-memo">메모</label>
+						<textarea id="pf-memo" className="memo-input" rows={2} value={p.memo ?? ""} onChange={(e) => set({ memo: e.target.value || null })} placeholder="용도·주의할 점(목록과 마우스 올리면 보임)" />
+					</div>
+					<label className="check" style={{ marginTop: 0, marginBottom: 10 }}>
+						<input type="checkbox" checked={p.favorite} onChange={(e) => set({ favorite: e.target.checked })} /> 즐겨찾기(목록 맨 위)
+					</label>
 					{p.kind === "ssh" && (
 						<div className="field">
 							<label htmlFor="pf-path">시작 폴더(비우면 홈)</label>

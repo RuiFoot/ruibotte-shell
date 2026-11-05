@@ -36,6 +36,8 @@ export type Profile = {
 	groupName?: string | null;
 	/** DB SSL: off · prefer · require · verify */
 	ssl?: string | null;
+	/** 메모 */
+	memo?: string | null;
 };
 
 export type SshError = {

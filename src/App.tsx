@@ -34,6 +34,15 @@ const TAB_ICON: Record<TabKind, ReactNode> = {
 	dict: <BookOpen size={14} />,
 	settings: <SettingsIcon size={14} />,
 };
+/** 마지막 접속 — 초(유닉스) → "3시간 전" */
+function ago(t: number) {
+	const s = Math.max(0, Date.now() / 1000 - t);
+	if (s < 60) return "방금";
+	if (s < 3600) return `${Math.floor(s / 60)}분 전`;
+	if (s < 86400) return `${Math.floor(s / 3600)}시간 전`;
+	if (s < 86400 * 30) return `${Math.floor(s / 86400)}일 전`;
+	return new Date(t * 1000).toLocaleDateString();
+}
 const LEVEL_BADGE: Record<string, string> = { rsa: "구형 SSH · RSA", sha1: "구형 SSH · SHA-1", weakest: "구형 SSH · 최후" };
 
 let seq = 0;
@@ -64,6 +73,28 @@ export function App() {
 	const [pmenu, setPmenu] = useState<{ x: number; y: number; p: Profile } | null>(null);
 	const [folded, setFolded] = useState<Set<string>>(new Set());
 	const upd = useUpdate();
+
+	// 지난번 열려 있던 연결(앱을 다시 켜면 홈에서 한 번에 다시 열기)
+	const [lastSession, setLastSession] = useState<number[]>([]);
+	const sessionLoaded = useRef(false);
+	useEffect(() => {
+		void api.settingGet("session.open").then((v) => {
+			try {
+				setLastSession(v ? (JSON.parse(v) as number[]) : []);
+			} catch {
+				setLastSession([]);
+			}
+			sessionLoaded.current = true;
+		});
+	}, []);
+	useEffect(() => {
+		if (!sessionLoaded.current) return;
+		const ids = tabs.map((t) => t.ssh?.profile.id ?? t.db?.profile.id).filter((x): x is number => x != null);
+		if (ids.length) {
+			setLastSession([]);
+			void api.settingSet("session.open", JSON.stringify([...new Set(ids)]));
+		} else if (!lastSession.length) void api.settingSet("session.open", "[]");
+	}, [tabs, lastSession.length]);
 
 	const reload = useCallback(() => {
 		void api.profilesList().then(setProfiles);
@@ -382,6 +413,32 @@ export function App() {
 								<div className="home-inner">
 									<h1>{greeting()}</h1>
 									<p className="sub">어디에 접속할까요?</p>
+									{lastSession.length > 0 && profiles.some((p) => p.id != null && lastSession.includes(p.id)) && (
+										<div className="resume-bar">
+											<span>
+												지난번에 열려 있던 연결 —{" "}
+												{profiles
+													.filter((p) => p.id != null && lastSession.includes(p.id))
+													.map((p) => p.name)
+													.join(", ")}
+											</span>
+											<button
+												type="button"
+												className="btn primary"
+												onClick={() => {
+													const list = profiles.filter((p) => p.id != null && lastSession.includes(p.id));
+													setLastSession([]);
+													// 하나씩(암호 창이 겹치지 않게) — 첫 것만 바로, 나머지는 잠깐씩 띄워서
+													list.forEach((p, i) => window.setTimeout(() => connect(p), i * 400));
+												}}
+											>
+												다시 열기
+											</button>
+											<button type="button" className="btn ghost" onClick={() => setLastSession([])}>
+												닫기
+											</button>
+										</div>
+									)}
 									<label className="search">
 										<Search size={17} />
 										<input id="home-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="서버·데이터베이스 찾기" spellCheck={false} />
@@ -417,6 +474,7 @@ export function App() {
 															<div
 																key={p.id}
 																className="pcard"
+																title={p.memo ?? undefined}
 																role="button"
 																tabIndex={0}
 																onClick={() => connect(p)}
@@ -429,6 +487,17 @@ export function App() {
 																<span style={{ width: 10, height: 10, borderRadius: "50%", flex: "none", background: p.color ?? "var(--accent)" }} />
 																<div className="meta">
 																	<b>
+																		<button
+																			type="button"
+																			className={`star${p.favorite ? " on" : ""}`}
+																			title={p.favorite ? "즐겨찾기 빼기" : "즐겨찾기(목록 맨 위)"}
+																			onClick={(e) => {
+																				e.stopPropagation();
+																				void api.profileSave({ ...p, favorite: !p.favorite }).then(reload);
+																			}}
+																		>
+																			{p.favorite ? "★" : "☆"}
+																		</button>
 																		<span className="nm">{p.name}</span>
 																		{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
 																	</b>
@@ -437,7 +506,9 @@ export function App() {
 																		{p.kind === "db" ? `${p.engine} · ` : ""}
 																		{p.username ? `${p.username}@` : ""}
 																		{p.host}:{p.port}
+																		{p.lastUsedAt ? <span className="last-used"> · {ago(p.lastUsedAt)}</span> : null}
 																	</small>
+																	{p.memo && <small className="memo">{p.memo}</small>}
 																</div>
 																<button
 																	type="button"
