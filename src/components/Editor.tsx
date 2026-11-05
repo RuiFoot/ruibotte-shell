@@ -117,6 +117,11 @@ export function EditorView_({
 				else if (f.binary) setStatus({ text: "바이너리 파일 — 편집할 수 없습니다", tone: "warn" });
 				else if (f.meta.guessed) setStatus({ text: `인코딩을 확신할 수 없어 읽기 전용(${f.meta.encoding}로 추측). 오른쪽에서 인코딩을 골라 다시 여세요.`, tone: "warn" });
 				else setStatus({ text: `${ms} ms에 열림` });
+				// CSV·TSV·마크다운은 처음부터 표·미리보기로(상태 줄 단추로 편집)
+				if (altView(path) && !f.tooLarge) {
+					setAltText(text);
+					setAlt(true);
+				}
 				const guess = detectLang(path, text.slice(0, text.indexOf("\n") >>> 0));
 				setAutoLang(guess);
 				void api.settingGet(`lang.${path.split(".").pop()}`).then((saved) => !gone && setLangId(saved || guess));

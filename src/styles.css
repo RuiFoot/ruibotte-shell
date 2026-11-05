@@ -3028,3 +3028,57 @@ input[type="radio"] {
 	color: #fff;
 	text-decoration: underline;
 }
+/* 미리보기: 시트 탭·이미지 확대·워드 */
+.sheet-tabs {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding: 4px 8px;
+	border-bottom: 0.5px solid var(--hairline);
+	overflow-x: auto;
+	flex: none;
+}
+.sheet-tabs button {
+	height: 24px;
+	padding: 0 10px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text-2);
+	font-size: 12px;
+	white-space: nowrap;
+}
+.sheet-tabs button[aria-pressed="true"] {
+	background: var(--accent-soft);
+	color: var(--accent);
+	font-weight: 600;
+}
+.sheet-info {
+	margin-left: auto;
+	padding-left: 12px;
+	color: var(--text-3);
+	font-size: 11.5px;
+	white-space: nowrap;
+}
+.img-box {
+	overflow: auto;
+}
+.img-box.fit {
+	display: grid;
+	place-items: center;
+}
+.img-box:not(.fit) {
+	display: block;
+}
+.docx-view {
+	flex: 1;
+	overflow: auto;
+}
+.docx-view table {
+	border-collapse: collapse;
+}
+.docx-view td,
+.docx-view th {
+	border: 0.5px solid var(--hairline-strong);
+	padding: 3px 6px;
+}

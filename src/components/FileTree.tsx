@@ -183,12 +183,13 @@ export const FileTree = memo(function FileTree({
 			p = up;
 		}
 		void (async () => {
-			for (const dir of [root, ...chain.slice(0, -1)]) {
+			// 그 폴더 자신도 펼쳐 안이 보이게(이전 판과 같이)
+			for (const dir of [root, ...chain]) {
 				if (gone) return;
 				if (!nodes[dir]?.entries) await load(dir);
 			}
 			if (gone) return;
-			setOpen((s) => new Set([...s, root, ...chain.slice(0, -1)]));
+			setOpen((s) => new Set([...s, root, ...chain]));
 			setShown((s) => {
 				const n = { ...s };
 				for (const d of [root, ...chain.slice(0, -1)]) n[d] = Number.MAX_SAFE_INTEGER;

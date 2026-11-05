@@ -52,10 +52,12 @@
 		"dockview-react": "8.8.3",
 		"dompurify": "3.4.17",
 		"lucide-react": "1.68.0",
+		"mammoth": "^1.13.0",
 		"marked": "18.1.1",
 		"react": "19.3.1",
 		"react-dom": "19.3.1",
-		"sql-formatter": "^15.9.0"
+		"sql-formatter": "^15.9.0",
+		"xlsx": "0.18.5"
 	},
 	"devDependencies": {
 		"@tauri-apps/cli": "2.12.4",
