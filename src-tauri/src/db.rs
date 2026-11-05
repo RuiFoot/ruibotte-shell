@@ -105,7 +105,7 @@ type MsClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStrea
 // 연결마다 하나뿐이라 크기 차이는 상관없다
 #[allow(clippy::large_enum_variant)]
 enum Engine {
-    Pg { client: tokio_postgres::Client, cancel: tokio_postgres::CancelToken },
+    Pg { client: tokio_postgres::Client, cancel: tokio_postgres::CancelToken, tls: Option<tokio_postgres_rustls::MakeRustlsConnect> },
     My { conn: tokio::sync::Mutex<mysql_async::Conn>, opts: mysql_async::Opts, thread: u32 },
     Ms { client: tokio::sync::Mutex<MsClient> },
     Jdbc { side: crate::jdbc::Sidecar },
@@ -184,6 +184,9 @@ pub struct DbConnectReq {
     /// MySQL old_password 허용(프로필 구형 호환)
     #[serde(default)]
     legacy: bool,
+    /// SSL: off | prefer | require(인증서 확인 안 함) | verify(인증서 확인)
+    #[serde(default)]
+    ssl: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -227,7 +230,18 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
         if let Some(p) = &pw {
             cfg.password(p);
         }
-        let (client, connection) = match cfg.connect(tokio_postgres::NoTls).await {
+        let mode = req.ssl.as_deref().unwrap_or("prefer");
+        let tls = (mode != "off").then(|| tls_connector(mode == "verify"));
+        cfg.ssl_mode(match mode {
+            "off" => tokio_postgres::config::SslMode::Disable,
+            "require" | "verify" => tokio_postgres::config::SslMode::Require,
+            _ => tokio_postgres::config::SslMode::Prefer,
+        });
+        let res = match &tls {
+            Some(t) => cfg.connect(t.clone()).await.map(|(c, conn)| (c, tauri::async_runtime::spawn(async move { let _ = conn.await; }))),
+            None => cfg.connect(tokio_postgres::NoTls).await.map(|(c, conn)| (c, tauri::async_runtime::spawn(async move { let _ = conn.await; }))),
+        };
+        let (client, _task) = match res {
             Ok(x) => x,
             Err(x) => {
                 let msg = x.to_string();
@@ -237,9 +251,6 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
                 return Err(pg_err(x));
             }
         };
-        tauri::async_runtime::spawn(async move {
-            let _ = connection.await;
-        });
         if req.read_only {
             client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await.map_err(pg_err)?;
         }
@@ -249,7 +260,7 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
             .find_map(|m| if let tokio_postgres::SimpleQueryMessage::Row(r) = m { r.get(0).map(|s| format!("PostgreSQL {s}")) } else { None })
             .unwrap_or_default();
         let cancel = client.cancel_token();
-        (Engine::Pg { client, cancel }, version)
+        (Engine::Pg { client, cancel, tls }, version)
     } else if req.engine == "mssql" {
         let Some(p) = pw.clone() else {
             return Err(e("NEED_SECRET", "암호를 입력하세요"));
@@ -302,7 +313,14 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
         }
         (Engine::Jdbc { side }, v["version"].as_str().unwrap_or("").to_string())
     } else {
+        let mode = req.ssl.as_deref().unwrap_or("off");
+        let ssl = match mode {
+            "require" | "prefer" => Some(mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true)),
+            "verify" => Some(mysql_async::SslOpts::default()),
+            _ => None,
+        };
         let opts: mysql_async::Opts = mysql_async::OptsBuilder::default()
+            .ssl_opts(ssl)
             .ip_or_hostname(req.host.clone())
             .tcp_port(req.port)
             .user(Some(req.username.clone()))
@@ -536,7 +554,7 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
     let mut truncated = false;
     let mut has_set = false;
     match &c.engine {
-        Engine::Pg { client, cancel } => {
+        Engine::Pg { client, cancel, tls } => {
             let stream = client.simple_query_raw(&sql).await.map_err(pg_err)?;
             pin_mut!(stream);
             while let Some(m) = stream.next().await {
@@ -552,7 +570,10 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
                         }
                         if rows.len() >= max {
                             truncated = true;
-                            let _ = cancel.cancel_query(tokio_postgres::NoTls).await;
+                            let _ = match tls {
+                                Some(t) => cancel.cancel_query(t.clone()).await,
+                                None => cancel.cancel_query(tokio_postgres::NoTls).await,
+                            };
                             break;
                         }
                         rows.push((0..r.len()).map(|i| r.get(i).map(String::from)).collect());
@@ -683,7 +704,10 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
 pub async fn db_cancel(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
     let c = dbs.get(conn)?;
     match &c.engine {
-        Engine::Pg { cancel, .. } => cancel.cancel_query(tokio_postgres::NoTls).await.map_err(pg_err),
+        Engine::Pg { cancel, tls, .. } => match tls {
+            Some(t) => cancel.cancel_query(t.clone()).await.map_err(pg_err),
+            None => cancel.cancel_query(tokio_postgres::NoTls).await.map_err(pg_err),
+        },
         Engine::My { opts, thread, .. } => {
             let mut k = mysql_async::Conn::new(opts.clone()).await.map_err(my_err)?;
             k.query_drop(format!("KILL QUERY {thread}")).await.map_err(my_err)?;
@@ -1248,6 +1272,7 @@ mod live {
             read_only,
             save_secret: false,
             legacy: false,
+            ssl: None,
         }
     }
 
@@ -1355,6 +1380,7 @@ mod live_mssql {
             read_only: ro,
             save_secret: false,
             legacy: false,
+            ssl: None,
         };
         let t = Instant::now();
         let ok = connect(&store, &dbs, req(false), None).await.unwrap();
@@ -1401,7 +1427,7 @@ mod live_edit {
         let dbs = DbConns::default();
         let engines = [("postgres", 25432u16, "postgres", pw.clone(), "postgres"), ("mariadb", 23306, "root", pw.clone(), "shop"), ("mssql", 21433, "sa", format!("Rb!{pw}9a"), "master")];
         for (engine, port, user, p, db) in engines {
-            let ok = connect(&store, &dbs, DbConnectReq { profile_id: None, engine: engine.into(), host: "127.0.0.1".into(), port, username: user.into(), password: Some(p), database: Some(db.into()), read_only: false, save_secret: false, legacy: false }, None).await.unwrap();
+            let ok = connect(&store, &dbs, DbConnectReq { profile_id: None, engine: engine.into(), host: "127.0.0.1".into(), port, username: user.into(), password: Some(p), database: Some(db.into()), read_only: false, save_secret: false, legacy: false, ssl: None }, None).await.unwrap();
             let c = ok.conn_id;
             let (ph, cast) = match engine { "postgres" => ("$", true), "mssql" => ("@P", false), _ => ("?", false) };
             let a = |n: usize, ty: &str| if ph == "?" { "?".to_string() } else if cast { format!("${n}::text::{ty}") } else { format!("@P{n}") };
@@ -1465,5 +1491,90 @@ mod view_tests {
         assert_eq!(view_core(&r, None, false, Some("null")), 1);
         assert_eq!(view_core(&r, None, false, None), 4);
         assert!(r.view.lock().unwrap().is_none());
+    }
+}
+
+/// PostgreSQL TLS — verify 면 공인 루트로 인증서 확인, 아니면 암호화만(사내 자체 서명 인증서)
+fn tls_connector(verify: bool) -> tokio_postgres_rustls::MakeRustlsConnect {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().expect("TLS 판");
+    let config = if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder.dangerous().with_custom_certificate_verifier(std::sync::Arc::new(NoVerify(provider))).with_no_client_auth()
+    };
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}
+
+/// 인증서를 확인하지 않는 검증기(libpq sslmode=require 와 같은 뜻)
+#[derive(Debug)]
+struct NoVerify(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod live_tls {
+    use super::*;
+
+    /// RB_PGTLS=127.0.0.1:25433 · RB_PGTLS_PW — SSL 만 받는 서버: off 는 거절, prefer·require 는 SSL 로, verify 는 자체 서명이라 거절
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_pg_tls() {
+        let spec = std::env::var("RB_PGTLS").unwrap();
+        let pw = std::env::var("RB_PGTLS_PW").unwrap();
+        let (host, port) = spec.split_once(':').unwrap();
+        let dir = std::env::temp_dir().join(format!("rbshell-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(dir.join("db"), false).unwrap();
+        let dbs = DbConns::default();
+        let req = |ssl: &str| DbConnectReq {
+            profile_id: None,
+            engine: "postgres".into(),
+            host: host.into(),
+            port: port.parse().unwrap(),
+            username: "postgres".into(),
+            password: Some(pw.clone()),
+            database: Some("postgres".into()),
+            read_only: false,
+            save_secret: false,
+            legacy: false,
+            ssl: Some(ssl.into()),
+        };
+        let off = connect(&store, &dbs, req("off"), None).await;
+        println!("off → {:?}", off.as_ref().err().map(|x| &x.message));
+        assert!(off.is_err());
+        for m in ["prefer", "require"] {
+            let ok = connect(&store, &dbs, req(m), None).await.unwrap();
+            let q = query(&dbs, ok.conn_id, "select ssl::text from pg_stat_ssl where pid = pg_backend_pid()".into(), Some(10)).await.unwrap();
+            let rows = db_rows_core(&dbs, q.result_id.unwrap(), 0, 10);
+            println!("{m} → ssl={:?} ({})", rows[0][0], ok.version);
+            assert_eq!(rows[0][0].as_deref(), Some("true"));
+        }
+        let verify = connect(&store, &dbs, req("verify"), None).await;
+        println!("verify → {:?}", verify.as_ref().err().map(|x| &x.message));
+        assert!(verify.is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

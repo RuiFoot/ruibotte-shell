@@ -35,7 +35,7 @@ tauri-plugin-dialog = "2"
 trash = "5"
 urlencoding = "2"
 tokio-postgres = { version = "0.7", features = ["runtime"] }
-mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
 futures-util = "0.3"
 tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -51,6 +51,9 @@ tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+tokio-postgres-rustls = { version = "0.13", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
 [profile.release]
 # 설치 크기·기동 우선

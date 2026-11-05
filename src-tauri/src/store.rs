@@ -68,6 +68,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE profile ADD COLUMN jump_id INTEGER;",
     // 6: 연결 묶음(폴더) — 빈 값이면 묶지 않음
     "ALTER TABLE profile ADD COLUMN group_name TEXT;",
+    // 7: DB SSL 방식(off·prefer·require·verify)
+    "ALTER TABLE profile ADD COLUMN ssl TEXT;",
 ];
 
 pub struct Store {
@@ -205,6 +207,9 @@ pub struct Profile {
     /// 연결 묶음(폴더) 이름 — 홈·사이드바에서 이 이름으로 묶는다
     #[serde(default)]
     pub group_name: Option<String>,
+    /// DB SSL: off · prefer · require(인증서 확인 안 함) · verify
+    #[serde(default)]
+    pub ssl: Option<String>,
 }
 
 fn default_auth() -> String {
@@ -215,7 +220,7 @@ fn default_legacy() -> String {
 }
 
 const PROFILE_COLS: &str = "id, kind, name, host, port, username, engine, color, favorite, last_used_at,
-    auth, key_path, legacy, default_path, database, secret_saved_at, jump_id, group_name";
+    auth, key_path, legacy, default_path, database, secret_saved_at, jump_id, group_name, ssl";
 
 fn profile_row(r: &Row) -> rusqlite::Result<Profile> {
     Ok(Profile {
@@ -237,6 +242,7 @@ fn profile_row(r: &Row) -> rusqlite::Result<Profile> {
         secret_saved: r.get::<_, Option<i64>>(15)?.is_some(),
         jump_id: r.get(16)?,
         group_name: r.get(17)?,
+        ssl: r.get(18)?,
     })
 }
 
@@ -271,9 +277,9 @@ pub fn profile_save(store: State<'_, Store>, p: Profile) -> Result<i64, String> 
         Some(id) => {
             conn.execute(
                 "UPDATE profile SET kind=?1, name=?2, host=?3, port=?4, username=?5, engine=?6, color=?7,
-                 favorite=?8, updated_at=?9, auth=?10, key_path=?11, legacy=?12, default_path=?13, database=?14, jump_id=?16, group_name=?17 WHERE id=?15",
+                 favorite=?8, updated_at=?9, auth=?10, key_path=?11, legacy=?12, default_path=?13, database=?14, jump_id=?16, group_name=?17, ssl=?18 WHERE id=?15",
                 params![p.kind, p.name.trim(), host, p.port, p.username, p.engine, p.color, p.favorite as i64, t,
-                    p.auth, p.key_path, p.legacy, p.default_path, p.database, id, p.jump_id.filter(|j| *j != id), group],
+                    p.auth, p.key_path, p.legacy, p.default_path, p.database, id, p.jump_id.filter(|j| *j != id), group, p.ssl],
             )
             .map_err(|e| e.to_string())?;
             Ok(id)
@@ -281,10 +287,10 @@ pub fn profile_save(store: State<'_, Store>, p: Profile) -> Result<i64, String> 
         None => {
             conn.execute(
                 "INSERT INTO profile (kind, name, host, port, username, engine, color, favorite, created_at, updated_at,
-                  auth, key_path, legacy, default_path, database, jump_id, group_name)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  auth, key_path, legacy, default_path, database, jump_id, group_name, ssl)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![p.kind, p.name.trim(), host, p.port, p.username, p.engine, p.color, p.favorite as i64, t,
-                    p.auth, p.key_path, p.legacy, p.default_path, p.database, p.jump_id, group],
+                    p.auth, p.key_path, p.legacy, p.default_path, p.database, p.jump_id, group, p.ssl],
             )
             .map_err(|e| e.to_string())?;
             Ok(conn.last_insert_rowid())

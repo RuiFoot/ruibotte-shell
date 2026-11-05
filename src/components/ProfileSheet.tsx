@@ -106,6 +106,7 @@ export function ProfileSheet({
 						database: p.database,
 						readOnly: false,
 						legacy: p.legacy !== "off",
+						ssl: p.ssl ?? null,
 					},
 				});
 				setTest({ s: "ok", text: `접속됨 · ${r.ms} ms · ${r.version}` });
@@ -218,6 +219,22 @@ export function ProfileSheet({
 							<input id="pf-port" inputMode="numeric" value={p.port} onChange={(e) => set({ port: Number(e.target.value.replace(/\D/g, "")) || 0 })} />
 						</div>
 					</div>
+					{p.kind === "db" && ["postgres", "mysql", "mariadb"].includes(p.engine ?? "postgres") && (
+						<div className="field">
+							<label htmlFor="pf-ssl">SSL</label>
+							<Select
+								id="pf-ssl"
+								value={p.ssl ?? (p.engine === "postgres" || !p.engine ? "prefer" : "off")}
+								onChange={(v) => set({ ssl: v })}
+								options={[
+									{ value: "off", label: "끔" },
+									{ value: "prefer", label: "되면 사용", hint: "서버가 받으면 암호화" },
+									{ value: "require", label: "반드시 사용", hint: "인증서는 확인 안 함(자체 서명)" },
+									{ value: "verify", label: "사용·인증서 확인", hint: "공인 인증서만" },
+								]}
+							/>
+						</div>
+					)}
 					{p.kind === "db" && (
 						<div className="field">
 							<label htmlFor="pf-db">{engineOf(p.engine).dbLabel}</label>

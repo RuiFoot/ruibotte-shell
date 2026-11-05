@@ -34,6 +34,8 @@ export type Profile = {
 	jumpId?: number | null;
 	/** 연결 묶음(폴더) */
 	groupName?: string | null;
+	/** DB SSL: off · prefer · require · verify */
+	ssl?: string | null;
 };
 
 export type SshError = {

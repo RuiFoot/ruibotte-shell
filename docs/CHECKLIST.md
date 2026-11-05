@@ -108,7 +108,8 @@
 - [~] 객체 찾기에 함수, 표 크기 인덱스·죽은 행, 세션 끊기, 스키마 비교 PK
 
 ### DB — 접속·ERD
-- [ ] TLS/SSL 접속(PG sslmode·MySQL TLS), 접속 속성 편집
+- [x] TLS/SSL 접속(PostgreSQL·MySQL·MariaDB: 끔·되면 사용·반드시(자체 서명)·인증서 확인)
+- [ ] 접속 속성 편집(serverTimezone 등)
 - [~] 프로필에 읽기 전용, 작업대 안 운영 색 표시
 - [ ] ERD: 자리 기억·다시 배치·표 찾기·이웃만·추정 관계·접기·PNG/SVG·새로 읽기
 

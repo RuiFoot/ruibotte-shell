@@ -53,6 +53,7 @@ export function DbConnectDialog({
 						readOnly: ro,
 						saveSecret: save,
 						legacy: profile.legacy !== "off",
+						ssl: profile.ssl ?? null,
 					},
 				});
 				void api.settingSet(roKey, ro ? "1" : "0");
