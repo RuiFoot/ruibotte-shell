@@ -22,7 +22,7 @@ export function SyncPanel({ conn, remoteHome, user, host, port, onRun }: { conn:
 	const [direction, setDirection] = useState<"up" | "down">("up");
 	const [del, setDel] = useState(false);
 	const [checksum, setChecksum] = useState(false);
-	const [excludes, setExcludes] = useState(".git\nnode_modules\n*.log\n*.tmp");
+	const [excludes, setExcludes] = useState(".git\nnode_modules\n*.log\n*.tmp\n.DS_Store\n*.swp\nThumbs.db");
 	const [plan, setPlan] = useState<Plan | null>(null);
 	const [msg, setMsg] = useState("");
 	const [busy, setBusy] = useState(false);
