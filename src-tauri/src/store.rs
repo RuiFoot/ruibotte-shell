@@ -53,6 +53,17 @@ const MIGRATIONS: &[&str] = &[
         body TEXT NOT NULL,
         updated_at INTEGER NOT NULL
      );",
+    // 4: 쿼리 기록(프로필별)
+    "CREATE TABLE query_history (
+        id INTEGER PRIMARY KEY,
+        scope TEXT NOT NULL,
+        sql TEXT NOT NULL,
+        ms INTEGER,
+        rows INTEGER,
+        ok INTEGER NOT NULL,
+        at INTEGER NOT NULL
+     );
+     CREATE INDEX query_history_scope ON query_history(scope, at DESC);",
 ];
 
 pub struct Store {
@@ -336,4 +347,48 @@ pub fn snippet_delete(store: State<'_, Store>, id: i64) -> Result<(), String> {
     let conn = store.conn.lock().unwrap();
     conn.execute("DELETE FROM snippet WHERE id=?1", [id]).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItem {
+    pub id: Option<i64>,
+    pub sql: String,
+    pub ms: Option<i64>,
+    pub rows: Option<i64>,
+    pub ok: bool,
+    pub at: Option<i64>,
+}
+
+/// 쿼리 기록 하나 — 프로필(scope)마다 최근 2000개만 남긴다
+#[tauri::command]
+pub fn history_add(store: State<'_, Store>, scope: String, item: HistoryItem) -> Result<(), String> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO query_history (scope, sql, ms, rows, ok, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![scope, item.sql, item.ms, item.rows, item.ok as i64, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM query_history WHERE scope = ?1 AND id NOT IN (SELECT id FROM query_history WHERE scope = ?1 ORDER BY at DESC LIMIT 2000)",
+        [scope],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn history_list(store: State<'_, Store>, scope: String, q: Option<String>) -> Result<Vec<HistoryItem>, String> {
+    let conn = store.conn.lock().unwrap();
+    // 찾는 말은 글자 그대로(와일드카드 없이) — instr 로
+    let like = q.unwrap_or_default().to_lowercase();
+    let mut st = conn
+        .prepare("SELECT id, sql, ms, rows, ok, at FROM query_history WHERE scope = ?1 AND instr(lower(sql), ?2) > 0 ORDER BY at DESC LIMIT 300")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map(params![scope, like], |r| {
+            Ok(HistoryItem { id: r.get(0)?, sql: r.get(1)?, ms: r.get(2)?, rows: r.get(3)?, ok: r.get::<_, i64>(4)? != 0, at: r.get(5)? })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
 }

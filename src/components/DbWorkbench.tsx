@@ -9,9 +9,13 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, LayoutTemplate, Lock, Play, PlayCircle, Square, Table } from "lucide-react";
-import { createContext, type ReactElement, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, lazy, type ReactElement, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { ComparePanel, HistoryPanel } from "./DbPanels";
+
+const ErdPanelLazy = lazy(() => import("./DbErd").then((m) => ({ default: m.ErdPanel })));
 import { api } from "../lib/ipc";
 import { type Cell, type ColMeta, type EditStmt, buildDelete, buildInsert, buildUpdate, formatRows, previewSql, qualified } from "../lib/edits";
+import { ddlSql, explainSql, killSql, queryRows, searchSql, type Tool, toolSql } from "../lib/dbtools";
 import { quoteIdentFor, selectTop } from "../lib/engines";
 import { splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -32,7 +36,7 @@ type QueryOk = {
 };
 type DbError = { code: string; message: string };
 type Source = { schema: string | null; table: string };
-type ResultParams = { sql: string; state: "running" | "ok" | "error"; ok?: QueryOk; error?: DbError; at: number; source?: Source };
+type ResultParams = { sql: string; state: "running" | "ok" | "error"; ok?: QueryOk; error?: DbError; at: number; source?: Source; tool?: string };
 
 type Node = { name: string; kind: "schema" | "table" | "view" | "column"; detail?: string | null };
 
@@ -41,7 +45,10 @@ type Ctx = {
 	engine: string;
 	mysql: boolean;
 	readOnly: boolean;
-	run: (stmts: string[], source?: Source) => void;
+	run: (stmts: string[], source?: Source, tool?: string) => void;
+	openSql: (text: string, title?: string) => void;
+	openPanel: (id: string, component: string, title: string, params: object) => void;
+	historyScope: string;
 	inTx: boolean;
 	insertText: (s: string) => void;
 	registerEditor: (id: string, v: EditorView | null) => void;
@@ -91,7 +98,7 @@ function pickStatements(v: EditorView, all: boolean): string[] {
 	return s ? [s.text] : [];
 }
 
-function SqlPanel(props: IDockviewPanelProps<{ n: number }>) {
+function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 	const ctx = useDb();
 	const host = useRef<HTMLDivElement>(null);
 	const runRef = useRef(ctx.run);
@@ -135,9 +142,11 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number }>) {
 				],
 			}),
 		});
-		void api.settingGet(key).then((t) => {
-			if (t && v.state.doc.length === 0) v.dispatch({ changes: { from: 0, insert: t } });
-		});
+		if (props.params.initial) v.dispatch({ changes: { from: 0, insert: props.params.initial } });
+		else
+			void api.settingGet(key).then((t) => {
+				if (t && v.state.doc.length === 0) v.dispatch({ changes: { from: 0, insert: t } });
+			});
 		ctx.registerEditor(props.api.id, v);
 		return () => {
 			window.clearTimeout(timer);
@@ -327,6 +336,21 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 			{ label: "복사 — Markdown 표", run: () => void copy("markdown")() },
 			{ label: "복사 — INSERT 문", run: () => void copy("insert")() },
 		);
+		if (p.tool === "sessions") {
+			const id = grid.current?.row(r)?.[0] ?? null;
+			const k = id ? killSql(ctx.engine, id) : null;
+			if (k)
+				items.unshift(
+					{
+						label: `세션 ${id} 의 쿼리 멈추기`,
+						danger: true,
+						run: () => {
+							if (confirm(`세션 ${id} 에서 실행 중인 쿼리를 멈출까요?`)) ctx.run([k]);
+						},
+					},
+					{ sep: true },
+				);
+		}
 		if (canEdit) {
 			items.push(
 				{ sep: true },
@@ -551,6 +575,34 @@ function ObjectsPanel() {
 								{ label: "데이터 보기(고치기)", run: () => ctx.run([`SELECT * FROM ${q}`], { schema: path[0] === "(기본)" ? null : path[0], table: n.name }) },
 								{ label: "행 수 세기", run: () => ctx.run([`SELECT count(*) AS row_count FROM ${q}`]) },
 								{ label: "SELECT 문 넣기", run: () => ctx.insertText(`${selectTop(ctx.engine, q, 100)};\n`) },
+							);
+							const dq = ddlSql(ctx.engine, path[0], n.name, n.kind === "view");
+							if (dq)
+								items.push({
+									label: "DDL 보기",
+									run: async () => {
+										try {
+											const rows = await queryRows(ctx.conn, dq, 5);
+											const text = rows[0]?.[rows[0].length - 1] ?? "";
+											ctx.openSql(`${text}${text.trim().endsWith(";") ? "" : ";"}\n`, `DDL ${n.name}`);
+										} catch (x) {
+											alert((x as DbError).message ?? String(x));
+										}
+									},
+								});
+							items.push({ sep: true });
+						}
+						if (n.kind === "schema") {
+							items.push(
+								{ label: "ERD(관계도)", run: () => ctx.openPanel(`erd:${n.name}`, "erd", `ERD ${n.name}`, { schema: n.name }) },
+								{ label: "표 크기", run: () => toolSql(ctx.engine, "sizes", n.name) && ctx.run([toolSql(ctx.engine, "sizes", n.name) as string], undefined, "sizes") },
+								{
+									label: "다른 스키마와 비교…",
+									run: () => {
+										const other = prompt(`${n.name} 와(과) 비교할 스키마 이름`);
+										if (other) ctx.openPanel(`cmp:${n.name}:${other}`, "compare", `비교 ${n.name}↔${other}`, { a: n.name, b: other });
+									},
+								},
 								{ sep: true },
 							);
 						}
@@ -578,7 +630,24 @@ function ObjectsPanel() {
 	);
 }
 
-const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel };
+function HistoryDock() {
+	const ctx = useDb();
+	return <HistoryPanel scope={ctx.historyScope} onInsert={ctx.insertText} onRun={(sql) => ctx.run([sql])} />;
+}
+function ErdDock(props: IDockviewPanelProps<{ schema: string }>) {
+	const ctx = useDb();
+	return (
+		<Suspense fallback={<div className="dock-watermark">불러오는 중…</div>}>
+			<ErdPanelLazy conn={ctx.conn} engine={ctx.engine} schema={props.params.schema} />
+		</Suspense>
+	);
+}
+function CompareDock(props: IDockviewPanelProps<{ a: string; b: string }>) {
+	const ctx = useDb();
+	return <ComparePanel conn={ctx.conn} a={props.params.a} b={props.params.b} />;
+}
+
+const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock };
 const FIXED = /^(objects|sql-\d+)$/;
 
 function defaultLayout(d: DockviewApi) {
@@ -613,6 +682,8 @@ export function DbWorkbench({
 	const [maxRows, setMaxRows] = useState(10_000);
 	const [running, setRunning] = useState(false);
 	const [inTx, setInTx] = useState(false);
+	const historyScope = `db:${profileId ?? "adhoc"}`;
+	const [toolsMenu, setToolsMenu] = useState<{ x: number; y: number } | null>(null);
 	const [snip, setSnip] = useState(false);
 	const txOp = async (op: "begin" | "commit" | "rollback") => {
 		try {
@@ -641,7 +712,7 @@ export function DbWorkbench({
 	};
 
 	const run = useCallback(
-		async (input: string[], source?: Source) => {
+		async (input: string[], source?: Source, tool?: string) => {
 			const d = dock.current;
 			if (!d || !input.length) return;
 			// :이름 파라미터 — 문자열·주석 밖, ::형변환 제외
@@ -674,7 +745,7 @@ export function DbWorkbench({
 			}
 			for (let i = 0; i < stmts.length; i++) {
 				const id = `res-${i + 1}`;
-				const params: ResultParams = { sql: stmts[i], state: "running", at: Date.now(), source: stmts.length === 1 ? source : undefined };
+				const params: ResultParams = { sql: stmts[i], state: "running", at: Date.now(), source: stmts.length === 1 ? source : undefined, tool };
 				let panel = d.getPanel(id);
 				const oldRid = (panel?.params as ResultParams | undefined)?.ok?.resultId;
 				if (oldRid) void db.closeResult(oldRid);
@@ -696,8 +767,10 @@ export function DbWorkbench({
 				try {
 					const ok = await db.query(conn, stmts[i], maxRef.current);
 					panel.api.updateParameters({ ...params, state: "ok", ok });
+					if (!tool) void invoke("history_add", { scope: historyScope, item: { sql: stmts[i], ms: ok.ms, rows: ok.rowCount, ok: true } }).then(() => window.dispatchEvent(new Event("rb-history")));
 				} catch (e) {
 					panel.api.updateParameters({ ...params, state: "error", error: e as DbError });
+					if (!tool) void invoke("history_add", { scope: historyScope, item: { sql: stmts[i], ok: false } }).then(() => window.dispatchEvent(new Event("rb-history")));
 					// 여러 문장이면 첫 오류에서 멈춘다
 					for (const rest of d.panels.filter((p) => p.id.startsWith("res-") && Number(p.id.slice(4)) > i + 1)) d.removePanel(rest);
 					break;
@@ -706,7 +779,7 @@ export function DbWorkbench({
 			setRunning(false);
 			currentEditor()?.focus();
 		},
-		[conn],
+		[conn, historyScope],
 	);
 
 	const insertText = useCallback((s: string) => {
@@ -715,6 +788,43 @@ export function DbWorkbench({
 		v.dispatch({ changes: { from: v.state.selection.main.head, insert: s } });
 		v.focus();
 	}, []);
+
+	const openSql = useCallback((text: string, title?: string) => {
+		const d = dock.current;
+		if (!d) return;
+		sqlSeq.current += 1;
+		const n = sqlSeq.current;
+		const ref = d.panels.find((p) => p.id.startsWith("sql-"));
+		d.addPanel({ id: `sql-${n}`, component: "sql", title: title ?? `SQL ${n}`, params: { n, initial: text }, renderer: "always", position: ref ? { referencePanel: ref.id, direction: "within" } : undefined });
+	}, []);
+
+	const openPanel = useCallback((id: string, component: string, title: string, params: object) => {
+		const d = dock.current;
+		if (!d) return;
+		const ex = d.getPanel(id);
+		if (ex) return void ex.api.setActive();
+		const ref = d.panels.find((p) => p.id.startsWith("sql-"));
+		d.addPanel({ id, component, title, params, renderer: "always", position: ref ? { referencePanel: ref.id, direction: "within" } : undefined });
+	}, []);
+
+	const runTool = (t: Tool) => {
+		const sql = toolSql(engine, t);
+		if (sql) void run([sql], undefined, t);
+	};
+
+	const findObjects = () => {
+		const q = prompt("표·열 이름에서 찾을 말");
+		const sql = q ? searchSql(engine, q) : null;
+		if (sql) void run([sql], undefined, "search");
+	};
+
+	const explain = () => {
+		const v = currentEditor();
+		if (!v) return;
+		const st = pickStatements(v, false)[0];
+		const sqls = st ? explainSql(engine, st) : null;
+		if (sqls) void run(sqls, undefined, "explain");
+	};
 
 	const addSql = () => {
 		const d = dock.current;
@@ -768,10 +878,34 @@ export function DbWorkbench({
 	useEffect(() => {
 		if (active) requestAnimationFrame(() => currentEditor()?.focus());
 	}, [active]);
+	useEffect(() => {
+		if (!active) return;
+		const on = (e: KeyboardEvent) => {
+			if (e.altKey && e.code === "KeyO") {
+				e.preventDefault();
+				findObjects();
+			}
+		};
+		window.addEventListener("keydown", on);
+		return () => window.removeEventListener("keydown", on);
+	});
 
 	const ctx = useMemo<Ctx>(
-		() => ({ conn, engine, mysql, readOnly, inTx, run: (s, src) => void run(s, src), insertText, registerEditor, draftKey: `sql.draft.${profileId ?? "adhoc"}` }),
-		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, profileId],
+		() => ({
+			conn,
+			engine,
+			mysql,
+			readOnly,
+			inTx,
+			run: (s, src, tool) => void run(s, src, tool),
+			insertText,
+			registerEditor,
+			openSql,
+			openPanel,
+			historyScope,
+			draftKey: `sql.draft.${profileId ?? "adhoc"}`,
+		}),
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId],
 	);
 
 	return (
@@ -806,6 +940,9 @@ export function DbWorkbench({
 								자동 커밋
 							</button>
 						))}
+					<button type="button" className="btn ghost" onClick={(e) => setToolsMenu({ x: e.clientX, y: e.clientY + 12 })} title="DB 도구">
+						도구 ▾
+					</button>
 					<button type="button" className="btn ghost" onClick={() => setSnip(true)} title="즐겨찾는 SQL(스니펫)">
 						★ SQL
 					</button>
@@ -837,6 +974,23 @@ export function DbWorkbench({
 				<div className="wb-dock">
 					<DockviewReact theme={theme} components={components} onReady={onReady} />
 				</div>
+				{toolsMenu && (
+					<ContextMenu
+						x={toolsMenu.x}
+						y={toolsMenu.y}
+						onClose={() => setToolsMenu(null)}
+						items={[
+							{ label: "객체 찾기  Alt+O", run: findObjects, disabled: !searchSql(engine, "x") },
+							{ label: "실행 계획(커서 문장)", run: explain, disabled: !explainSql(engine, "x") },
+							{ sep: true },
+							{ label: "표 크기", run: () => runTool("sizes"), disabled: !toolSql(engine, "sizes") },
+							{ label: "세션(우클릭으로 멈추기)", run: () => runTool("sessions"), disabled: !toolSql(engine, "sessions") },
+							{ label: "잠금 기다림", run: () => runTool("locks"), disabled: !toolSql(engine, "locks") },
+							{ sep: true },
+							{ label: "쿼리 기록", run: () => openPanel("history", "history", "기록", {}) },
+						]}
+					/>
+				)}
 				{snip && (
 					<SnippetPalette
 						kind="sql"

@@ -108,6 +108,8 @@ pub fn run() {
             store::snippets_list,
             store::snippet_save,
             store::snippet_delete,
+            store::history_add,
+            store::history_list,
             secrets::secret_forget,
             ssh::ssh_connect,
             ssh::ssh_disconnect,
