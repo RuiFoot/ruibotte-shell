@@ -422,10 +422,12 @@ pub async fn ssh_shell_open(
     ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(map_russh)?;
     ch.request_shell(true).await.map_err(map_russh)?;
     let (mut read, write) = ch.split();
-    // 셸 통합(bash): 프롬프트마다 OSC 7 로 지금 폴더를 알려 트리가 따라오게. 서버 파일은 바꾸지 않는다.
+    // 셸 통합(bash) — 서버 파일은 바꾸지 않고 이 셸에만 PROMPT_COMMAND 를 얹는다. 프롬프트마다:
+    //   OSC 133;D;종료코드(앞 명령 끝) · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작)
+    //   (exit $__rb_s) 로 $? 를 되돌려 원래 PROMPT_COMMAND·PS1 이 같은 값을 본다. 끝맺음은 모두 BEL.
     // 앞 공백 = 셸 기록에 남지 않게(HISTCONTROL=ignorespace). 끝에 clear 로 이 줄을 화면에서 지운다.
     let mut line = String::from(
-        " [ -n \"$BASH_VERSION\" ] && PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-}\" \"$PWD\"'\"${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"",
+        r#" [ -n "$BASH_VERSION" ] && PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#,
     );
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
         line.push_str(&format!("; cd '{}'", dir.replace('\'', "'\\''")));
@@ -459,11 +461,19 @@ pub async fn ssh_shell_open(
 }
 
 #[tauri::command]
-pub async fn ssh_shell_write(conns: State<'_, SshConns>, conn: u32, shell: u32, data: String) -> R<()> {
+pub async fn ssh_shell_write(conns: State<'_, SshConns>, conn: u32, shell: u32, data: String, encoding: Option<String>) -> R<()> {
     let c = conns.get(conn)?;
     let shells = c.shells.lock().await;
     let w = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
-    w.data(data.as_bytes()).await.map_err(map_russh)
+    // 터미널 인코딩이 UTF-8 이 아니면(EUC-KR 서버) 입력 글자를 그 인코딩으로 바꿔 보낸다
+    match encoding.as_deref().filter(|e| !e.eq_ignore_ascii_case("utf-8")) {
+        Some(label) => {
+            let enc = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+            let (bytes, _, _) = enc.encode(&data);
+            w.data(bytes.as_ref()).await.map_err(map_russh)
+        }
+        None => w.data(data.as_bytes()).await.map_err(map_russh),
+    }
 }
 
 #[tauri::command]

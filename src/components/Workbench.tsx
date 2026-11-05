@@ -1,7 +1,7 @@
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, ShieldAlert, SquareTerminal, X } from "lucide-react";
+import { ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, ShieldAlert, SquareTerminal, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -44,6 +44,8 @@ type Ctx = {
 	cd: (dir: string) => void;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
 	onCwd: (path: string) => void;
+	/** 동시 입력: 한 터미널에 친 것을 다른 터미널에도 */
+	broadcast: (fromPanel: string, data: string) => void;
 	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
 	treeKey: string;
 };
@@ -104,6 +106,7 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number }>) {
 				toolbar={false}
 				onShell={(h) => ctx.registerShell(props.api.id, h)}
 				onCwd={ctx.onCwd}
+				onInput={(d) => ctx.broadcast(props.api.id, d)}
 			/>
 		</div>
 	);
@@ -258,6 +261,9 @@ export function Workbench({
 	const [sudoOn, setSudoOn] = useState(false);
 	const [sudoMode, setSudoMode] = useState<"together" | "apart">("together");
 	const [follow, setFollow] = useState(true);
+	const [broadcastOn, setBroadcastOn] = useState(false);
+	const broadcastRef = useRef(false);
+	broadcastRef.current = broadcastOn;
 	const [sudoAsk, setSudoAsk] = useState<{ error?: string } | null>(null);
 	const sudoPw = useRef<string | null>(null);
 	const instance = useRef(`wb${Math.random().toString(36).slice(2, 8)}`);
@@ -305,6 +311,11 @@ export function Workbench({
 		const termId = d?.panels.find((p) => p.id.startsWith("term-") && p.api.isVisible)?.id ?? [...shells.current.keys()][0];
 		return termId ? { id: termId, h: shells.current.get(termId) } : null;
 	};
+
+	const broadcast = useCallback((from: string, data: string) => {
+		if (!broadcastRef.current) return;
+		for (const [id, h] of shells.current) if (id !== from) h.send(data);
+	}, []);
 
 	const onCwd = useCallback(
 		(path: string) => {
@@ -486,9 +497,10 @@ export function Workbench({
 			cd,
 			registerShell,
 			onCwd,
+			broadcast,
 			treeKey: instance.current,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -510,6 +522,15 @@ export function Workbench({
 							<ArrowDownUp size={14} /> 전송
 						</button>
 					)}
+					<button
+						type="button"
+						className={`btn ghost${broadcastOn ? " on" : ""}`}
+						style={broadcastOn ? { color: "#c77700", background: "color-mix(in srgb, #ff9f0a 18%, transparent)" } : undefined}
+						title="동시 입력 — 한 터미널에 친 것을 이 작업대의 모든 터미널에"
+						onClick={() => setBroadcastOn((b) => !b)}
+					>
+						<Radio size={14} /> 동시 입력{broadcastOn ? " 켜짐" : ""}
+					</button>
 					<button type="button" className="btn ghost" onClick={addTerminal} title="터미널 하나 더(같은 연결 위 새 채널)">
 						<SquareTerminal size={14} /> 터미널 +
 					</button>

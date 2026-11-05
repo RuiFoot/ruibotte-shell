@@ -45,6 +45,14 @@ const MIGRATIONS: &[&str] = &[
         pinned_at INTEGER NOT NULL,
         PRIMARY KEY (host, port)
      );",
+    // 3: 스니펫(터미널 명령·SQL 즐겨찾기 공용)
+    "CREATE TABLE snippet (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('shell','sql')),
+        name TEXT NOT NULL,
+        body TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+     );",
 ];
 
 pub struct Store {
@@ -276,5 +284,56 @@ pub fn setting_set(store: State<'_, Store>, key: String, value: String) -> Resul
         params![key, value],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Snippet {
+    pub id: Option<i64>,
+    pub kind: String,
+    pub name: String,
+    pub body: String,
+}
+
+#[tauri::command]
+pub fn snippets_list(store: State<'_, Store>, kind: String) -> Result<Vec<Snippet>, String> {
+    let conn = store.conn.lock().unwrap();
+    let mut st = conn
+        .prepare("SELECT id, kind, name, body FROM snippet WHERE kind = ?1 ORDER BY updated_at DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([kind], |r| Ok(Snippet { id: r.get(0)?, kind: r.get(1)?, name: r.get(2)?, body: r.get(3)? }))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn snippet_save(store: State<'_, Store>, s: Snippet) -> Result<i64, String> {
+    if s.name.trim().is_empty() || s.body.trim().is_empty() {
+        return Err("이름과 내용을 입력하세요".into());
+    }
+    let conn = store.conn.lock().unwrap();
+    match s.id {
+        Some(id) => {
+            conn.execute("UPDATE snippet SET name=?1, body=?2, updated_at=?3 WHERE id=?4", params![s.name.trim(), s.body, now(), id])
+                .map_err(|e| e.to_string())?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO snippet (kind, name, body, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![s.kind, s.name.trim(), s.body, now()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn snippet_delete(store: State<'_, Store>, id: i64) -> Result<(), String> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute("DELETE FROM snippet WHERE id=?1", [id]).map_err(|e| e.to_string())?;
     Ok(())
 }

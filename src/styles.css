@@ -1398,3 +1398,110 @@ html[data-os="macos"] .sidebar {
 .toggle[aria-checked="true"] i {
 	transform: translateX(16px);
 }
+
+/* ── 터미널 부가 ───────────────────────── */
+.cmd-mark {
+	font-family: var(--font-mono);
+	font-size: 11px;
+	line-height: inherit;
+	text-align: right;
+	padding-right: 6px;
+	pointer-events: auto;
+	white-space: nowrap;
+}
+.cmd-mark.ok {
+	color: var(--ok);
+}
+.cmd-mark.bad {
+	color: var(--danger);
+}
+.term-find {
+	position: absolute;
+	right: 18px;
+	top: 6px;
+	z-index: 5;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding: 4px;
+	border-radius: 10px;
+	background: var(--elevated);
+	backdrop-filter: blur(20px) saturate(180%);
+	box-shadow: var(--shadow-pop);
+}
+.term-find input {
+	width: 220px;
+	height: 26px;
+	border: 0;
+	border-radius: 6px;
+	padding: 0 8px;
+	background: var(--fill);
+	color: var(--text);
+	font: inherit;
+	outline: none;
+}
+.panel-fill {
+	position: relative;
+}
+.palette {
+	width: min(560px, calc(100vw - 32px));
+	border-radius: var(--r-xl);
+	background: var(--elevated);
+	backdrop-filter: blur(30px) saturate(180%);
+	box-shadow: var(--shadow-pop);
+	overflow: hidden;
+	animation: pop 140ms ease;
+}
+.palette-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 10px 10px 10px 14px;
+	border-bottom: 0.5px solid var(--hairline);
+}
+.palette-head input {
+	flex: 1;
+	height: 32px;
+	border: 0;
+	background: transparent;
+	font: inherit;
+	font-size: 15px;
+	color: var(--text);
+	outline: none;
+}
+.palette-list {
+	max-height: 50vh;
+	overflow: auto;
+	padding: 6px;
+}
+.palette-item {
+	display: grid;
+	grid-template-columns: 160px 1fr auto;
+	align-items: center;
+	gap: 10px;
+	padding: 7px 10px;
+	border-radius: 8px;
+}
+.palette-item[aria-selected="true"] {
+	background: var(--accent);
+	color: #fff;
+}
+.palette-item code {
+	font-family: var(--font-mono);
+	font-size: 12px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	opacity: 0.8;
+}
+.palette-item b {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.palette-foot {
+	padding: 7px 14px;
+	border-top: 0.5px solid var(--hairline);
+	font-size: 11px;
+	color: var(--text-3);
+}

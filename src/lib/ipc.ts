@@ -155,7 +155,8 @@ export function joinPath(dir: string, name: string): string {
 /** 터미널이 보는 셸 — 원격(SSH 채널)과 내 PC(PTY) 가 같은 모양 */
 export type TermBackend = {
 	open(cols: number, rows: number, onData: Channel<ArrayBuffer | number[]>, cwd?: string): Promise<number>;
-	write(id: number, data: string): Promise<void>;
+	/** encoding: 터미널 인코딩(UTF-8 이 아니면 원격이 그 인코딩으로 바꿔 보낸다) */
+	write(id: number, data: string, encoding?: string): Promise<void>;
 	resize(id: number, cols: number, rows: number): Promise<void>;
 	close(id: number): Promise<void>;
 	/** 셸이 끝났을 때 이벤트 이름과 그 이벤트가 이 셸 것인지 */
@@ -238,7 +239,7 @@ export type ShellHandle = {
 export function sshTerm(conn: number): TermBackend {
 	return {
 		open: (cols, rows, onData, cwd) => invoke<number>("ssh_shell_open", { conn, cols, rows, cwd, onData }),
-		write: (shell, data) => invoke("ssh_shell_write", { conn, shell, data }),
+		write: (shell, data, encoding) => invoke("ssh_shell_write", { conn, shell, data, encoding }),
 		resize: (shell, cols, rows) => invoke("ssh_shell_resize", { conn, shell, cols, rows }),
 		close: (shell) => invoke("ssh_shell_close", { conn, shell }),
 		exitEvent: "ssh-shell-exit",
