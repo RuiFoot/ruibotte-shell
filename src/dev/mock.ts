@@ -7,7 +7,8 @@ import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 type Args = Record<string, unknown>;
 const now = Math.floor(Date.now() / 1000);
 
-const profiles = [
+const settings = new Map<string, string>();
+const profiles: Record<string, any>[] = [
 	{ id: 1, kind: "ssh", name: "개발 서버", host: "dev.example.com", port: 22, username: "deploy", color: "#0a84ff", favorite: true, auth: "key", keyPath: "~/.ssh/id_ed25519", legacy: "off", defaultPath: null, database: null, secretSaved: true, lastUsedAt: now - 3600, groupName: "개발" },
 	{ id: 2, kind: "ssh", name: "구형 로그 서버", host: "10.0.0.6", port: 22, username: "root", color: "#ff9f0a", favorite: true, auth: "password", legacy: "sha1", defaultPath: "/var/log", database: null, secretSaved: false, lastUsedAt: now - 86400 * 3, groupName: "개발" },
 	{ id: 3, kind: "db", name: "운영 PostgreSQL", host: "db.example.com", port: 5432, username: "app", engine: "postgres", color: "#30d158", favorite: true, auth: "password", legacy: "off", database: "app", secretSaved: true, lastUsedAt: now - 7200, groupName: "운영" },
@@ -77,10 +78,23 @@ export function installMock() {
 				case "app_info":
 					return { name: "RuiBotte Shell", version: "0.6.0", os: "windows", arch: "x86_64", dataPath: "C:/Users/me/AppData/Roaming/RuiBotte Shell", portable: false, osBackdrop: false };
 				case "profiles_list":
-					return profiles;
-				case "profile_save":
-					return 99;
+					return profiles.map((p) => ({ ...p }));
+				case "profile_save": {
+					const p = (args as { p: Record<string, any> }).p;
+					const i = profiles.findIndex((x) => x.id === p.id);
+					if (i >= 0) profiles[i] = { ...profiles[i], ...p };
+					else profiles.push({ ...p, id: Math.max(0, ...profiles.map((x) => x.id)) + 1 });
+					return p.id ?? profiles[profiles.length - 1].id;
+				}
+				case "profile_delete": {
+					const i = profiles.findIndex((x) => x.id === (args as { id: number }).id);
+					if (i >= 0) profiles.splice(i, 1);
+					return null;
+				}
 				case "setting_get":
+					return settings.get((args as { key: string }).key) ?? null;
+				case "setting_set":
+					settings.set((args as { key: string; value: string }).key, (args as { key: string; value: string }).value);
 					return null;
 				case "local_home":
 					return "C:/Users/me";

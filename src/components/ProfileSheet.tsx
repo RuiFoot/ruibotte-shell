@@ -48,12 +48,15 @@ export function ProfileSheet({
 	onDeleted,
 	onDuplicate,
 	others = [],
+	extraGroups = [],
 	inline = false,
 	onConnect,
 	onDirty,
 }: {
 	/** 점프 호스트·묶음 후보를 고를 다른 프로필 */
 	others?: Profile[];
+	/** 연결이 아직 없는 묶음 */
+	extraGroups?: string[];
 	initial: Profile;
 	onClose: () => void;
 	onSaved: (id: number) => void;
@@ -82,7 +85,7 @@ export function ProfileSheet({
 	const dirty = JSON.stringify(p) !== JSON.stringify(initial) || !!secret || forget;
 	useEffect(() => onDirty?.(dirty), [dirty, onDirty]);
 	const savedSecret = !!initial.secretSaved && !forget;
-	const groups = [...new Set(others.map((o) => o.groupName).filter((g): g is string => !!g))].sort();
+	const groups = [...new Set([...others.map((o) => o.groupName), ...extraGroups].filter((g): g is string => !!g))].sort((a, b) => a.localeCompare(b, "ko"));
 
 	async function runTest(trust?: string, legacy?: LegacyLevel) {
 		setTest({ s: "running" });

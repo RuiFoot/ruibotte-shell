@@ -251,8 +251,6 @@ export function App() {
 		});
 		return list;
 	}, [profiles, q, kindF, groupF, sortBy]);
-	const ssh = profiles.filter((p) => p.kind === "ssh");
-	const dbs = profiles.filter((p) => p.kind === "db");
 	const editProfile = (p: Profile) => {
 		setSheetKey((k) => k + 1);
 		setSheet(p);
@@ -282,42 +280,36 @@ export function App() {
 		const rank = (g: string) => (pinnedGroups.includes(g) ? pinnedGroups.indexOf(g) : 1000);
 		return [...m.entries()].sort(([a], [b]) => rank(a) - rank(b) || (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "ko")));
 	};
-	const sbList = (list: Profile[], title: (p: Profile) => string) =>
-		grouped(list).map(([g, items]) => {
-			const key = `sb:${g}`;
-			return (
-				<div key={g || "-"}>
-					{g && (
-						<button type="button" className="sb-group" onClick={() => setFolded((f) => { const n = new Set(f); if (n.has(key)) n.delete(key); else n.add(key); return n; })}>
-							{folded.has(key) ? <ChevronRight size={12} /> : <ChevronDown size={12} />} {g}
-						</button>
-					)}
-					{!folded.has(key) &&
-						items.map((p) => (
-							<div
-								key={p.id}
-								className={`sb-row${g ? " in-group" : ""}`}
-								onContextMenu={(e) => {
-									e.preventDefault();
-									setPmenu({ x: e.clientX, y: e.clientY, p });
-								}}
-							>
-								<button type="button" className="sb-item" title={`${title(p)} — 눌러 접속`} onClick={() => connect(p)}>
-									<span className="dot" style={{ background: p.color ?? "var(--accent)" }} /> <span className="sb-name">{p.name}</span>
-								</button>
-								<span className="sb-acts">
-									<button type="button" className="sb-act" title="접속" aria-label={`${p.name} 접속`} onClick={() => connect(p)}>
-										<Play size={12} />
-									</button>
-									<button type="button" className="sb-act" title="설정(고치기·복제·지우기)" aria-label={`${p.name} 설정`} onClick={() => editProfile(p)}>
-										<Pencil size={12} />
-									</button>
-								</span>
-							</div>
-						))}
-				</div>
-			);
-		});
+	// 사이드바: 즐겨찾기(★) + 즐겨찾기가 아닌 최근 5개 — 나머지는 연결 관리·홈에서
+	const favs = profiles.filter((p) => p.favorite).sort((a, b) => a.name.localeCompare(b.name, "ko"));
+	const recent = profiles
+		.filter((p) => !p.favorite && p.lastUsedAt)
+		.sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
+		.slice(0, 5);
+	const sbRow = (p: Profile) => (
+		<div
+			key={p.id}
+			className="sb-row"
+			onContextMenu={(e) => {
+				e.preventDefault();
+				setPmenu({ x: e.clientX, y: e.clientY, p });
+			}}
+		>
+			<button type="button" className="sb-item" title={`${p.kind === "db" ? `${p.engine} ` : ""}${p.username ? `${p.username}@` : ""}${p.host}:${p.port}${p.memo ? `\n${p.memo}` : ""} — 눌러 접속`} onClick={() => connect(p)}>
+				<span className="dot" style={{ background: p.color ?? "var(--accent)" }} />
+				{p.kind === "ssh" ? <Server size={12} className="sb-kind" /> : <Database size={12} className="sb-kind" />}
+				<span className="sb-name">{p.name}</span>
+			</button>
+			<span className="sb-acts">
+				<button type="button" className="sb-act" title="접속" onClick={() => connect(p)}>
+					<Play size={12} />
+				</button>
+				<button type="button" className="sb-act" title="설정" onClick={() => editProfile(p)}>
+					<Pencil size={12} />
+				</button>
+			</span>
+		</div>
+	);
 	const isWin = info?.os === "windows";
 	const mod = info?.os === "macos" ? "⌘" : "Ctrl+";
 	const win = getCurrentWindow();
@@ -383,22 +375,24 @@ export function App() {
 					<ListTree size={16} /> 연결 관리
 				</button>
 
-				<div className="sb-section">SSH 서버</div>
-				{ssh.length ? (
-					sbList(ssh, (p) => `${p.username ? `${p.username}@` : ""}${p.host}:${p.port}`)
+				<div className="sb-section">즐겨찾기</div>
+				{favs.length ? (
+					favs.map((p) => sbRow(p))
 				) : (
-					<button type="button" className="sb-item" style={{ color: "var(--text-3)" }} onClick={() => setSheet(blankProfile("ssh"))}>
-						<Plus size={14} /> 서버 추가
-					</button>
+					<div className="sb-hint">연결 카드의 ☆ 를 누르면 여기에 둡니다</div>
 				)}
-				<div className="sb-section">데이터베이스</div>
-				{dbs.length ? (
-					sbList(dbs, (p) => `${p.engine} ${p.host}:${p.port}`)
-				) : (
-					<button type="button" className="sb-item" style={{ color: "var(--text-3)" }} onClick={() => setSheet(blankProfile("db"))}>
-						<Plus size={14} /> DB 추가
-					</button>
+				{recent.length > 0 && (
+					<>
+						<div className="sb-section">최근</div>
+						{recent.map((p) => sbRow(p))}
+					</>
 				)}
+				<button type="button" className="sb-item sb-more" onClick={() => open("connections", "연결 관리", true)}>
+					<ListTree size={14} /> 모든 연결 {profiles.length ? `(${profiles.length})` : ""}
+				</button>
+				<button type="button" className="sb-item sb-more" onClick={() => setSheet(blankProfile("ssh"))}>
+					<Plus size={14} /> 새 연결
+				</button>
 
 				<div className="sb-foot">
 					{upd.phase === "available" && (

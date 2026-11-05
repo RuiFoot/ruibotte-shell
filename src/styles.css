@@ -3443,3 +3443,50 @@ h2 .count {
 .sheet-actions {
 	flex-wrap: wrap;
 }
+
+/* 사이드바 즐겨찾기·최근 */
+.sb-kind {
+	color: var(--text-3);
+	flex: none;
+}
+.sb-hint {
+	padding: 4px 12px 6px;
+	font-size: 11px;
+	color: var(--text-3);
+	line-height: 1.45;
+}
+.sb-more {
+	color: var(--text-3);
+	font-size: 12px;
+}
+
+/* 연결 관리: 묶음 머리 */
+.conn-ghead {
+	display: flex;
+	align-items: center;
+	border-radius: 6px;
+}
+.conn-ghead.drop {
+	background: var(--accent-soft, rgba(10, 132, 255, 0.14));
+	outline: 1px dashed var(--accent);
+}
+.conn-ghead .conn-group {
+	flex: 1;
+	min-width: 0;
+}
+.conn-gacts {
+	display: flex;
+	gap: 2px;
+	padding-right: 4px;
+	opacity: 0;
+	transition: opacity 0.12s;
+}
+.conn-ghead:hover .conn-gacts,
+.conn-ghead:focus-within .conn-gacts {
+	opacity: 1;
+}
+.conn-empty {
+	padding: 4px 10px 8px 28px;
+	font-size: 11px;
+	color: var(--text-3);
+}

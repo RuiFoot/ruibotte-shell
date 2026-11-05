@@ -1,5 +1,5 @@
-import { ChevronDown, ChevronRight, Database, FileDown, FileUp, Folder, KeyRound, Plus, Search, Server, Trash2 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, Database, FileDown, FileUp, Folder, FolderPlus, KeyRound, Pencil, Plus, Search, Server, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Profile } from "../lib/ipc";
 import { blankProfile, ProfileSheet } from "./ProfileSheet";
 
@@ -29,6 +29,23 @@ export function ConnectionsPane({
 	const [folded, setFolded] = useState<Set<string>>(new Set());
 	const [formKey, setFormKey] = useState(0);
 	const dirty = useRef(false);
+	// 연결이 아직 없는 빈 묶음(설정에 보관) — 연결이 들어오면 저절로 목록에서 이어진다
+	const [emptyGroups, setEmptyGroups] = useState<string[]>([]);
+	const [dropOn, setDropOn] = useState<string | null>(null);
+	useEffect(() => {
+		void api.settingGet("conn.groups").then((v) => {
+			try {
+				setEmptyGroups(v ? JSON.parse(v) : []);
+			} catch {
+				setEmptyGroups([]);
+			}
+		});
+	}, []);
+	const saveEmpty = (list: string[]) => {
+		const uniq = [...new Set(list)];
+		setEmptyGroups(uniq);
+		void api.settingSet("conn.groups", JSON.stringify(uniq));
+	};
 
 	const go = (next: Sel) => {
 		if (dirty.current && !confirm("고친 것을 저장하지 않았습니다. 버리고 옮길까요?")) return;
@@ -54,18 +71,59 @@ export function ConnectionsPane({
 			const g = p.groupName?.trim() || "";
 			m.set(g, [...(m.get(g) ?? []), p]);
 		}
+		if (!q.trim() && kind === "all") for (const g of emptyGroups) if (!m.has(g)) m.set(g, []);
 		return [...m.entries()].sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "ko")));
-	}, [list]);
-	const allGroups = useMemo(() => [...new Set(profiles.map((p) => p.groupName?.trim()).filter((g): g is string => !!g))].sort(), [profiles]);
+	}, [list, emptyGroups, q, kind]);
+	const allGroups = useMemo(
+		() => [...new Set([...profiles.map((p) => p.groupName?.trim()), ...emptyGroups].filter((g): g is string => !!g))].sort((a, b) => a.localeCompare(b, "ko")),
+		[profiles, emptyGroups],
+	);
+	const inGroup = (g: string) => profiles.filter((p) => (p.groupName?.trim() || "") === g);
+	const moveTo = async (ids: number[], g: string) => {
+		for (const p of profiles.filter((x) => x.id != null && ids.includes(x.id))) if ((p.groupName?.trim() || "") !== g) await api.profileSave({ ...p, groupName: g || null });
+		reload();
+	};
+	const addGroup = () => {
+		const g = prompt("새 묶음 이름")?.trim();
+		if (!g) return;
+		if (allGroups.includes(g)) return alert("이미 있는 묶음입니다");
+		saveEmpty([...emptyGroups, g]);
+		setFolded((f) => {
+			const n = new Set(f);
+			n.delete(g);
+			return n;
+		});
+	};
+	const renameGroup = async (g: string) => {
+		const to = prompt(`'${g}' 묶음의 새 이름`, g)?.trim();
+		if (!to || to === g) return;
+		if (allGroups.includes(to) && !confirm(`'${to}' 묶음이 이미 있습니다. 합칠까요?`)) return;
+		for (const p of inGroup(g)) await api.profileSave({ ...p, groupName: to });
+		saveEmpty(emptyGroups.map((x) => (x === g ? to : x)));
+		reload();
+	};
+	const deleteGroup = async (g: string, withConns: boolean) => {
+		const items = inGroup(g);
+		if (withConns) {
+			if (!confirm(`'${g}' 묶음과 안의 연결 ${items.length}개를 모두 지울까요? 저장한 암호도 함께 지웁니다.`)) return;
+			for (const p of items) if (p.id != null) await api.profileDelete(p.id);
+			if (sel?.kind === "id" && items.some((p) => p.id === sel.id)) setSel(null);
+		} else {
+			if (items.length && !confirm(`'${g}' 묶음을 지울까요? 안의 연결 ${items.length}개는 지우지 않고 '묶지 않음'으로 옮깁니다.`)) return;
+			for (const p of items) await api.profileSave({ ...p, groupName: null });
+		}
+		saveEmpty(emptyGroups.filter((x) => x !== g));
+		reload();
+	};
 
 	const current = sel?.kind === "id" ? profiles.find((p) => p.id === sel.id) : sel?.kind === "new" ? sel.p : undefined;
 
 	const bulkMove = async () => {
 		const g = prompt(`고른 ${checked.size}개를 옮길 묶음(비우면 묶지 않음)${allGroups.length ? `\n있는 묶음: ${allGroups.join(", ")}` : ""}`);
 		if (g === null) return;
-		for (const p of profiles.filter((x) => x.id != null && checked.has(x.id))) await api.profileSave({ ...p, groupName: g.trim() || null });
+		await moveTo([...checked], g.trim());
+		if (g.trim()) saveEmpty(emptyGroups.filter((x) => x !== g.trim()));
 		setChecked(new Set());
-		reload();
 	};
 	const bulkDelete = async () => {
 		if (!confirm(`고른 ${checked.size}개 연결을 지울까요? 저장한 암호도 함께 지웁니다.`)) return;
@@ -84,6 +142,9 @@ export function ConnectionsPane({
 					</button>
 					<button type="button" className="btn" onClick={() => go({ kind: "new", p: blankProfile("db") })}>
 						<Plus size={13} /> DB
+					</button>
+					<button type="button" className="btn ghost" title="새 묶음(연결을 끌어다 넣거나 체크 뒤 '묶음 옮기기')" onClick={addGroup}>
+						<FolderPlus size={13} /> 묶음
 					</button>
 					<span style={{ flex: 1 }} />
 					<button type="button" className="btn ghost icon" title="가져오기(~/.ssh/config·PuTTY·DataGrip·DBeaver)" onClick={onImport}>
@@ -127,21 +188,59 @@ export function ConnectionsPane({
 				<div className="conn-items">
 					{groups.map(([g, items]) => (
 						<div key={g || "-"}>
-							<button
-								type="button"
-								className="conn-group"
-								onClick={() =>
-									setFolded((f) => {
-										const n = new Set(f);
-										if (n.has(g)) n.delete(g);
-										else n.add(g);
-										return n;
-									})
-								}
+							<div
+								className={`conn-ghead${dropOn === g ? " drop" : ""}`}
+								onDragOver={(e) => {
+									if (!e.dataTransfer.types.includes("application/x-rbs-conn")) return;
+									e.preventDefault();
+									setDropOn(g);
+								}}
+								onDragLeave={() => setDropOn((d) => (d === g ? null : d))}
+								onDrop={(e) => {
+									e.preventDefault();
+									setDropOn(null);
+									const ids = JSON.parse(e.dataTransfer.getData("application/x-rbs-conn") || "[]") as number[];
+									if (ids.length) void moveTo(ids, g).then(() => setChecked(new Set()));
+								}}
 							>
-								{folded.has(g) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-								<Folder size={12} /> {g || "묶지 않음"} <small>{items.length}</small>
-							</button>
+								<button
+									type="button"
+									className="conn-group"
+									onClick={() =>
+										setFolded((f) => {
+											const n = new Set(f);
+											if (n.has(g)) n.delete(g);
+											else n.add(g);
+											return n;
+										})
+									}
+									onDoubleClick={() => g && void renameGroup(g)}
+								>
+									{folded.has(g) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+									<Folder size={12} /> {g || "묶지 않음"} <small>{items.length}</small>
+								</button>
+								<span className="conn-gacts">
+									<button type="button" className="sb-act" title="이 묶음에 새 SSH 연결" onClick={() => go({ kind: "new", p: { ...blankProfile("ssh"), groupName: g || null } })}>
+										<Plus size={12} />
+									</button>
+									{g && (
+										<>
+											<button type="button" className="sb-act" title="묶음 이름 바꾸기(두 번 눌러도 됨)" onClick={() => void renameGroup(g)}>
+												<Pencil size={12} />
+											</button>
+											<button
+												type="button"
+												className="sb-act"
+												title="묶음 지우기 — Shift 를 누른 채면 안의 연결까지 지움"
+												onClick={(e) => void deleteGroup(g, e.shiftKey)}
+											>
+												<Trash2 size={12} />
+											</button>
+										</>
+									)}
+								</span>
+							</div>
+							{!folded.has(g) && !items.length && <div className="conn-empty">비어 있음 — 연결을 끌어다 놓으세요</div>}
 							{!folded.has(g) &&
 								items.map((p) => (
 									<div
@@ -150,6 +249,12 @@ export function ConnectionsPane({
 										aria-current={sel?.kind === "id" && sel.id === p.id}
 										onClick={() => p.id != null && go({ kind: "id", id: p.id })}
 										onDoubleClick={() => onConnect(p)}
+										draggable
+										onDragStart={(e) => {
+											const ids = p.id != null && checked.has(p.id) ? [...checked] : p.id != null ? [p.id] : [];
+											e.dataTransfer.setData("application/x-rbs-conn", JSON.stringify(ids));
+											e.dataTransfer.effectAllowed = "move";
+										}}
 										onKeyDown={(e) => e.key === "Enter" && p.id != null && go({ kind: "id", id: p.id })}
 										role="button"
 										tabIndex={0}
@@ -192,6 +297,7 @@ export function ConnectionsPane({
 						inline
 						initial={current}
 						others={profiles}
+						extraGroups={emptyGroups}
 						onDirty={(d) => {
 							dirty.current = d;
 						}}
