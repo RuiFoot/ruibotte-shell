@@ -5,7 +5,7 @@ SSH 터미널·SFTP·편집기와 DataGrip식 DB 접근기를 하나로 합친 *
 
 - 백엔드 Rust(Tauri 2) — SSH·SFTP·DB·인코딩·파일·비밀 저장
 - 화면 React 19 + TypeScript — 터미널 xterm.js(WebGL), 결과 표 가상화, Apple macOS·iOS 풍 자체 디자인
-- 앱 자체 저장 SQLite 파일 하나, 암호·키는 OS 자격 증명 저장소(다음 판)
+- 앱 자체 저장 SQLite 파일 하나, 암호는 원할 때만 OS 자격 증명 저장소(Windows 자격 증명 관리자·macOS 키체인)
 
 ## 할 수 있는 것 (0.2)
 
