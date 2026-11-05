@@ -3287,3 +3287,159 @@ input[type="radio"] {
 	color: var(--danger);
 	font-size: 11px;
 }
+/* ── 연결 관리(목록 + 설정) ───────────── */
+.conn-pane {
+	display: grid;
+	grid-template-columns: minmax(260px, 340px) 1fr;
+	height: 100%;
+	min-height: 0;
+}
+.conn-list {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	border-right: 0.5px solid var(--hairline);
+	background: var(--surface-2);
+}
+.conn-tools {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 10px 8px 8px;
+}
+.conn-tools .btn {
+	height: 26px;
+	gap: 4px;
+}
+.conn-items {
+	flex: 1;
+	overflow: auto;
+	padding: 0 4px 12px;
+}
+.conn-group {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	width: 100%;
+	padding: 6px 6px 3px;
+	border: 0;
+	background: none;
+	color: var(--text-2);
+	font-size: 11.5px;
+	font-weight: 600;
+	text-align: left;
+}
+.conn-group small {
+	font-weight: 400;
+	color: var(--text-3);
+}
+.conn-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 30px;
+	padding: 0 8px 0 10px;
+	border-radius: 7px;
+	font-size: 12.5px;
+	cursor: default;
+}
+.conn-row:hover {
+	background: var(--fill);
+}
+.conn-row[aria-current="true"] {
+	background: var(--accent-soft);
+}
+.conn-row .dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	flex: none;
+}
+.conn-name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.conn-host {
+	margin-left: auto;
+	padding-left: 8px;
+	color: var(--text-3);
+	font-family: var(--font-mono);
+	font-size: 11px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	max-width: 45%;
+}
+.bulk-bar {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	margin: 0 8px 6px;
+	padding: 4px 8px;
+	border-radius: 7px;
+	background: var(--accent-soft);
+	font-size: 12px;
+}
+.bulk-bar span {
+	margin-right: auto;
+	font-weight: 600;
+}
+.bulk-bar .btn {
+	height: 22px;
+	font-size: 11.5px;
+}
+.conn-detail {
+	overflow: auto;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+}
+.conn-detail > .panel-hint {
+	margin: auto;
+}
+.pf-inline {
+	max-width: 640px;
+	width: 100%;
+	padding: 22px 28px 0;
+}
+.pf-inline .sheet-actions {
+	background: linear-gradient(to bottom, transparent, var(--surface) 30%);
+	margin: 18px -28px 0;
+	padding: 12px 28px 18px;
+}
+/* 홈 조회 줄 */
+.find-bar {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin: -2px 0 14px;
+}
+.find-bar .seg.tiny {
+	margin: 0;
+}
+h2 .count {
+	margin-left: 6px;
+	font-size: 12px;
+	font-weight: 400;
+	color: var(--text-3);
+}
+.pin {
+	margin-left: 6px;
+	opacity: 0.25;
+	font-size: 11px;
+	cursor: pointer;
+}
+.pin.on,
+.pgroup-head:hover .pin {
+	opacity: 1;
+}
+.sheet-actions .btn {
+	white-space: nowrap;
+	flex: none;
+}
+.sheet-actions {
+	flex-wrap: wrap;
+}

@@ -1,11 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, ListTree, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
+import { Select } from "./components/Select";
 import { confirmDiscard, dirtyTitles } from "./lib/dirty";
+import { ConnectionsPane } from "./components/ConnectionsPane";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
@@ -20,7 +22,7 @@ const SettingsPane = lazy(() => import("./components/SettingsPane").then((m) => 
 const DbWorkbench = lazy(() => import("./components/DbWorkbench").then((m) => ({ default: m.DbWorkbench })));
 const CommandDictionaryPane = lazy(() => import("./components/CommandDictionary").then((m) => ({ default: m.CommandDictionaryPane })));
 
-type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict" | "settings";
+type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict" | "settings" | "connections";
 type DbInfo = { ok: DbConnectOk; profile: Profile; readOnly: boolean };
 type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean };
 type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; db?: DbInfo; color?: string | null };
@@ -33,6 +35,7 @@ const TAB_ICON: Record<TabKind, ReactNode> = {
 	grid: <Table2 size={14} />,
 	dict: <BookOpen size={14} />,
 	settings: <SettingsIcon size={14} />,
+	connections: <ListTree size={14} />,
 };
 /** 마지막 접속 — 초(유닉스) → "3시간 전" */
 function ago(t: number) {
@@ -191,11 +194,63 @@ export function App() {
 		return () => window.removeEventListener("keydown", onKey);
 	}, [info?.os, open, close, active]);
 
+	// 내 연결 조회 — 종류·묶음 거르기·정렬, 지금 조회를 시작 화면으로 고정, 묶음 고정(맨 위·펼침)
+	const [kindF, setKindF] = useState<"all" | "ssh" | "db" | "fav">("all");
+	const [groupF, setGroupF] = useState<string | null>(null);
+	const [sortBy, setSortBy] = useState<"fav" | "name" | "recent" | "host">("fav");
+	const [pinnedGroups, setPinnedGroups] = useState<string[]>([]);
+	const [viewPinned, setViewPinned] = useState(false);
+	useEffect(() => {
+		void api.settingGet("home.view").then((v) => {
+			if (!v) return;
+			try {
+				const o = JSON.parse(v) as { q?: string; kind?: typeof kindF; group?: string | null; sort?: typeof sortBy };
+				setQ(o.q ?? "");
+				setKindF(o.kind ?? "all");
+				setGroupF(o.group ?? null);
+				setSortBy(o.sort ?? "fav");
+				setViewPinned(true);
+			} catch {
+				// 무시
+			}
+		});
+		void api.settingGet("home.pinnedGroups").then((v) => {
+			try {
+				setPinnedGroups(v ? (JSON.parse(v) as string[]) : []);
+			} catch {
+				setPinnedGroups([]);
+			}
+		});
+	}, []);
+	const togglePinGroup = (g: string) => {
+		const next = pinnedGroups.includes(g) ? pinnedGroups.filter((x) => x !== g) : [...pinnedGroups, g];
+		setPinnedGroups(next);
+		void api.settingSet("home.pinnedGroups", JSON.stringify(next));
+	};
+	const pinView = (on: boolean) => {
+		setViewPinned(on);
+		void api.settingSet("home.view", on ? JSON.stringify({ q, kind: kindF, group: groupF, sort: sortBy }) : "");
+	};
+	const allGroups = useMemo(() => [...new Set(profiles.map((p) => p.groupName?.trim()).filter((g): g is string => !!g))].sort((a, b) => a.localeCompare(b, "ko")), [profiles]);
 	const filtered = useMemo(() => {
-		const w = q.trim().toLowerCase();
-		if (!w) return profiles;
-		return profiles.filter((p) => `${p.name} ${p.host} ${p.username} ${p.engine ?? ""}`.toLowerCase().includes(w));
-	}, [profiles, q]);
+		const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+		let list = profiles.filter((p) => {
+			if (kindF === "ssh" && p.kind !== "ssh") return false;
+			if (kindF === "db" && p.kind !== "db") return false;
+			if (kindF === "fav" && !p.favorite) return false;
+			if (groupF !== null && (p.groupName?.trim() || "") !== groupF) return false;
+			if (!words.length) return true;
+			const hay = [p.name, p.host, p.username, p.engine, p.groupName, p.memo, p.database, `${p.host}:${p.port}`].filter(Boolean).join(" ").toLowerCase();
+			return words.every((w) => hay.includes(w));
+		});
+		list = [...list].sort((a, b) => {
+			if (sortBy === "name") return a.name.localeCompare(b.name, "ko");
+			if (sortBy === "host") return a.host.localeCompare(b.host) || a.port - b.port;
+			if (sortBy === "recent") return (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0);
+			return Number(b.favorite) - Number(a.favorite) || (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0) || a.name.localeCompare(b.name, "ko");
+		});
+		return list;
+	}, [profiles, q, kindF, groupF, sortBy]);
 	const ssh = profiles.filter((p) => p.kind === "ssh");
 	const dbs = profiles.filter((p) => p.kind === "db");
 	const editProfile = (p: Profile) => {
@@ -223,7 +278,9 @@ export function App() {
 			const g = p.groupName?.trim() || "";
 			m.set(g, [...(m.get(g) ?? []), p]);
 		}
-		return [...m.entries()].sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "ko")));
+		// 고정한 묶음 먼저(고정한 순서), 그다음 이름순, 묶지 않음은 맨 뒤
+		const rank = (g: string) => (pinnedGroups.includes(g) ? pinnedGroups.indexOf(g) : 1000);
+		return [...m.entries()].sort(([a], [b]) => rank(a) - rank(b) || (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "ko")));
 	};
 	const sbList = (list: Profile[], title: (p: Profile) => string) =>
 		grouped(list).map(([g, items]) => {
@@ -321,6 +378,9 @@ export function App() {
 				</button>
 				<button type="button" className="sb-item" aria-current={activeKind === "dict"} onClick={() => open("dict", "명령어 사전", true)}>
 					<BookOpen size={16} /> 명령어 사전
+				</button>
+				<button type="button" className="sb-item" aria-current={activeKind === "connections"} onClick={() => open("connections", "연결 관리", true)}>
+					<ListTree size={16} /> 연결 관리
 				</button>
 
 				<div className="sb-section">SSH 서버</div>
@@ -451,13 +511,78 @@ export function App() {
 										<QuickCard color="#ff9f0a" icon={<BookOpen size={18} />} title="명령어 사전" desc="358개 리눅스 명령 한국어" onClick={() => open("dict", "명령어 사전", true)} />
 									</div>
 									<div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-										<h2 style={{ margin: 0, flex: 1 }}>내 연결</h2>
+										<h2 style={{ margin: 0, flex: 1 }}>
+											내 연결 <small className="count">{filtered.length === profiles.length ? profiles.length : `${filtered.length} / ${profiles.length}`}</small>
+										</h2>
+										<button type="button" className="btn ghost" onClick={() => open("connections", "연결 관리", true)} title="연결 만들기·고치기·지우기·묶음 — 한 화면에서">
+											<ListTree size={14} /> 연결 관리
+										</button>
 										<button type="button" className="btn ghost" onClick={() => setImporting(true)} title="~/.ssh/config·PuTTY 에서">
 											<FileDown size={14} /> 가져오기
 										</button>
 										<button type="button" className="btn ghost" onClick={() => setExporting(true)} title="ssh config 로">
 											<FileUp size={14} /> 내보내기
 										</button>
+									</div>
+									<div className="find-bar">
+										<div className="seg tiny" role="group">
+											{(
+												[
+													["all", "전체"],
+													["ssh", "SSH"],
+													["db", "DB"],
+													["fav", "★ 즐겨찾기"],
+												] as const
+											).map(([k, l]) => (
+												<button key={k} type="button" aria-pressed={kindF === k} onClick={() => setKindF(k)}>
+													{l}
+												</button>
+											))}
+										</div>
+										{allGroups.length > 0 && (
+											<div className="chips" style={{ margin: 0 }}>
+												{allGroups.map((g) => (
+													<button key={g} type="button" className={`chip${groupF === g ? " on" : ""}`} onClick={() => setGroupF(groupF === g ? null : g)}>
+														{pinnedGroups.includes(g) ? "📌 " : ""}
+														{g}
+													</button>
+												))}
+											</div>
+										)}
+										<span style={{ flex: 1 }} />
+										<Select<"fav" | "name" | "recent" | "host">
+											size="sm"
+											value={sortBy}
+											onChange={setSortBy}
+											title="정렬"
+											options={[
+												{ value: "fav", label: "즐겨찾기·최근 순" },
+												{ value: "recent", label: "최근 접속 순" },
+												{ value: "name", label: "이름 순" },
+												{ value: "host", label: "주소 순" },
+											]}
+										/>
+										<button
+											type="button"
+											className={`btn ghost${viewPinned ? " on" : ""}`}
+											title={viewPinned ? "시작 화면 고정 풀기" : "지금 조회(검색어·종류·묶음·정렬)를 앱을 켤 때 그대로 보이게 고정"}
+											onClick={() => pinView(!viewPinned)}
+										>
+											📌 {viewPinned ? "고정됨" : "이 조회 고정"}
+										</button>
+										{(q || kindF !== "all" || groupF !== null) && (
+											<button
+												type="button"
+												className="btn ghost"
+												onClick={() => {
+													setQ("");
+													setKindF("all");
+													setGroupF(null);
+												}}
+											>
+												모두 보기
+											</button>
+										)}
 									</div>
 									{filtered.length ? (
 										grouped(filtered).map(([g, items]) => (
@@ -466,9 +591,23 @@ export function App() {
 													<button type="button" className="pgroup-head" onClick={() => setFolded((f) => { const n = new Set(f); if (n.has(g)) n.delete(g); else n.add(g); return n; })}>
 														{folded.has(g) ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
 														<Folder size={13} /> {g || "묶지 않음"} <small>{items.length}</small>
+														{g && (
+															<span
+																role="button"
+																tabIndex={-1}
+																className={`pin${pinnedGroups.includes(g) ? " on" : ""}`}
+																title={pinnedGroups.includes(g) ? "고정 풀기" : "이 묶음 고정(맨 위·늘 펼침)"}
+																onClick={(e) => {
+																	e.stopPropagation();
+																	togglePinGroup(g);
+																}}
+															>
+																📌
+															</span>
+														)}
 													</button>
 												)}
-												{!folded.has(g) && (
+												{(!folded.has(g) || pinnedGroups.includes(g)) && (
 													<div className="plist">
 														{items.map((p) => (
 															<div
@@ -598,6 +737,9 @@ export function App() {
 								)}
 								{t.kind === "grid" && <ResultGridPane />}
 								{t.kind === "settings" && <SettingsPane info={info} />}
+								{t.kind === "connections" && (
+									<ConnectionsPane profiles={profiles} reload={reload} onConnect={connect} onImport={() => setImporting(true)} onExport={() => setExporting(true)} />
+								)}
 								{t.kind === "dict" && <CommandDictionaryPane />}
 							</Suspense>
 						</section>

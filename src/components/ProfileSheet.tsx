@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { CheckCircle2, Copy, Eye, EyeOff, FolderOpen, KeyRound, Loader2, PlugZap, ShieldQuestion, Trash2, XCircle } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ENGINES, engineOf } from "../lib/engines";
 import { api, asSshError, type LegacyLevel, type Profile } from "../lib/ipc";
 import { Select } from "./Select";
@@ -48,6 +48,9 @@ export function ProfileSheet({
 	onDeleted,
 	onDuplicate,
 	others = [],
+	inline = false,
+	onConnect,
+	onDirty,
 }: {
 	/** 점프 호스트·묶음 후보를 고를 다른 프로필 */
 	others?: Profile[];
@@ -56,6 +59,12 @@ export function ProfileSheet({
 	onSaved: (id: number) => void;
 	onDeleted?: (id: number) => void;
 	onDuplicate?: (p: Profile) => void;
+	/** 연결 관리 화면 안에 그대로(시트가 아니라) */
+	inline?: boolean;
+	/** 저장한 뒤 바로 접속 */
+	onConnect?: (p: Profile) => void;
+	/** 고친 게 있는지(다른 연결로 옮길 때 묻기) */
+	onDirty?: (dirty: boolean) => void;
 }) {
 	const [p, setP] = useState<Profile>(initial);
 	const [err, setErr] = useState("");
@@ -70,6 +79,8 @@ export function ProfileSheet({
 		if (test.s !== "running") setTest({ s: "idle" });
 	};
 	const editing = initial.id != null;
+	const dirty = JSON.stringify(p) !== JSON.stringify(initial) || !!secret || forget;
+	useEffect(() => onDirty?.(dirty), [dirty, onDirty]);
 	const savedSecret = !!initial.secretSaved && !forget;
 	const groups = [...new Set(others.map((o) => o.groupName).filter((g): g is string => !!g))].sort();
 
@@ -144,14 +155,14 @@ export function ProfileSheet({
 	const keyAuth = p.kind === "ssh" && p.auth === "key";
 
 	return (
-		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+		<Wrap inline={inline} onClose={onClose}>
 			<form
-				className="sheet wide"
+				className={inline ? "pf-inline" : "sheet wide"}
 				onSubmit={(e) => {
 					e.preventDefault();
 					void save();
 				}}
-				onKeyDown={(e) => e.key === "Escape" && onClose()}
+				onKeyDown={(e) => !inline && e.key === "Escape" && onClose()}
 			>
 				<div className="sheet-title">
 					<h3>{editing ? "연결 설정" : "새 연결"}</h3>
@@ -453,14 +464,29 @@ export function ProfileSheet({
 						</button>
 					)}
 					<span style={{ flex: 1 }} />
-					<button type="button" className="btn" onClick={onClose}>
-						취소
+					<button type="button" className="btn" onClick={onClose} disabled={inline && !dirty}>
+						{inline ? "되돌리기" : "취소"}
 					</button>
-					<button type="submit" className="btn primary" disabled={saving || !p.name.trim() || !p.host.trim()}>
+					{inline && onConnect && editing && (
+						<button type="button" className="btn" disabled={dirty} title={dirty ? "먼저 저장하세요" : "이 연결로 접속"} onClick={() => onConnect(p)}>
+							접속
+						</button>
+					)}
+					<button type="submit" className="btn primary" disabled={saving || !p.name.trim() || !p.host.trim() || (inline && !dirty && editing)}>
 						저장
 					</button>
 				</div>
 			</form>
+		</Wrap>
+	);
+}
+
+/** 시트(가운데 떠 있는 창) 또는 화면 안에 그대로 */
+function Wrap({ inline, onClose, children }: { inline: boolean; onClose: () => void; children: React.ReactNode }) {
+	if (inline) return <>{children}</>;
+	return (
+		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+			{children}
 		</div>
 	);
 }
