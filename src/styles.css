@@ -790,3 +790,240 @@ html[data-os="macos"] .sidebar {
 		transform: translateY(6px) scale(0.98);
 	}
 }
+
+/* ── 3칸 작업대 ───────────────────────── */
+.wb {
+	display: grid;
+	height: 100%;
+	min-height: 0;
+}
+.splitter {
+	cursor: col-resize;
+	background: var(--hairline);
+	position: relative;
+	touch-action: none;
+}
+.splitter:hover,
+.splitter:active {
+	background: var(--accent);
+}
+.tree,
+.wb-center,
+.wb-term {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+}
+.tree {
+	background: var(--surface-2);
+}
+.tree-head {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	height: 38px;
+	padding: 0 6px;
+	border-bottom: 0.5px solid var(--hairline);
+	flex: none;
+}
+.path-input {
+	width: 100%;
+	height: 26px;
+	padding: 0 8px;
+	border: 0;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	color: var(--text);
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	outline: none;
+}
+.path-input:focus {
+	box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.tree-body {
+	flex: 1;
+	overflow: auto;
+	padding: 4px 4px 12px;
+}
+.tree-row {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	width: 100%;
+	height: 24px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	text-align: left;
+	font-size: 12.5px;
+	white-space: nowrap;
+	color: var(--text);
+}
+.tree-row span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.tree-row:hover {
+	background: var(--fill);
+}
+.tree-row[aria-current="true"] {
+	background: var(--accent-soft);
+}
+.tree-row .chev {
+	flex: none;
+	color: var(--text-3);
+	transition: transform 120ms ease;
+}
+.ti {
+	flex: none;
+	color: var(--text-3);
+}
+.ti.dir {
+	color: var(--accent);
+}
+.dim {
+	color: var(--text-3);
+}
+.tree-msg {
+	height: 22px;
+	display: flex;
+	align-items: center;
+	font-size: 11.5px;
+	color: var(--text-3);
+}
+.tree-msg.err,
+.statusbar .err {
+	color: var(--danger);
+}
+.statusbar .warn {
+	color: #ff9f0a;
+}
+.doc-tabs {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	height: 38px;
+	padding: 0 6px;
+	border-bottom: 0.5px solid var(--hairline);
+	overflow-x: auto;
+	scrollbar-width: none;
+	flex: none;
+}
+.doc-tab {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 28px;
+	padding: 0 6px 0 10px;
+	border: 0;
+	border-radius: var(--r-sm);
+	background: transparent;
+	color: var(--text-2);
+	font-size: 12.5px;
+	white-space: nowrap;
+}
+.doc-tab:hover {
+	background: var(--fill);
+}
+.doc-tab[aria-selected="true"] {
+	background: var(--fill-hover);
+	color: var(--text);
+}
+.doc-tab .x {
+	display: grid;
+	place-items: center;
+	width: 16px;
+	height: 16px;
+	border-radius: 4px;
+	opacity: 0.55;
+}
+.doc-tab .x:hover {
+	background: var(--fill-hover);
+	opacity: 1;
+}
+.doc-tab .dirty {
+	width: 8px;
+	height: 8px;
+	margin: 0 4px;
+	border-radius: 50%;
+	background: var(--text-2);
+}
+.doc-body {
+	position: relative;
+	flex: 1;
+	min-height: 0;
+}
+.doc-pane {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+}
+.doc-pane[hidden] {
+	display: none;
+}
+.cm-host {
+	flex: 1;
+	min-height: 0;
+	overflow: hidden;
+}
+.doc-empty {
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	color: var(--text-3);
+}
+.doc-empty p {
+	margin: 6px 0 0;
+	font-size: 13px;
+	color: var(--text-2);
+}
+.status-select {
+	height: 18px;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--text-2);
+	font: inherit;
+}
+.status-select:hover {
+	background: var(--fill);
+}
+.badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	height: 20px;
+	padding: 0 8px;
+	border-radius: 999px;
+	background: var(--fill);
+	color: var(--text-2);
+	font-size: 11px;
+	white-space: nowrap;
+}
+.badge.warn {
+	background: color-mix(in srgb, #ff9f0a 18%, transparent);
+	color: #c77700;
+}
+.fp {
+	font-family: var(--font-mono);
+	font-size: 12px;
+	padding: 10px 12px;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	word-break: break-all;
+	user-select: text;
+}
+.check {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 12.5px;
+	color: var(--text-2);
+	margin-top: 10px;
+}

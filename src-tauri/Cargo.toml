@@ -25,6 +25,13 @@ portable-pty = "0.9"
 rusqlite = { version = "0.41", features = ["bundled"] }
 window-vibrancy = "0.6"
 anyhow = "1"
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa", "des", "dsa"] }
+russh-sftp = "3"
+keyring = "4"
+encoding_rs = "0.8.35"
+chardetng = "1.0.0"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "io-util"] }
+tauri-plugin-dialog = "2"
 
 [profile.release]
 # 설치 크기·기동 우선

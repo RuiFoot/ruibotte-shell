@@ -5,9 +5,9 @@ import "@xterm/xterm/css/xterm.css";
 import { listen } from "@tauri-apps/api/event";
 import { Gauge, RotateCcw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { api, bytesChannel } from "../lib/ipc";
+import { api, bytesChannel, type TermBackend } from "../lib/ipc";
 
-function themeFromCss(): { background: string; foreground: string; cursor: string; selectionBackground: string } {
+function themeFromCss() {
 	const s = getComputedStyle(document.documentElement);
 	const v = (n: string) => s.getPropertyValue(n).trim();
 	return {
@@ -20,16 +20,34 @@ function themeFromCss(): { background: string; foreground: string; cursor: strin
 
 type Stat = { label: string; ok?: boolean };
 
-/** 로컬 터미널(PTY). 출력은 바이너리 채널 → xterm.write(Uint8Array). React 상태를 거치지 않는다. */
-export function TerminalPane({ active }: { active: boolean }) {
+/**
+ * 터미널 칸 — 원격(SSH 채널)·내 PC(PTY) 공용. 출력은 바이너리 채널 → xterm.write(Uint8Array).
+ * React 상태를 거치지 않는다(대량 출력에서 멈추지 않게).
+ */
+export function TerminalView({
+	backend,
+	active,
+	cwd,
+	label,
+	showBench = false,
+	toolbar = true,
+}: {
+	backend: TermBackend;
+	active: boolean;
+	cwd?: string;
+	label: string;
+	showBench?: boolean;
+	toolbar?: boolean;
+}) {
 	const host = useRef<HTMLDivElement>(null);
 	const termRef = useRef<XTerm | null>(null);
 	const fitRef = useRef<FitAddon | null>(null);
 	const idRef = useRef<number | null>(null);
-	const [stat, setStat] = useState<Stat>({ label: "시작 중…" });
+	const [stat, setStat] = useState<Stat>({ label: "여는 중…" });
 	const [gen, setGen] = useState(0);
 	const [benching, setBenching] = useState(false);
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: gen 이 바뀌면 다시 연다
 	useEffect(() => {
 		const el = host.current;
 		if (!el) return;
@@ -38,7 +56,7 @@ export function TerminalPane({ active }: { active: boolean }) {
 			fontSize: 13,
 			lineHeight: 1.15,
 			cursorBlink: true,
-			scrollback: 10000,
+			scrollback: 5000,
 			allowProposedApi: true,
 			theme: themeFromCss(),
 		});
@@ -50,7 +68,7 @@ export function TerminalPane({ active }: { active: boolean }) {
 			webgl.onContextLoss(() => webgl.dispose());
 			term.loadAddon(webgl);
 		} catch {
-			// WebGL 이 안 되는 GPU 는 xterm 기본 렌더러로 물러난다
+			// WebGL 이 안 되는 GPU 는 xterm 기본 렌더러로
 		}
 		fit.fit();
 		termRef.current = term;
@@ -59,32 +77,32 @@ export function TerminalPane({ active }: { active: boolean }) {
 		let disposed = false;
 		const started = performance.now();
 		const ch = bytesChannel((b) => term.write(b));
-		api
-			.ptyOpen(term.cols, term.rows, ch)
+		backend
+			.open(term.cols, term.rows, ch, cwd)
 			.then((id) => {
 				if (disposed) {
-					void api.ptyClose(id);
+					void backend.close(id);
 					return;
 				}
 				idRef.current = id;
-				setStat({ label: `로컬 셸 · ${Math.round(performance.now() - started)} ms에 열림`, ok: true });
+				setStat({ label: `${label} · ${Math.round(performance.now() - started)} ms에 열림`, ok: true });
 			})
-			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${String(e)}` }));
+			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${typeof e === "object" ? (e as { message?: string }).message : String(e)}` }));
 
 		const onData = term.onData((d) => {
-			if (idRef.current != null) void api.ptyWrite(idRef.current, d);
+			if (idRef.current != null) void backend.write(idRef.current, d);
 		});
 		const onResize = term.onResize(({ cols, rows }) => {
-			if (idRef.current != null) void api.ptyResize(idRef.current, cols, rows);
+			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
 		const ro = new ResizeObserver(() => {
-			if (el.offsetWidth > 0) fit.fit();
+			if (el.offsetWidth > 0 && el.offsetHeight > 0) fit.fit();
 		});
 		ro.observe(el);
-		const unlisten = listen<{ id: number }>("pty-exit", (e) => {
-			if (e.payload.id === idRef.current) {
+		const unlisten = listen(backend.exitEvent, (e) => {
+			if (idRef.current != null && backend.isMine(e.payload, idRef.current)) {
 				idRef.current = null;
-				setStat({ label: "셸이 끝났습니다 — 다시 열기" });
+				setStat({ label: "셸이 끝났습니다 — ↻ 로 다시 열기" });
 			}
 		});
 		const mq = matchMedia("(prefers-color-scheme: dark)");
@@ -100,12 +118,12 @@ export function TerminalPane({ active }: { active: boolean }) {
 			ro.disconnect();
 			onData.dispose();
 			onResize.dispose();
-			if (idRef.current != null) void api.ptyClose(idRef.current);
+			if (idRef.current != null) void backend.close(idRef.current);
 			idRef.current = null;
 			term.dispose();
 			termRef.current = null;
 		};
-	}, [gen]);
+	}, [gen, backend]);
 
 	useEffect(() => {
 		if (active) {
@@ -146,18 +164,27 @@ export function TerminalPane({ active }: { active: boolean }) {
 
 	return (
 		<>
-			<div className="toolbar">
-				<span className="title">로컬 터미널</span>
-				<button type="button" className="btn ghost" onClick={bench} disabled={benching} title="24 MiB 출력 벤치(스파이크 1)">
-					<Gauge size={15} /> 출력 벤치
-				</button>
-				<button type="button" className="btn ghost icon" onClick={() => setGen((g) => g + 1)} title="다시 열기">
-					<RotateCcw size={15} />
-				</button>
-			</div>
-			<div className="term-host" ref={host} />
+			{toolbar && (
+				<div className="toolbar">
+					<span className="title">{label}</span>
+					{showBench && (
+						<button type="button" className="btn ghost" onClick={bench} disabled={benching} title="24 MiB 출력 벤치">
+							<Gauge size={15} /> 출력 벤치
+						</button>
+					)}
+					<button type="button" className="btn ghost icon" onClick={() => setGen((g) => g + 1)} title="셸 다시 열기">
+						<RotateCcw size={15} />
+					</button>
+				</div>
+			)}
+			<div className="term-host" ref={host} onClick={() => termRef.current?.focus()} />
 			<div className="statusbar">
 				<span className={stat.ok ? "ok" : undefined}>{stat.label}</span>
+				{!toolbar && (
+					<button type="button" className="btn ghost icon" style={{ marginLeft: "auto", height: 20, width: 20 }} onClick={() => setGen((g) => g + 1)} title="셸 다시 열기">
+						<RotateCcw size={12} />
+					</button>
+				)}
 			</div>
 		</>
 	);

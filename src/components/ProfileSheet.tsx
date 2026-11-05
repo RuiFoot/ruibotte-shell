@@ -1,39 +1,57 @@
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { FolderOpen } from "lucide-react";
 import { useState } from "react";
-import { api, type Profile } from "../lib/ipc";
+import { api, type LegacyLevel, type Profile } from "../lib/ipc";
 
 const COLORS = ["#0a84ff", "#30d158", "#ff9f0a", "#ff453a", "#bf5af2", "#8e8e93"];
 const DB_PORT: Record<string, number> = { postgres: 5432, mariadb: 3306, mysql: 3306 };
 
-/** 접속 프로필 시트 — 이 판은 저장만(실제 SSH·DB 연결은 다음 판) */
+export function blankProfile(kind: "ssh" | "db"): Profile {
+	return {
+		kind,
+		name: "",
+		host: "",
+		port: kind === "ssh" ? 22 : 5432,
+		username: "",
+		engine: kind === "db" ? "postgres" : null,
+		color: COLORS[0],
+		favorite: true,
+		auth: "password",
+		keyPath: null,
+		legacy: "off",
+		defaultPath: null,
+		database: null,
+	};
+}
+
+/** 접속 프로필 만들기·고치기 */
 export function ProfileSheet({
-	initialKind,
+	initial,
 	onClose,
 	onSaved,
 }: {
-	initialKind: "ssh" | "db";
+	initial: Profile;
 	onClose: () => void;
-	onSaved: () => void;
+	onSaved: (id: number) => void;
 }) {
-	const [p, setP] = useState<Profile>({
-		kind: initialKind,
-		name: "",
-		host: "",
-		port: initialKind === "ssh" ? 22 : 5432,
-		username: "",
-		engine: initialKind === "db" ? "postgres" : null,
-		color: COLORS[0],
-		favorite: true,
-	});
+	const [p, setP] = useState<Profile>(initial);
 	const [err, setErr] = useState("");
+	const [advanced, setAdvanced] = useState(initial.legacy !== "off");
 	const set = (patch: Partial<Profile>) => setP((x) => ({ ...x, ...patch }));
+	const editing = initial.id != null;
 
 	async function save() {
 		try {
-			await api.profileSave(p);
-			onSaved();
+			const id = await api.profileSave(p);
+			onSaved(id);
 		} catch (e) {
 			setErr(String(e));
 		}
+	}
+
+	async function pickKey() {
+		const f = await openDialog({ multiple: false, directory: false, title: "개인키 파일 고르기" });
+		if (typeof f === "string") set({ keyPath: f });
 	}
 
 	return (
@@ -46,19 +64,27 @@ export function ProfileSheet({
 				}}
 				onKeyDown={(e) => e.key === "Escape" && onClose()}
 			>
-				<h3>새 연결</h3>
-				<div className="seg" role="group">
-					{(["ssh", "db"] as const).map((k) => (
-						<button
-							key={k}
-							type="button"
-							aria-pressed={p.kind === k}
-							onClick={() => set({ kind: k, port: k === "ssh" ? 22 : DB_PORT[p.engine ?? "postgres"] ?? 5432, engine: k === "db" ? (p.engine ?? "postgres") : null })}
-						>
-							{k === "ssh" ? "SSH 서버" : "데이터베이스"}
-						</button>
-					))}
-				</div>
+				<h3>{editing ? "연결 고치기" : "새 연결"}</h3>
+				{!editing && (
+					<div className="seg" role="group">
+						{(["ssh", "db"] as const).map((k) => (
+							<button
+								key={k}
+								type="button"
+								aria-pressed={p.kind === k}
+								onClick={() =>
+									set({
+										kind: k,
+										port: k === "ssh" ? 22 : (DB_PORT[p.engine ?? "postgres"] ?? 5432),
+										engine: k === "db" ? (p.engine ?? "postgres") : null,
+									})
+								}
+							>
+								{k === "ssh" ? "SSH 서버" : "데이터베이스"}
+							</button>
+						))}
+					</div>
+				)}
 				<div className="field">
 					<label htmlFor="pf-name">이름</label>
 					<input id="pf-name" autoFocus value={p.name} onChange={(e) => set({ name: e.target.value })} placeholder="예: 개발 서버" />
@@ -87,6 +113,42 @@ export function ProfileSheet({
 					<label htmlFor="pf-user">계정</label>
 					<input id="pf-user" value={p.username} onChange={(e) => set({ username: e.target.value })} spellCheck={false} />
 				</div>
+				{p.kind === "ssh" && (
+					<>
+						<div className="field">
+							<label>인증</label>
+							<div className="seg" role="group" style={{ margin: 0 }}>
+								<button type="button" aria-pressed={p.auth === "password"} onClick={() => set({ auth: "password" })}>
+									암호
+								</button>
+								<button type="button" aria-pressed={p.auth === "key"} onClick={() => set({ auth: "key" })}>
+									개인키
+								</button>
+							</div>
+						</div>
+						{p.auth === "key" && (
+							<div className="field">
+								<label htmlFor="pf-key">개인키 파일</label>
+								<div style={{ display: "flex", gap: 6 }}>
+									<input id="pf-key" style={{ flex: 1 }} value={p.keyPath ?? ""} onChange={(e) => set({ keyPath: e.target.value })} placeholder="~/.ssh/id_ed25519" spellCheck={false} />
+									<button type="button" className="btn" onClick={() => void pickKey()}>
+										<FolderOpen size={14} /> 찾기
+									</button>
+								</div>
+							</div>
+						)}
+						<div className="field">
+							<label htmlFor="pf-path">시작 폴더(비우면 홈)</label>
+							<input id="pf-path" value={p.defaultPath ?? ""} onChange={(e) => set({ defaultPath: e.target.value || null })} placeholder="/var/log" spellCheck={false} />
+						</div>
+					</>
+				)}
+				{p.kind === "db" && (
+					<div className="field">
+						<label htmlFor="pf-db">데이터베이스</label>
+						<input id="pf-db" value={p.database ?? ""} onChange={(e) => set({ database: e.target.value || null })} spellCheck={false} />
+					</div>
+				)}
 				<div className="field">
 					<label>색</label>
 					<div style={{ display: "flex", gap: 8 }}>
@@ -109,9 +171,25 @@ export function ProfileSheet({
 						))}
 					</div>
 				</div>
-				<p style={{ color: "var(--text-3)", fontSize: 12, margin: "10px 0 0" }}>
-					암호는 저장하지 않습니다. 실제 연결과 OS 자격 증명 저장은 다음 판에서 붙습니다.
-				</p>
+				{p.kind === "ssh" && (
+					<>
+						<button type="button" className="btn ghost" style={{ padding: 0, color: "var(--text-2)" }} onClick={() => setAdvanced((a) => !a)}>
+							{advanced ? "▾" : "▸"} 고급
+						</button>
+						{advanced && (
+							<div className="field" style={{ marginTop: 8 }}>
+								<label htmlFor="pf-legacy">구형 SSH 호환(이 서버에만)</label>
+								<select id="pf-legacy" value={p.legacy} onChange={(e) => set({ legacy: e.target.value as LegacyLevel })}>
+									<option value="off">끔(권장)</option>
+									<option value="rsa">RSA — ssh-rsa(SHA-1) 호스트 키</option>
+									<option value="sha1">SHA1 — SHA-1 키 교환·CBC 암호</option>
+									<option value="weakest">최후 — ssh-dss·group1·3des 까지</option>
+								</select>
+							</div>
+						)}
+					</>
+				)}
+				<p style={{ color: "var(--text-3)", fontSize: 12, margin: "10px 0 0" }}>암호는 여기서 받지 않습니다. 접속할 때 묻고, 원하면 OS 자격 증명 저장소에 저장합니다.</p>
 				{err && <p className="err">{err}</p>}
 				<div className="sheet-actions">
 					<button type="button" className="btn" onClick={onClose}>

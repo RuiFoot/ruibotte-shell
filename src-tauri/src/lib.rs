@@ -1,6 +1,10 @@
 mod grid;
+mod localfs;
 mod pty;
+mod secrets;
+mod ssh;
 mod store;
+mod textcodec;
 
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -59,8 +63,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(pty::Ptys::default())
         .manage(grid::Grids::default())
+        .manage(ssh::SshConns::default())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
@@ -84,6 +90,21 @@ pub fn run() {
             store::profile_delete,
             store::setting_get,
             store::setting_set,
+            secrets::secret_forget,
+            ssh::ssh_connect,
+            ssh::ssh_disconnect,
+            ssh::ssh_shell_open,
+            ssh::ssh_shell_write,
+            ssh::ssh_shell_resize,
+            ssh::ssh_shell_close,
+            ssh::sftp_list,
+            ssh::sftp_read_text,
+            ssh::sftp_write_text,
+            ssh::sftp_realpath,
+            localfs::local_home,
+            localfs::local_list,
+            localfs::local_read_text,
+            localfs::local_write_text,
         ])
         .run(tauri::generate_context!())
         .expect("RuiBotte Shell 을 시작하지 못했습니다");

@@ -1,0 +1,699 @@
+//! SSH 접속 — russh 클라이언트 하나에 터미널 채널 여러 개 + SFTP 채널 하나.
+//! - 호스트 키: 처음엔 지문을 보여 주고 사용자가 확인하면 고정(TOFU). 바뀌면 인증 전에 끊는다.
+//! - 구형 호환 단계(off·rsa·sha1·weakest): 그 연결에만 오래된 알고리즘을 더한다.
+//!   협상이 실패하면 서버가 내민 목록으로 가장 낮은 단계를 제안한다.
+//! - 비밀(암호·개인키 암호)은 접속에 성공한 뒤에만, 사용자가 원할 때 OS 자격 증명 저장소에 넣는다.
+
+// 오류는 화면에 그대로 넘기는 드문 경로라 크기를 줄이지 않는다
+#![allow(clippy::result_large_err)]
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use russh::client::{self, Handle, Msg};
+use russh::keys::{load_secret_key, Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::{cipher, kex, mac, ChannelMsg, ChannelWriteHalf, Disconnect, Preferred};
+use russh_sftp::client::SftpSession;
+use serde::{Deserialize, Serialize};
+use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{AppHandle, Emitter, State};
+
+use crate::secrets;
+use crate::store::{PinnedKey, Store};
+use crate::textcodec::{self, TextMeta};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+/// 편집기로 여는 파일 상한 — 넘으면 읽기만 권한다
+const MAX_TEXT: u64 = 8 * 1024 * 1024;
+
+// ── 오류 ─────────────────────────────
+
+#[derive(Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SshError {
+    /// HOSTKEY_UNKNOWN | HOSTKEY_MISMATCH | NEGOTIATION | AUTH_FAILED | NEED_SECRET | NETWORK | CLOSED | SFTP | OTHER
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    algorithm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theirs: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggest: Option<&'static str>,
+}
+
+fn err(code: &'static str, message: impl Into<String>) -> SshError {
+    SshError { code, message: message.into(), ..Default::default() }
+}
+
+type R<T> = Result<T, SshError>;
+
+/// 서버가 내민 목록에서 켜야 할 가장 낮은 단계
+fn suggest_level(theirs: &[String]) -> Option<&'static str> {
+    let has = |n: &str| theirs.iter().any(|t| t == n);
+    if has("ssh-rsa") && theirs.iter().all(|t| t == "ssh-rsa" || t == "ssh-dss") {
+        return Some("rsa");
+    }
+    let sha1 = has("diffie-hellman-group14-sha1")
+        || has("diffie-hellman-group-exchange-sha1")
+        || has("hmac-sha1")
+        || theirs.iter().any(|t| t.starts_with("aes") && t.ends_with("-cbc"));
+    if sha1 {
+        return Some("sha1");
+    }
+    if has("diffie-hellman-group1-sha1") || has("ssh-dss") || has("3des-cbc") {
+        return Some("weakest");
+    }
+    None
+}
+
+fn map_russh(e: russh::Error) -> SshError {
+    match e {
+        russh::Error::NoCommonAlgo { kind, ours: _, theirs } => {
+            let suggest = suggest_level(&theirs);
+            SshError {
+                code: "NEGOTIATION",
+                message: format!("서버와 맞는 {kind:?} 알고리즘이 없습니다"),
+                kind: Some(format!("{kind:?}")),
+                suggest,
+                theirs: Some(theirs),
+                ..Default::default()
+            }
+        }
+        russh::Error::IO(io) => err("NETWORK", format!("연결하지 못했습니다: {io}")),
+        russh::Error::ConnectionTimeout | russh::Error::KeepaliveTimeout | russh::Error::InactivityTimeout => {
+            err("NETWORK", "응답이 없습니다")
+        }
+        russh::Error::Disconnect | russh::Error::HUP => err("CLOSED", "연결이 끊겼습니다"),
+        other => err("OTHER", other.to_string()),
+    }
+}
+
+// ── 구형 호환 단계 ───────────────────
+
+fn preferred(level: &str) -> Preferred {
+    let base = Preferred::default();
+    let mut key: Vec<Algorithm> = base.key.to_vec();
+    let mut kexes: Vec<kex::Name> = base.kex.to_vec();
+    let mut ciphers: Vec<cipher::Name> = base.cipher.to_vec();
+    let mut macs: Vec<mac::Name> = base.mac.to_vec();
+    if level == "off" {
+        // 기본은 SHA-1 서명 ssh-rsa 도 뺀다(서버마다 켜는 것)
+        key.retain(|a| *a != Algorithm::Rsa { hash: None });
+    }
+    if level == "sha1" || level == "weakest" {
+        kexes.extend([kex::DH_G14_SHA1, kex::DH_GEX_SHA1]);
+        ciphers.extend([cipher::AES_128_CBC, cipher::AES_192_CBC, cipher::AES_256_CBC]);
+        macs.extend([mac::HMAC_SHA1_ETM, mac::HMAC_SHA1]);
+    }
+    if level == "weakest" {
+        kexes.push(kex::DH_G1_SHA1);
+        ciphers.push(cipher::TRIPLE_DES_CBC);
+        key.push(Algorithm::Dsa);
+    }
+    Preferred {
+        kex: Cow::Owned(kexes),
+        key: Cow::Owned(key),
+        cipher: Cow::Owned(ciphers),
+        mac: Cow::Owned(macs),
+        ..base
+    }
+}
+
+// ── 클라이언트 처리기(호스트 키) ─────
+
+struct Client {
+    pinned: Option<PinnedKey>,
+    trust: Option<String>,
+    seen: Arc<Mutex<Option<PinnedKey>>>,
+}
+
+impl client::Handler for Client {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, server: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        let PublicKeyOrCertificate::PublicKey { key, .. } = server else {
+            return Ok(false); // 인증서 호스트 키는 다음 판
+        };
+        let seen = PinnedKey {
+            algorithm: key.algorithm().to_string(),
+            fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+            public_key: key.to_openssh().unwrap_or_default(),
+        };
+        let ok = match (&self.pinned, &self.trust) {
+            (_, Some(t)) => *t == seen.fingerprint,
+            (Some(p), None) => p.fingerprint == seen.fingerprint,
+            (None, None) => false,
+        };
+        *self.seen.lock().unwrap() = Some(seen);
+        Ok(ok)
+    }
+}
+
+// ── 연결 상태 ────────────────────────
+
+struct Conn {
+    handle: Handle<Client>,
+    sftp: SftpSession,
+    shells: tokio::sync::Mutex<HashMap<u32, ChannelWriteHalf<Msg>>>,
+    next_shell: AtomicU32,
+}
+
+#[derive(Default)]
+pub struct SshConns {
+    next: AtomicU32,
+    map: Mutex<HashMap<u32, Arc<Conn>>>,
+}
+
+impl SshConns {
+    fn get(&self, id: u32) -> R<Arc<Conn>> {
+        self.map.lock().unwrap().get(&id).cloned().ok_or_else(|| err("CLOSED", "연결이 닫혔습니다"))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectReq {
+    profile_id: Option<i64>,
+    host: String,
+    port: u16,
+    username: String,
+    /// "password" | "key"
+    auth: String,
+    key_path: Option<String>,
+    /// 암호(auth=password) 또는 개인키 암호(auth=key). 비우면 저장된 비밀을 쓴다
+    secret: Option<String>,
+    legacy: String,
+    /// 사용자가 화면에서 확인한 지문 — 고정 키가 없거나 바뀌었을 때만
+    trust_fingerprint: Option<String>,
+    #[serde(default)]
+    save_secret: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectOk {
+    conn_id: u32,
+    home: String,
+    fingerprint: String,
+    algorithm: String,
+    newly_pinned: bool,
+    used_saved_secret: bool,
+}
+
+#[tauri::command]
+pub async fn ssh_connect(store: State<'_, Store>, conns: State<'_, SshConns>, req: ConnectReq) -> R<ConnectOk> {
+    connect(&store, &conns, req).await
+}
+
+pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) -> R<ConnectOk> {
+    let pinned = store.host_key(&req.host, req.port);
+    let seen = Arc::new(Mutex::new(None));
+    let handler = Client { pinned: pinned.clone(), trust: req.trust_fingerprint.clone(), seen: seen.clone() };
+    let config = Arc::new(client::Config {
+        preferred: preferred(&req.legacy),
+        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_max: 4,
+        nodelay: true,
+        ..Default::default()
+    });
+
+    let connected = tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, (req.host.as_str(), req.port), handler))
+        .await
+        .map_err(|_| err("NETWORK", format!("{}:{} 에 {}초 안에 닿지 못했습니다", req.host, req.port, CONNECT_TIMEOUT.as_secs())))?;
+    let mut handle = match connected {
+        Ok(h) => h,
+        Err(e) => {
+            // 호스트 키를 거절한 경우: 모르는 키인지 바뀐 키인지 알려 준다
+            if let Some(s) = seen.lock().unwrap().clone() {
+                let accepted = req.trust_fingerprint.as_deref() == Some(&s.fingerprint)
+                    || pinned.as_ref().map(|p| p.fingerprint == s.fingerprint).unwrap_or(false);
+                if !accepted {
+                    let mismatch = pinned.is_some();
+                    return Err(SshError {
+                        code: if mismatch { "HOSTKEY_MISMATCH" } else { "HOSTKEY_UNKNOWN" },
+                        message: if mismatch {
+                            "서버의 호스트 키가 고정한 키와 다릅니다. 서버를 다시 설치했거나 다른 서버로 연결되고 있을 수 있습니다.".into()
+                        } else {
+                            "처음 접속하는 서버입니다. 지문을 확인하세요.".into()
+                        },
+                        fingerprint: Some(s.fingerprint),
+                        algorithm: Some(s.algorithm),
+                        pinned_fingerprint: pinned.map(|p| p.fingerprint),
+                        ..Default::default()
+                    });
+                }
+            }
+            return Err(map_russh(e));
+        }
+    };
+
+    // 인증
+    let mut used_saved = false;
+    let secret = match req.secret.clone().filter(|s| !s.is_empty()) {
+        Some(s) => Some(s),
+        None => {
+            let saved = req.profile_id.and_then(|id| secrets::get(&format!("profile:{id}")));
+            used_saved = saved.is_some();
+            saved
+        }
+    };
+    let ok = if req.auth == "key" {
+        let path = req.key_path.clone().filter(|p| !p.is_empty()).ok_or_else(|| err("OTHER", "개인키 파일을 고르세요"))?;
+        let key = match load_secret_key(&path, secret.as_deref()) {
+            Ok(k) => k,
+            Err(russh::keys::Error::KeyIsEncrypted) => return Err(err("NEED_SECRET", "개인키 암호를 입력하세요")),
+            Err(e) => return Err(err("AUTH_FAILED", format!("개인키를 읽지 못했습니다: {e}"))),
+        };
+        let hash = handle.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
+        handle
+            .authenticate_publickey(&req.username, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+            .await
+            .map_err(map_russh)?
+            .success()
+    } else {
+        let Some(pw) = secret.clone() else {
+            return Err(err("NEED_SECRET", "암호를 입력하세요"));
+        };
+        let mut ok = handle.authenticate_password(&req.username, &pw).await.map_err(map_russh)?.success();
+        if !ok {
+            // 암호 방식이 꺼지고 keyboard-interactive 만 켠 서버(흔함)
+            ok = keyboard_interactive(&mut handle, &req.username, &pw).await.unwrap_or(false);
+        }
+        ok
+    };
+    if !ok {
+        if used_saved {
+            if let Some(id) = req.profile_id {
+                secrets::forget(&format!("profile:{id}"));
+                store.mark_used(id, Some(false));
+            }
+        }
+        return Err(err("AUTH_FAILED", if used_saved { "저장한 암호가 맞지 않아 지웠습니다. 다시 입력하세요." } else { "계정 또는 암호가 맞지 않습니다" }));
+    }
+
+    // 접속 성공 — 처음 키면 고정, 원하면 비밀 저장
+    let seen_key = seen.lock().unwrap().clone().ok_or_else(|| err("OTHER", "호스트 키를 받지 못했습니다"))?;
+    let newly_pinned = pinned.as_ref().map(|p| p.fingerprint != seen_key.fingerprint).unwrap_or(true);
+    if newly_pinned {
+        store.pin_host_key(&req.host, req.port, &seen_key).map_err(|e| err("OTHER", e))?;
+    }
+    if let Some(id) = req.profile_id {
+        let mut saved = None;
+        if req.save_secret {
+            if let Some(s) = secret.as_deref().filter(|_| !used_saved) {
+                saved = Some(secrets::set(&format!("profile:{id}"), s).is_ok());
+            }
+        }
+        store.mark_used(id, saved);
+    }
+
+    let ch = handle.channel_open_session().await.map_err(map_russh)?;
+    ch.request_subsystem(true, "sftp").await.map_err(map_russh)?;
+    let sftp = SftpSession::new(ch.into_stream()).await.map_err(|e| err("SFTP", format!("SFTP 를 열지 못했습니다: {e}")))?;
+    let home = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
+
+    let id = conns.next.fetch_add(1, Ordering::Relaxed) + 1;
+    conns.map.lock().unwrap().insert(
+        id,
+        Arc::new(Conn { handle, sftp, shells: Default::default(), next_shell: AtomicU32::new(0) }),
+    );
+    Ok(ConnectOk {
+        conn_id: id,
+        home,
+        fingerprint: seen_key.fingerprint,
+        algorithm: seen_key.algorithm,
+        newly_pinned,
+        used_saved_secret: used_saved,
+    })
+}
+
+async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, pw: &str) -> Result<bool, russh::Error> {
+    use russh::client::KeyboardInteractiveAuthResponse as K;
+    let mut resp = handle.authenticate_keyboard_interactive_start(user, None::<String>).await?;
+    for _ in 0..4 {
+        match resp {
+            K::Success => return Ok(true),
+            K::Failure { .. } => return Ok(false),
+            K::InfoRequest { prompts, .. } => {
+                let answers = prompts.iter().map(|_| pw.to_string()).collect();
+                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[tauri::command]
+pub async fn ssh_disconnect(conns: State<'_, SshConns>, conn: u32) -> R<()> {
+    let c = conns.map.lock().unwrap().remove(&conn);
+    if let Some(c) = c {
+        let _ = c.sftp.close().await;
+        let _ = c.handle.disconnect(Disconnect::ByApplication, "", "ko").await;
+    }
+    Ok(())
+}
+
+// ── 터미널 채널 ──────────────────────
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ShellExit {
+    conn: u32,
+    shell: u32,
+    code: Option<u32>,
+}
+
+#[tauri::command]
+pub async fn ssh_shell_open(
+    app: AppHandle,
+    conns: State<'_, SshConns>,
+    conn: u32,
+    cols: u32,
+    rows: u32,
+    cwd: Option<String>,
+    on_data: Channel<InvokeResponseBody>,
+) -> R<u32> {
+    let c = conns.get(conn)?;
+    let ch = c.handle.channel_open_session().await.map_err(map_russh)?;
+    ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(map_russh)?;
+    ch.request_shell(true).await.map_err(map_russh)?;
+    let (mut read, write) = ch.split();
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        // 시작 폴더 — 앞 공백은 셸 기록에 남지 않게(HISTCONTROL=ignorespace 인 서버)
+        let line = format!(" cd '{}' && clear\n", dir.replace('\'', "'\\''"));
+        let _ = write.data(line.as_bytes()).await;
+    }
+    let shell = c.next_shell.fetch_add(1, Ordering::Relaxed) + 1;
+    c.shells.lock().await.insert(shell, write);
+    let conns_map = c.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut code = None;
+        while let Some(msg) = read.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    if on_data.send(InvokeResponseBody::Raw(data.to_vec())).is_err() {
+                        break;
+                    }
+                }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    let _ = on_data.send(InvokeResponseBody::Raw(data.to_vec()));
+                }
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        conns_map.shells.lock().await.remove(&shell);
+        let _ = app.emit("ssh-shell-exit", ShellExit { conn, shell, code });
+    });
+    Ok(shell)
+}
+
+#[tauri::command]
+pub async fn ssh_shell_write(conns: State<'_, SshConns>, conn: u32, shell: u32, data: String) -> R<()> {
+    let c = conns.get(conn)?;
+    let shells = c.shells.lock().await;
+    let w = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
+    w.data(data.as_bytes()).await.map_err(map_russh)
+}
+
+#[tauri::command]
+pub async fn ssh_shell_resize(conns: State<'_, SshConns>, conn: u32, shell: u32, cols: u32, rows: u32) -> R<()> {
+    let c = conns.get(conn)?;
+    let shells = c.shells.lock().await;
+    if let Some(w) = shells.get(&shell) {
+        w.window_change(cols, rows, 0, 0).await.map_err(map_russh)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ssh_shell_close(conns: State<'_, SshConns>, conn: u32, shell: u32) -> R<()> {
+    if let Ok(c) = conns.get(conn) {
+        if let Some(w) = c.shells.lock().await.remove(&shell) {
+            let _ = w.close().await;
+        }
+    }
+    Ok(())
+}
+
+// ── SFTP ─────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsEntry {
+    name: String,
+    path: String,
+    /// "dir" | "file" | "link" | "other"
+    kind: &'static str,
+    size: u64,
+    mtime: Option<u32>,
+    mode: Option<u32>,
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+fn sftp_err(e: russh_sftp::client::error::Error) -> SshError {
+    let msg = e.to_string();
+    let friendly = if msg.contains("Permission denied") || msg.contains("PermissionDenied") {
+        "권한이 없습니다".to_string()
+    } else if msg.contains("No such file") || msg.contains("NoSuchFile") {
+        "파일이 없습니다".to_string()
+    } else {
+        msg
+    };
+    err("SFTP", friendly)
+}
+
+#[tauri::command]
+pub async fn sftp_list(conns: State<'_, SshConns>, conn: u32, path: String) -> R<Vec<FsEntry>> {
+    list(&conns, conn, path).await
+}
+
+pub(crate) async fn list(conns: &SshConns, conn: u32, path: String) -> R<Vec<FsEntry>> {
+    let c = conns.get(conn)?;
+    let dir = c.sftp.read_dir(path.clone()).await.map_err(sftp_err)?;
+    let mut out: Vec<FsEntry> = Vec::new();
+    for e in dir {
+        let name = e.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let m = e.metadata();
+        let mut kind = if m.is_dir() {
+            "dir"
+        } else if m.is_symlink() {
+            "link"
+        } else if m.is_regular() {
+            "file"
+        } else {
+            "other"
+        };
+        let full = join(&path, &name);
+        if kind == "link" {
+            // 링크가 가리키는 것이 폴더면 폴더처럼 펼친다
+            if let Ok(t) = c.sftp.metadata(full.clone()).await {
+                if t.is_dir() {
+                    kind = "dir";
+                }
+            }
+        }
+        out.push(FsEntry { name, path: full, kind, size: m.size.unwrap_or(0), mtime: m.mtime, mode: m.permissions });
+    }
+    out.sort_by(|a, b| (a.kind != "dir").cmp(&(b.kind != "dir")).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(out)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileText {
+    path: String,
+    size: u64,
+    mtime: Option<u32>,
+    text: Option<String>,
+    meta: TextMeta,
+    binary: bool,
+    too_large: bool,
+}
+
+#[tauri::command]
+pub async fn sftp_read_text(conns: State<'_, SshConns>, conn: u32, path: String, encoding: Option<String>) -> R<FileText> {
+    read_text(&conns, conn, path, encoding).await
+}
+
+pub(crate) async fn read_text(conns: &SshConns, conn: u32, path: String, encoding: Option<String>) -> R<FileText> {
+    let c = conns.get(conn)?;
+    let m = c.sftp.metadata(path.clone()).await.map_err(sftp_err)?;
+    let size = m.size.unwrap_or(0);
+    if size > MAX_TEXT {
+        return Ok(FileText {
+            path,
+            size,
+            mtime: m.mtime,
+            text: None,
+            meta: TextMeta { encoding: "UTF-8".into(), bom: false, eol: "LF".into(), guessed: false },
+            binary: false,
+            too_large: true,
+        });
+    }
+    let bytes = c.sftp.read(path.clone()).await.map_err(sftp_err)?;
+    let d = textcodec::decode(&bytes, encoding.as_deref());
+    Ok(FileText { path, size, mtime: m.mtime, text: d.text, meta: d.meta, binary: d.binary, too_large: false })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Saved {
+    size: u64,
+    mtime: Option<u32>,
+}
+
+/// 저장 — 연 뒤 서버에서 바뀌었으면(mtime·크기) 덮어쓰지 않고 알린다(expectMtime 을 주면)
+#[tauri::command]
+pub async fn sftp_write_text(
+    conns: State<'_, SshConns>,
+    conn: u32,
+    path: String,
+    text: String,
+    meta: TextMeta,
+    expect_mtime: Option<u32>,
+) -> R<Saved> {
+    let c = conns.get(conn)?;
+    if let Some(exp) = expect_mtime {
+        if let Ok(m) = c.sftp.metadata(path.clone()).await {
+            if m.mtime.is_some_and(|t| t != exp) {
+                return Err(err("CONFLICT", "연 뒤에 서버에서 파일이 바뀌었습니다. 다시 열어 확인하세요."));
+            }
+        }
+    }
+    let bytes = textcodec::encode(&text, &meta).map_err(|e| err("ENCODING", e))?;
+    // 같은 파일에 덮어써 소유자·권한을 지킨다(TRUNCATE)
+    c.sftp.write(path.clone(), &bytes).await.map_err(sftp_err)?;
+    let m = c.sftp.metadata(path).await.map_err(sftp_err)?;
+    Ok(Saved { size: m.size.unwrap_or(bytes.len() as u64), mtime: m.mtime })
+}
+
+#[tauri::command]
+pub async fn sftp_realpath(conns: State<'_, SshConns>, conn: u32, path: String) -> R<String> {
+    let c = conns.get(conn)?;
+    c.sftp.canonicalize(path).await.map_err(sftp_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggests_lowest_level() {
+        let s = |v: &[&str]| suggest_level(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(s(&["ssh-rsa", "ssh-dss"]), Some("rsa"));
+        assert_eq!(s(&["diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1"]), Some("sha1"));
+        assert_eq!(s(&["diffie-hellman-group1-sha1"]), Some("weakest"));
+        assert_eq!(s(&["aes128-cbc", "3des-cbc"]), Some("sha1"));
+        assert_eq!(s(&["curve25519-sha256"]), None);
+    }
+
+    /// 실제 sshd 로 — `RB_SSH_TEST=127.0.0.1:22122:22123` 와 `RB_SSH_TEST_PW` 를 줄 때만(cargo test -- --ignored)
+    #[tokio::test]
+    #[ignore]
+    async fn live_connect_pin_list_read_legacy() {
+        let spec = std::env::var("RB_SSH_TEST").expect("RB_SSH_TEST=host:modernPort:legacyPort");
+        let pw = std::env::var("RB_SSH_TEST_PW").expect("RB_SSH_TEST_PW");
+        let mut it = spec.split(':');
+        let host = it.next().unwrap().to_string();
+        let modern: u16 = it.next().unwrap().parse().unwrap();
+        let legacy: u16 = it.next().unwrap().parse().unwrap();
+        let dir = std::env::temp_dir().join(format!("rbshell-test-{}", std::process::id()));
+        let store = Store::open(dir.clone(), false).unwrap();
+        let conns = SshConns::default();
+        let req = |port: u16, level: &str, trust: Option<String>, secret: Option<&str>| ConnectReq {
+            profile_id: None,
+            host: host.clone(),
+            port,
+            username: "rbtest".into(),
+            auth: "password".into(),
+            key_path: None,
+            secret: secret.map(Into::into),
+            legacy: level.into(),
+            trust_fingerprint: trust,
+            save_secret: false,
+        };
+
+        // 1) 처음 → 지문 확인 요구
+        let e = connect(&store, &conns, req(modern, "off", None, Some(&pw))).await.err().unwrap();
+        assert_eq!(e.code, "HOSTKEY_UNKNOWN");
+        let fp = e.fingerprint.clone().unwrap();
+        println!("modern 지문 {fp} ({:?})", e.algorithm);
+        // 2) 확인 → 접속·고정
+        let t0 = std::time::Instant::now();
+        let ok = connect(&store, &conns, req(modern, "off", Some(fp.clone()), Some(&pw))).await.unwrap();
+        println!("접속 {} ms, home {}", t0.elapsed().as_millis(), ok.home);
+        assert!(ok.newly_pinned);
+        // 3) 고정 뒤에는 묻지 않음
+        let ok2 = connect(&store, &conns, req(modern, "off", None, Some(&pw))).await.unwrap();
+        assert!(!ok2.newly_pinned);
+        // 4) 틀린 암호
+        let bad = connect(&store, &conns, req(modern, "off", None, Some("wrong-password"))).await.err().unwrap();
+        assert_eq!(bad.code, "AUTH_FAILED");
+        // 5) 목록·EUC-KR 읽기
+        let entries = list(&conns, ok.conn_id, format!("{}/app", ok.home)).await.unwrap();
+        println!("app/: {:?}", entries.iter().map(|e| format!("{}:{}", e.name, e.kind)).collect::<Vec<_>>());
+        assert!(entries.iter().any(|e| e.name == "logs" && e.kind == "dir"));
+        let f = read_text(&conns, ok.conn_id, format!("{}/app/euckr.txt", ok.home), None).await.unwrap();
+        println!("euckr.txt → {} {} {:?}", f.meta.encoding, f.meta.eol, f.text);
+        assert_eq!(f.meta.encoding, "EUC-KR");
+        assert_eq!(f.meta.eol, "CRLF");
+        assert!(f.text.unwrap().starts_with("안녕하세요"));
+
+        // 6) 구형 흉내 서버: off 면 협상 실패 + 단계 제안
+        let neg = connect(&store, &conns, req(legacy, "off", None, Some(&pw))).await.err().unwrap();
+        println!("legacy off → {} {:?} theirs={:?} suggest={:?}", neg.code, neg.kind, neg.theirs, neg.suggest);
+        assert_eq!(neg.code, "NEGOTIATION");
+        let level = neg.suggest.unwrap();
+        // 제안 단계로 올려 가며(단계 하나에 실패하면 다음 제안) 접속
+        let mut level = level.to_string();
+        let mut fp_legacy = None;
+        for _ in 0..3 {
+            match connect(&store, &conns, req(legacy, &level, fp_legacy.clone(), Some(&pw))).await {
+                Ok(ok) => {
+                    println!("legacy {level} 접속 성공, 키 {} {}", ok.algorithm, ok.fingerprint);
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+                Err(e) if e.code == "HOSTKEY_UNKNOWN" => fp_legacy = e.fingerprint,
+                Err(e) if e.code == "NEGOTIATION" => {
+                    println!("  {level} → 아직 {:?} {:?}", e.kind, e.theirs);
+                    level = e.suggest.unwrap_or("weakest").to_string();
+                }
+                Err(e) => panic!("legacy {level}: {e:?}"),
+            }
+        }
+        panic!("구형 흉내 서버에 붙지 못함");
+    }
+
+    #[test]
+    fn levels_add_algorithms() {
+        assert!(!preferred("off").key.contains(&Algorithm::Rsa { hash: None }));
+        assert!(preferred("rsa").key.contains(&Algorithm::Rsa { hash: None }));
+        assert!(preferred("sha1").kex.contains(&kex::DH_G14_SHA1));
+        assert!(!preferred("sha1").kex.contains(&kex::DH_G1_SHA1));
+        assert!(preferred("weakest").key.contains(&Algorithm::Dsa));
+        assert!(preferred("weakest").cipher.contains(&cipher::TRIPLE_DES_CBC));
+    }
+}
