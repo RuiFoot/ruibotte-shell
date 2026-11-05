@@ -239,6 +239,11 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const [viewCount, setViewCount] = useState<number | null>(null);
 	const [viewSeq, setViewSeq] = useState(0);
 	const [valueView, setValueView] = useState<{ col: string; value: string | null } | null>(null);
+	const [thousands, setThousands] = useState(false);
+	const [where, setWhere] = useState("");
+	useEffect(() => {
+		void api.settingGet("db.thousands").then((v) => setThousands(v === "1"));
+	}, []);
 	const filterTimer = useRef<number | undefined>(undefined);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 새 결과면 보기를 처음으로
 	useEffect(() => {
@@ -454,24 +459,27 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					run: () => setAdded([...added, cols.map(() => undefined) as unknown as Cell[]]),
 				},
 				{
-					label: picked.every((x) => deleted.has(x)) ? "지우기 취소" : `행 지우기(${picked.length})`,
+					label: picked.every((x) => deleted.has(x)) ? "지우기 취소" : `행 지우기(${picked.length})  Del`,
 					danger: true,
-					run: () => {
-						const n = new Set(deleted);
-						const undo = picked.every((x) => n.has(x));
-						for (const x of picked) {
-							if (x >= ok.rowCount) continue;
-							if (undo) n.delete(x);
-							else n.add(x);
-						}
-						setAdded(added.filter((_, i) => !picked.includes(ok.rowCount + i)));
-						setDeleted(n);
-					},
+					run: () => toggleDelete(picked),
 				},
 			);
 		}
 		setMenu({ x: e.clientX, y: e.clientY, items });
 	};
+
+	/** 행 지우기 표시(이미 표시면 취소), 새 행은 바로 뺀다 */
+	function toggleDelete(picked: number[]) {
+		const n = new Set(deleted);
+		const undo = picked.every((x) => n.has(x));
+		for (const x of picked) {
+			if (x >= total) continue;
+			if (undo) n.delete(x);
+			else n.add(x);
+		}
+		setAdded(added.filter((_, i) => !picked.includes(total + i)));
+		setDeleted(n);
+	}
 
 	async function applyView(next: { sort: { col: number; desc: boolean } | null; filter: string }) {
 		if (!rid || !ok) return;
@@ -531,10 +539,23 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					</button>
 				</div>
 			)}
+			{p.source && (
+				<form
+					className="where-bar"
+					onSubmit={(e) => {
+						e.preventDefault();
+						const w = where.trim();
+						ctx.run([`SELECT * FROM ${table}${w ? ` WHERE ${w}` : ""}`], p.source);
+					}}
+				>
+					<code>SELECT * FROM {table} WHERE</code>
+					<input value={where} onChange={(e) => setWhere(e.target.value)} placeholder="조건(비우면 전체) — Enter 로 다시 읽기" spellCheck={false} />
+				</form>
+			)}
 			{rid ? (
 				<DataGrid
 					apiRef={grid}
-					columns={cols}
+					columns={cols.map((c, i) => ({ ...c, pk: !!metaOf(i)?.pk, hint: metaOf(i)?.dataType }))}
 					rowCount={total}
 					fetchRows={fetchRows}
 					resetKey={`${rid}:${viewSeq}`}
@@ -543,8 +564,24 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					overlay={overlay}
 					editable={() => canEdit}
 					onCellNull={(r, c) => metaOf(c)?.nullable !== false && void setCell(r, c, null)}
-					renderEditor={(r, c, value, done) => (
+					onDeleteRows={(rs) => toggleDelete(rs)}
+					onPaste={(r0, c0, grid) => {
+						let n = 0;
+						for (let i = 0; i < grid.length; i++)
+							for (let j = 0; j < grid[i].length; j++) {
+								const r = r0 + i;
+								const c = c0 + j;
+								if (r >= total + added.length || c >= cols.length) continue;
+								const v = grid[i][j];
+								void setCell(r, c, v === "NULL" && metaOf(c)?.nullable !== false ? null : v);
+								n++;
+							}
+						setMsg(`${n}칸 붙여 넣음 — 반영 전입니다`);
+					}}
+					thousands={thousands}
+					renderEditor={(r, c, value, done, seeded) => (
 						<CellEditor
+							seeded={seeded}
 							meta={metaOf(c)}
 							value={value}
 							onDone={(v, move) => {
@@ -572,6 +609,18 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				<span style={{ marginLeft: "auto" }} />
 				{rid ? (
 					<>
+						<button
+							type="button"
+							className={`btn ghost${thousands ? " on" : ""}`}
+							style={{ height: 20 }}
+							title="숫자 천 단위 구분"
+							onClick={() => {
+								setThousands(!thousands);
+								void api.settingSet("db.thousands", thousands ? "0" : "1");
+							}}
+						>
+							1,000
+						</button>
 						<label className="res-filter" title="받은 행에서 거르기 — 띄어 쓰면 모두 들어간 행, 대소문자 무시, Esc 로 지우기">
 							<Search size={11} />
 							<input

@@ -4,7 +4,7 @@ import { type ReactNode, useCallback, useEffect, useImperativeHandle, useMemo, u
 const PAGE = 200;
 const ROW_H = 26;
 
-export type GridCol = { name: string; kind: string };
+export type GridCol = { name: string; kind: string; pk?: boolean; hint?: string };
 export type Cell = string | null;
 
 /** 편집 덧씌우기 — 바뀐 값·행 상태(편집됨/지울 것/새 행) */
@@ -23,6 +23,14 @@ export type GridApi = {
 	selectedCell: () => { r: number; c: number } | null;
 	refresh: () => void;
 };
+
+/** 1234567.89 → 1,234,567.89 (자릿수 그대로) */
+function groupDigits(v: string) {
+	const [i, f] = v.split(".");
+	const sign = i.startsWith("-") ? "-" : "";
+	const g = i.replace("-", "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+	return f != null ? `${sign}${g}.${f}` : sign + g;
+}
 
 function widthOf(c: GridCol) {
 	const head = c.name.length * 8 + 34;
@@ -63,6 +71,9 @@ export function DataGrid({
 	editable,
 	renderEditor,
 	onCellNull,
+	onDeleteRows,
+	onPaste,
+	thousands,
 	onContextMenu,
 	apiRef,
 	sort,
@@ -75,8 +86,14 @@ export function DataGrid({
 	overlay?: GridOverlay;
 	/** 이 칸을 고칠 수 있는지 */
 	editable?: (r: number, c: number) => boolean;
-	renderEditor?: (r: number, c: number, value: Cell, done: (v: Cell | undefined, move?: "next" | "down") => void) => ReactNode;
+	renderEditor?: (r: number, c: number, value: Cell, done: (v: Cell | undefined, move?: "next" | "down") => void, seeded?: boolean) => ReactNode;
 	onCellNull?: (r: number, c: number) => void;
+	/** Delete — 고른 행 지우기 표시(없으면 Delete 가 NULL) */
+	onDeleteRows?: (rows: number[]) => void;
+	/** Ctrl+V — 엑셀·TSV 붙여넣기(고른 칸부터) */
+	onPaste?: (r: number, c: number, grid: string[][]) => void;
+	/** 숫자 천 단위 구분 */
+	thousands?: boolean;
 	onContextMenu?: (e: React.MouseEvent, r: number, c: number) => void;
 	apiRef?: React.Ref<GridApi>;
 	/** 지금 정렬(머리에 ▲▼) */
@@ -91,7 +108,7 @@ export function DataGrid({
 	const [sel, setSel] = useState<{ r: number; c: number } | null>(null);
 	const [rows, setRows] = useState<Set<number>>(new Set());
 	const anchor = useRef<number | null>(null);
-	const [editing, setEditing] = useState<{ r: number; c: number } | null>(null);
+	const [editing, setEditing] = useState<{ r: number; c: number; seed?: string } | null>(null);
 	const added = overlay?.added ?? [];
 	const count = rowCount + added.length;
 
@@ -169,8 +186,8 @@ export function DataGrid({
 		ensure(Math.floor(Math.min(items[items.length - 1].index, rowCount - 1) / PAGE));
 	}
 
-	const startEdit = (r: number, c: number) => {
-		if (editable?.(r, c) && renderEditor) setEditing({ r, c });
+	const startEdit = (r: number, c: number, seed?: string) => {
+		if (editable?.(r, c) && renderEditor) setEditing({ r, c, seed });
 	};
 
 	return (
@@ -178,6 +195,14 @@ export function DataGrid({
 			className="grid-scroll selectable"
 			ref={scroller}
 			tabIndex={0}
+			onPaste={(e) => {
+				if (!onPaste || !sel || editing) return;
+				const t = e.clipboardData.getData("text/plain");
+				if (!t) return;
+				e.preventDefault();
+				const grid = t.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").map((l) => l.split("\t"));
+				onPaste(sel.r, sel.c, grid);
+			}}
 			onKeyDown={(e) => {
 				if (editing || !sel) return;
 				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && !rows.size) {
@@ -190,9 +215,22 @@ export function DataGrid({
 					startEdit(sel.r, sel.c);
 					return;
 				}
-				if (e.key === "Delete" && onCellNull && editable?.(sel.r, sel.c)) {
+				// Ctrl+Delete·Ctrl+Shift+N = NULL, Delete = 행 지우기 표시(지원할 때)
+				const nullKey = (e.key === "Delete" && (e.ctrlKey || e.metaKey || !onDeleteRows)) || ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === "KeyN");
+				if (nullKey && onCellNull && editable?.(sel.r, sel.c)) {
 					e.preventDefault();
 					onCellNull(sel.r, sel.c);
+					return;
+				}
+				if (e.key === "Delete" && onDeleteRows && editable?.(sel.r, sel.c)) {
+					e.preventDefault();
+					onDeleteRows(rows.size ? [...rows] : [sel.r]);
+					return;
+				}
+				// 글자를 치면 바로 고치기 시작(그 글자부터)
+				if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && editable?.(sel.r, sel.c) && renderEditor) {
+					e.preventDefault();
+					startEdit(sel.r, sel.c, e.key);
 					return;
 				}
 				const mv: Record<string, [number, number]> = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], Tab: [0, 1] };
@@ -221,7 +259,9 @@ export function DataGrid({
 								onSort?.(i);
 							}}
 						>
+							{c.pk && <span className="pk-mark" title="기본 키">🔑</span>}
 							{c.name}
+							{c.hint && <small>{c.hint}</small>}
 							{sort?.col === i && <span className="sort-mark">{sort.desc ? "▼" : "▲"}</span>}
 							<span
 								className="col-resize"
@@ -291,13 +331,13 @@ export function DataGrid({
 										return (
 											// biome-ignore lint/suspicious/noArrayIndexKey: 열 순서가 곧 정체
 											<div key={ci} className="cell-editing">
-												{renderEditor(r, ci, val ?? null, (nv, move) => {
+												{renderEditor(r, ci, editing.seed ?? val ?? null, (nv, move) => {
 													setEditing(null);
 													scroller.current?.focus();
 													if (move === "next") setSel({ r, c: Math.min(columns.length - 1, ci + 1) });
 													if (move === "down") setSel({ r: Math.min(count - 1, r + 1), c: ci });
 													void nv;
-												})}
+												}, editing.seed != null)}
 											</div>
 										);
 									}
@@ -318,7 +358,19 @@ export function DataGrid({
 											}}
 											title={val && val.length > 40 ? val.slice(0, 2000) : undefined}
 										>
-											{row || st === "added" ? (val === null ? "NULL" : (val ?? "")) : ""}
+											{row || st === "added" ? (
+												val === null ? (
+													"NULL"
+												) : val === "" ? (
+													<span className="empty-str">''</span>
+												) : thousands && (c.kind === "int" || c.kind === "numeric") && /^-?\d+(\.\d+)?$/.test(val ?? "") ? (
+													groupDigits(val ?? "")
+												) : (
+													val
+												)
+											) : (
+												""
+											)}
 										</div>
 									);
 								})}

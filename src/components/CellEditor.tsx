@@ -9,14 +9,19 @@ const NULL_KEY = "\u0000";
  * 칸 안 형식별 입력기 — 날짜·날짜시각·시각, 참/거짓(3상태), enum, 숫자(검사), JSON·긴 글(여러 줄), UUID(새로 만들기).
  * Enter 확정(여러 줄은 Ctrl+Enter), Tab 확정 후 다음 칸, Esc 취소, NULL 단추(허용 열), 틀린 값은 빨간 테두리로 막는다.
  */
-export function CellEditor({ meta, value, onDone }: { meta?: ColMeta; value: Cell; onDone: (v: Cell | undefined, move?: "next" | "down") => void }) {
+export function CellEditor({ meta, value, onDone, seeded }: { meta?: ColMeta; value: Cell; onDone: (v: Cell | undefined, move?: "next" | "down") => void; seeded?: boolean }) {
 	const kind: FieldKind = fieldKind(meta);
 	const [v, setV] = useState<Cell>(value);
 	const [err, setErr] = useState<string | null>(null);
 	const ref = useRef<HTMLInputElement & HTMLTextAreaElement & HTMLSelectElement>(null);
 	useEffect(() => {
 		ref.current?.focus();
-		if (ref.current && "select" in ref.current && kind !== "enum" && kind !== "bool") ref.current.select?.();
+		if (ref.current && "select" in ref.current && kind !== "enum" && kind !== "bool") {
+			if (seeded) {
+				const n = ref.current.value?.length ?? 0;
+				ref.current.setSelectionRange?.(n, n);
+			} else ref.current.select?.();
+		}
 	}, [kind]);
 
 	const commit = (val: Cell, move?: "next" | "down") => {
