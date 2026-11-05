@@ -204,6 +204,8 @@ export function TerminalView({
 				} catch {
 					// 그대로
 				}
+				// Windows: file://localhost/C:/Users → C:/Users
+				if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
 				completer?.cwd(p);
 				onCwdRef.current?.(p);
 			}

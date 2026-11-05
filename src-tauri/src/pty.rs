@@ -76,10 +76,28 @@ pub fn pty_open(
     if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
         cmd.cwd(home);
     }
+    let program = cmd.get_argv().first().map(|a| a.to_string_lossy().to_lowercase()).unwrap_or_default();
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    // 셸 통합(이 셸에만, 설정 파일은 바꾸지 않음): 프롬프트마다 OSC 133 D(종료)·7(폴더)·A(프롬프트)
+    let init = if program.contains("pwsh") || program.contains("powershell") {
+        // $? 는 프롬프트 함수 첫 줄에서 읽어야 앞 명령 결과다. 폴더는 file://localhost/C:/… 꼴
+        // 쓰던 프롬프트(oh-my-posh 등)는 그대로 두고 앞에 표식만 붙인다
+        " $global:__rbp = $function:prompt; function global:prompt { $c = if ($?) {0} else {1}; $e = [char]27; $b = [char]7; $p = $PWD.ProviderPath -replace '\\\\','/'; \"$e]133;D;$c$b$e]7;file://localhost/$p$b$e]133;A$b\" + (& $global:__rbp) }; Clear-Host\r"
+    } else if program.contains("zsh") {
+        " __rb_precmd() { local s=$?; printf '\\033]133;D;%s\\007\\033]7;file://%s%s\\007\\033]133;A\\007' \"$s\" \"$HOST\" \"$PWD\"; }; precmd_functions+=(__rb_precmd); clear\n"
+    } else if program.contains("bash") {
+        r#" PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; clear
+"#
+    } else {
+        ""
+    };
+    if !init.is_empty() {
+        let _ = writer.write_all(init.as_bytes());
+        let _ = writer.flush();
+    }
 
     let id = ptys.next.fetch_add(1, Ordering::Relaxed) + 1;
     ptys.map
