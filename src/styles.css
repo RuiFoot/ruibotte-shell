@@ -2777,3 +2777,72 @@ input[type="radio"] {
 .seg button[aria-pressed="false"] {
 	color: var(--text-2);
 }
+
+/* ── 편집기 자동완성·도움말 팝업(CodeMirror) ── */
+.cm-editor .cm-tooltip {
+	border: 0;
+	border-radius: var(--r-md);
+	background: var(--elevated);
+	backdrop-filter: blur(24px) saturate(180%);
+	box-shadow: var(--shadow-pop);
+	color: var(--text);
+	overflow: hidden;
+}
+.cm-editor .cm-tooltip-autocomplete > ul {
+	max-height: 280px;
+	padding: 4px;
+	font-family: var(--font-mono);
+	font-size: 12.5px;
+}
+.cm-editor .cm-tooltip-autocomplete > ul > li {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 2px 8px 2px 4px;
+	border-radius: 6px;
+	line-height: 1.6;
+}
+.cm-editor .cm-tooltip-autocomplete > ul > li[aria-selected] {
+	background: var(--accent);
+	color: #fff;
+}
+.cm-editor .cm-completionDetail {
+	margin-left: auto;
+	padding-left: 16px;
+	font-family: var(--font-ui);
+	font-size: 11px;
+	font-style: normal;
+	color: var(--text-3);
+}
+.cm-editor li[aria-selected] .cm-completionDetail {
+	color: rgb(255 255 255 / 0.75);
+}
+.cm-editor .cm-completionMatchedText {
+	text-decoration: none;
+	font-weight: 700;
+}
+.cm-editor .cm-completionIcon {
+	width: 16px;
+	opacity: 0.7;
+	padding: 0;
+	text-align: center;
+}
+.cm-editor .cm-completionInfo {
+	padding: 6px 10px;
+	font-family: var(--font-ui);
+	font-size: 12px;
+}
+.cm-editor .cm-panel.cm-gotoLine,
+.cm-editor .cm-panels {
+	font-family: var(--font-ui);
+	font-size: 12.5px;
+}
+.cm-editor .cm-panels input,
+.cm-editor .cm-panels button {
+	font: inherit;
+	color: var(--text);
+	background: var(--surface);
+	border: 0.5px solid var(--hairline-strong);
+	border-radius: 6px;
+	padding: 2px 8px;
+}

@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { asSshError, type FileText, type FsBackend } from "../lib/ipc";
 import { Select } from "./Select";
 import { codeHighlight } from "../lib/cmTheme";
+import { editingExtensions } from "../lib/cmEditing";
 
 const ENCODINGS = ["UTF-8", "EUC-KR", "UTF-16LE", "UTF-16BE", "Shift_JIS", "windows-1252"];
 
@@ -163,6 +164,7 @@ export function EditorView_({
 					highlightSelectionMatches(),
 					search({ top: true }),
 					codeHighlight,
+					...editingExtensions(),
 					keymap.of([
 						{ key: "Mod-s", preventDefault: true, run: () => (saveRef.current(), true) },
 						indentWithTab,

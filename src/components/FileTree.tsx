@@ -1,4 +1,4 @@
-import { ChevronRight, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronRight, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw } from "lucide-react";
 import { memo, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { asSshError, type FsBackend, type FsEntry, joinPath, notifyFsChanged, parentDir } from "../lib/ipc";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -75,6 +75,38 @@ export const FileTree = memo(function FileTree({
 	const [msg, setMsg] = useState<string | null>(null);
 	const openRef = useRef(open);
 	openRef.current = open;
+
+	// 폴더 이동 기록 — 뒤로·앞으로(단추·마우스 옆 단추·Alt+←/→). 터미널 따라가기로 바뀐 것도 기록한다
+	const hist = useRef({ back: [] as string[], fwd: [] as string[], prev: root, nav: false });
+	const [, bump] = useState(0);
+	useEffect(() => {
+		const h = hist.current;
+		if (root === h.prev) return;
+		if (!h.nav) {
+			h.back.push(h.prev);
+			if (h.back.length > 100) h.back.shift();
+			h.fwd = [];
+		}
+		h.nav = false;
+		h.prev = root;
+		bump((n) => n + 1);
+	}, [root]);
+	const goBack = () => {
+		const h = hist.current;
+		const p = h.back.pop();
+		if (p == null) return;
+		h.fwd.push(h.prev);
+		h.nav = true;
+		onRoot(p);
+	};
+	const goForward = () => {
+		const h = hist.current;
+		const p = h.fwd.pop();
+		if (p == null) return;
+		h.back.push(h.prev);
+		h.nav = true;
+		onRoot(p);
+	};
 
 	const load = useCallback(
 		(path: string) => {
@@ -274,8 +306,37 @@ export const FileTree = memo(function FileTree({
 
 	const atTop = root === "/" || /^[A-Za-z]:\/?$/.test(root);
 	return (
-		<div className="tree">
+		<div
+			className="tree"
+			// 마우스 옆 단추: 3 = 뒤로, 4 = 앞으로
+			onMouseUp={(ev) => {
+				if (ev.button === 3 || ev.button === 4) {
+					ev.preventDefault();
+					if (ev.button === 3) goBack();
+					else goForward();
+				}
+			}}
+			onKeyDown={(ev) => {
+				const typing = (ev.target as HTMLElement).closest("input, textarea");
+				if (ev.altKey && ev.key === "ArrowLeft") {
+					ev.preventDefault();
+					goBack();
+				} else if (ev.altKey && ev.key === "ArrowRight") {
+					ev.preventDefault();
+					goForward();
+				} else if ((ev.key === "Backspace" || (ev.altKey && ev.key === "ArrowUp")) && !typing && !atTop) {
+					ev.preventDefault();
+					onRoot(parentDir(root));
+				}
+			}}
+		>
 			<div className="tree-head">
+				<button type="button" className="btn ghost icon" title="뒤로 (Alt+← · 마우스 뒤로 단추)" onClick={goBack} disabled={!hist.current.back.length}>
+					<ArrowLeft size={14} />
+				</button>
+				<button type="button" className="btn ghost icon" title="앞으로 (Alt+→ · 마우스 앞으로 단추)" onClick={goForward} disabled={!hist.current.fwd.length}>
+					<ArrowRight size={14} />
+				</button>
 				<form
 					onSubmit={(ev) => {
 						ev.preventDefault();
@@ -285,7 +346,7 @@ export const FileTree = memo(function FileTree({
 				>
 					<input className="path-input" value={rootInput} onChange={(e) => setRootInput(e.target.value)} spellCheck={false} title="경로를 치고 Enter" />
 				</form>
-				<button type="button" className="btn ghost icon" title="위 폴더" onClick={() => onRoot(parentDir(root))} disabled={atTop}>
+				<button type="button" className="btn ghost icon" title="위 폴더 (Backspace · Alt+↑)" onClick={() => onRoot(parentDir(root))} disabled={atTop}>
 					<ChevronRight size={14} style={{ transform: "rotate(-90deg)" }} />
 				</button>
 				<button type="button" className="btn ghost icon" title="홈" onClick={() => onRoot(fs.home)}>

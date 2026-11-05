@@ -24,6 +24,8 @@ import { DataGrid, type GridApi, type GridCol, type GridOverlay } from "./DataGr
 import { Select } from "./Select";
 import { SnippetPalette } from "./SnippetPalette";
 import { codeHighlight } from "../lib/cmTheme";
+import { editingExtensions } from "../lib/cmEditing";
+import { dbCompletionSource } from "../lib/sqlComplete";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
@@ -58,6 +60,17 @@ type Ctx = {
 };
 const DbCtx = createContext<Ctx | null>(null);
 const useDb = () => useContext(DbCtx) as Ctx;
+
+/** 연결마다 하나 — 열어 둔 SQL 편집기들이 같은 이름 목록을 함께 쓴다 */
+const completions = new Map<number, ReturnType<typeof dbCompletionSource>>();
+function completionFor(conn: number) {
+	let s = completions.get(conn);
+	if (!s) {
+		s = dbCompletionSource((path) => invoke<Node[]>("db_tree", { conn, path }));
+		completions.set(conn, s);
+	}
+	return s;
+}
 
 const db = {
 	query: (conn: number, sql: string, maxRows: number) => invoke<QueryOk>("db_query", { conn, sql, maxRows }),
@@ -122,6 +135,9 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					highlightSelectionMatches(),
 					search({ top: true }),
 					codeHighlight,
+					...editingExtensions(),
+					// DB 이름(스키마·표·열·별칭) 완성 — 키워드 완성은 sql() 이 함께 낸다
+					EditorState.languageData.of(() => [{ autocomplete: completionFor(ctx.conn) }]),
 					sql({
 						dialect:
 							ctx.engine === "postgres" ? PostgreSQL : ctx.mysql ? MySQL : ctx.engine === "mssql" ? MSSQL : ctx.engine === "oracle" || ctx.engine === "tibero" ? PLSQL : StandardSQL,

@@ -3,6 +3,15 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 import { App } from "./App";
 
+// 마우스 뒤로·앞으로 단추가 웹뷰 페이지 기록을 넘기지 않게(앱 안에서는 트리 뒤로·앞으로로 쓴다)
+window.addEventListener(
+	"mouseup",
+	(e) => {
+		if (e.button === 3 || e.button === 4) e.preventDefault();
+	},
+	{ capture: true },
+);
+
 // 웹 흔적 지우기: 브라우저 기본 우클릭 메뉴는 앱 전체에서 끈다(입력칸만 예외). 자체 메뉴는 각 칸이 띄운다.
 window.addEventListener(
 	"contextmenu",
