@@ -723,6 +723,27 @@ async fn remove_rec(c: &Conn, path: String) -> R<u32> {
     }
 }
 
+/// 시험용 — 암호로 접속하고 처음 키를 신뢰한다
+#[cfg(test)]
+pub(crate) async fn test_connect(store: &Store, conns: &SshConns, host: &str, port: u16, user: &str, pw: &str) -> u32 {
+    let req = |trust: Option<String>| ConnectReq {
+        profile_id: None,
+        host: host.into(),
+        port,
+        username: user.into(),
+        auth: "password".into(),
+        key_path: None,
+        secret: Some(pw.into()),
+        legacy: "off".into(),
+        trust_fingerprint: trust,
+        save_secret: false,
+    };
+    match connect(store, conns, req(None)).await {
+        Ok(ok) => ok.conn_id,
+        Err(e) => connect(store, conns, req(e.fingerprint)).await.unwrap().conn_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

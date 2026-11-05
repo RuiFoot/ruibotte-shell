@@ -124,6 +124,8 @@ export type TransferProgress = {
 	filesDone: number;
 	filesTotal: number;
 	skipped: number;
+	verified: number;
+	resumed: number;
 	state: "running" | "done" | "error" | "cancelled";
 	error?: string | null;
 	ms: number;

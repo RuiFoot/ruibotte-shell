@@ -38,6 +38,10 @@ export const FileTree = memo(function FileTree({
 	onSend,
 	sendLabel,
 	onCd,
+	onTail,
+	onCompare,
+	compareLabel,
+	onArchive,
 	selected,
 }: {
 	fs: FsBackend;
@@ -51,6 +55,13 @@ export const FileTree = memo(function FileTree({
 	sendLabel?: string;
 	/** 터미널에서 이 폴더로 이동 */
 	onCd?: (dir: string) => void;
+	/** 실시간 보기 */
+	onTail?: (e: FsEntry) => void;
+	/** 비교 — 첫 번째는 고르기, 두 번째는 비교 */
+	onCompare?: (e: FsEntry) => void;
+	compareLabel?: (e: FsEntry) => string;
+	/** 폴더째 받기(.tar.gz) */
+	onArchive?: (e: FsEntry) => void;
 	selected?: string;
 }) {
 	const [nodes, setNodes] = useState<Record<string, Node>>({});
@@ -140,6 +151,9 @@ export const FileTree = memo(function FileTree({
 		if (e) {
 			items.push({ sep: true });
 			if (e.kind !== "dir") items.push({ label: "열기", run: () => onOpen(e) });
+			if (e.kind !== "dir" && onTail) items.push({ label: "실시간 보기(tail -F)", run: () => onTail(e) });
+			if (e.kind !== "dir" && onCompare) items.push({ label: compareLabel?.(e) ?? "비교 대상으로 고르기", run: () => onCompare(e) });
+			if (e.kind === "dir" && onArchive) items.push({ label: "폴더째 받기(.tar.gz)…", run: () => onArchive(e) });
 			if (onSend) items.push({ label: sendLabel ?? "보내기", run: () => onSend(e) });
 			if (e.kind === "dir" && onCd) items.push({ label: "터미널에서 이 폴더로", run: () => onCd(e.path) });
 			if (e.kind === "dir") items.push({ label: "여기를 맨 위로", run: () => onRoot(e.path) });

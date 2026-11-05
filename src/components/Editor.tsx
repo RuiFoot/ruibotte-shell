@@ -3,7 +3,9 @@ import { bracketMatching, foldGutter, indentOnInput, type LanguageSupport, Strea
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from "@codemirror/view";
-import { Save } from "lucide-react";
+import { Braces, Eye, Save, Table2 } from "lucide-react";
+import { api } from "../lib/ipc";
+import { altView, BinaryPreview, MarkdownView, TableView } from "./Preview";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { asSshError, type FileText, type FsBackend } from "../lib/ipc";
 
@@ -98,6 +100,14 @@ export function EditorView_({
 	const [status, setStatus] = useState<Status>({ text: "여는 중…" });
 	const [encoding, setEncoding] = useState<string | undefined>(undefined);
 	const saveRef = useRef<() => void>(() => {});
+	const [alt, setAlt] = useState(false);
+	const [altText, setAltText] = useState("");
+	const [autoSave, setAutoSave] = useState(false);
+	const autoTimer = useRef<number | undefined>(undefined);
+	const altKind = altView(path);
+	useEffect(() => {
+		void api.settingGet("editor.autosave").then((v) => setAutoSave(v === "1"));
+	}, []);
 
 	const readOnly = !file || file.binary || file.tooLarge || file.meta.guessed;
 
@@ -196,9 +206,51 @@ export function EditorView_({
 	}, [fs, path, file, readOnly]);
 	saveRef.current = () => void save();
 
+	// 자동 저장 — 고친 뒤 1.5초 멈추면(읽기 전용·충돌이면 하지 않음)
+	useEffect(() => {
+		window.clearTimeout(autoTimer.current);
+		if (autoSave && dirty && !readOnly) autoTimer.current = window.setTimeout(() => saveRef.current(), 1500);
+		return () => window.clearTimeout(autoTimer.current);
+	}, [autoSave, dirty, readOnly]);
+
+	const tidy = () => {
+		const v = view.current;
+		if (!v) return;
+		const src = v.state.doc.toString();
+		let out: string | null = null;
+		try {
+			if (/\.json$/i.test(path)) out = JSON.stringify(JSON.parse(src), null, 2);
+			else if (/\.(xml|xsd|pom|svg|xhtml)$/i.test(path)) {
+				let depth = 0;
+				out = src
+					.replace(/>\s*</g, ">\n<")
+					.split("\n")
+					.map((line) => {
+						const l = line.trim();
+						if (/^<\//.test(l)) depth = Math.max(0, depth - 1);
+						const s = "  ".repeat(depth) + l;
+						if (/^<[^!?/][^>]*[^/]>$/.test(l) && !/<\/[^>]+>$/.test(l)) depth++;
+						return s;
+					})
+					.join("\n");
+			}
+		} catch (x) {
+			setStatus({ text: `정리하지 못했습니다: ${String(x)}`, tone: "err" });
+			return;
+		}
+		if (out != null && out !== src) {
+			v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: out }, userEvent: "input" });
+			setDirty(true);
+		}
+	};
+
+	if (file?.binary) return <BinaryPreview fs={fs} path={path} kind="hex" />;
+
 	return (
 		<>
-			<div className="cm-host" ref={host} />
+			<div className="cm-host" ref={host} hidden={alt} />
+			{alt && altKind === "markdown" && <MarkdownView text={altText} />}
+			{alt && (altKind === "csv" || altKind === "tsv") && <TableView text={altText} sep={altKind === "csv" ? "," : "\t"} />}
 			<div className="statusbar">
 				<span className={status.tone === "ok" ? "ok" : status.tone === "err" ? "err" : status.tone === "warn" ? "warn" : undefined}>
 					{status.text}
@@ -221,6 +273,26 @@ export function EditorView_({
 							{file.meta.bom ? " · BOM" : ""}
 						</span>
 						{readOnly ? <span>읽기 전용</span> : null}
+						{autoSave && !readOnly ? <span title="설정 › 편집기에서 끔">자동 저장</span> : null}
+						{altKind && (
+							<button
+								type="button"
+								className={`btn ghost${alt ? " on" : ""}`}
+								style={{ height: 20 }}
+								onClick={() => {
+									setAltText(view.current?.state.doc.toString() ?? "");
+									setAlt((x) => !x);
+								}}
+								title={altKind === "markdown" ? "미리보기" : "표로 보기"}
+							>
+								{altKind === "markdown" ? <Eye size={12} /> : <Table2 size={12} />} {alt ? "편집" : altKind === "markdown" ? "미리보기" : "표"}
+							</button>
+						)}
+						{/\.(json|xml|xsd|pom|svg|xhtml)$/i.test(path) && !readOnly && (
+							<button type="button" className="btn ghost" style={{ height: 20 }} onClick={tidy} title="들여쓰기 정리">
+								<Braces size={12} /> 정리
+							</button>
+						)}
 						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={!dirty || readOnly} onClick={() => void save()} title="저장 (Ctrl+S)">
 							<Save size={12} /> 저장
 						</button>

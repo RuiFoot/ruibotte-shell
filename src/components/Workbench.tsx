@@ -18,7 +18,11 @@ import {
 	type TransferProgress,
 	transfers,
 } from "../lib/ipc";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
+import { BinaryPreview, previewKind } from "./Preview";
+import { TailView } from "./TailView";
 import { invoke } from "@tauri-apps/api/core";
 import type { CompletionSource } from "../lib/termComplete";
 import { type DragEntry, FileTree } from "./FileTree";
@@ -47,6 +51,10 @@ type Ctx = {
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
 	onCwd: (path: string) => void;
 	completion: CompletionSource;
+	openTail: (which: Which, e: FsEntry) => void;
+	compare: (which: Which, e: FsEntry) => void;
+	compareLabel: (which: Which, e: FsEntry) => string;
+	archive: (e: FsEntry) => void;
 	/** 동시 입력: 한 터미널에 친 것을 다른 터미널에도 */
 	broadcast: (fromPanel: string, data: string) => void;
 	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
@@ -78,6 +86,10 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 				onSend={ctx.local ? (e) => ctx.sendTo(props.params.which, e) : undefined}
 				sendLabel={props.params.which === "local" ? "서버로 올리기" : "내 PC로 받기"}
 				onCd={props.params.which === "remote" || !ctx.local ? ctx.cd : undefined}
+				onTail={(e) => ctx.openTail(props.params.which, e)}
+				onCompare={(e) => ctx.compare(props.params.which, e)}
+				compareLabel={(e) => ctx.compareLabel(props.params.which, e)}
+				onArchive={props.params.which === "remote" && fs.side === "remote" ? ctx.archive : undefined}
 			/>
 		</div>
 	);
@@ -90,9 +102,14 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 		(dirty: boolean) => props.api.setTitle(`${dirty ? "● " : ""}${props.params.name}`),
 		[props.api, props.params.name],
 	);
+	const kind = previewKind(props.params.path);
 	return (
 		<div className="panel-fill">
-			<EditorView_ fs={fs} path={props.params.path} active={ctx.activePanel === props.api.id} onDirtyChange={onDirty} />
+			{kind ? (
+				<BinaryPreview fs={fs} path={props.params.path} kind={kind} />
+			) : (
+				<EditorView_ fs={fs} path={props.params.path} active={ctx.activePanel === props.api.id} onDirtyChange={onDirty} />
+			)}
 		</div>
 	);
 }
@@ -114,6 +131,23 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number }>) {
 			/>
 		</div>
 	);
+}
+
+function TailPanel(props: IDockviewPanelProps<{ which: Which; path: string }>) {
+	const ctx = useWb();
+	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+	return <TailView fs={fs} path={props.params.path} />;
+}
+
+function DiffPanel(props: IDockviewPanelProps<{ a: { which: Which; path: string }; b: { which: Which; path: string } }>) {
+	const ctx = useWb();
+	const side = (s: { which: Which; path: string }) => {
+		const fs = s.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+		return { fs, path: s.path, label: `${s.which === "local" ? "내 PC" : fs.label}:${s.path.split("/").pop()}` };
+	};
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 열 때 한 번
+	const sides = useMemo(() => [side(props.params.a), side(props.params.b)] as const, []);
+	return <DiffView a={sides[0]} b={sides[1]} />;
 }
 
 function Watermark() {
@@ -152,9 +186,33 @@ function TransfersPanel() {
 		});
 		return () => void un.then((f) => f());
 	}, [ctx.fs.conn]);
-	if (!list.length) return <div className="dock-watermark">트리끼리 끌어 놓거나 우클릭 › 올리기·받기</div>;
+	const [archives, setArchives] = useState<{ path: string; dest: string; bytes: number; state: string; error?: string | null }[]>([]);
+	useEffect(() => {
+		const un = listen<{ path: string; dest: string; bytes: number; state: string; error?: string | null }>("archive", (e) => {
+			const p = e.payload;
+			setArchives((l) => [p, ...l.filter((x) => x.dest !== p.dest)].slice(0, 20));
+		});
+		return () => void un.then((f) => f());
+	}, []);
+	if (!list.length && !archives.length) return <div className="dock-watermark">트리끼리 끌어 놓거나 우클릭 › 올리기·받기</div>;
 	return (
 		<div className="xfer">
+			{archives.map((a) => (
+				<div key={a.dest} className="xfer-row">
+					<span>
+						↓ 폴더째 <b>{a.path.split("/").pop()}</b> (.tar.gz)
+					</span>
+					<small>{a.state === "running" ? "받는 중" : a.state === "done" ? "완료" : "실패"}</small>
+					<div className={`bar ${a.state}`}>
+						<i style={{ width: a.state === "running" ? "40%" : "100%" }} />
+					</div>
+					<small>
+						{fmtBytes(a.bytes)}
+						{a.error ? ` · ${a.error}` : ""}
+					</small>
+					<small />
+				</div>
+			))}
 			{list.map((p) => {
 				const pct = p.bytesTotal ? Math.round((100 * p.bytesDone) / p.bytesTotal) : p.state === "done" ? 100 : 0;
 				const speed = p.ms > 0 ? p.bytesDone / (p.ms / 1000) : 0;
@@ -176,6 +234,8 @@ function TransfersPanel() {
 						<small>
 							{fmtBytes(p.bytesDone)} / {fmtBytes(p.bytesTotal)} · 파일 {p.filesDone}/{p.filesTotal}
 							{p.skipped ? ` · 건너뜀 ${p.skipped}` : ""}
+							{p.verified ? ` · sha256 확인 ${p.verified}` : ""}
+							{p.resumed ? ` · 이어받음 ${p.resumed}` : ""}
 							{p.error ? ` · ${p.error}` : ""}
 						</small>
 						<small>{speed ? `${fmtBytes(speed)}/s` : ""}</small>
@@ -186,7 +246,7 @@ function TransfersPanel() {
 	);
 }
 
-const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel };
+const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel };
 const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
 
 /** 기본 배치: 트리 왼쪽 · 편집기 가운데 · 터미널 오른쪽 */
@@ -440,6 +500,57 @@ export function Workbench({
 		[drop, fs, local],
 	);
 
+	/** 편집기들이 있는 칸 옆에(없으면 트리 오른쪽) */
+	const addBeside = (opts: { id: string; component: string; title: string; params: object }) => {
+		const d = dock.current;
+		if (!d) return;
+		const ex = d.getPanel(opts.id);
+		if (ex) return void ex.api.setActive();
+		const anyEditor = d.panels.find((p) => p.id.startsWith("edit:") || p.id.startsWith("tail:") || p.id.startsWith("diff:"));
+		d.addPanel({
+			...opts,
+			renderer: "always",
+			position: anyEditor ? { referencePanel: anyEditor.id, direction: "within" } : { referencePanel: d.getPanel("tree") ? "tree" : (d.panels[0]?.id ?? ""), direction: "right" },
+		});
+	};
+
+	const openTail = useCallback((which: Which, e: FsEntry) => {
+		addBeside({ id: `tail:${which}:${e.path}`, component: "tail", title: `⟳ ${e.name}`, params: { which, path: e.path } });
+	}, []);
+
+	const compareFirst = useRef<{ which: Which; path: string; name: string } | null>(null);
+	const compareLabel = useCallback((which: Which, e: FsEntry) => {
+		const f = compareFirst.current;
+		if (!f) return "비교 대상으로 고르기";
+		if (f.which === which && f.path === e.path) return "비교 대상 고르기 취소";
+		return `${f.name} 와(과) 비교`;
+	}, []);
+	const compare = useCallback((which: Which, e: FsEntry) => {
+		const f = compareFirst.current;
+		if (!f) {
+			compareFirst.current = { which, path: e.path, name: e.name };
+			return;
+		}
+		compareFirst.current = null;
+		if (f.which === which && f.path === e.path) return;
+		addBeside({ id: `diff:${f.which}:${f.path}|${which}:${e.path}`, component: "diff", title: `⇄ ${f.name} · ${e.name}`, params: { a: { which: f.which, path: f.path }, b: { which, path: e.path } } });
+	}, []);
+
+	const archive = useCallback(
+		async (e: FsEntry) => {
+			if (fs.conn == null) return;
+			const dest = await saveDialog({ defaultPath: `${e.name}.tar.gz`, filters: [{ name: "tar.gz", extensions: ["gz", "tgz"] }] });
+			if (!dest) return;
+			showTransfers();
+			try {
+				await invoke("ssh_download_targz", { conn: fs.conn, path: e.path, dest });
+			} catch (x) {
+				alert(asSshError(x).message);
+			}
+		},
+		[fs],
+	);
+
 	const addTerminal = () => {
 		const d = dock.current;
 		if (!d) return;
@@ -517,9 +628,13 @@ export function Workbench({
 			onCwd,
 			broadcast,
 			completion,
+			openTail,
+			compare,
+			compareLabel,
+			archive: (e: FsEntry) => void archive(e),
 			treeKey: instance.current,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);

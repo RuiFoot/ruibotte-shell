@@ -1563,3 +1563,77 @@ html[data-os="macos"] .sidebar {
 	font-size: 11px;
 	color: var(--text-3);
 }
+
+/* ── 미리보기·비교 ───────────────────── */
+.preview-body {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	display: flex;
+	align-items: flex-start;
+	justify-content: center;
+	background: var(--surface-2);
+}
+.preview-img {
+	max-width: 100%;
+	margin: 20px;
+	box-shadow: var(--shadow-card);
+	background: repeating-conic-gradient(var(--fill) 0 25%, transparent 0 50%) 0 0 / 16px 16px;
+}
+.preview-pdf {
+	width: 100%;
+	height: 100%;
+	border: 0;
+}
+.preview-hex {
+	margin: 0;
+	padding: 14px 18px;
+	width: 100%;
+	font-family: var(--font-mono);
+	font-size: 12px;
+	line-height: 1.5;
+	background: var(--surface);
+}
+.md-view {
+	flex: 1;
+	overflow: auto;
+	padding: 20px 28px;
+	font-size: 14px;
+	line-height: 1.65;
+}
+.md-view pre,
+.md-view code {
+	font-family: var(--font-mono);
+	font-size: 12.5px;
+	background: var(--surface-2);
+	border-radius: 6px;
+}
+.md-view pre {
+	padding: 10px 12px;
+	overflow: auto;
+}
+.md-view table {
+	border-collapse: collapse;
+}
+.md-view th,
+.md-view td {
+	border: 0.5px solid var(--hairline-strong);
+	padding: 4px 10px;
+}
+.diff-host {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+}
+.diff-host .cm-mergeView {
+	height: 100%;
+}
+.diff-label {
+	font-family: var(--font-mono);
+	font-size: 12px;
+	color: var(--text-2);
+	max-width: 40%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}

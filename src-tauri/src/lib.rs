@@ -13,6 +13,7 @@ mod store;
 mod sudo;
 mod textcodec;
 mod transfer;
+mod viewer;
 
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -80,6 +81,7 @@ pub fn run() {
         .manage(ssh::SshConns::default())
         .manage(transfer::Transfers::default())
         .manage(db::DbConns::default())
+        .manage(viewer::Tails::default())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
@@ -151,6 +153,12 @@ pub fn run() {
             sudo::sudo_write_text,
             sudo::sudo_op,
             transfer::transfer_cancel,
+            viewer::sftp_read_bytes,
+            viewer::local_read_bytes,
+            viewer::ssh_tail_open,
+            viewer::local_tail_open,
+            viewer::tail_close,
+            viewer::ssh_download_targz,
         ])
         .run(tauri::generate_context!())
         .expect("RuiBotte Shell 을 시작하지 못했습니다");

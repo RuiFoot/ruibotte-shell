@@ -2,7 +2,7 @@ import { disable as autostartOff, enable as autostartOn, isEnabled as autostartI
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useState } from "react";
 import iconUrl from "../../assets/icon.svg?url";
-import type { AppInfo } from "../lib/ipc";
+import { type AppInfo, api } from "../lib/ipc";
 import { checkNow, installNow, RELEASES, setAuto, useUpdate } from "../lib/updater";
 
 function ago(ms: number) {
@@ -38,6 +38,10 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 	const u = useUpdate();
 	const [autostart, setAutostart] = useState<boolean | null>(null);
 	const [msg, setMsg] = useState("");
+	const [autoSave, setAutoSave] = useState(false);
+	useEffect(() => {
+		void api.settingGet("editor.autosave").then((v) => setAutoSave(v === "1"));
+	}, []);
 
 	useEffect(() => {
 		autostartIsOn()
@@ -122,6 +126,20 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 			<p className="set-foot">
 				{u.checkedAt ? `마지막 확인 ${ago(u.checkedAt)}` : "아직 확인하지 않았어요"} · 받은 파일은 서명을 확인한 뒤에만 설치합니다
 			</p>
+
+			<h4>편집기</h4>
+			<div className="set-group">
+				<Row label="자동 저장" sub="고친 뒤 1.5초 멈추면 저장(읽기 전용·충돌은 제외). 새로 여는 파일부터 적용됩니다">
+					<Toggle
+						on={autoSave}
+						label="자동 저장"
+						onChange={(v) => {
+							setAutoSave(v);
+							void api.settingSet("editor.autosave", v ? "1" : "0");
+						}}
+					/>
+				</Row>
+			</div>
 
 			<h4>시작</h4>
 			<div className="set-group">
