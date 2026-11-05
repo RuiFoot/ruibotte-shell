@@ -644,6 +644,27 @@ pub async fn sftp_realpath(conns: State<'_, SshConns>, conn: u32, path: String) 
     c.sftp.canonicalize(path).await.map_err(sftp_err)
 }
 
+/// 원격에서 짧은 명령 하나 실행해 표준출력을 받는다(자동완성용 compgen 등). 1 MiB·10초 상한
+#[tauri::command]
+pub async fn ssh_exec(conns: State<'_, SshConns>, conn: u32, cmd: String) -> R<String> {
+    let c = conns.get(conn)?;
+    let run = async {
+        let mut ch = c.handle.channel_open_session().await.map_err(map_russh)?;
+        ch.exec(true, cmd.as_str()).await.map_err(map_russh)?;
+        let mut out = Vec::new();
+        while let Some(m) = ch.wait().await {
+            if let ChannelMsg::Data { data } = m {
+                out.extend_from_slice(&data);
+                if out.len() > 1024 * 1024 {
+                    break;
+                }
+            }
+        }
+        Ok::<_, SshError>(String::from_utf8_lossy(&out).into_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(10), run).await.map_err(|_| err("NETWORK", "응답이 없습니다"))?
+}
+
 // ── 파일 조작 ────────────────────────
 
 #[tauri::command]

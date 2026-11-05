@@ -117,6 +117,7 @@ pub fn run() {
             ssh::sftp_read_text,
             ssh::sftp_write_text,
             ssh::sftp_realpath,
+            ssh::ssh_exec,
             localfs::local_home,
             localfs::local_list,
             localfs::local_read_text,

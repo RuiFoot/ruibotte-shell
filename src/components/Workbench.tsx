@@ -19,6 +19,8 @@ import {
 	transfers,
 } from "../lib/ipc";
 import { EditorView_ } from "./Editor";
+import { invoke } from "@tauri-apps/api/core";
+import type { CompletionSource } from "../lib/termComplete";
 import { type DragEntry, FileTree } from "./FileTree";
 import { TerminalView } from "./Terminal";
 
@@ -44,6 +46,7 @@ type Ctx = {
 	cd: (dir: string) => void;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
 	onCwd: (path: string) => void;
+	completion: CompletionSource;
 	/** 동시 입력: 한 터미널에 친 것을 다른 터미널에도 */
 	broadcast: (fromPanel: string, data: string) => void;
 	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
@@ -107,6 +110,7 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number }>) {
 				onShell={(h) => ctx.registerShell(props.api.id, h)}
 				onCwd={ctx.onCwd}
 				onInput={(d) => ctx.broadcast(props.api.id, d)}
+				completion={ctx.completion}
 			/>
 		</div>
 	);
@@ -272,6 +276,20 @@ export function Workbench({
 		[fs, profileId],
 	);
 	const fsNow = sudoOn && sudoFs ? sudoFs : fs;
+	// 자동완성 출처 — 원격은 SFTP 목록·compgen, 내 PC 는 파일 목록·사전
+	const completion = useMemo<CompletionSource>(
+		() => ({
+			key: fs.side === "remote" ? `ssh:${label}` : "local",
+			home: fs.home,
+			listDir: (dir) => fs.list(dir),
+			commands: async () => {
+				if (fs.side !== "remote" || fs.conn == null) return [];
+				const out = await invoke<string>("ssh_exec", { conn: fs.conn, cmd: "bash -lc 'compgen -c' 2>/dev/null | sort -u | head -5000" });
+				return out.split("\n").filter((x) => /^[\w.+-]+$/.test(x));
+			},
+		}),
+		[fs, label],
+	);
 	const lastCwd = useRef<string | null>(null);
 	const dock = useRef<DockviewApi | null>(null);
 	const [activePanel, setActivePanel] = useState<string | null>(null);
@@ -498,9 +516,10 @@ export function Workbench({
 			registerShell,
 			onCwd,
 			broadcast,
+			completion,
 			treeKey: instance.current,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);

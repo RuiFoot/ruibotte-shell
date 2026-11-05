@@ -1,17 +1,7 @@
 import { BookOpen, Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-/** data/cmd-dict/dict.json 형식(Orbit D24 에서 만든 데이터를 그대로 씀) */
-type DictOpt = [flags: string, desc: string, arg?: string];
-type DictCmd = { d: string; k: string[]; o?: DictOpt[]; s?: Record<string, { d: string }>; x?: [string, string][] };
-type Dict = { v: number; src: { fig: string; tldr: string }; c: Record<string, DictCmd> };
-
-let cache: Promise<Dict> | null = null;
-/** 사전은 처음 열 때 받는다(기동 비용 0) */
-function loadDict(): Promise<Dict> {
-	cache ??= import("../../data/cmd-dict/dict.json").then((m) => (m as unknown as { default: Dict }).default);
-	return cache;
-}
+import { type Dict, type DictCmd, loadDict } from "../lib/dict";
 
 const SYN: string[][] = [
 	["교체", "바꾸기", "치환", "대체"],

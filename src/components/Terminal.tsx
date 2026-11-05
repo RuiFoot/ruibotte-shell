@@ -13,6 +13,7 @@ import "@xterm/xterm/css/xterm.css";
 import { ChevronDown, ChevronUp, Gauge, RotateCcw, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ipc";
+import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { SnippetPalette } from "./SnippetPalette";
 
@@ -46,6 +47,7 @@ export function TerminalView({
 	onShell,
 	onCwd,
 	onInput,
+	completion,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -59,7 +61,11 @@ export function TerminalView({
 	onCwd?: (path: string) => void;
 	/** 사람이 친 입력(동시 입력용) */
 	onInput?: (data: string) => void;
+	/** 자동완성(흐린 제안·Tab 목록) 출처 */
+	completion?: CompletionSource;
 }) {
+	const completionRef = useRef(completion);
+	completionRef.current = completion;
 	const host = useRef<HTMLDivElement>(null);
 	const termRef = useRef<XTerm | null>(null);
 	const fitRef = useRef<FitAddon | null>(null);
@@ -157,12 +163,19 @@ export function TerminalView({
 			}
 		});
 
+		// ── 자동완성 ──
+		let completer: Completer | null = null;
+		if (completionRef.current) completer = attachCompletion(term, el, completionRef.current, (s) => write(s));
+
 		// ── 셸 통합 ──
 		let atPrompt = false;
 		let pending: Pending | null = null;
 		const osc133 = term.parser.registerOscHandler(133, (data) => {
 			const [kind, arg] = data.split(";");
-			if (kind === "A") atPrompt = true;
+			if (kind === "A") {
+				atPrompt = true;
+				completer?.prompt();
+			}
 			if (kind === "D" && pending) {
 				const code = Number(arg ?? 0);
 				const ms = Date.now() - pending.start;
@@ -185,11 +198,14 @@ export function TerminalView({
 		const osc7 = term.parser.registerOscHandler(7, (data) => {
 			const m = /^file:\/\/[^/]*(\/.*)$/.exec(data);
 			if (m) {
+				let p = m[1];
 				try {
-					onCwdRef.current?.(decodeURIComponent(m[1]));
+					p = decodeURIComponent(m[1]);
 				} catch {
-					onCwdRef.current?.(m[1]);
+					// 그대로
 				}
+				completer?.cwd(p);
+				onCwdRef.current?.(p);
 			}
 			return true;
 		});
@@ -225,6 +241,8 @@ export function TerminalView({
 			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${typeof e === "object" ? (e as { message?: string }).message : String(e)}` }));
 
 		const onData = term.onData((d) => {
+			if (d === "\r") completer?.submitted();
+			else if (d.length === 1 && d >= " ") completer?.typed();
 			if (atPrompt && d.includes("\r")) {
 				const buf = term.buffer.active;
 				const line = buf.getLine(buf.cursorY + buf.baseY)?.translateToString(true) ?? "";
@@ -239,6 +257,7 @@ export function TerminalView({
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
 		term.attachCustomKeyEventHandler((e) => {
+			if (completer && !completer.key(e)) return false;
 			if (e.type !== "keydown") return true;
 			const mod = e.ctrlKey || e.metaKey;
 			if (mod && e.shiftKey && e.code === "KeyC") {
@@ -298,6 +317,7 @@ export function TerminalView({
 
 		return () => {
 			disposed = true;
+			completer?.dispose();
 			ta?.removeEventListener("paste", onPaste, true);
 			osc133.dispose();
 			osc7.dispose();
