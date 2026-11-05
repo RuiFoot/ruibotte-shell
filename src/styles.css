@@ -3173,3 +3173,25 @@ input[type="radio"] {
 .where-bar input:focus {
 	border-color: var(--accent);
 }
+.tree-filter {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	margin: 6px 8px 2px;
+	padding: 0 8px;
+	height: 26px;
+	border-radius: 7px;
+	background: var(--fill);
+	color: var(--text-3);
+	flex: none;
+}
+.tree-filter input {
+	flex: 1;
+	min-width: 0;
+	border: 0;
+	background: transparent;
+	outline: none;
+	color: var(--text);
+	font: inherit;
+	font-size: 12px;
+}

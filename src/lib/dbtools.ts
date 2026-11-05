@@ -131,3 +131,38 @@ export async function queryRows(conn: number, sql: string, max = 20000): Promise
 	void invoke("db_result_close", { result: ok.resultId });
 	return rows;
 }
+
+/** 표의 인덱스 */
+export function indexSql(engine: string, schema: string | null, table: string): string | null {
+	const s = schema ?? "";
+	if (engine === "postgres") return `SELECT indexname AS 인덱스, indexdef AS 정의 FROM pg_indexes WHERE ${schema ? `schemaname = ${lit(s)} AND ` : ""}tablename = ${lit(table)} ORDER BY 1`;
+	if (engine === "mysql" || engine === "mariadb")
+		return `SELECT index_name AS 인덱스, GROUP_CONCAT(column_name ORDER BY seq_in_index) AS 열, MAX(non_unique) = 0 AS 고유, MAX(index_type) AS 종류 FROM information_schema.statistics WHERE ${schema ? `table_schema = ${lit(s)}` : "table_schema = DATABASE()"} AND table_name = ${lit(table)} GROUP BY index_name ORDER BY 1`;
+	if (engine === "mssql")
+		return `SELECT i.name AS 인덱스, i.type_desc AS 종류, i.is_unique AS 고유, i.is_primary_key AS 기본키, STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS 열 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.object_id = OBJECT_ID(${lit(schema ? `${s}.${table}` : table)}) GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key ORDER BY 1`;
+	if (engine === "oracle" || engine === "tibero")
+		return `SELECT i.index_name AS 인덱스, i.uniqueness AS 고유, LISTAGG(c.column_name, ', ') WITHIN GROUP (ORDER BY c.column_position) AS 열, i.status AS 상태 FROM all_indexes i JOIN all_ind_columns c ON c.index_owner = i.owner AND c.index_name = i.index_name WHERE i.table_owner = ${lit(s.toUpperCase())} AND i.table_name = ${lit(table.toUpperCase())} GROUP BY i.index_name, i.uniqueness, i.status ORDER BY 1`;
+	return null;
+}
+
+/** 스키마의 함수·프로시저·패키지 */
+export function routinesSql(engine: string, schema: string | null): string | null {
+	const s = schema ?? "";
+	if (engine === "postgres")
+		return `SELECT p.proname AS 이름, CASE p.prokind WHEN 'p' THEN '프로시저' WHEN 'f' THEN '함수' WHEN 'a' THEN '집계' WHEN 'w' THEN '윈도' ELSE p.prokind::text END AS 종류, pg_get_function_identity_arguments(p.oid) AS 인자, pg_get_function_result(p.oid) AS 반환 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = ${lit(s || "public")} ORDER BY 1`;
+	if (engine === "mysql" || engine === "mariadb")
+		return `SELECT routine_name AS 이름, routine_type AS 종류, dtd_identifier AS 반환, created AS 만든_때 FROM information_schema.routines WHERE ${schema ? `routine_schema = ${lit(s)}` : "routine_schema = DATABASE()"} ORDER BY 1`;
+	if (engine === "mssql") return `SELECT name AS 이름, type_desc AS 종류, create_date AS 만든_때, modify_date AS 고친_때 FROM sys.objects WHERE type IN ('P','FN','IF','TF','TR') ${schema ? `AND SCHEMA_NAME(schema_id) = ${lit(s)} ` : ""}ORDER BY 1`;
+	if (engine === "oracle" || engine === "tibero")
+		return `SELECT object_name AS 이름, object_type AS 종류, status AS 상태, last_ddl_time AS 고친_때 FROM all_objects WHERE owner = ${lit(s.toUpperCase())} AND object_type IN ('PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','TRIGGER','TYPE') ORDER BY 1`;
+	return null;
+}
+
+/** 스키마의 시퀀스 */
+export function sequencesSql(engine: string, schema: string | null): string | null {
+	const s = schema ?? "";
+	if (engine === "postgres") return `SELECT sequencename AS 시퀀스, last_value AS 지금_값, increment_by AS 증가, max_value AS 최대 FROM pg_sequences WHERE schemaname = ${lit(s || "public")} ORDER BY 1`;
+	if (engine === "mssql") return `SELECT name AS 시퀀스, current_value AS 지금_값, increment AS 증가 FROM sys.sequences ${schema ? `WHERE SCHEMA_NAME(schema_id) = ${lit(s)} ` : ""}ORDER BY 1`;
+	if (engine === "oracle" || engine === "tibero") return `SELECT sequence_name AS 시퀀스, last_number AS 지금_값, increment_by AS 증가 FROM all_sequences WHERE sequence_owner = ${lit(s.toUpperCase())} ORDER BY 1`;
+	return null;
+}

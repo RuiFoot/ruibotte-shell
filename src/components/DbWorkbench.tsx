@@ -15,7 +15,7 @@ import { ComparePanel, HistoryPanel } from "./DbPanels";
 const ErdPanelLazy = lazy(() => import("./DbErd").then((m) => ({ default: m.ErdPanel })));
 import { api } from "../lib/ipc";
 import { type Cell, type ColMeta, type EditStmt, buildDelete, buildInsert, buildUpdate, formatRows, previewSql, qualified } from "../lib/edits";
-import { ddlSql, explainSql, killSql, queryRows, searchSql, type Tool, toolSql } from "../lib/dbtools";
+import { ddlSql, explainSql, indexSql, killSql, queryRows, routinesSql, searchSql, sequencesSql, type Tool, toolSql } from "../lib/dbtools";
 import { quoteIdentFor, selectTop } from "../lib/engines";
 import { type Stmt, splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -680,6 +680,8 @@ function ObjectsPanel() {
 	const ctx = useDb();
 	const [kids, setKids] = useState<Record<string, Node[] | string>>({});
 	const [open, setOpen] = useState<Set<string>>(new Set());
+	const [filter, setFilter] = useState("");
+	const openKey = `dbtree.open.${ctx.historyScope}`;
 	const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
 
 	const load = useCallback(
@@ -691,7 +693,71 @@ function ObjectsPanel() {
 		},
 		[ctx.conn],
 	);
-	useEffect(() => load([]), [load]);
+	// 펼쳐 둔 스키마·표를 기억했다가 다시 펼친다
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 연결이 바뀔 때만
+	useEffect(() => {
+		load([]);
+		void api.settingGet(openKey).then((v) => {
+			try {
+				const keys = v ? (JSON.parse(v) as string[]) : [];
+				setOpen(new Set(keys));
+				for (const k of keys) load(k.split("\u0001"));
+			} catch {
+				// 무시
+			}
+		});
+	}, [load]);
+	useEffect(() => {
+		const t = window.setTimeout(() => void api.settingSet(openKey, JSON.stringify([...open].slice(0, 200))), 500);
+		return () => window.clearTimeout(t);
+	}, [open, openKey]);
+	const showSql = (sql: string | null, tool?: string) => {
+		if (sql) ctx.run([sql], undefined, tool ?? "catalog");
+		else alert("이 엔진에서는 아직 지원하지 않습니다");
+	};
+	/** 열 정보로 INSERT·UPDATE·DELETE 틀(값은 :이름 파라미터) */
+	const dml = async (kind: "insert" | "update" | "delete", schema: string, table: string) => {
+		try {
+			const cols = await db.meta(ctx.conn, schema === "(기본)" ? null : schema, table);
+			const q = qname(schema, table);
+			const id = (n: string) => quoteIdentFor(ctx.engine, n);
+			const param = (n: string) => `:${n.replace(/\W/g, "_")}`;
+			const pk = cols.filter((c) => c.pk);
+			const where = (pk.length ? pk : cols.slice(0, 1)).map((c) => `${id(c.name)} = ${param(c.name)}`).join(" AND ");
+			const text =
+				kind === "insert"
+					? `INSERT INTO ${q} (${cols.map((c) => id(c.name)).join(", ")})\nVALUES (${cols.map((c) => param(c.name)).join(", ")});\n`
+					: kind === "update"
+						? `UPDATE ${q}\nSET ${cols.filter((c) => !c.pk).map((c) => `${id(c.name)} = ${param(c.name)}`).join(",\n    ")}\nWHERE ${where};\n`
+						: `DELETE FROM ${q}\nWHERE ${where};\n`;
+			ctx.insertText(text);
+		} catch (x) {
+			alert((x as DbError).message ?? String(x));
+		}
+	};
+	/** 표 전체를 파일로(최대 100만 행) */
+	const exportTable = async (schema: string, table: string, format: "csv" | "tsv" | "json") => {
+		const path = await saveDialog({ defaultPath: `${table}.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+		if (!path) return;
+		try {
+			const ok = await db.query(ctx.conn, `SELECT * FROM ${qname(schema, table)}`, 1_000_000);
+			if (!ok.resultId) return;
+			const n = await db.export(ok.resultId, format, path);
+			void db.closeResult(ok.resultId);
+			alert(`${n.toLocaleString()}행을 저장했습니다${ok.truncated ? "(100만 행에서 멈춤)" : ""}`);
+		} catch (x) {
+			alert((x as DbError).message ?? String(x));
+		}
+	};
+	/** 비우기·지우기 — 이름을 그대로 쳐야 실행 */
+	const destroy = (kind: "truncate" | "drop", schema: string, table: string, isView: boolean) => {
+		const word = kind === "truncate" ? "모든 행을 지웁니다(되살릴 수 없음)" : `${isView ? "뷰" : "표"}를 지웁니다(되살릴 수 없음)`;
+		if (prompt(`${table} — ${word}\n실행하려면 이름을 그대로 치세요: ${table}`) !== table) return;
+		const q = qname(schema, table);
+		ctx.run([kind === "truncate" ? `TRUNCATE TABLE ${q}` : `DROP ${isView ? "VIEW" : "TABLE"} ${q}`]);
+		window.setTimeout(() => load([schema]), 800);
+	};
+	const fl = filter.trim().toLowerCase();
 
 	const qname = (schema: string, table: string) =>
 		schema === "(기본)" ? quoteIdentFor(ctx.engine, table) : `${quoteIdentFor(ctx.engine, schema)}.${quoteIdentFor(ctx.engine, table)}`;
@@ -728,6 +794,7 @@ function ObjectsPanel() {
 			return;
 		}
 		for (const n of v) {
+			if (fl && (n.kind === "table" || n.kind === "view") && !n.name.toLowerCase().includes(fl)) continue;
 			const p = [...path, n.name];
 			const k = p.join("\u0001");
 			const expandable = n.kind !== "column";
@@ -741,7 +808,10 @@ function ObjectsPanel() {
 					className="tree-row"
 					style={{ paddingLeft: 6 + depth * 14 }}
 					onClick={() => expandable && toggle(p)}
-					onDoubleClick={() => (n.kind === "table" || n.kind === "view") && ctx.run([`SELECT * FROM ${qname(path[0], n.name)}`], { schema: path[0] === "(기본)" ? null : path[0], table: n.name })}
+					onDoubleClick={() => {
+						if (n.kind === "table" || n.kind === "view") ctx.run([`SELECT * FROM ${qname(path[0], n.name)}`], { schema: path[0] === "(기본)" ? null : path[0], table: n.name });
+						else if (n.kind === "column") ctx.insertText(quoteIdentFor(ctx.engine, n.name));
+					}}
 					onContextMenu={(e) => {
 						e.preventDefault();
 						const items: MenuItem[] = [];
@@ -766,9 +836,44 @@ function ObjectsPanel() {
 										}
 									},
 								});
+							const sch = path[0];
+							items.push(
+								{ label: "인덱스", run: () => showSql(indexSql(ctx.engine, sch === "(기본)" ? null : sch, n.name)) },
+								{ sep: true },
+								{ label: "INSERT 문 만들기", run: () => void dml("insert", sch, n.name) },
+								{ label: "UPDATE 문 만들기", run: () => void dml("update", sch, n.name) },
+								{ label: "DELETE 문 만들기", run: () => void dml("delete", sch, n.name) },
+								{ sep: true },
+								{ label: "내보내기 — CSV…", run: () => void exportTable(sch, n.name, "csv") },
+								{ label: "내보내기 — TSV…", run: () => void exportTable(sch, n.name, "tsv") },
+								{ label: "내보내기 — JSON…", run: () => void exportTable(sch, n.name, "json") },
+							);
+							if (!ctx.readOnly) {
+								items.push({ sep: true });
+								if (n.kind === "table") items.push({ label: "비우기(TRUNCATE)…", danger: true, run: () => destroy("truncate", sch, n.name, false) });
+								items.push({ label: n.kind === "view" ? "뷰 지우기(DROP)…" : "표 지우기(DROP)…", danger: true, run: () => destroy("drop", sch, n.name, n.kind === "view") });
+							}
 							items.push({ sep: true });
 						}
+						if (n.kind === "column") {
+							const sch = path[0];
+							const t = path[1];
+							const col = quoteIdentFor(ctx.engine, n.name);
+							items.push(
+								{ label: "이름 넣기", run: () => ctx.insertText(col) },
+								{
+									label: "값 분포(많은 순 100)",
+									run: () => {
+										const base = `${col} AS 값, COUNT(*) AS 개수 FROM ${qname(sch, t)} GROUP BY ${col} ORDER BY 2 DESC`;
+										ctx.run([ctx.engine === "mssql" ? `SELECT TOP 100 ${base}` : ctx.engine === "oracle" || ctx.engine === "tibero" ? `SELECT ${base} FETCH FIRST 100 ROWS ONLY` : `SELECT ${base} LIMIT 100`]);
+									},
+								},
+								{ sep: true },
+							);
+						}
 						if (n.kind === "schema") {
+							const sch = n.name === "(기본)" ? null : n.name;
+							items.push({ label: "함수·프로시저", run: () => showSql(routinesSql(ctx.engine, sch)) }, { label: "시퀀스", run: () => showSql(sequencesSql(ctx.engine, sch)) });
 							items.push(
 								{ label: "ERD(관계도)", run: () => ctx.openPanel(`erd:${n.name}`, "erd", `ERD ${n.name}`, { schema: n.name }) },
 								{ label: "표 크기", run: () => toolSql(ctx.engine, "sizes", n.name) && ctx.run([toolSql(ctx.engine, "sizes", n.name) as string], undefined, "sizes") },
@@ -800,6 +905,10 @@ function ObjectsPanel() {
 	walk([], 0);
 	return (
 		<div className="tree">
+			<label className="tree-filter">
+				<Search size={12} />
+				<input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="표·뷰 이름 거르기" spellCheck={false} onKeyDown={(e) => e.key === "Escape" && setFilter("")} />
+			</label>
 			<div className="tree-body">{rows}</div>
 			{menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
 		</div>
