@@ -51,7 +51,8 @@ import { quoteIdentFor, selectTop } from "../lib/engines";
 import { type Stmt, splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { CellEditor } from "./CellEditor";
-import { DataGrid, type GridApi, type GridCol, type GridOverlay } from "./DataGrid";
+import { DataGrid, type GridApi, type GridCol, type GridOverlay, groupDigits, type SelStats } from "./DataGrid";
+import { saveXlsx, XLSX_MAX_ROWS } from "../lib/xlsxExport";
 import { Select } from "./Select";
 import { SnippetPalette } from "./SnippetPalette";
 import { codeHighlight } from "../lib/cmTheme";
@@ -323,6 +324,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const [valueView, setValueView] = useState<{ col: string; value: string | null } | null>(null);
 	const [bigEdit, setBigEdit] = useState<{ r: number; c: number; value: string | null } | null>(null);
 	const [thousands, setThousands] = useState(false);
+	const [stats, setStats] = useState<SelStats | null>(null);
 	const [where, setWhere] = useState(p.source?.where ?? "");
 	const [fks, setFks] = useState<Fk[]>([]);
 	const [totalRows, setTotalRows] = useState<number | null>(null);
@@ -685,13 +687,39 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 		}
 	};
 
-	async function doExport(format: "csv" | "tsv" | "json") {
+	async function doExport(format: "csv" | "tsv" | "json" | "xlsx") {
 		if (!rid) return;
-		const path = await saveDialog({ defaultPath: `result.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+		const path = await saveDialog({ defaultPath: `result.${format}`, filters: [{ name: format === "xlsx" ? "엑셀" : format.toUpperCase(), extensions: [format] }] });
 		if (!path) return;
+		if (format === "xlsx") {
+			// 보이는 행(정렬·거르기 적용) 그대로 — db_rows 가 보기 순서로 준다
+			setMsg("엑셀 만드는 중…");
+			try {
+				const r = await saveXlsx(path, cols, total, (from, to) => db.rows(rid, from, to), src?.table ?? "result");
+				setMsg(`${r.rows.toLocaleString()}행을 엑셀로 저장했습니다${r.capped ? `(엑셀 한 장 상한 ${XLSX_MAX_ROWS.toLocaleString()}행에서 멈춤)` : ""}`);
+			} catch (x) {
+				setMsg(`엑셀 저장 실패: ${String((x as DbError).message ?? x)}`);
+			}
+			return;
+		}
 		const n = await db.export(rid, format, path);
 		setMsg(`${n.toLocaleString()}행을 저장했습니다`);
 	}
+	const num = (v: string) => (thousands ? groupDigits(v) : v);
+	const statChip = (label: string, v: string | undefined) =>
+		v == null ? null : (
+			<button
+				type="button"
+				className="sel-stat"
+				title={`${label} 복사`}
+				onClick={() => {
+					void navigator.clipboard.writeText(v);
+					setMsg(`${label} ${num(v)} 복사함`);
+				}}
+			>
+				{label} <b>{num(v)}</b>
+			</button>
+		);
 
 	return (
 		<div className="panel-fill">
@@ -758,6 +786,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 						setMsg(`${got.length}행 복사함(TSV)`);
 					}}
 					onBigEdit={(r, c) => setBigEdit({ r, c, value: grid.current?.row(r)?.[c] ?? null })}
+					onStats={setStats}
 					onPaste={(r0, c0, pasted) => {
 						const list: { r: number; c: number; v: Cell }[] = [];
 						for (let i = 0; i < pasted.length; i++)
@@ -827,6 +856,16 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				)}
 				{msg && <span>{msg}</span>}
 				<span style={{ marginLeft: "auto" }} />
+				{stats && (
+					<span className="sel-stats" title={stats.partial ? "칸이 너무 많아 앞쪽 50만 칸만 셌습니다" : "누르면 그 값을 복사"}>
+						{statChip("개수", String(stats.count))}
+						{statChip("합계", stats.sum)}
+						{statChip("평균", stats.avg)}
+						{statChip("최소", stats.min)}
+						{statChip("최대", stats.max)}
+						{stats.partial && <span className="muted">일부</span>}
+					</span>
+				)}
 				{rid ? (
 					<>
 						<button
@@ -869,6 +908,9 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 						</button>
 						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void doExport("json")}>
 							JSON
+						</button>
+						<button type="button" className="btn ghost" style={{ height: 20 }} title="엑셀(xlsx) — 보이는 행(정렬·거르기 적용)" onClick={() => void doExport("xlsx")}>
+							엑셀
 						</button>
 					</>
 				) : null}
@@ -974,12 +1016,22 @@ function ObjectsPanel() {
 		}
 	};
 	/** 표 전체를 파일로(최대 100만 행) — sql 은 INSERT 문 */
-	const exportTable = async (schema: string, table: string, format: "csv" | "tsv" | "json" | "sql") => {
-		const path = await saveDialog({ defaultPath: `${table}.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+	const exportTable = async (schema: string, table: string, format: "csv" | "tsv" | "json" | "sql" | "xlsx") => {
+		const path = await saveDialog({ defaultPath: `${table}.${format}`, filters: [{ name: format === "xlsx" ? "엑셀" : format.toUpperCase(), extensions: [format] }] });
 		if (!path) return;
 		try {
-			const ok = await db.query(ctx.conn, `SELECT * FROM ${qname(schema, table)}`, 1_000_000);
+			const ok = await db.query(ctx.conn, `SELECT * FROM ${qname(schema, table)}`, format === "xlsx" ? XLSX_MAX_ROWS : 1_000_000);
 			if (!ok.resultId) return;
+			if (format === "xlsx") {
+				const rid = ok.resultId;
+				try {
+					const r = await saveXlsx(path, ok.columns, ok.rowCount, (from, to) => db.rows(rid, from, to), table);
+					ctx.notice(`${r.rows.toLocaleString()}행을 엑셀로 저장했습니다${ok.truncated ? `(엑셀 한 장 상한 ${XLSX_MAX_ROWS.toLocaleString()}행에서 멈춤)` : ""}`);
+				} finally {
+					void db.closeResult(rid);
+				}
+				return;
+			}
 			const prefix = format === "sql" ? `INSERT INTO ${qname(schema, table)} (${ok.columns.map((c) => quoteIdentFor(ctx.engine, c.name)).join(", ")}) VALUES ` : undefined;
 			const n = await db.export(ok.resultId, format, path, prefix, ctx.mysql);
 			void db.closeResult(ok.resultId);
@@ -1142,6 +1194,7 @@ function ObjectsPanel() {
 								{ label: "내보내기 — CSV…", run: () => void exportTable(sch, n.name, "csv") },
 								{ label: "내보내기 — TSV…", run: () => void exportTable(sch, n.name, "tsv") },
 								{ label: "내보내기 — JSON…", run: () => void exportTable(sch, n.name, "json") },
+								{ label: "내보내기 — 엑셀(xlsx)…", run: () => void exportTable(sch, n.name, "xlsx") },
 								{ label: "내보내기 — SQL INSERT 파일…", run: () => void exportTable(sch, n.name, "sql") },
 							);
 							if (!ctx.readOnly && n.kind === "table") items.push({ label: "CSV 가져오기…", run: () => ctx.importCsv(sch === "(기본)" ? null : sch, n.name) });

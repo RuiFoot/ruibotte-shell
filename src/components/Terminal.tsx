@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FitAddon } from "@xterm/addon-fit";
@@ -17,6 +17,10 @@ import { attachCompletion, type Completer, type CompletionSource } from "../lib/
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { SnippetPalette } from "./SnippetPalette";
 import { DANGER, setActiveTerminal } from "../lib/activeTerm";
+import { revealLogDir, SessionRecorder } from "../lib/sessionLog";
+import { attachHighlighter } from "../lib/termHighlight";
+import { loadTermPrefs, TERM_PREFS_EVENT } from "../lib/termPrefs";
+import { createZmodem, type ZmodemBridge, type ZmProgress } from "../lib/zmodemTerm";
 import { Select } from "./Select";
 
 function themeFromCss() {
@@ -40,6 +44,23 @@ type Pending = { marker: IMarker; start: number; text: string };
  * 스크롤백 저장·인코딩(UTF-8/EUC-KR)·스니펫(Alt+P).
  */
 
+/** 바이트 → x-user-defined 글(0x80~0xFF 는 U+F780~) — 원격이 그 인코딩으로 바이트 그대로 되돌려 보낸다(ZMODEM 바이너리) */
+function bytesAsUserDefined(b: Uint8Array) {
+	let out = "";
+	for (let i = 0; i < b.length; i += 8192) {
+		const part = b.subarray(i, i + 8192);
+		const u = new Uint16Array(part.length);
+		for (let j = 0; j < part.length; j++) u[j] = part[j] < 0x80 ? part[j] : 0xf700 + part[j];
+		out += String.fromCharCode(...u);
+	}
+	return out;
+}
+
+const fmtBytes = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`);
+
+/** rz/sz 를 쳤는데 서버에 없을 때 나오는 말 */
+const NO_LRZSZ = /(?:^|[\s:])[rs]z: (?:command )?not found|command not found: [rs]z\b|Command '[rs]z' not found|[rs]z: 명령어를 찾을 수 없음/;
+
 /** 출력의 경로 — 절대 경로(/…, C:/…)와 뒤에 붙은 :줄 */
 const PATH_RE = /(?:^|[\s'"(=:])((?:\/|[A-Za-z]:[\\/])[\w.@+~\-\\/]*[\w])(?::(\d+))?/g;
 
@@ -62,6 +83,8 @@ export function TerminalView({
 	onSplit,
 	onRootShell,
 	statusExtra,
+	onRecording,
+	logName,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -92,6 +115,10 @@ export function TerminalView({
 	onRootShell?: (on: boolean) => void;
 	/** 상태 줄 오른쪽에 덧붙일 것(원격: 작은 자원 표시) */
 	statusExtra?: ReactNode;
+	/** 세션 기록을 켜고 끌 때(탭에 ● 표시) */
+	onRecording?: (on: boolean) => void;
+	/** 기록 폴더 이름(서버 이름) — 없으면 label */
+	logName?: string;
 }) {
 	const completionRef = useRef(completion);
 	completionRef.current = completion;
@@ -129,6 +156,52 @@ export function TerminalView({
 	const onOpenPathRef = useRef(onOpenPath);
 	onOpenPathRef.current = onOpenPath;
 	const menuLine = useRef<number | null>(null);
+	// 세션 기록 — 셸을 다시 열어도 이어서 기록, 칸을 닫으면 멈춤
+	const recRef = useRef<SessionRecorder | null>(null);
+	const recStarting = useRef(false);
+	const [recording, setRecording] = useState<string | null>(null);
+	const logNameRef = useRef(logName ?? label);
+	logNameRef.current = logName ?? label;
+	const onRecordingRef = useRef(onRecording);
+	onRecordingRef.current = onRecording;
+	// rz/sz — 원격 셸에서만
+	const isRemote = backend.exitEvent === "ssh-shell-exit";
+	const zmRef = useRef<ZmodemBridge | null>(null);
+	const [zm, setZm] = useState<ZmProgress | null>(null);
+
+	const startRec = async () => {
+		if (recRef.current || recStarting.current) return;
+		recStarting.current = true;
+		try {
+			const p = await loadTermPrefs();
+			const r = await SessionRecorder.start(logNameRef.current, { dir: p.logDir, strip: p.logStrip, timestamps: p.logStamp });
+			recRef.current = r;
+			setRecording(r.path);
+			setStat({ label: `기록 중 — ${r.path}`, ok: true });
+		} catch (e) {
+			setStat({ label: `기록을 시작하지 못했습니다: ${String(e)}` });
+		} finally {
+			recStarting.current = false;
+		}
+	};
+	const stopRec = async () => {
+		const r = recRef.current;
+		if (!r) return;
+		recRef.current = null;
+		setRecording(null);
+		await r.stop();
+		setStat({ label: `기록을 멈췄습니다 — ${r.path}`, ok: true });
+	};
+	useEffect(() => {
+		onRecordingRef.current?.(!!recording);
+	}, [recording]);
+	useEffect(
+		() => () => {
+			void recRef.current?.stop();
+			recRef.current = null;
+		},
+		[],
+	);
 
 	const write = (s: string) => {
 		if (idRef.current != null) void backend.write(idRef.current, s, encRef.current);
@@ -225,10 +298,68 @@ export function TerminalView({
 		const started = performance.now();
 		const plain = new TextDecoder();
 		let tail = "";
-		const ch = bytesChannel((b) => {
+		// ── 단어 색칠·기록·rz/sz 설정(설정 화면이 바꾸면 다시 읽는다) ──
+		const hi = attachHighlighter(term);
+		const utf8 = new TextEncoder();
+		/** 화면에 그리고 기록에도 — EUC-KR 이면 기록은 UTF-8 로 */
+		const show = (b: Uint8Array) => {
 			const dec = decoderRef.current;
-			if (dec) term.write(dec.decode(b, { stream: true }));
-			else term.write(b);
+			const rec = recRef.current;
+			if (dec) {
+				const t = dec.decode(b, { stream: true });
+				term.write(t);
+				rec?.push(utf8.encode(t));
+			} else {
+				term.write(b);
+				rec?.push(b);
+			}
+		};
+		const zmb = isRemote
+			? createZmodem({
+					send: async (b) => {
+						if (idRef.current != null) await backend.write(idRef.current, bytesAsUserDefined(b), "x-user-defined");
+					},
+					toTerminal: show,
+					pickDir: async () => {
+						const p = await loadTermPrefs();
+						if (p.zmDir) return p.zmDir;
+						const d = await openDialog({ directory: true, multiple: false, title: "sz — 받을 폴더 고르기" });
+						return typeof d === "string" ? d : null;
+					},
+					pickFiles: async () => {
+						const r = await openDialog({ multiple: true, title: "rz — 서버로 올릴 파일 고르기" });
+						return r == null ? null : Array.isArray(r) ? r : [r];
+					},
+					progress: setZm,
+					notice: (m, ok) => setStat({ label: m, ok }),
+				})
+			: null;
+		zmRef.current = zmb;
+		const applyPrefs = () =>
+			void loadTermPrefs().then((p) => {
+				if (disposed) return;
+				hi.setRules(p.hiOn ? p.hiWords : null);
+				zmb?.setEnabled(p.zmOn);
+				if (p.logAuto && !recRef.current) void startRec();
+			});
+		applyPrefs();
+		window.addEventListener(TERM_PREFS_EVENT, applyPrefs);
+		/** rz/sz 를 친 직후 몇 초 — 서버에 lrzsz 가 없다는 말을 찾는다 */
+		let zmWatch = 0;
+		let zmTail = "";
+		const ch = bytesChannel((b) => {
+			if (zmb) zmb.consume(b);
+			else show(b);
+			if (zmWatch) {
+				if (Date.now() > zmWatch) zmWatch = 0;
+				else {
+					zmTail = (zmTail + plain.decode(b)).slice(-300);
+					if (NO_LRZSZ.test(zmTail)) {
+						zmWatch = 0;
+						setStat({ label: "서버에 lrzsz 가 없습니다 — 설치: sudo apt install lrzsz (RHEL 계열: sudo dnf install lrzsz)" });
+					}
+				}
+			}
 			if (waiters.current.length) {
 				tail = (tail + plain.decode(b)).slice(-400);
 				for (const w of waiters.current.slice()) {
@@ -316,6 +447,7 @@ export function TerminalView({
 				onShellRef.current?.({
 					idle: () => !promptSeen || (atPrompt && !typedAtPrompt),
 					send: (s) => write(s),
+					sudoPw: backend.sudoPw ? () => backend.sudoPw?.(id) ?? Promise.resolve(false) : undefined,
 					expect: (re, ms) =>
 						new Promise<boolean>((res) => {
 							const w = { re, done: res };
@@ -333,6 +465,19 @@ export function TerminalView({
 			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${typeof e === "object" ? (e as { message?: string }).message : String(e)}` }));
 
 		const onData = term.onData((d) => {
+			// rz/sz 전송 중 — 셸에 글을 보내지 않는다(Ctrl+C 는 전송 멈추기)
+			if (zmb?.active()) {
+				if (d === "\x03") zmb.cancel();
+				return;
+			}
+			if (zmb && d.includes("\r")) {
+				const buf = term.buffer.active;
+				const typed = (buf.getLine(buf.cursorY + buf.baseY)?.translateToString(true) ?? "").replace(/^.*?[$#>]\s/, "").trim();
+				if (/^(?:sudo\s+)?(?:rz|sz)(?:\s|$)/.test(typed)) {
+					zmWatch = Date.now() + 4000;
+					zmTail = "";
+				}
+			}
 			if (atPrompt && d !== "\r") typedAtPrompt = true;
 			if (d === "\r") completer?.submitted();
 			else if (d.length === 1 && d >= " ") completer?.typed();
@@ -435,6 +580,11 @@ export function TerminalView({
 
 		return () => {
 			disposed = true;
+			window.removeEventListener(TERM_PREFS_EVENT, applyPrefs);
+			zmb?.cancel();
+			zmRef.current = null;
+			setZm(null);
+			hi.dispose();
 			completer?.dispose();
 			ta?.removeEventListener("paste", onPaste, true);
 			ta?.removeEventListener("focus", onFocusIn);
@@ -557,6 +707,14 @@ export function TerminalView({
 		{ label: "스니펫  Alt+P", run: () => setPalette(true) },
 		{ label: "화면 지우기", run: () => termRef.current?.clear() },
 		{ label: "스크롤백 저장…", run: () => void exportScrollback() },
+		recording ? { label: "이 터미널 기록 멈추기", run: () => void stopRec() } : { label: "이 터미널 기록 시작", run: () => void startRec() },
+		{
+			label: "기록 폴더 열기",
+			run: () =>
+				void loadTermPrefs()
+					.then((p) => revealLogDir(p.logDir, logNameRef.current))
+					.catch((e) => setStat({ label: `폴더를 열지 못했습니다: ${String(e)}` })),
+		},
 		{ sep: true },
 		{ label: encoding === "UTF-8" ? "인코딩: EUC-KR 로" : "인코딩: UTF-8 로", run: () => changeEncoding(encoding === "UTF-8" ? "EUC-KR" : "UTF-8") },
 		{ label: "셸 다시 열기", run: () => setGen((g) => g + 1) },
@@ -641,7 +799,31 @@ export function TerminalView({
 					setMenu({ x: e.clientX, y: e.clientY });
 				}}
 			/>
+			{zm && (
+				<div className="zm-bar" role="status">
+					<span className="zm-dir">{zm.dir === "down" ? "받는 중" : "올리는 중"}</span>
+					<span className="zm-name" title={zm.name}>
+						{zm.count > 1 ? `(${zm.index}/${zm.count}) ` : ""}
+						{zm.name}
+					</span>
+					<div className="bar">
+						<i style={{ width: `${zm.total ? Math.min(100, (zm.done / zm.total) * 100) : 0}%` }} />
+					</div>
+					<small>
+						{fmtBytes(zm.done)}
+						{zm.total ? ` / ${fmtBytes(zm.total)} · ${Math.floor((zm.done / zm.total) * 100)}%` : ""}
+					</small>
+					<button type="button" className="btn ghost" onClick={() => zmRef.current?.cancel()} title="전송 멈추기(Ctrl+C)">
+						취소
+					</button>
+				</div>
+			)}
 			<div className="statusbar">
+				{recording && (
+					<button type="button" className="rec-dot" title={`기록 중 — ${recording}\n눌러 멈추기`} onClick={() => void stopRec()}>
+						● 기록
+					</button>
+				)}
 				<span className={stat.ok ? "ok" : undefined}>{stat.label}</span>
 				{last && (
 					<span className={last.code === 0 ? "ok" : "err"}>

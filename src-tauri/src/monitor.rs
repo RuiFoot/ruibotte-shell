@@ -9,7 +9,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::ssh::{err, Conn, SshConns, R};
-use crate::sudo::{exec, pw_for, q, sudo};
+use crate::sudo::{exec, q, sudo};
 
 /// 한 번 재는 스크립트 — 구획마다 `@이름` 줄로 나눈다
 const SCRIPT: &str = r#"export LC_ALL=C
@@ -323,15 +323,15 @@ pub(crate) fn parse_du(text: &str) -> Vec<DuEntry> {
 
 /// 폴더 안 크기(한 단계) — 같은 파일 시스템만(-x), 낮은 우선순위로. 읽을 수 없는 곳은 빠진다(sudo 면 다 본다)
 #[tauri::command]
-pub async fn ssh_du(conns: State<'_, SshConns>, conn: u32, path: String, profile_id: Option<i64>, as_root: bool) -> R<Vec<DuEntry>> {
-    du(&*conns.get(conn)?, &path, profile_id, as_root).await
+pub async fn ssh_du(conns: State<'_, SshConns>, conn: u32, path: String, as_root: bool) -> R<Vec<DuEntry>> {
+    du(&*conns.get(conn)?, &path, as_root).await
 }
 
-pub(crate) async fn du(c: &Conn, path: &str, profile_id: Option<i64>, as_root: bool) -> R<Vec<DuEntry>> {
+pub(crate) async fn du(c: &Conn, path: &str, as_root: bool) -> R<Vec<DuEntry>> {
     let inner = format!("cd -- {} && {{ du -xk --max-depth=1 . 2>/dev/null || du -xk -d 1 . 2>/dev/null; }}; true", q(path));
     let run = async {
         if as_root {
-            sudo(c, pw_for(profile_id, None).as_deref(), &format!("nice -n 19 sh -c {}", q(&inner)), None).await
+            sudo(c, &format!("nice -n 19 sh -c {}", q(&inner)), None).await
         } else {
             exec(c, &format!("nice -n 19 sh -c {}", q(&inner)), None).await
         }
@@ -342,16 +342,16 @@ pub(crate) async fn du(c: &Conn, path: &str, profile_id: Option<i64>, as_root: b
 
 /// 프로세스 멈추기 — TERM(정상 종료 요청) 또는 KILL(강제)
 #[tauri::command]
-pub async fn ssh_kill(conns: State<'_, SshConns>, conn: u32, pid: u32, force: bool, profile_id: Option<i64>, as_root: bool) -> R<()> {
-    kill(&*conns.get(conn)?, pid, force, profile_id, as_root).await
+pub async fn ssh_kill(conns: State<'_, SshConns>, conn: u32, pid: u32, force: bool, as_root: bool) -> R<()> {
+    kill(&*conns.get(conn)?, pid, force, as_root).await
 }
 
-pub(crate) async fn kill(c: &Conn, pid: u32, force: bool, profile_id: Option<i64>, as_root: bool) -> R<()> {
+pub(crate) async fn kill(c: &Conn, pid: u32, force: bool, as_root: bool) -> R<()> {
     if pid <= 1 {
         return Err(err("OTHER", "이 프로세스는 멈출 수 없습니다"));
     }
     let cmd = format!("kill -s {} {pid}", if force { "KILL" } else { "TERM" });
-    let o = if as_root { sudo(c, pw_for(profile_id, None).as_deref(), &cmd, None).await? } else { exec(c, &cmd, None).await? };
+    let o = if as_root { sudo(c, &cmd, None).await? } else { exec(c, &cmd, None).await? };
     if o.code != Some(0) {
         let m = o.stderr.trim();
         return Err(err(
@@ -439,11 +439,11 @@ mod live {
         assert!(b.cpu[0].total >= a.cpu[0].total);
         assert!(b.procs.iter().any(|p| p.name == "sshd" && p.user == "root"));
         assert!(!b.disks.is_empty());
-        let d = du(&c, "/home/rbtest", None, false).await.unwrap();
+        let d = du(&c, "/home/rbtest", false).await.unwrap();
         println!("du {:?}", d.iter().take(5).collect::<Vec<_>>());
         assert_eq!(d[0].name, ".");
         assert!(d.iter().any(|e| e.name == "app"));
-        let d = du(&c, "/root", None, true).await.unwrap();
+        let d = du(&c, "/root", true).await.unwrap();
         assert!(d.iter().any(|e| e.name == "."), "sudo du {d:?}");
         // 내 프로세스 TERM, root 프로세스는 거절 → sudo 로 KILL
         let mut ch = c.handle_ref().channel_open_session().await.unwrap();
@@ -452,11 +452,11 @@ mod live {
         while let Some(m) = ch.wait().await { if let russh::ChannelMsg::Data { data } = m { out.extend_from_slice(&data); } }
         let ids: Vec<u32> = String::from_utf8_lossy(&out).split_whitespace().filter_map(|x| x.parse().ok()).collect();
         println!("pids {ids:?}");
-        kill(&c, ids[0], false, None, false).await.unwrap();
-        let e = kill(&c, ids[1], false, None, false).await.unwrap_err();
+        kill(&c, ids[0], false, false).await.unwrap();
+        let e = kill(&c, ids[1], false, false).await.unwrap_err();
         println!("거절: {e:?}");
-        kill(&c, ids[1], true, None, true).await.unwrap();
-        assert!(kill(&c, 1, true, None, true).await.is_err());
+        kill(&c, ids[1], true, true).await.unwrap();
+        assert!(kill(&c, 1, true, true).await.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

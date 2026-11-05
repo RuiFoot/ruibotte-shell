@@ -45,6 +45,7 @@ export function ConnectDialog({
 			try {
 				const ok = await api.sshConnect({
 					profileId: prof.id,
+					accountId: prof.accountId,
 					host: prof.host,
 					port: prof.port,
 					username: prof.username,
@@ -61,6 +62,7 @@ export function ConnectDialog({
 				const e = asSshError(raw);
 				if (e.code === "HOSTKEY_UNKNOWN" || e.code === "HOSTKEY_MISMATCH") setStep({ s: "hostkey", e });
 				else if (e.code === "NEGOTIATION") setStep({ s: "negotiation", e });
+				else if (prof.auth === "agent") setStep({ s: "error", e });
 				else if (e.code === "NEED_SECRET" || e.code === "AUTH_FAILED") setStep({ s: "secret", error: e.code === "AUTH_FAILED" ? e.message : undefined });
 				else setStep({ s: "error", e });
 			}
@@ -107,7 +109,7 @@ export function ConnectDialog({
 						{p.id != null && (
 							<label className="check">
 								<input type="checkbox" checked={save} onChange={(e) => setSave(e.target.checked)} />
-								접속에 성공하면 OS 자격 증명 저장소에 저장
+								접속에 성공하면 이 계정 암호로 OS 자격 증명 저장소에 저장
 							</label>
 						)}
 						<div className="sheet-actions">

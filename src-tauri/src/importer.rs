@@ -18,7 +18,7 @@ pub struct Candidate {
     pub username: String,
     pub key_path: Option<String>,
     pub legacy: String,
-    /// 같은 주소·포트·계정 프로필이 이미 있으면
+    /// 같은 주소·포트 서버에 같은 사용자 계정이 이미 있으면
     pub duplicate: bool,
 }
 
@@ -169,12 +169,12 @@ pub fn import_candidates(store: State<'_, Store>, ssh_config_path: Option<String
     for c in &mut all {
         c.duplicate = existing
             .iter()
-            .any(|p| p.kind == "ssh" && p.host.eq_ignore_ascii_case(&c.host) && p.port == c.port && p.username == c.username);
+            .any(|p| p.kind == "ssh" && p.host.eq_ignore_ascii_case(&c.host) && p.port == c.port && p.accounts.iter().any(|a| a.username == c.username));
     }
     Ok(all)
 }
 
-/// 내 SSH 프로필을 ssh config 로(암호 없음). 구형 단계는 켠 만큼 알고리즘 줄을 붙인다
+/// 내 SSH 서버를 ssh config 로(암호 없음, 계정은 기본 계정). 구형 단계는 켠 만큼 알고리즘 줄을 붙인다
 #[tauri::command]
 pub fn export_ssh_config(store: State<'_, Store>) -> Result<String, String> {
     let list: Vec<Profile> = crate::store::profiles_list(store)?;

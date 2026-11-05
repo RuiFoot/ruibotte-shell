@@ -127,7 +127,7 @@ export function ConnectionsPane({
 		setChecked(new Set());
 	};
 	const bulkDelete = async () => {
-		if (!confirm(`고른 ${checked.size}개 연결을 지울까요? 저장한 암호도 함께 지웁니다.`)) return;
+		if (!confirm(`고른 ${checked.size}개 서버를 지울까요? 딸린 계정과 저장한 암호도 함께 지웁니다.`)) return;
 		for (const id of checked) await api.profileDelete(id);
 		if (sel?.kind === "id" && checked.has(sel.id)) setSel(null);
 		setChecked(new Set());
@@ -259,7 +259,7 @@ export function ConnectionsPane({
 										onKeyDown={(e) => e.key === "Enter" && p.id != null && go({ kind: "id", id: p.id })}
 										role="button"
 										tabIndex={0}
-										title={`${p.username ? `${p.username}@` : ""}${p.host}:${p.port}${p.memo ? `\n${p.memo}` : ""}\n두 번 누르면 접속`}
+										title={`${p.host}:${p.port} · 계정 ${(p.accounts ?? []).map((a) => a.username).join(", ") || p.username}${p.memo ? `\n${p.memo}` : ""}\n두 번 누르면 서버 카드(계정 골라 접속)`}
 									>
 										<input
 											type="checkbox"
@@ -280,6 +280,7 @@ export function ConnectionsPane({
 											{p.name}
 										</span>
 										{p.secretSaved && <KeyRound size={10} className="ti" />}
+										{(p.accounts?.length ?? 0) > 1 && <small className="conn-host">계정 {p.accounts?.length}</small>}
 										<small className="conn-host">
 											{p.kind === "db" ? `${p.engine} · ` : ""}
 											{p.host}
@@ -319,11 +320,12 @@ export function ConnectionsPane({
 						}}
 						onDuplicate={(p) => go({ kind: "new", p })}
 						onConnect={onConnect}
+						onAccountsChanged={reload}
 					/>
 				) : (
 					<div className="panel-hint">
 						왼쪽에서 연결을 고르면 여기서 바로 고칩니다(저장·되돌리기·연결 테스트·복제·지우기).
-						<br />두 번 누르면 접속, 체크로 여러 개를 골라 묶음 옮기기·지우기.
+						<br />두 번 누르면 서버 카드(계정 골라 접속), 체크로 여러 개를 골라 묶음 옮기기·지우기.
 					</div>
 				)}
 			</section>

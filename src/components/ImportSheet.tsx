@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Copy } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, type LegacyLevel } from "../lib/ipc";
+import { api, type LegacyLevel, type Profile } from "../lib/ipc";
 
 type Candidate = {
 	source: "ssh-config" | "putty";
@@ -20,6 +20,8 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 	const [list, setList] = useState<Candidate[] | null>(null);
 	const [pick, setPick] = useState<Set<number>>(new Set());
 	const [err, setErr] = useState("");
+	// 같은 주소·포트의 다른 사용자는 서버 하나의 계정 여럿으로
+	const [merge, setMerge] = useState(true);
 
 	useEffect(() => {
 		invoke<Candidate[]>("import_candidates", { sshConfigPath: null })
@@ -41,35 +43,65 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 		}
 	}
 	async function run() {
-		for (const d of dbs) {
-			await api.profileSave({ kind: "db", name: d.name, host: d.host, port: d.port, username: d.username, engine: d.engine, database: d.database || null, favorite: false, color: "#30d158", auth: "password", keyPath: null, legacy: "off", defaultPath: null });
+		try {
+			const have: Profile[] = await api.profilesList();
+			const same = (p: Profile, kind: "ssh" | "db", host: string, port: number, extra?: (p: Profile) => boolean) =>
+				p.kind === kind && p.host.toLowerCase() === host.toLowerCase() && p.port === port && (!extra || extra(p));
+			/** 같은 서버가 있으면 계정만 더하고, 없으면 서버(기본 계정 포함)를 만든다 */
+			const put = async (target: Profile | undefined, make: Profile, auth: "password" | "key", keyPath: string | null) => {
+				if (merge && target?.id != null) {
+					if ((target.accounts ?? []).some((x) => x.username === make.username)) return;
+					await api.accountSave({ profileId: target.id, username: make.username, auth, keyPath, sudo: "off", sudoUser: "root", isDefault: false, label: null });
+					target.accounts = [...(target.accounts ?? []), { profileId: target.id, username: make.username, auth, keyPath, sudo: "off", sudoUser: "root", isDefault: false }];
+					return;
+				}
+				const id = await api.profileSave(make);
+				have.push({ ...make, id, accounts: [{ profileId: id, username: make.username, auth, keyPath, sudo: "off", sudoUser: "root", isDefault: true }] });
+			};
+			for (const d of dbs) {
+				const make: Profile = { kind: "db", name: d.name, host: d.host, port: d.port, username: d.username, engine: d.engine, database: d.database || null, favorite: false, color: "#30d158", auth: "password", keyPath: null, legacy: "off", defaultPath: null };
+				await put(
+					have.find((p) => same(p, "db", d.host, d.port, (x) => x.engine === d.engine && (x.database ?? "") === (d.database ?? ""))),
+					make,
+					"password",
+					null,
+				);
+			}
+			for (const i of list ? [...pick].sort((x, y) => x - y) : []) {
+				const c = (list as Candidate[])[i];
+				const auth = c.keyPath ? "key" : "password";
+				const make: Profile = {
+					kind: "ssh",
+					name: c.name,
+					host: c.host,
+					port: c.port,
+					username: c.username,
+					favorite: false,
+					color: "#0a84ff",
+					auth,
+					keyPath: c.keyPath ?? null,
+					legacy: c.legacy,
+					defaultPath: null,
+					database: null,
+				};
+				await put(
+					have.find((p) => same(p, "ssh", c.host, c.port)),
+					make,
+					auth,
+					c.keyPath ?? null,
+				);
+			}
+			onDone();
+		} catch (e) {
+			setErr(String((e as { message?: string }).message ?? e));
 		}
-		if (!list) return;
-		for (const i of pick) {
-			const c = list[i];
-			await api.profileSave({
-				kind: "ssh",
-				name: c.name,
-				host: c.host,
-				port: c.port,
-				username: c.username,
-				favorite: false,
-				color: "#0a84ff",
-				auth: c.keyPath ? "key" : "password",
-				keyPath: c.keyPath ?? null,
-				legacy: c.legacy,
-				defaultPath: null,
-				database: null,
-			});
-		}
-		onDone();
 	}
 
 	return (
 		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
 			<div className="sheet" style={{ width: "min(560px, calc(100vw - 32px))" }}>
 				<h3>접속 정보 가져오기</h3>
-				<p style={{ color: "var(--text-2)", marginTop: -8 }}>~/.ssh/config 와 PuTTY 저장 세션에서 찾았습니다. DB 는 "DB 파일…"로 DataGrip·DBeaver 파일을 고르세요. 암호는 가져오지 않습니다.</p>
+				<p style={{ color: "var(--text-2)", marginTop: -8 }}>~/.ssh/config 와 PuTTY 저장 세션에서 찾았습니다. DB 는 "DB 파일…"로 DataGrip·DBeaver 파일을 고르세요. 암호는 가져오지 않습니다. "이미 있음"은 같은 서버에 같은 사용자 계정이 있다는 뜻입니다.</p>
 				{dbs.length > 0 && (
 					<p style={{ fontSize: 12.5 }}>
 						DB {dbs.length}개: {dbs.map((d) => `${d.name}(${d.engine})`).join(", ")}
@@ -106,6 +138,9 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 						))}
 					</div>
 				)}
+				<label className="check" title="예: 같은 서버에 root·deploy 두 줄이 있으면 서버 하나에 계정 두 개로 넣습니다">
+					<input type="checkbox" checked={merge} onChange={(e) => setMerge(e.target.checked)} /> 같은 주소·포트의 다른 사용자는 한 서버의 계정으로 합치기(이미 있는 서버에도)
+				</label>
 				<div className="sheet-actions">
 					<button type="button" className="btn" onClick={onClose}>
 						닫기

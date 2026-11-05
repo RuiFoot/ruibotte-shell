@@ -137,6 +137,9 @@ importers:
       xlsx:
         specifier: 0.18.5
         version: 0.18.5
+      zmodem.js:
+        specifier: 0.1.10
+        version: 0.1.10
     devDependencies:
       '@tauri-apps/cli':
         specifier: 2.12.4
@@ -1075,6 +1078,9 @@ packages:
     resolution: {integrity: sha512-OyzrcFLL/nb6fMGHbiRDuPup9ljBycsdCypwuyg5AAHvyWzGfChJpCXMG88AGTIMFhGZ9RccFN1e6lhg3hkwKg==}
     engines: {node: '>=4.0'}
 
+  zmodem.js@0.1.10:
+    resolution: {integrity: sha512-Z1DWngunZ/j3BmIzSJpFZVNV73iHkj89rxXX4IciJdU9ga3nZ7rJ5LkfjV/QDsKhc7bazDWTTJCLJ+iRXD82dw==}
+
   zustand@4.5.7:
     resolution: {integrity: sha512-CHOUy7mu3lbD6o6LJLfllpjkzhHXSBlX8B9+qPddUsIfeF5S/UZ5q0kmCsnRqT1UHFQZchNFDDzMbQsuesHWlw==}
     engines: {node: '>=12.7.0'}
@@ -1914,6 +1920,10 @@ snapshots:
       word: 0.3.0
 
   xmlbuilder@10.1.1: {}
+
+  zmodem.js@0.1.10:
+    dependencies:
+      crc-32: 1.2.2
 
   zustand@4.5.7(@types/react@19.3.0)(react@19.3.1):
     dependencies:

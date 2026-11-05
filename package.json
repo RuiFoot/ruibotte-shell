@@ -58,7 +58,8 @@
 		"react": "19.3.1",
 		"react-dom": "19.3.1",
 		"sql-formatter": "^15.9.0",
-		"xlsx": "0.18.5"
+		"xlsx": "0.18.5",
+		"zmodem.js": "0.1.10"
 	},
 	"devDependencies": {
 		"@tauri-apps/cli": "2.12.4",

@@ -4,11 +4,13 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Database, Download, FolderOpen } from "lucide-react";
 import { engineOf } from "../lib/engines";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Profile } from "../lib/ipc";
+import { api, type Profile, tunnelReq } from "../lib/ipc";
 
 export type DbConnectOk = { connId: number; version: string; database?: string | null; usedSavedSecret: boolean; features: string[] };
 type Install = { what: string; done: number; total: number; state: "running" | "done" | "error"; message?: string | null };
-type DbError = { code: string; message: string };
+type DbError = { code: string; message: string; fingerprint?: string; algorithm?: string; pinnedFingerprint?: string };
+/** 거칠 SSH 서버에서 물을 것 — 처음 보는 지문·바뀐 지문·암호 */
+type SshAsk = { need: "hostkey" | "mismatch" | "secret"; fingerprint?: string; algorithm?: string; pinned?: string };
 
 /** DB 접속 — 암호(저장 선택)·읽기 전용 고르기 */
 export function DbConnectDialog({
@@ -34,6 +36,11 @@ export function DbConnectDialog({
 	const [readOnly, setReadOnly] = useState(false);
 	const [err, setErr] = useState("");
 	const started = useRef(false);
+	// SSH 터널: 물어볼 것·입력한 SSH 암호·확인한 지문
+	const [sshAsk, setSshAsk] = useState<SshAsk | null>(null);
+	const [sshPw, setSshPw] = useState("");
+	const [sshSave, setSshSave] = useState(true);
+	const sshTrust = useRef<string | null>(null);
 	const roKey = `db.readonly.${profile.id}`;
 
 	const run = useCallback(
@@ -44,6 +51,7 @@ export function DbConnectDialog({
 				const ok = await invoke<DbConnectOk>("db_connect", {
 					req: {
 						profileId: profile.id,
+						accountId: profile.accountId,
 						engine: profile.engine ?? "postgres",
 						host: profile.host,
 						port: profile.port,
@@ -54,6 +62,7 @@ export function DbConnectDialog({
 						saveSecret: save,
 						legacy: profile.legacy !== "off",
 						ssl: profile.ssl ?? null,
+						...tunnelReq(profile, { sshSecret: sshPw || null, sshTrustFingerprint: sshTrust.current, sshSaveSecret: sshSave }),
 					},
 				});
 				void api.settingSet(roKey, ro ? "1" : "0");
@@ -69,10 +78,23 @@ export function DbConnectDialog({
 					return;
 				}
 				setStep("form");
+				if (x.code === "SSH_HOSTKEY_UNKNOWN") {
+					setSshAsk({ need: "hostkey", fingerprint: x.fingerprint, algorithm: x.algorithm });
+					return;
+				}
+				if (x.code === "SSH_HOSTKEY_MISMATCH") {
+					setSshAsk({ need: "mismatch", fingerprint: x.fingerprint, algorithm: x.algorithm, pinned: x.pinnedFingerprint });
+					return;
+				}
+				if (x.code === "SSH_NEED_SECRET" || x.code === "SSH_AUTH_FAILED") {
+					setSshAsk({ need: "secret" });
+					if (x.code === "SSH_AUTH_FAILED") setErr(x.message);
+					return;
+				}
 				if (x.code !== "NEED_SECRET") setErr(x.message ?? String(e));
 			}
 		},
-		[profile, save, onConnected, roKey],
+		[profile, save, onConnected, roKey, sshPw, sshSave],
 	);
 
 	useEffect(() => {
@@ -102,6 +124,7 @@ export function DbConnectDialog({
 				<p style={{ margin: "0 0 16px", color: "var(--text-2)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
 					{profile.engine} · {profile.username}@{profile.host}:{profile.port}
 					{profile.database ? `/${profile.database}` : ""}
+					{profile.sshTunnelProfileId ? <span className="badge via-badge">SSH 경유</span> : null}
 				</p>
 				{(step === "java" || step === "driver") && (
 					<>
@@ -171,6 +194,49 @@ export function DbConnectDialog({
 					<p style={{ color: "var(--text-2)" }}>접속 중…{eng.jdbc ? " (JDBC 브리지를 띄우는 데 1~2초 걸립니다)" : ""}</p>
 				) : step !== "form" ? null : (
 					<>
+						{sshAsk?.need === "hostkey" && (
+							<div className="test-box hostkey">
+								<div className="test-col">
+									<span>거칠 SSH 서버를 처음 봅니다. 지문이 맞는지 확인하세요</span>
+									<code>
+										{sshAsk.algorithm} {sshAsk.fingerprint}
+									</code>
+									<button
+										type="button"
+										className="btn"
+										onClick={() => {
+											sshTrust.current = sshAsk.fingerprint ?? null;
+											setSshAsk(null);
+											void run(pw || null, readOnly);
+										}}
+									>
+										이 지문을 믿고 접속
+									</button>
+								</div>
+							</div>
+						)}
+						{sshAsk?.need === "mismatch" && (
+							<div className="test-box fail">
+								<div className="test-col">
+									<span>거칠 SSH 서버의 호스트 키가 고정한 것과 다릅니다 — 서버가 바뀌었거나 가로채기일 수 있어 접속하지 않았습니다. 그 SSH 서버로 직접 접속해 확인하세요.</span>
+									<code>
+										{sshAsk.algorithm} {sshAsk.fingerprint}
+									</code>
+								</div>
+							</div>
+						)}
+						{sshAsk?.need === "secret" && (
+							<>
+								<div className="field">
+									<label htmlFor="db-sshpw">거칠 SSH 서버 암호(개인키면 키 암호)</label>
+									<input id="db-sshpw" type="password" autoFocus value={sshPw} onChange={(e) => setSshPw(e.target.value)} />
+								</div>
+								<label className="check">
+									<input type="checkbox" checked={sshSave} onChange={(e) => setSshSave(e.target.checked)} />
+									SSH 암호도 그 계정에 저장
+								</label>
+							</>
+						)}
 						<div className="field">
 							<label htmlFor="db-pw">암호</label>
 							<input id="db-pw" type="password" autoFocus value={pw} onChange={(e) => setPw(e.target.value)} />

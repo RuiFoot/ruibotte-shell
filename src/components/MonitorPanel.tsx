@@ -71,7 +71,7 @@ function Bar({ value, cls = "" }: { value: number; cls?: string }) {
  * 서버 자원 — CPU·메모리·디스크·네트워크·프로세스. 서버에 아무것도 깔지 않고 /proc·df 를 몇 초마다 읽는다.
  * 칸이 보일 때만 잰다(숨기면 멈춤). 디스크는 폴더별 용량(du)으로 파고들 수 있다.
  */
-export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: number; profileId?: number; sudoOn: boolean; visible: boolean }) {
+export function MonitorPanel({ conn, sudoOn, visible }: { conn: number; sudoOn: boolean; visible: boolean }) {
 	const [cur, setCur] = useState<Stats | null>(null);
 	const prev = useRef<Stats | null>(null);
 	const [delta, setDelta] = useState<{ cpu: number[]; iowait: number; netRx: number; netTx: number; ioR: number; ioW: number; procCpu: Map<number, number> } | null>(null);
@@ -156,7 +156,7 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 	const openDu = async (path: string, root = du?.root ?? path) => {
 		setDu({ root, path, list: null, busy: true });
 		try {
-			const list = await invoke<DuEntry[]>("ssh_du", { conn, path, profileId, asRoot: sudoOn });
+			const list = await invoke<DuEntry[]>("ssh_du", { conn, path, asRoot: sudoOn });
 			setDu({ root, path, list, busy: false });
 		} catch (e) {
 			setDu({ root, path, list: [], busy: false, error: errMsg(e) });
@@ -165,7 +165,7 @@ export function MonitorPanel({ conn, profileId, sudoOn, visible }: { conn: numbe
 	const kill = async (p: Proc, force: boolean) => {
 		if (!confirm(`${p.name}(PID ${p.pid}, ${p.user})을(를) ${force ? "강제로 끝냅니다(KILL — 저장하지 않은 작업이 사라질 수 있음)" : "멈추라고 요청합니다(TERM)"}. 계속할까요?`)) return;
 		try {
-			await invoke("ssh_kill", { conn, pid: p.pid, force, profileId, asRoot: sudoOn });
+			await invoke("ssh_kill", { conn, pid: p.pid, force, asRoot: sudoOn });
 			setNote(`PID ${p.pid} 에 ${force ? "KILL" : "TERM"} 을 보냈습니다`);
 			void sample();
 		} catch (e) {

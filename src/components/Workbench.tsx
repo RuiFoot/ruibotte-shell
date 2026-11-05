@@ -11,13 +11,14 @@ import {
 import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, LayoutTemplate, Monitor, Plus, Radio, RefreshCcw, Rows2, ShieldAlert, X } from "lucide-react";
+import { Activity, ArrowDownUp, ArrowLeftRight, ArrowRightLeft, Columns2, FileText, FolderTree, Layers, LayoutTemplate, Monitor, Plus, Radio, RefreshCcw, Rows2, ShieldAlert, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
 	asSshError,
 	type FsBackend,
 	type FsEntry,
+	type SudoMode,
 	joinPath,
 	notifyFsChanged,
 	parentDir,
@@ -37,6 +38,7 @@ import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
 import { freeName, useConflictAsk } from "./ConflictSheet";
 import { ContextMenu } from "./ContextMenu";
+import { ForwardChips, ForwardSheet, TmuxSheet } from "./ForwardPanel";
 import { MiniMonitor } from "./MiniMonitor";
 import { QuickOpen } from "./QuickOpen";
 import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
@@ -102,8 +104,7 @@ type Ctx = {
 	treeKey: string;
 	/** 저장 안 한 편집기 기록의 주인(앱 탭) */
 	owner: string;
-	/** 원격 프로필(sudo 암호)·sudo 켜짐 — 자원 칸의 du·kill 용 */
-	profileId?: number;
+	/** sudo 켜짐 — 자원 칸의 du·kill 용(암호·대상 사용자는 연결한 계정을 따른다) */
 	sudoOn: boolean;
 	/** 이 터미널 옆(오른쪽·아래)에 새 터미널 */
 	splitTerminal: (panelId: string, dir: "right" | "below") => void;
@@ -118,6 +119,8 @@ type Ctx = {
 	addTerminalNear: (panelId?: string) => void;
 	/** 큰 자원 칸 열기 */
 	openMonitor: () => void;
+	/** 원격: 포트 포워딩 관리 창 열기(상태 줄 표시를 누르면) */
+	openForwards?: () => void;
 };
 const WbCtx = createContext<Ctx | null>(null);
 const useWb = () => useContext(WbCtx) as Ctx;
@@ -246,8 +249,20 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 				defaultEncoding={ctx.termEncoding}
 				onOpenPath={(p) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 })}
 				onSplit={(dir) => ctx.splitTerminal(props.api.id, dir)}
-				statusExtra={visible && ctx.fs.side === "remote" && ctx.fs.conn != null ? <MiniMonitor conn={ctx.fs.conn} onOpen={ctx.openMonitor} /> : undefined}
+				statusExtra={
+					visible && ctx.fs.side === "remote" && ctx.fs.conn != null ? (
+						<>
+							{ctx.openForwards && <ForwardChips conn={ctx.fs.conn} onOpen={ctx.openForwards} />}
+							<MiniMonitor conn={ctx.fs.conn} onOpen={ctx.openMonitor} />
+						</>
+					) : undefined
+				}
 				onRootShell={ctx.rootShell ? (on) => ctx.rootShell?.(props.api.id, on) : undefined}
+				onRecording={(on) => {
+					// 기록 중이면 탭 이름 앞(동시 입력 표시 뒤)에 ●
+					const m = /^(⇉ )?(● )?([\s\S]*)$/.exec(props.api.title ?? "");
+					props.api.setTitle(`${m?.[1] ?? ""}${on ? "● " : ""}${m?.[3] ?? ""}`);
+				}}
 			/>
 		</div>
 	);
@@ -284,7 +299,7 @@ function MonitorDock(props: IDockviewPanelProps) {
 		return () => d.dispose();
 	}, [props.api]);
 	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return <div className="panel-fill mon-empty"><p>원격 서버 작업대에서만 볼 수 있습니다</p></div>;
-	return <MonitorPanel conn={ctx.fs.conn} profileId={ctx.profileId} sudoOn={ctx.sudoOn} visible={visible} />;
+	return <MonitorPanel conn={ctx.fs.conn} sudoOn={ctx.sudoOn} visible={visible} />;
 }
 
 /** 탭 — 저장 안 한 편집기는 닫기 전에 묻는다 */
@@ -566,10 +581,11 @@ export function Workbench({
 	startPath,
 	badge,
 	layoutKey,
-	profileId,
+	sudo,
 	peers = [],
 	syncInfo,
 	ownerId,
+	server,
 }: {
 	fs: FsBackend;
 	/** 원격 작업대일 때 내 PC 트리(전송용) */
@@ -581,22 +597,28 @@ export function Workbench({
 	badge?: ReactNode;
 	/** 배치 저장 이름(작업대 종류별) */
 	layoutKey: string;
-	/** 원격 프로필(저장한 sudo 암호용) */
-	profileId?: number;
+	/** 연결한 계정의 sudo 설정 — off 면 sudo 단추·root 셸을 숨긴다(원격만) */
+	sudo?: { mode: SudoMode; user: string };
 	/** 열려 있는 다른 SSH 연결(중계 대상) */
 	peers?: { conn: number; label: string; home: string }[];
 	syncInfo?: { user: string; host: string; port: number };
 	/** 앱 탭 이름 — 저장 안 한 편집기를 앱 탭 단위로 묻기 위해 */
 	ownerId?: string;
+	/** 원격: 이 연결의 서버(포트 포워딩 규칙·tmux 설정) */
+	server?: { profileId: number; conn: number; tmux: boolean; name: string };
 }) {
+	const [fwdOpen, setFwdOpen] = useState(false);
+	const [tmuxOpen, setTmuxOpen] = useState(false);
 	const [sudoOn, setSudoOn] = useState(false);
-	const [sudoMode, setSudoMode] = useState<"together" | "apart">("together");
+	const [sudoPlace, setSudoPlace] = useState<"together" | "apart">("together");
 	const [follow, setFollow] = useState(true);
 	const [broadcastOn, setBroadcastOn] = useState(false);
 	const broadcastRef = useRef(false);
 	broadcastRef.current = broadcastOn;
 	const [sudoAsk, setSudoAsk] = useState<{ error?: string } | null>(null);
-	const sudoPw = useRef<string | null>(null);
+	const sudoMode = sudo?.mode ?? "ask";
+	const sudoUser = sudo?.user && sudo.user !== "root" ? sudo.user : "";
+	const sudoAs = sudoUser ? ` -u ${sudoUser}` : "";
 	const instance = useRef(`wb${Math.random().toString(36).slice(2, 8)}`);
 	const owner = ownerId ?? instance.current;
 	// 서버 로캘이 EUC-KR(CP949) 이면 터미널을 처음부터 EUC-KR 로
@@ -642,8 +664,8 @@ export function Workbench({
 	}, [fs]);
 	useEffect(() => () => forgetOwner(owner), [owner]);
 	const sudoFs = useMemo(
-		() => (fs.side === "remote" && fs.conn != null ? sshSudoFs(fs.conn, fs.label, fs.home, profileId) : null),
-		[fs, profileId],
+		() => (fs.side === "remote" && fs.conn != null && sudoMode !== "off" ? sshSudoFs(fs.conn, fs.label, fs.home, sudoUser || "root") : null),
+		[fs, sudoMode, sudoUser],
 	);
 	const fsNow = sudoOn && sudoFs ? sudoFs : fs;
 	// 자동완성 출처 — 원격은 SFTP 목록·compgen, 내 PC 는 파일 목록·사전
@@ -731,17 +753,15 @@ export function Workbench({
 	const enableSudo = async (password: string | null, save: boolean) => {
 		if (fs.conn == null) return;
 		try {
-			await sudoApi.check(fs.conn, profileId, password, save);
-			if (password) sudoPw.current = password;
+			await sudoApi.check(fs.conn, password, save);
 			setSudoAsk(null);
 			setSudoOn(true);
-			if (sudoMode === "together") {
+			if (sudoPlace === "together") {
 				const s = visibleShell();
 				if (s?.h) {
-					s.h.send(" sudo -s\r");
-					if (await s.h.expect(/assword[^\n]*:\s*$/, 2500)) {
-						if (sudoPw.current) s.h.send(`${sudoPw.current}\r`);
-					}
+					s.h.send(` sudo -s${sudoAs}\r`);
+					// 암호는 화면을 거치지 않고 앱이 그 셸에 넣는다(이번에 넣었거나 저장한 sudo 암호)
+					if (await s.h.expect(/assword[^\n]*:\s*$/, 2500)) await s.h.sudoPw?.();
 				}
 			}
 		} catch (e) {
@@ -752,7 +772,7 @@ export function Workbench({
 	};
 	const disableSudo = () => {
 		setSudoOn(false);
-		if (sudoMode === "together") visibleShell()?.h?.send(" exit\r");
+		if (sudoPlace === "together") visibleShell()?.h?.send(" exit\r");
 	};
 
 	/** 터미널에서 그 폴더로 — 보이는(없으면 첫) 터미널에 */
@@ -982,9 +1002,9 @@ export function Workbench({
 			h.send(" exit\r");
 			return;
 		}
-		h.send(" sudo -i\r");
-		if (sudoPw.current && (await h.expect(/assword[^\n]*:\s*$/, 2500))) h.send(`${sudoPw.current}\r`);
-	}, []);
+		h.send(` sudo -i${sudoAs}\r`);
+		if (await h.expect(/assword[^\n]*:\s*$/, 2500)) await h.sudoPw?.();
+	}, [sudoAs]);
 
 	const toggle = (id: "tree" | "localtree") => {
 		const d = dock.current;
@@ -1085,7 +1105,6 @@ export function Workbench({
 			syncInfo,
 			treeKey: instance.current,
 			owner,
-			profileId,
 			sudoOn: sudoOn && !!sudoFs,
 			splitTerminal,
 			locked,
@@ -1093,9 +1112,10 @@ export function Workbench({
 			setBroadcast: setBroadcastOn,
 			addTerminalNear: (id?: string) => addTerminalRef.current(undefined, undefined, id),
 			openMonitor: () => openMonitorRef.current(),
-			rootShell: fs.side === "remote" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
+			openForwards: server ? () => setFwdOpen(true) : undefined,
+			rootShell: fs.side === "remote" && sudoMode !== "off" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server],
 	);
 
 	useEffect(() => {
@@ -1173,6 +1193,20 @@ export function Workbench({
 							</button>
 						)}
 					</span>
+					{server && (
+						<>
+							<span className="sep" />
+							<span className="wb-group" role="group" aria-label="연결">
+								<span className="wb-group-label">연결</span>
+								<button type="button" className={`btn ghost${fwdOpen ? " on" : ""}`} onClick={() => setFwdOpen(true)} title="포트 포워딩 — 로컬·원격·SOCKS 규칙 추가·고치기·켜고 끄기(켜진 것은 터미널 상태 줄에 ⇄ 로)">
+									<ArrowRightLeft size={14} /> <span className="lbl">포워딩</span>
+								</button>
+								<button type="button" className={`btn ghost${tmuxOpen ? " on" : ""}`} onClick={() => setTmuxOpen(true)} title={`tmux 세션 보기·끝내기${server.tmux ? " — 이 서버는 터미널을 tmux 로 엽니다(끊겨도 이어짐)" : ""}`}>
+									<Layers size={14} /> <span className="lbl">tmux{server.tmux ? " ●" : ""}</span>
+								</button>
+							</span>
+						</>
+					)}
 					{(sudoFs || fs.side === "local") && <span className="sep" />}
 					{(sudoFs || fs.side === "local") && (
 						<span className="wb-group" role="group" aria-label="권한">
@@ -1196,15 +1230,15 @@ export function Workbench({
 										type="button"
 										className={`btn ghost${sudoOn ? " on danger-on" : ""}`}
 										aria-pressed={sudoOn}
-										title={sudoOn ? `sudo 켜짐 — 파일 트리·편집기가 root 권한${sudoMode === "together" ? ", 보이는 터미널도 root 셸" : ""}. 눌러 끄기` : `sudo — 파일 작업(트리·편집기)에 root 권한${sudoMode === "together" ? ", 보이는 터미널도 root 셸로" : ""}. 눌러 켜기`}
+										title={`${sudoOn ? `sudo 켜짐 — 파일 트리·편집기가 ${sudoUser || "root"} 권한${sudoPlace === "together" ? ", 보이는 터미널도 sudo 셸" : ""}. 눌러 끄기` : `sudo — 파일 작업(트리·편집기)에 ${sudoUser || "root"} 권한${sudoPlace === "together" ? ", 보이는 터미널도 sudo 셸로" : ""}. 눌러 켜기`} · 계정 설정: ${sudoMode === "ask" ? "물어보기" : sudoMode === "saved" ? "암호 저장" : "암호 없이"}`}
 										onClick={() => (sudoOn ? disableSudo() : void enableSudo(null, false))}
 									>
-										<ShieldAlert size={14} /> <span className="lbl keep">{sudoOn ? "sudo 켜짐" : "sudo"}</span>
+										<ShieldAlert size={14} /> <span className="lbl keep">{sudoOn ? "sudo 켜짐" : "sudo"}{sudoUser ? ` (${sudoUser})` : ""}</span>
 									</button>
 									<Select<"together" | "apart">
 										size="sm"
-										value={sudoMode}
-										onChange={setSudoMode}
+										value={sudoPlace}
+										onChange={setSudoPlace}
 										title="sudo 를 어디에 — 켜기 전에 고릅니다"
 										disabled={sudoOn}
 										options={[
@@ -1244,6 +1278,8 @@ export function Workbench({
 					)}
 					<span className="wb-chip">{badge}</span>
 				</div>
+				{server && fwdOpen && <ForwardSheet profileId={server.profileId} conn={server.conn} title={server.name} onClose={() => setFwdOpen(false)} />}
+				{server && tmuxOpen && <TmuxSheet conn={server.conn} title={server.name} enabled={server.tmux} onClose={() => setTmuxOpen(false)} />}
 				{sudoAsk && (
 					<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && setSudoAsk(null)}>
 						<form
@@ -1255,14 +1291,14 @@ export function Workbench({
 							}}
 						>
 							<h3>sudo 암호</h3>
-							<p style={{ color: "var(--text-2)", marginTop: 0 }}>root 권한으로 파일을 읽고 씁니다. 저장하면 이 서버에서 다시 묻지 않습니다.</p>
+							<p style={{ color: "var(--text-2)", marginTop: 0 }}>{sudoUser || "root"} 권한으로 파일을 읽고 씁니다. 넣은 암호는 이 연결 동안 기억하고, 저장하면 이 계정에서 다시 묻지 않습니다.</p>
 							<div className="field">
 								<input name="pw" type="password" autoFocus placeholder="sudo 암호" />
 							</div>
 							{sudoAsk.error && <p className="err">{sudoAsk.error}</p>}
-							{profileId != null && (
+							{fs.side === "remote" && (
 								<label className="check">
-									<input name="save" type="checkbox" /> OS 자격 증명 저장소에 저장
+									<input name="save" type="checkbox" /> 이 계정의 sudo 암호로 저장(OS 자격 증명 저장소, sudo 설정이 '암호 저장'으로)
 								</label>
 							)}
 							<div className="sheet-actions">

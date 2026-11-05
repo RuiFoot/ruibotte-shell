@@ -47,3 +47,5 @@ SOFTWARE.
 | `mammoth` | BSD-2-Clause | 워드(docx) 미리보기 |
 | `sql-formatter` | MIT | SQL 정렬 |
 | CodeMirror 6(`@codemirror/*`, `@lezer/*`) | MIT | 편집기·자동완성·언어 |
+| `zmodem.js` 0.1.10 (FGasper/zmodemjs) | Apache-2.0 | 터미널 rz/sz(ZMODEM) 파일 주고받기 |
+| `crc-32` 1.2.2 (SheetJS, zmodem.js 가 씀) | Apache-2.0 | ZMODEM 검사 합 |

@@ -12,6 +12,31 @@ export type AppInfo = {
 
 export type LegacyLevel = "off" | "rsa" | "sha1" | "weakest";
 
+/** 인증 방식 — 에이전트는 SSH 만 */
+export type AuthKind = "password" | "key" | "agent";
+/** 계정의 sudo — 안 씀 · 켤 때 물음 · 저장한 암호 · 암호 없이(NOPASSWD) */
+export type SudoMode = "off" | "ask" | "saved" | "nopasswd";
+
+/** 서버(접속 정보)에 딸린 계정 하나 */
+export type Account = {
+	id?: number;
+	profileId: number;
+	/** 보이는 이름(비우면 사용자명) */
+	label?: string | null;
+	username: string;
+	auth: AuthKind;
+	keyPath?: string | null;
+	sudo: SudoMode;
+	/** sudo -u 대상(기본 root) */
+	sudoUser: string;
+	isDefault: boolean;
+	lastUsedAt?: number | null;
+	/** 읽기 전용 — 계정 암호(키 암호)가 OS 저장소에 있는지 */
+	secretSaved?: boolean;
+	/** 읽기 전용 — sudo 암호가 OS 저장소에 있는지 */
+	sudoSaved?: boolean;
+};
+
 export type Profile = {
 	id?: number;
 	kind: "ssh" | "db";
@@ -23,7 +48,8 @@ export type Profile = {
 	color?: string | null;
 	favorite: boolean;
 	lastUsedAt?: number | null;
-	auth: "password" | "key";
+	/** 기본 계정 값(읽기용) — 새 서버를 만들 때는 이 값으로 기본 계정이 생긴다 */
+	auth: AuthKind;
 	keyPath?: string | null;
 	legacy: LegacyLevel;
 	defaultPath?: string | null;
@@ -38,7 +64,99 @@ export type Profile = {
 	ssl?: string | null;
 	/** 메모 */
 	memo?: string | null;
+	/** 읽기 전용 — 이 서버의 계정(기본 계정이 맨 앞) */
+	accounts?: Account[];
+	/** 화면 전용 — 이 프로필 값이 어느 계정으로 채워졌는지(접속·다시 연결에 쓴다) */
+	accountId?: number;
+	/** DB: 이 SSH 서버(프로필)를 거쳐 접속(SSH 터널) */
+	sshTunnelProfileId?: number | null;
+	/** DB: 터널에 쓸 그 SSH 서버의 계정(비우면 기본 계정) */
+	sshTunnelAccountId?: number | null;
+	/** SSH: 새 터미널을 tmux 세션으로(끊겨도 다시 연결하면 이어짐) */
+	tmux?: boolean;
 };
+
+/** DB 접속 요청에 붙이는 SSH 터널 값 — 서버 설정의 "거칠 SSH 서버" */
+export function tunnelReq(p: Pick<Profile, "kind" | "sshTunnelProfileId" | "sshTunnelAccountId">, extra?: { sshSecret?: string | null; sshTrustFingerprint?: string | null; sshSaveSecret?: boolean }) {
+	if (p.kind !== "db" || !p.sshTunnelProfileId) return {};
+	return { sshProfileId: p.sshTunnelProfileId, sshAccountId: p.sshTunnelAccountId ?? null, ...extra };
+}
+
+/** 포트 포워딩 규칙 — local: 내 PC 포트 → 서버 쪽 대상, remote: 서버 포트 → 내 PC 쪽 대상, dynamic: 내 PC SOCKS5 */
+export type ForwardKind = "local" | "remote" | "dynamic";
+export type Forward = {
+	id?: number;
+	profileId: number;
+	kind: ForwardKind;
+	bindHost: string;
+	bindPort: number;
+	targetHost?: string | null;
+	targetPort?: number | null;
+	autoStart: boolean;
+	label?: string | null;
+};
+/** 켜 둔 규칙의 지금 상태 */
+export type ForwardActive = {
+	id: number;
+	conn: number;
+	profileId: number;
+	kind: ForwardKind;
+	label?: string | null;
+	/** 짧은 표시 — "3306→db:3306" */
+	short: string;
+	bindHost: string;
+	port: number;
+	targetHost?: string | null;
+	targetPort?: number | null;
+	open: number;
+	total: number;
+	up: number;
+	down: number;
+	error?: string | null;
+	startedAt: number;
+};
+export type ForwardStatus = { active: ForwardActive[]; failed: { id: number; conn: number; label: string; error: string }[] };
+export type TmuxSession = { name: string; windows: number; attached: number; created?: number | null; ours: boolean };
+
+/** 규칙을 짧게(켜기 전 목록용) */
+export function forwardShort(f: Pick<Forward, "kind" | "bindPort" | "targetHost" | "targetPort">): string {
+	const t = `${f.targetHost ?? ""}:${f.targetPort ?? ""}`;
+	if (f.kind === "dynamic") return `SOCKS ${f.bindPort}`;
+	if (f.kind === "remote") return `서버 ${f.bindPort || "자동"}→${t}`;
+	return `${f.bindPort}→${t}`;
+}
+
+export const forwards = {
+	list: (profileId: number) => invoke<Forward[] | null>("forward_list", { profileId }).then((x) => x ?? []),
+	save: (f: Forward) => invoke<number>("forward_save", { f }),
+	remove: (id: number) => invoke<void>("forward_delete", { id }),
+	start: (conn: number, id: number) => invoke<void>("forward_start", { conn, id }),
+	stop: (id: number) => invoke<void>("forward_stop", { id }),
+	status: (q: { conn?: number; profileId?: number }) =>
+		invoke<ForwardStatus | null>("forward_status", { conn: q.conn ?? null, profileId: q.profileId ?? null }).then((x) => x ?? { active: [], failed: [] }),
+};
+
+export const tmux = {
+	/** null = 서버에 tmux 가 없음 */
+	list: (conn: number) => invoke<TmuxSession[] | null>("ssh_tmux_list", { conn }),
+	kill: (conn: number, name: string) => invoke<void>("ssh_tmux_kill", { conn, name }),
+};
+
+/** 서버의 기본 계정(없으면 undefined) */
+export function defaultAccount(p: Profile): Account | undefined {
+	return p.accounts?.find((a) => a.isDefault) ?? p.accounts?.[0];
+}
+
+/** 계정 보이는 이름 */
+export function accountName(a: Pick<Account, "label" | "username">): string {
+	return a.label?.trim() || a.username || "(이름 없음)";
+}
+
+/** 계정으로 채운 접속용 프로필 — 사용자명·인증·키·저장 표시를 그 계정 값으로 */
+export function withAccount(p: Profile, a?: Account): Profile {
+	if (!a) return p;
+	return { ...p, username: a.username, auth: a.auth, keyPath: a.keyPath, secretSaved: !!a.secretSaved, accountId: a.id };
+}
 
 export type SshError = {
 	code:
@@ -64,10 +182,12 @@ export type SshError = {
 
 export type ConnectReq = {
 	profileId?: number;
+	/** 이 계정으로(사용자명·인증·키·저장한 비밀을 계정 값으로) */
+	accountId?: number;
 	host: string;
 	port: number;
 	username: string;
-	auth: "password" | "key";
+	auth: AuthKind;
 	keyPath?: string | null;
 	secret?: string | null;
 	legacy: LegacyLevel;
@@ -83,6 +203,11 @@ export type ConnectOk = {
 	algorithm: string;
 	newlyPinned: boolean;
 	usedSavedSecret: boolean;
+	accountId?: number | null;
+	username: string;
+	/** 계정의 sudo 설정 — 작업대가 따른다 */
+	sudo: SudoMode;
+	sudoUser: string;
 };
 
 export type FsEntry = {
@@ -192,6 +317,8 @@ export type TermBackend = {
 	/** 셸이 끝났을 때 이벤트 이름과 그 이벤트가 이 셸 것인지 */
 	exitEvent: string;
 	isMine(payload: unknown, id: number): boolean;
+	/** 원격: sudo 암호를 그 셸에 넣기 */
+	sudoPw?(id: number): Promise<boolean>;
 };
 
 export function localFs(home: string): FsBackend {
@@ -246,18 +373,18 @@ export function sshFs(conn: number, label: string, home: string): FsBackend {
 	};
 }
 
-/** sudo 로 다루는 원격 파일 시스템(같은 연결의 exec 채널) */
-export function sshSudoFs(conn: number, label: string, home: string, profileId?: number): FsBackend {
-	const op = (op: string, path: string, to?: string) => invoke<void>("sudo_op", { conn, profileId, op, path, to });
+/** sudo 로 다루는 원격 파일 시스템(같은 연결의 exec 채널) — sudo 설정·암호는 연결한 계정을 따른다 */
+export function sshSudoFs(conn: number, label: string, home: string, sudoUser = "root"): FsBackend {
+	const op = (op: string, path: string, to?: string) => invoke<void>("sudo_op", { conn, op, path, to });
 	return {
 		side: "remote",
 		conn,
-		label: `${label} (sudo)`,
+		label: `${label} (sudo${sudoUser && sudoUser !== "root" ? ` -u ${sudoUser}` : ""})`,
 		home,
 		sep: "/",
-		list: (path) => invoke("sudo_list", { conn, profileId, path }),
-		read: (path, encoding) => invoke("sudo_read_text", { conn, profileId, path, encoding }),
-		write: (path, text, meta, expectMtime) => invoke("sudo_write_text", { conn, profileId, path, text, meta, expectMtime }),
+		list: (path) => invoke("sudo_list", { conn, path }),
+		read: (path, encoding) => invoke("sudo_read_text", { conn, path, encoding }),
+		write: (path, text, meta, expectMtime) => invoke("sudo_write_text", { conn, path, text, meta, expectMtime }),
 		mkdir: (path) => op("mkdir", path),
 		touch: (path) => op("touch", path),
 		rename: (from, to) => op("rename", from, to),
@@ -266,8 +393,8 @@ export function sshSudoFs(conn: number, label: string, home: string, profileId?:
 }
 
 export const sudoApi = {
-	check: (conn: number, profileId: number | undefined, password: string | null, save: boolean) =>
-		invoke<boolean>("sudo_check", { conn, profileId, password, save }),
+	/** 되는지 보기 — 넣은 암호는 이 연결 동안 기억, save 면 계정의 sudo 암호로 저장 */
+	check: (conn: number, password: string | null, save: boolean) => invoke<boolean>("sudo_check", { conn, password, save }),
 };
 
 /** 바깥에서 셸을 다루는 손잡이 — 글 넣기, 출력에서 글귀 기다리기 */
@@ -276,6 +403,8 @@ export type ShellHandle = {
 	expect: (re: RegExp, ms: number) => Promise<boolean>;
 	/** 프롬프트에서 아무것도 치지 않고 기다리는 중인지(셸 통합이 없으면 늘 true) */
 	idle?: () => boolean;
+	/** 원격: sudo 암호를 이 셸에 넣기(값은 화면을 거치지 않는다) — 넣을 암호가 없으면 false */
+	sudoPw?: () => Promise<boolean>;
 };
 
 export function sshTerm(conn: number): TermBackend {
@@ -284,6 +413,7 @@ export function sshTerm(conn: number): TermBackend {
 		write: (shell, data, encoding) => invoke("ssh_shell_write", { conn, shell, data, encoding }),
 		resize: (shell, cols, rows) => invoke("ssh_shell_resize", { conn, shell, cols, rows }),
 		close: (shell) => invoke("ssh_shell_close", { conn, shell }),
+		sudoPw: (shell) => invoke<boolean>("ssh_shell_sudo_pw", { conn, shell }),
 		exitEvent: "ssh-shell-exit",
 		isMine: (p, id) => {
 			const x = p as { conn: number; shell: number };
@@ -324,4 +454,13 @@ export const api = {
 	profilesList: () => invoke<Profile[]>("profiles_list"),
 	profileSave: (p: Profile) => invoke<number>("profile_save", { p }),
 	profileDelete: (id: number) => invoke<void>("profile_delete", { id }),
+	accountsList: (profileId: number) => invoke<Account[]>("accounts_list", { profileId }),
+	accountSave: (a: Account) => invoke<number>("account_save", { a }),
+	accountDelete: (id: number) => invoke<void>("account_delete", { id }),
+	accountSetDefault: (id: number) => invoke<void>("account_set_default", { id }),
+	/** 빈 값이면 지운다 */
+	accountSecretSet: (id: number, secret: string) => invoke<void>("account_secret_set", { id, secret }),
+	/** 빈 값이면 지운다(sudo 는 "물어보기"로) */
+	accountSudoSecretSet: (id: number, secret: string) => invoke<void>("account_sudo_secret_set", { id, secret }),
+	hostKeyGet: (host: string, port: number) => invoke<{ algorithm: string; fingerprint: string; pinnedAt: number } | null>("host_key_get", { host, port }),
 };

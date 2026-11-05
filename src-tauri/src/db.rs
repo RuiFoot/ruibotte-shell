@@ -24,11 +24,38 @@ use crate::store::Store;
 #[serde(rename_all = "camelCase")]
 pub struct DbError {
     /// NEED_SECRET | AUTH_FAILED | NETWORK | READ_ONLY | BUSY | CANCELLED | SQL | CLOSED | OTHER
+    /// SSH 터널: SSH_HOSTKEY_UNKNOWN | SSH_HOSTKEY_MISMATCH | SSH_NEED_SECRET | SSH_AUTH_FAILED
     code: &'static str,
     message: String,
+    /// SSH 터널 호스트 키 확인용(지문·알고리즘·고정된 지문)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    algorithm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_fingerprint: Option<String>,
 }
 fn e(code: &'static str, m: impl Into<String>) -> DbError {
-    DbError { code, message: m.into() }
+    DbError { code, message: m.into(), ..Default::default() }
+}
+
+/// SSH 터널 오류 → DB 접속 오류(화면이 SSH 지문·암호를 물을 수 있게 코드를 나눈다)
+fn ssh_db_err(x: crate::ssh::SshError) -> DbError {
+    let (code, msg, fp, alg, pinned) = x.parts();
+    let code = match code {
+        "HOSTKEY_UNKNOWN" => "SSH_HOSTKEY_UNKNOWN",
+        "HOSTKEY_MISMATCH" => "SSH_HOSTKEY_MISMATCH",
+        "NEED_SECRET" => "SSH_NEED_SECRET",
+        "AUTH_FAILED" => "SSH_AUTH_FAILED",
+        "OTHER" => "OTHER",
+        _ => "NETWORK",
+    };
+    let message = if code == "NETWORK" && x.parts().0 == "NEGOTIATION" {
+        format!("거칠 SSH 서버: {msg} — 그 SSH 서버 설정에서 구형 호환을 켜세요")
+    } else {
+        format!("거칠 SSH 서버: {msg}")
+    };
+    DbError { code, message, fingerprint: fp.map(Into::into), algorithm: alg.map(Into::into), pinned_fingerprint: pinned.map(Into::into) }
 }
 type R<T> = Result<T, DbError>;
 
@@ -143,12 +170,14 @@ pub(crate) struct DbConn {
     gen: u64,
     /// 끊김을 이미 알렸는지
     closed: AtomicBool,
+    /// SSH 터널을 거치면 — 이 연결을 닫으면(놓으면) 터널도 닫힌다
+    tunnel: Option<Arc<crate::tunnel::DbTunnel>>,
 }
 
 static GEN: AtomicU64 = AtomicU64::new(1);
 
 impl DbConn {
-    fn new(engine: Engine, req: DbConnectReq, gen: u64) -> Self {
+    fn new(engine: Engine, req: DbConnectReq, gen: u64, tunnel: Option<Arc<crate::tunnel::DbTunnel>>) -> Self {
         DbConn {
             engine,
             read_only: req.read_only,
@@ -160,6 +189,7 @@ impl DbConn {
             req,
             gen,
             closed: Default::default(),
+            tunnel,
         }
     }
     fn is_mysql(&self) -> bool {
@@ -270,6 +300,9 @@ pub struct Col {
 #[serde(rename_all = "camelCase")]
 pub struct DbConnectReq {
     profile_id: Option<i64>,
+    /// 접속할 계정 — 주면 그 계정의 사용자명·저장한 암호를 쓴다(없으면 서버의 기본 계정 암호)
+    #[serde(default)]
+    account_id: Option<i64>,
     /// postgres | mariadb | mysql
     engine: String,
     host: String,
@@ -287,6 +320,40 @@ pub struct DbConnectReq {
     /// SSL: off | prefer | require(인증서 확인 안 함) | verify(인증서 확인)
     #[serde(default)]
     ssl: Option<String>,
+    /// SSH 터널(거칠 SSH 서버·계정·그 비밀) — 화면이 늘 함께 보낸다
+    #[serde(default, flatten)]
+    tunnel: TunnelReq,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelReq {
+    /// 거칠 SSH 서버(프로필) — 없으면 바로 접속
+    #[serde(default)]
+    ssh_profile_id: Option<i64>,
+    /// 그 서버의 계정(없으면 기본 계정)
+    #[serde(default)]
+    ssh_account_id: Option<i64>,
+    /// SSH 암호(또는 개인키 암호) — 비우면 그 계정에 저장한 것
+    #[serde(default)]
+    ssh_secret: Option<String>,
+    /// 화면에서 확인한 SSH 서버 지문(처음 접속일 때)
+    #[serde(default)]
+    ssh_trust_fingerprint: Option<String>,
+    #[serde(default)]
+    ssh_save_secret: bool,
+}
+
+impl TunnelReq {
+    fn spec(&self) -> Option<crate::tunnel::TunnelSpec> {
+        self.ssh_profile_id.map(|profile_id| crate::tunnel::TunnelSpec {
+            profile_id,
+            account_id: self.ssh_account_id,
+            secret: self.ssh_secret.clone().filter(|s| !s.is_empty()),
+            trust: self.ssh_trust_fingerprint.clone(),
+            save: self.ssh_save_secret,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -309,50 +376,118 @@ fn lit(s: &str, mysql: bool) -> String {
 
 #[tauri::command]
 pub async fn db_connect(app: AppHandle, store: State<'_, Store>, dbs: State<'_, DbConns>, req: DbConnectReq) -> R<DbConnectOk> {
+    let mut req = req;
+    if let Some(aid) = req.account_id {
+        let a = store.account(aid).map_err(|m| e("OTHER", m))?;
+        req.username = a.username;
+        req.profile_id = Some(a.profile_id);
+    }
     connect(&store, &dbs, req, Some(&app)).await
+}
+
+/// SSH 터널 열기(거칠 서버가 있으면)
+async fn open_tunnel(store: &Store, req: &DbConnectReq) -> R<Option<Arc<crate::tunnel::DbTunnel>>> {
+    let Some(spec) = req.tunnel.spec() else { return Ok(None) };
+    let t = crate::tunnel::open_db_tunnel(store, &spec, &req.host, req.port).await.map_err(ssh_db_err)?;
+    Ok(Some(Arc::new(t)))
+}
+
+/// 터널 위에서 엔진이 실패하면 — 터널이 남긴 오류(서버에서 DB 로 가는 길을 못 엶 등)가 더 정확하다
+fn tunnel_fail(t: &Option<Arc<crate::tunnel::DbTunnel>>, x: DbError) -> DbError {
+    match t.as_ref().and_then(|t| t.last_error()) {
+        Some(m) if !matches!(x.code, "AUTH_FAILED" | "NEED_SECRET" | "NEED_JAVA" | "NEED_DRIVER") => e("NETWORK", format!("SSH 터널: {m}")),
+        _ => x,
+    }
+}
+
+/// 거친 SSH 연결이 끊기면 DB 연결도 끊겼다고 알린다
+fn spawn_tunnel_watch(app: AppHandle, id: u32, gen: u64) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let c = {
+                let dbs = app.state::<DbConns>();
+                let got = dbs.map.lock().unwrap().get(&id).cloned();
+                got
+            };
+            let Some(c) = c else { return };
+            if c.gen != gen {
+                return; // 다시 연결함 — 새 연결이 따로 지켜본다
+            }
+            if c.tunnel.as_ref().is_some_and(|t| t.closed()) {
+                notify_closed(&app, id, gen);
+                return;
+            }
+        }
+    });
 }
 
 pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app: Option<&AppHandle>) -> R<DbConnectOk> {
     let mut used_saved = false;
+    let aid = match (req.account_id, req.profile_id) {
+        (Some(aid), _) => Some(aid),
+        (None, Some(pid)) => store.default_account(pid).ok().and_then(|a| a.id),
+        _ => None,
+    };
     let pw = match req.password.clone().filter(|p| !p.is_empty()) {
         Some(p) => Some(p),
         None => {
-            let s = req.profile_id.and_then(|id| secrets::get(&format!("profile:{id}")));
+            let s = aid.and_then(|id| secrets::get(&secrets::account_key(id)));
             used_saved = s.is_some();
             s
         }
     };
     let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
     let gen = GEN.fetch_add(1, Ordering::Relaxed);
-    let (engine, version) = open_engine(&req, pw.clone(), app, id, gen).await?;
-    if let Some(pid) = req.profile_id {
+    let tunnel = open_tunnel(store, &req).await?;
+    let dial = tunnel.as_ref().map(|t| t.port);
+    let (engine, version) = open_engine(&req, pw.clone(), app, id, gen, dial).await.map_err(|x| tunnel_fail(&tunnel, x))?;
+    if let Some(id) = aid {
         let mut saved = None;
         if req.save_secret && !used_saved {
             if let Some(p) = &pw {
-                saved = Some(secrets::set(&format!("profile:{pid}"), p).is_ok());
+                saved = Some(secrets::set(&secrets::account_key(id), p).is_ok());
             }
         }
-        store.mark_used(pid, saved);
+        store.mark_account_used(id, saved);
+    } else if let Some(pid) = req.profile_id {
+        store.mark_used(pid);
     }
     let features = engine.features();
     let database = req.database.clone();
     let mut keep = req;
     keep.password = pw;
     keep.save_secret = false;
-    dbs.map.lock().unwrap().insert(id, Arc::new(DbConn::new(engine, keep, gen)));
+    // 다시 연결할 때는 고정된 지문·메모리의 SSH 비밀로(저장은 한 번만)
+    keep.tunnel.ssh_trust_fingerprint = None;
+    keep.tunnel.ssh_save_secret = false;
+    let watch = tunnel.is_some();
+    dbs.map.lock().unwrap().insert(id, Arc::new(DbConn::new(engine, keep, gen, tunnel)));
     if let Some(a) = app {
         spawn_keepalive(a.clone(), id);
+        if watch {
+            spawn_tunnel_watch(a.clone(), id, gen);
+        }
     }
     Ok(DbConnectOk { conn_id: id, features, version, database, used_saved_secret: used_saved })
 }
 
 /// 엔진 하나 열기 — 처음 연결·다시 연결·데이터베이스 바꾸기가 함께 쓴다
-async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHandle>, id: u32, gen: u64) -> R<(Engine, String)> {
+/// dial: SSH 터널의 127.0.0.1 포트 — 주면 거기로 붙고, TLS 인증서 확인(verify)에는 원래 호스트 이름을 쓴다
+async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHandle>, id: u32, gen: u64, dial: Option<u16>) -> R<(Engine, String)> {
     let timeout = Duration::from_secs(12);
     let watch = app.cloned();
+    let (dial_host, dial_port) = match dial {
+        Some(p) => ("127.0.0.1".to_string(), p),
+        None => (req.host.clone(), req.port),
+    };
     let out = if req.engine == "postgres" {
         let mut cfg = tokio_postgres::Config::new();
-        cfg.host(&req.host).port(req.port).user(&req.username).connect_timeout(timeout).application_name("RuiBotte Shell");
+        cfg.host(&req.host).port(dial_port).user(&req.username).connect_timeout(timeout).application_name("RuiBotte Shell");
+        if dial.is_some() {
+            // 붙는 곳은 터널, 이름(TLS·인증서 확인)은 원래 호스트
+            cfg.hostaddr(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
         cfg.keepalives(true).keepalives_idle(Duration::from_secs(60));
         cfg.dbname(req.database.as_deref().filter(|d| !d.is_empty()).unwrap_or("postgres"));
         if let Some(p) = &pw {
@@ -421,7 +556,7 @@ async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHan
         cfg.application_name("RuiBotte Shell");
         // 사내 SQL Server 는 자체 서명 인증서가 흔하다 — 암호화는 하되 인증서 체인은 묻지 않는다
         cfg.trust_cert();
-        let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((req.host.as_str(), req.port)))
+        let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)))
             .await
             .map_err(|_| e("NETWORK", format!("{}:{} 에 닿지 못했습니다", req.host, req.port)))?
             .map_err(|x| e("NETWORK", x.to_string()))?;
@@ -448,7 +583,7 @@ async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHan
             Err(m) if m == "NEED_DRIVER" => return Err(e("NEED_DRIVER", format!("{} 드라이버가 없습니다", je.label))),
             Err(m) => return Err(e("OTHER", m)),
         };
-        let url = crate::jdbc::build_url(je, &req.host, req.port, req.database.as_deref().unwrap_or(""));
+        let url = crate::jdbc::build_url(je, &dial_host, dial_port, req.database.as_deref().unwrap_or(""));
         let v = side
             .call(json!({"op": "connect", "url": url, "user": req.username, "password": p, "driver": je.driver_class, "readOnly": req.read_only}))
             .await
@@ -462,14 +597,14 @@ async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHan
         let mode = req.ssl.as_deref().unwrap_or("off");
         let ssl = match mode {
             "require" | "prefer" => Some(mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true)),
-            "verify" => Some(mysql_async::SslOpts::default()),
+            "verify" => Some(mysql_async::SslOpts::default().with_danger_tls_hostname_override(dial.map(|_| req.host.clone()))),
             _ => None,
         };
         let build = |ssl: Option<mysql_async::SslOpts>| -> mysql_async::Opts {
             mysql_async::OptsBuilder::default()
                 .ssl_opts(ssl)
-                .ip_or_hostname(req.host.clone())
-                .tcp_port(req.port)
+                .ip_or_hostname(dial_host.clone())
+                .tcp_port(dial_port)
                 .user(Some(req.username.clone()))
                 .pass(pw.clone())
                 .db_name(req.database.clone().filter(|d| !d.is_empty()))
@@ -520,17 +655,28 @@ async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHan
 /// 같은 연결 번호로 다시 연결 — 끊긴 뒤 다시 잇기, PostgreSQL 데이터베이스 바꾸기(database 를 줄 때).
 /// 열린 트랜잭션은 사라진다(화면이 먼저 묻는다).
 #[tauri::command]
-pub async fn db_reconnect(app: AppHandle, dbs: State<'_, DbConns>, conn: u32, database: Option<String>) -> R<DbConnectOk> {
+pub async fn db_reconnect(app: AppHandle, store: State<'_, Store>, dbs: State<'_, DbConns>, conn: u32, database: Option<String>) -> R<DbConnectOk> {
     let old = dbs.get(conn)?;
     let mut req = old.req.clone();
     if let Some(d) = database.filter(|d| !d.is_empty()) {
         req.database = Some(d);
     }
     let gen = GEN.fetch_add(1, Ordering::Relaxed);
-    let (engine, version) = open_engine(&req, req.password.clone(), Some(&app), conn, gen).await?;
+    // 터널이 살아 있으면 그대로, 끊겼으면(SSH 가 끊김) 다시 연다
+    let tunnel = match &old.tunnel {
+        Some(t) if !t.closed() => Some(t.clone()),
+        Some(_) => open_tunnel(&store, &req).await?,
+        None => None,
+    };
+    let dial = tunnel.as_ref().map(|t| t.port);
+    let (engine, version) = open_engine(&req, req.password.clone(), Some(&app), conn, gen, dial).await.map_err(|x| tunnel_fail(&tunnel, x))?;
     let features = engine.features();
     let db = req.database.clone();
-    let prev = dbs.map.lock().unwrap().insert(conn, Arc::new(DbConn::new(engine, req, gen)));
+    let watch = tunnel.is_some();
+    let prev = dbs.map.lock().unwrap().insert(conn, Arc::new(DbConn::new(engine, req, gen, tunnel)));
+    if watch {
+        spawn_tunnel_watch(app.clone(), conn, gen);
+    }
     if let Some(p) = prev {
         // 옛 연결은 기다리지 않고 정리(끊긴 연결이면 오래 걸릴 수 있다)
         tauri::async_runtime::spawn(async move {
@@ -779,7 +925,8 @@ pub(crate) fn classify(sql: &str, mysql: bool) -> Classified {
     };
     let explain_like = first == "EXPLAIN" || (first == "ANALYZE" && mysql && top.len() > 1 && (MAIN_AFTER_WITH.contains(&top[1].as_str()) || top[1] == "FORMAT"));
     if explain_like {
-        let analyze = first == "ANALYZE" || top.iter().take(6).any(|w| w == "ANALYZE");
+        // EXPLAIN ANALYZE … 와 EXPLAIN (ANALYZE, BUFFERS) … 둘 다 — 괄호 안 옵션도 본다
+        let analyze = first == "ANALYZE" || toks.iter().take(16).any(|t| matches!(t, Tok::Word(w) if w == "ANALYZE"));
         // 안쪽 문장 — 첫 본 문장 낱말부터
         let at = top.iter().position(|w| ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE", "REPLACE"].contains(&w.as_str()));
         let inner_writes = at
@@ -2137,6 +2284,7 @@ mod live {
         let my = engine != "postgres";
         DbConnectReq {
             profile_id: None,
+            account_id: None,
             engine: engine.into(),
             host: host.into(),
             port,
@@ -2147,6 +2295,7 @@ mod live {
             save_secret: false,
             legacy: false,
             ssl: None,
+            tunnel: Default::default(),
         }
     }
 
@@ -2245,6 +2394,7 @@ mod live_mssql {
         let dbs = DbConns::default();
         let req = |ro: bool| DbConnectReq {
             profile_id: None,
+            account_id: None,
             engine: "mssql".into(),
             host: host.into(),
             port: port.parse().unwrap(),
@@ -2255,6 +2405,7 @@ mod live_mssql {
             save_secret: false,
             legacy: false,
             ssl: None,
+            tunnel: Default::default(),
         };
         let t = Instant::now();
         let ok = connect(&store, &dbs, req(false), None).await.unwrap();
@@ -2301,7 +2452,7 @@ mod live_edit {
         let dbs = DbConns::default();
         let engines = [("postgres", 25432u16, "postgres", pw.clone(), "postgres"), ("mariadb", 23306, "root", pw.clone(), "shop"), ("mssql", 21433, "sa", format!("Rb!{pw}9a"), "master")];
         for (engine, port, user, p, db) in engines {
-            let ok = connect(&store, &dbs, DbConnectReq { profile_id: None, engine: engine.into(), host: "127.0.0.1".into(), port, username: user.into(), password: Some(p), database: Some(db.into()), read_only: false, save_secret: false, legacy: false, ssl: None }, None).await.unwrap();
+            let ok = connect(&store, &dbs, DbConnectReq { profile_id: None, account_id: None, engine: engine.into(), host: "127.0.0.1".into(), port, username: user.into(), password: Some(p), database: Some(db.into()), read_only: false, save_secret: false, legacy: false, ssl: None, tunnel: Default::default() }, None).await.unwrap();
             let c = ok.conn_id;
             let (ph, cast) = match engine { "postgres" => ("$", true), "mssql" => ("@P", false), _ => ("?", false) };
             let a = |n: usize, ty: &str| if ph == "?" { "?".to_string() } else if cast { format!("${n}::text::{ty}") } else { format!("@P{n}") };
@@ -2425,6 +2576,7 @@ mod live_tls {
         let dbs = DbConns::default();
         let req = |ssl: &str| DbConnectReq {
             profile_id: None,
+            account_id: None,
             engine: "postgres".into(),
             host: host.into(),
             port: port.parse().unwrap(),
@@ -2435,6 +2587,7 @@ mod live_tls {
             save_secret: false,
             legacy: false,
             ssl: Some(ssl.into()),
+            tunnel: Default::default(),
         };
         let off = connect(&store, &dbs, req("off"), None).await;
         println!("off → {:?}", off.as_ref().err().map(|x| &x.message));
@@ -2449,6 +2602,74 @@ mod live_tls {
         let verify = connect(&store, &dbs, req("verify"), None).await;
         println!("verify → {:?}", verify.as_ref().err().map(|x| &x.message));
         assert!(verify.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// SSH 터널로 DB — RB_TUN_SSH·RB_TUN_KEY(tunnel 시험과 같음), RB_TUN_PG=SSH 서버에서 본 PG 주소:포트, RB_TUN_MY=MariaDB, RB_TUN_DB_PW
+#[cfg(test)]
+mod live_tunnel {
+    use super::*;
+
+    fn req(engine: &str, target: &str, pw: &str, pid: i64, aid: i64) -> DbConnectReq {
+        let (host, port) = target.split_once(':').unwrap();
+        DbConnectReq {
+            profile_id: None,
+            account_id: None,
+            engine: engine.into(),
+            host: host.into(),
+            port: port.parse().unwrap(),
+            username: if engine == "postgres" { "postgres".into() } else { "root".into() },
+            password: Some(pw.into()),
+            database: None,
+            read_only: false,
+            save_secret: false,
+            legacy: false,
+            ssl: Some("off".into()),
+            tunnel: TunnelReq { ssh_profile_id: Some(pid), ssh_account_id: Some(aid), ..Default::default() },
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_db_through_ssh_tunnel() {
+        let pw = std::env::var("RB_TUN_DB_PW").expect("RB_TUN_DB_PW");
+        let pg = std::env::var("RB_TUN_PG").expect("RB_TUN_PG");
+        let (store, dir, pid, aid) = crate::tunnel::tests::live_server("db").await;
+        let dbs = DbConns::default();
+
+        // PG 둘 — SSH 연결 하나를 나눠 쓴다
+        let t = Instant::now();
+        let a = connect(&store, &dbs, req("postgres", &pg, &pw, pid, aid), None).await.unwrap_or_else(|x| panic!("{} {}", x.code, x.message));
+        println!("PG 터널 경유 접속 {} ms · {}", t.elapsed().as_millis(), a.version);
+        let b = connect(&store, &dbs, req("postgres", &pg, &pw, pid, aid), None).await.unwrap();
+        assert_eq!(crate::tunnel::tests::link_count(), 1, "같은 계정이면 SSH 연결 하나");
+        let q = query(&dbs, a.conn_id, "select inet_server_addr()::text, inet_client_addr()::text".into(), Some(10)).await.unwrap();
+        let rows = db_rows_core(&dbs, q.result_id.unwrap(), 0, 1);
+        println!("PG 서버 주소 {:?} · PG 가 본 손님 주소 {:?}(= SSH 서버)", rows[0][0], rows[0][1]);
+        let tun = dbs.get(a.conn_id).unwrap().tunnel.clone().unwrap();
+        println!("엔진이 붙은 곳 127.0.0.1:{}", tun.port);
+        drop(tun);
+
+        // MariaDB
+        if let Ok(my) = std::env::var("RB_TUN_MY") {
+            let m = connect(&store, &dbs, req("mariadb", &my, &pw, pid, aid), None).await.unwrap_or_else(|x| panic!("{} {}", x.code, x.message));
+            let q = query(&dbs, m.conn_id, "select @@hostname, version()".into(), Some(10)).await.unwrap();
+            println!("MariaDB 터널 경유 {:?} · {}", db_rows_core(&dbs, q.result_id.unwrap(), 0, 1)[0], m.version);
+            close(&dbs, m.conn_id).await;
+        }
+
+        // 서버에서 닿지 않는 대상 — 터널 오류를 그대로
+        let bad = connect(&store, &dbs, req("postgres", "127.0.0.1:1", &pw, pid, aid), None).await.err().unwrap();
+        println!("닿지 않는 대상 → {} {}", bad.code, bad.message);
+        assert!(bad.message.contains("SSH 터널"));
+
+        // 다 닫으면 SSH 연결도 닫힌다
+        close(&dbs, a.conn_id).await;
+        close(&dbs, b.conn_id).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(crate::tunnel::tests::link_count(), 0, "마지막 DB 연결을 닫으면 SSH 연결도");
+        drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -2,6 +2,8 @@
 //! 암호 줄이 파일 내용으로 섞이지 않게: 늘 `sudo -n` 으로 시도하고, 암호가 필요하다고 하면
 //! `sudo -S -p '' -v` 로 한 번 인증한 뒤 다시 `sudo -n` 으로 실행한다.
 //! 목록은 GNU find 의 -printf 를 쓴다(리눅스 서버 전제).
+//! sudo 설정은 연결한 계정을 따른다: off(안 씀) · ask(켤 때 물음, 이 연결 동안만 기억) · saved(저장한 암호) · nopasswd(암호 없이).
+//! sudo 대상 사용자가 root 가 아니면 `sudo -u <사용자>`.
 
 use russh::ChannelMsg;
 use serde::Serialize;
@@ -51,15 +53,49 @@ fn needs_password(o: &Out) -> bool {
     o.code != Some(0) && (o.stderr.contains("password is required") || o.stderr.contains("a terminal is required"))
 }
 
-/// `sudo -n <cmd>` — 암호가 필요하면 저장/입력한 암호로 한 번 인증하고 다시
-pub(crate) async fn sudo(c: &Conn, password: Option<&str>, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
-    let full = format!("sudo -n -- {cmd}");
+/// 이 연결에서 쓸 sudo 암호 — 이번에 넣은 것(메모리), 없으면 "암호 저장" 계정의 저장한 암호. "암호 없이"면 없음
+pub(crate) fn password_of(c: &Conn) -> Option<String> {
+    let mode = c.sudo.lock().unwrap().mode.clone();
+    if mode == "nopasswd" || mode == "off" {
+        return None;
+    }
+    if let Some(p) = c.sudo_pw.lock().unwrap().clone().filter(|p| !p.is_empty()) {
+        return Some(p);
+    }
+    if mode == "saved" {
+        return c.account_id.and_then(|id| secrets::get(&secrets::sudo_key(id)));
+    }
+    None
+}
+
+/// `sudo -n [-u 사용자] -- <cmd>`
+fn sudo_cmd(c: &Conn, cmd: &str) -> R<String> {
+    let cfg = c.sudo.lock().unwrap().clone();
+    if cfg.mode == "off" {
+        return Err(err("AUTH_FAILED", "이 계정은 sudo 를 쓰지 않게 설정돼 있습니다 — 계정 설정에서 sudo 를 켜세요"));
+    }
+    Ok(if cfg.user.is_empty() || cfg.user == "root" { format!("sudo -n -- {cmd}") } else { format!("sudo -n -u {} -- {cmd}", q(&cfg.user)) })
+}
+
+/// `sudo -n <cmd>` — 암호가 필요하면 이번에 넣은(또는 저장한) 암호로 한 번 인증하고 다시
+pub(crate) async fn sudo(c: &Conn, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
+    sudo_with(c, None, cmd, stdin).await
+}
+
+async fn sudo_with(c: &Conn, typed: Option<&str>, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
+    let full = sudo_cmd(c, cmd)?;
     let o = exec(c, &full, stdin).await?;
     if !needs_password(&o) {
         return check(o);
     }
+    let nopasswd = c.sudo.lock().unwrap().mode == "nopasswd";
+    let password = typed.map(str::to_string).or_else(|| password_of(c));
     let Some(pw) = password.filter(|p| !p.is_empty()) else {
-        return Err(err("NEED_SECRET", "sudo 암호가 필요합니다"));
+        return Err(if nopasswd {
+            err("AUTH_FAILED", "이 계정은 '암호 없이'로 설정했지만 서버가 sudo 암호를 묻습니다 — 계정 설정에서 sudo 방식을 바꾸세요")
+        } else {
+            err("NEED_SECRET", "sudo 암호가 필요합니다")
+        });
     };
     let v = exec(c, "sudo -S -p '' -v", Some(format!("{pw}\n").as_bytes())).await?;
     if v.code != Some(0) {
@@ -79,9 +115,6 @@ fn check(o: Out) -> R<Out> {
     Err(err("SFTP", msg))
 }
 
-pub(crate) fn pw_for(profile_id: Option<i64>, password: Option<String>) -> Option<String> {
-    password.filter(|p| !p.is_empty()).or_else(|| profile_id.and_then(|id| secrets::get(&format!("profile:{id}:sudo"))))
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,23 +134,27 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// sudo 를 켤 때 한 번 — 되는지 보고, 원하면 sudo 암호를 OS 저장소에
+/// sudo 를 켤 때 한 번 — 되는지 보고(넣은 암호는 이 연결 동안 기억), 원하면 그 계정의 sudo 암호로 OS 저장소에
 #[tauri::command]
-pub async fn sudo_check(conns: State<'_, SshConns>, conn: u32, profile_id: Option<i64>, password: Option<String>, save: bool) -> R<bool> {
+pub async fn sudo_check(store: State<'_, crate::store::Store>, conns: State<'_, SshConns>, conn: u32, password: Option<String>, save: bool) -> R<bool> {
     let c = conns.get(conn)?;
-    let pw = pw_for(profile_id, password.clone());
-    sudo(&c, pw.as_deref(), "true", None).await?;
-    if let (true, Some(id), Some(p)) = (save, profile_id, password.filter(|p| !p.is_empty())) {
-        let _ = secrets::set(&format!("profile:{id}:sudo"), &p);
+    let typed = password.filter(|p| !p.is_empty());
+    sudo_with(&c, typed.as_deref(), "true", None).await?;
+    if let Some(p) = typed {
+        *c.sudo_pw.lock().unwrap() = Some(p.clone());
+        if let (true, Some(id)) = (save, c.account_id) {
+            if store.account_sudo_secret_set(id, &p).is_ok() {
+                c.sudo.lock().unwrap().mode = "saved".into();
+            }
+        }
     }
     Ok(true)
 }
 
 #[tauri::command]
-pub async fn sudo_list(conns: State<'_, SshConns>, conn: u32, profile_id: Option<i64>, path: String) -> R<Vec<FsEntry>> {
+pub async fn sudo_list(conns: State<'_, SshConns>, conn: u32, path: String) -> R<Vec<FsEntry>> {
     let c = conns.get(conn)?;
-    let pw = pw_for(profile_id, None);
-    let o = sudo(&c, pw.as_deref(), &format!("find {} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n'", q(&path)), None).await?;
+    let o = sudo(&c, &format!("find {} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%f\\n'", q(&path)), None).await?;
     let mut out: Vec<FsEntry> = String::from_utf8_lossy(&o.stdout)
         .lines()
         .filter_map(|l| {
@@ -154,21 +191,20 @@ pub struct FileText {
 }
 
 #[tauri::command]
-pub async fn sudo_read_text(conns: State<'_, SshConns>, conn: u32, profile_id: Option<i64>, path: String, encoding: Option<String>) -> R<FileText> {
+pub async fn sudo_read_text(conns: State<'_, SshConns>, conn: u32, path: String, encoding: Option<String>) -> R<FileText> {
     let c = conns.get(conn)?;
-    let pw = pw_for(profile_id, None);
-    let st = sudo(&c, pw.as_deref(), &format!("stat -c '%s %Y' -- {}", q(&path)), None).await?;
+    let st = sudo(&c, &format!("stat -c '%s %Y' -- {}", q(&path)), None).await?;
     let st = String::from_utf8_lossy(&st.stdout).to_string();
     let mut it = st.split_whitespace();
     let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
     let mtime: Option<u32> = it.next().and_then(|x| x.parse().ok());
     if size as usize > MAX_TEXT {
         // 앞부분만 읽기 전용으로
-        let o = sudo(&c, pw.as_deref(), &format!("head -c {} -- {}", crate::localfs::HEAD_TEXT, q(&path)), None).await?;
+        let o = sudo(&c, &format!("head -c {} -- {}", crate::localfs::HEAD_TEXT, q(&path)), None).await?;
         let d = textcodec::decode(&crate::localfs::trim_head(o.stdout), encoding.as_deref());
         return Ok(FileText { path, size, mtime, text: d.text, meta: d.meta, binary: d.binary, too_large: true });
     }
-    let o = sudo(&c, pw.as_deref(), &format!("cat -- {}", q(&path)), None).await?;
+    let o = sudo(&c, &format!("cat -- {}", q(&path)), None).await?;
     let d = textcodec::decode(&o.stdout, encoding.as_deref());
     Ok(FileText { path, size, mtime, text: d.text, meta: d.meta, binary: d.binary, too_large: false })
 }
@@ -186,33 +222,30 @@ pub struct Saved {
 pub async fn sudo_write_text(
     conns: State<'_, SshConns>,
     conn: u32,
-    profile_id: Option<i64>,
     path: String,
     text: String,
     meta: TextMeta,
     expect_mtime: Option<u32>,
 ) -> R<Saved> {
     let c = conns.get(conn)?;
-    let pw = pw_for(profile_id, None);
     if let Some(exp) = expect_mtime {
-        let st = sudo(&c, pw.as_deref(), &format!("stat -c '%Y' -- {}", q(&path)), None).await?;
+        let st = sudo(&c, &format!("stat -c '%Y' -- {}", q(&path)), None).await?;
         let now: Option<u32> = String::from_utf8_lossy(&st.stdout).trim().parse().ok();
         if now.is_some_and(|t| t != exp) {
             return Err(err("CONFLICT", "연 뒤에 서버에서 파일이 바뀌었습니다. 다시 열어 확인하세요."));
         }
     }
     let bytes = textcodec::encode(&text, &meta).map_err(|e| err("ENCODING", e))?;
-    sudo(&c, pw.as_deref(), &format!("tee -- {} > /dev/null", q(&path)), Some(&bytes)).await?;
-    let st = sudo(&c, pw.as_deref(), &format!("stat -c '%s %Y' -- {}", q(&path)), None).await?;
+    sudo(&c, &format!("tee -- {} > /dev/null", q(&path)), Some(&bytes)).await?;
+    let st = sudo(&c, &format!("stat -c '%s %Y' -- {}", q(&path)), None).await?;
     let st = String::from_utf8_lossy(&st.stdout).to_string();
     let mut it = st.split_whitespace();
     Ok(Saved { size: it.next().and_then(|x| x.parse().ok()).unwrap_or(bytes.len() as u64), mtime: it.next().and_then(|x| x.parse().ok()) })
 }
 
 #[tauri::command]
-pub async fn sudo_op(conns: State<'_, SshConns>, conn: u32, profile_id: Option<i64>, op: String, path: String, to: Option<String>) -> R<()> {
+pub async fn sudo_op(conns: State<'_, SshConns>, conn: u32, op: String, path: String, to: Option<String>) -> R<()> {
     let c = conns.get(conn)?;
-    let pw = pw_for(profile_id, None);
     if path.trim_end_matches('/').is_empty() {
         return Err(err("SFTP", "최상위 폴더는 다룰 수 없습니다"));
     }
@@ -223,6 +256,6 @@ pub async fn sudo_op(conns: State<'_, SshConns>, conn: u32, profile_id: Option<i
         "remove" => format!("rm -rf -- {}", q(&path)),
         _ => return Err(err("OTHER", "알 수 없는 작업")),
     };
-    sudo(&c, pw.as_deref(), &cmd, None).await?;
+    sudo(&c, &cmd, None).await?;
     Ok(())
 }

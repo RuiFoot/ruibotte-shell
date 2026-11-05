@@ -22,7 +22,7 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::secrets;
-use crate::store::{PinnedKey, Store};
+use crate::store::{Account, PinnedKey, Store};
 use crate::textcodec::{self, TextMeta};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
@@ -141,10 +141,36 @@ pub(crate) struct Client {
     pinned: Option<PinnedKey>,
     trust: Option<String>,
     seen: Arc<Mutex<Option<PinnedKey>>>,
+    /// 원격 포워딩(서버 포트 → 내 PC 쪽 대상) — 서버가 그 포트로 들어온 연결을 채널로 열어 준다
+    remote: crate::tunnel::RemoteMap,
 }
 
 impl client::Handler for Client {
     type Error = russh::Error;
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let target = self.remote.lock().unwrap().get(&connected_port).cloned();
+        match target {
+            Some(t) => {
+                reply.accept().await;
+                crate::tunnel::serve_remote(channel, t);
+            }
+            None => {
+                let _ = connected_address;
+                reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+            }
+        }
+        Ok(())
+    }
 
     async fn check_server_key(&mut self, server: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         let PublicKeyOrCertificate::PublicKey { key, .. } = server else {
@@ -174,6 +200,38 @@ pub(crate) struct Conn {
     pub(crate) sftp: SftpSession,
     shells: tokio::sync::Mutex<HashMap<u32, ChannelWriteHalf<Msg>>>,
     next_shell: AtomicU32,
+    /// 이 연결의 계정(sudo 암호 키)·sudo 설정 — 접속할 때의 계정 설정을 따른다
+    pub(crate) account_id: Option<i64>,
+    pub(crate) sudo: Mutex<SudoCfg>,
+    /// "물어보기"로 넣은 sudo 암호 — 이 연결이 살아 있는 동안만(메모리)
+    pub(crate) sudo_pw: Mutex<Option<String>>,
+    /// 이 연결의 서버(프로필) — 포워딩 규칙·tmux 설정
+    pub(crate) profile_id: Option<i64>,
+    /// 새 터미널을 tmux 세션(rbs-번호)으로
+    tmux: bool,
+    /// 서버에 tmux 가 있는지(0 모름·1 있음·2 없음)
+    tmux_ok: std::sync::atomic::AtomicU8,
+    /// 터미널 채널 → 붙은 tmux 세션 번호(빈 번호부터 다시 써서 다시 연결해도 같은 이름)
+    tmux_used: Mutex<HashMap<u32, u32>>,
+    /// 원격 포워딩 대상(처리기와 같은 것)
+    pub(crate) remote: crate::tunnel::RemoteMap,
+}
+
+/// 계정의 sudo 설정 — mode: off·ask·saved·nopasswd, user: sudo -u 대상
+#[derive(Clone, Debug)]
+pub(crate) struct SudoCfg {
+    pub(crate) mode: String,
+    pub(crate) user: String,
+}
+
+impl SudoCfg {
+    fn of(a: Option<&Account>) -> Self {
+        match a {
+            Some(a) => SudoCfg { mode: a.sudo.clone(), user: a.sudo_user.clone() },
+            // 계정 없이 붙은 연결(시험 등)은 예전처럼 물어본다
+            None => SudoCfg { mode: "ask".into(), user: "root".into() },
+        }
+    }
 }
 
 #[derive(Default)]
@@ -194,14 +252,17 @@ impl SshConns {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectReq {
     profile_id: Option<i64>,
+    /// 접속할 계정 — 주면 그 계정의 사용자명·인증 방식·키·저장한 비밀을 쓴다(없으면 서버의 기본 계정 비밀)
+    #[serde(default)]
+    account_id: Option<i64>,
     host: String,
     port: u16,
     username: String,
-    /// "password" | "key"
+    /// "password" | "key" | "agent"
     auth: String,
     key_path: Option<String>,
     /// 암호(auth=password) 또는 개인키 암호(auth=key). 비우면 저장된 비밀을 쓴다
@@ -225,6 +286,11 @@ pub struct ConnectOk {
     algorithm: String,
     newly_pinned: bool,
     used_saved_secret: bool,
+    /// 쓴 계정·사용자명·sudo 설정(작업대가 따른다)
+    account_id: Option<i64>,
+    username: String,
+    sudo: String,
+    sudo_user: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -235,8 +301,17 @@ struct Closed {
 
 #[tauri::command]
 pub async fn ssh_connect(app: AppHandle, store: State<'_, Store>, conns: State<'_, SshConns>, req: ConnectReq) -> R<ConnectOk> {
+    // 계정으로 접속 — 사용자명·인증 방식·키는 저장한 계정 값으로
+    let mut req = req;
+    if let Some(aid) = req.account_id {
+        let a = store.account(aid).map_err(|e| err("OTHER", e))?;
+        req.username = a.username;
+        req.auth = a.auth;
+        req.key_path = a.key_path;
+        req.profile_id = Some(a.profile_id);
+    }
     let ok = connect(&store, &conns, req).await?;
-    // 끊김 감시 — 서버가 끊거나 네트워크가 끊기면(keepalive 30초×4) 화면에 알린다
+    // 끊김 감시 — 서버가 끊거나 네트워크가 끊기면(keepalive 30초×4) 화면에 알린다. 이 연결의 포워딩도 정리
     let id = ok.conn_id;
     let c = conns.get(id)?;
     tauri::async_runtime::spawn(async move {
@@ -246,18 +321,124 @@ pub async fn ssh_connect(app: AppHandle, store: State<'_, Store>, conns: State<'
                 break; // 화면이 연결을 닫음
             }
             if c.handle.is_closed() {
+                crate::tunnel::stop_conn(id).await;
                 let _ = app.emit("ssh-closed", Closed { conn: id });
+                let _ = app.emit("forward-changed", Closed { conn: id });
                 break;
             }
         }
     });
+    // 이 서버의 "접속하면 켜기" 규칙
+    if let Ok(c) = conns.get(id) {
+        if let Some(pid) = c.profile_id {
+            let rules = store.forwards(pid).unwrap_or_default();
+            crate::tunnel::auto_start(&c, id, rules.into_iter().filter(|f| f.auto_start).collect()).await;
+        }
+    }
     Ok(ok)
 }
 
+/// 붙어서 인증까지 끝낸 SSH 세션(SFTP 없이) — 작업대 연결과 DB 터널이 함께 쓴다
+pub(crate) struct Authed {
+    pub(crate) handle: Handle<Client>,
+    pub(crate) jump: Option<Handle<Client>>,
+    seen_key: PinnedKey,
+    newly_pinned: bool,
+    used_saved: bool,
+    account: Option<Account>,
+    remote: crate::tunnel::RemoteMap,
+}
+
+impl SshError {
+    /// DB 터널 오류로 옮길 때 — (코드, 글, 지문, 알고리즘, 고정된 지문)
+    pub(crate) fn parts(&self) -> (&'static str, &str, Option<&str>, Option<&str>, Option<&str>) {
+        (self.code, &self.message, self.fingerprint.as_deref(), self.algorithm.as_deref(), self.pinned_fingerprint.as_deref())
+    }
+}
+
+/// DB 터널용 접속 요청 — 거칠 SSH 서버(프로필)와 계정(없으면 기본, 지워졌으면 기본)으로.
+/// secret 을 비우면 그 계정에 저장한 비밀을 쓴다
+pub(crate) fn tunnel_req(store: &Store, profile_id: i64, account_id: Option<i64>, secret: Option<String>, trust: Option<String>, save: bool) -> R<ConnectReq> {
+    let p = store.profile(profile_id).map_err(|_| err("OTHER", "거칠 SSH 서버가 없습니다. 연결 설정에서 다시 고르세요."))?;
+    if p.kind != "ssh" {
+        return Err(err("OTHER", "거칠 서버가 SSH 서버가 아닙니다"));
+    }
+    let a = match account_id.and_then(|id| store.account(id).ok()).filter(|a| a.profile_id == profile_id) {
+        Some(a) => a,
+        None => store.default_account(profile_id).map_err(|e| err("OTHER", e))?,
+    };
+    Ok(ConnectReq {
+        profile_id: Some(profile_id),
+        account_id: a.id,
+        host: p.host,
+        port: p.port,
+        username: a.username,
+        auth: a.auth,
+        key_path: a.key_path,
+        secret,
+        legacy: p.legacy,
+        trust_fingerprint: trust,
+        save_secret: save,
+        jump_id: p.jump_id,
+    })
+}
+
+/// 요청의 계정 id(터널 SSH 연결을 나눠 쓰는 열쇠)
+pub(crate) fn req_account(req: &ConnectReq) -> Option<i64> {
+    req.account_id
+}
+
 pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) -> R<ConnectOk> {
+    let a = open_authed(store, &req).await?;
+    let Authed { handle, jump, seen_key, newly_pinned, used_saved, account, remote } = a;
+    let aid = account.as_ref().and_then(|a| a.id);
+    let ch = handle.channel_open_session().await.map_err(map_russh)?;
+    ch.request_subsystem(true, "sftp").await.map_err(map_russh)?;
+    let sftp = SftpSession::new(ch.into_stream()).await.map_err(|e| err("SFTP", format!("SFTP 를 열지 못했습니다: {e}")))?;
+    let home = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
+
+    let profile_id = account.as_ref().map(|a| a.profile_id).or(req.profile_id);
+    let tmux = profile_id.and_then(|id| store.profile(id).ok()).map(|p| p.tmux).unwrap_or(false);
+    let id = conns.next.fetch_add(1, Ordering::Relaxed) + 1;
+    conns.map.lock().unwrap().insert(
+        id,
+        Arc::new(Conn {
+            handle,
+            _jump: jump,
+            sftp,
+            shells: Default::default(),
+            next_shell: AtomicU32::new(0),
+            account_id: aid,
+            sudo: Mutex::new(SudoCfg::of(account.as_ref())),
+            sudo_pw: Mutex::new(None),
+            profile_id,
+            tmux,
+            tmux_ok: Default::default(),
+            tmux_used: Default::default(),
+            remote,
+        }),
+    );
+    let sudo = SudoCfg::of(account.as_ref());
+    Ok(ConnectOk {
+        conn_id: id,
+        home,
+        fingerprint: seen_key.fingerprint,
+        algorithm: seen_key.algorithm,
+        newly_pinned,
+        used_saved_secret: used_saved,
+        account_id: aid,
+        username: req.username.clone(),
+        sudo: sudo.mode,
+        sudo_user: sudo.user,
+    })
+}
+
+/// 붙고(점프 호스트를 거치면 거쳐) 호스트 키를 확인하고 인증한다. 처음 키면 고정, 원하면 비밀 저장
+pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
     let pinned = store.host_key(&req.host, req.port);
     let seen = Arc::new(Mutex::new(None));
-    let handler = Client { pinned: pinned.clone(), trust: req.trust_fingerprint.clone(), seen: seen.clone() };
+    let remote = crate::tunnel::RemoteMap::default();
+    let handler = Client { pinned: pinned.clone(), trust: req.trust_fingerprint.clone(), seen: seen.clone(), remote: remote.clone() };
     let config = Arc::new(client::Config {
         preferred: preferred(&req.legacy),
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -309,17 +490,25 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
         }
     };
 
-    // 인증
+    // 인증 — 비밀은 계정 키에서(계정을 안 주면 서버의 기본 계정)
+    let account: Option<Account> = match (req.account_id, req.profile_id) {
+        (Some(aid), _) => store.account(aid).ok(),
+        (None, Some(pid)) => store.default_account(pid).ok(),
+        _ => None,
+    };
+    let aid = account.as_ref().and_then(|a| a.id);
     let mut used_saved = false;
     let secret = match req.secret.clone().filter(|s| !s.is_empty()) {
         Some(s) => Some(s),
         None => {
-            let saved = req.profile_id.and_then(|id| secrets::get(&format!("profile:{id}")));
+            let saved = aid.and_then(|id| secrets::get(&secrets::account_key(id)));
             used_saved = saved.is_some();
             saved
         }
     };
-    let ok = if req.auth == "key" {
+    let ok = if req.auth == "agent" {
+        agent_auth(&mut handle, &req.username).await?
+    } else if req.auth == "key" {
         let path = req.key_path.clone().filter(|p| !p.is_empty()).ok_or_else(|| err("OTHER", "개인키 파일을 고르세요"))?;
         let key = match load_secret_key(&path, secret.as_deref()) {
             Ok(k) => k,
@@ -345,9 +534,9 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
     };
     if !ok {
         if used_saved {
-            if let Some(id) = req.profile_id {
-                secrets::forget(&format!("profile:{id}"));
-                store.mark_used(id, Some(false));
+            if let Some(id) = aid {
+                secrets::forget(&secrets::account_key(id));
+                store.mark_account_used(id, Some(false));
             }
         }
         return Err(err("AUTH_FAILED", if used_saved { "저장한 암호가 맞지 않아 지웠습니다. 다시 입력하세요." } else { "계정 또는 암호가 맞지 않습니다" }));
@@ -359,34 +548,18 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
     if newly_pinned {
         store.pin_host_key(&req.host, req.port, &seen_key).map_err(|e| err("OTHER", e))?;
     }
-    if let Some(id) = req.profile_id {
+    if let Some(id) = aid {
         let mut saved = None;
-        if req.save_secret {
+        if req.save_secret && req.auth != "agent" {
             if let Some(s) = secret.as_deref().filter(|_| !used_saved) {
-                saved = Some(secrets::set(&format!("profile:{id}"), s).is_ok());
+                saved = Some(secrets::set(&secrets::account_key(id), s).is_ok());
             }
         }
-        store.mark_used(id, saved);
+        store.mark_account_used(id, saved);
+    } else if let Some(pid) = req.profile_id {
+        store.mark_used(pid);
     }
-
-    let ch = handle.channel_open_session().await.map_err(map_russh)?;
-    ch.request_subsystem(true, "sftp").await.map_err(map_russh)?;
-    let sftp = SftpSession::new(ch.into_stream()).await.map_err(|e| err("SFTP", format!("SFTP 를 열지 못했습니다: {e}")))?;
-    let home = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
-
-    let id = conns.next.fetch_add(1, Ordering::Relaxed) + 1;
-    conns.map.lock().unwrap().insert(
-        id,
-        Arc::new(Conn { handle, _jump: jump, sftp, shells: Default::default(), next_shell: AtomicU32::new(0) }),
-    );
-    Ok(ConnectOk {
-        conn_id: id,
-        home,
-        fingerprint: seen_key.fingerprint,
-        algorithm: seen_key.algorithm,
-        newly_pinned,
-        used_saved_secret: used_saved,
-    })
+    Ok(Authed { handle, jump, seen_key, newly_pinned, used_saved, account, remote })
 }
 
 /// 점프 호스트 접속 — 고정된 호스트 키·저장된 비밀만 쓴다(여기서는 묻지 않는다)
@@ -395,7 +568,7 @@ async fn connect_jump(store: &Store, jid: i64) -> R<Handle<Client>> {
     let pinned = store
         .host_key(&p.host, p.port)
         .ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 호스트 키가 아직 고정되지 않았습니다. 그 프로필로 한 번 직접 접속해 지문을 확인하세요.", p.name)))?;
-    let handler = Client { pinned: Some(pinned), trust: None, seen: Arc::new(Mutex::new(None)) };
+    let handler = Client { pinned: Some(pinned), trust: None, seen: Arc::new(Mutex::new(None)), remote: Default::default() };
     let config = Arc::new(client::Config {
         preferred: preferred(&p.legacy),
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -411,14 +584,22 @@ async fn connect_jump(store: &Store, jid: i64) -> R<Handle<Client>> {
             x.message = format!("점프 호스트 {}: {}", p.name, x.message);
             x
         })?;
-    let secret = secrets::get(&format!("profile:{jid}"));
-    let ok = if p.auth == "key" {
+    // 점프 호스트는 그 서버의 기본 계정으로
+    let a = store.default_account(jid).map_err(|e| err("OTHER", format!("점프 호스트 {}: {e}", p.name)))?;
+    let p = crate::store::Profile { username: a.username.clone(), auth: a.auth.clone(), key_path: a.key_path.clone(), ..p };
+    let secret = a.id.and_then(|id| secrets::get(&secrets::account_key(id)));
+    let ok = if p.auth == "agent" {
+        agent_auth(&mut h, &p.username).await.map_err(|mut x| {
+            x.message = format!("점프 호스트 {}: {}", p.name, x.message);
+            x
+        })?
+    } else if p.auth == "key" {
         let path = p.key_path.clone().unwrap_or_default();
         let key = load_secret_key(&path, secret.as_deref()).map_err(|e| err("AUTH_FAILED", format!("점프 호스트 개인키: {e}")))?;
         let hash = h.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
         h.authenticate_publickey(&p.username, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(map_russh)?.success()
     } else {
-        let pw = secret.ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 암호가 저장돼 있지 않습니다. 그 프로필로 접속하며 \"암호 저장\"을 켜 주세요.", p.name)))?;
+        let pw = secret.ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 암호가 저장돼 있지 않습니다. 그 서버의 기본 계정으로 접속하며 \"암호 저장\"을 켜 주세요.", p.name)))?;
         let mut ok = h.authenticate_password(&p.username, &pw).await.map_err(map_russh)?.success();
         if !ok {
             ok = keyboard_interactive(&mut h, &p.username, &pw).await.unwrap_or(false);
@@ -429,6 +610,51 @@ async fn connect_jump(store: &Store, jid: i64) -> R<Handle<Client>> {
         return Err(err("AUTH_FAILED", format!("점프 호스트 {} 인증에 실패했습니다", p.name)));
     }
     Ok(h)
+}
+
+/// SSH 에이전트로 인증 — Windows: OpenSSH 에이전트(파이프) → Pageant, 그 밖: SSH_AUTH_SOCK
+async fn agent_auth(handle: &mut Handle<Client>, user: &str) -> R<bool> {
+    use russh::keys::agent::client::AgentClient;
+    #[cfg(windows)]
+    {
+        if let Ok(a) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+            if let Some(ok) = agent_try(handle, user, a).await? {
+                return Ok(ok);
+            }
+        }
+        match AgentClient::connect_pageant().await {
+            Ok(a) => agent_try(handle, user, a).await.map(|r| r.unwrap_or(false)),
+            Err(_) => Err(err("AUTH_FAILED", "SSH 에이전트를 찾지 못했습니다 — OpenSSH 인증 에이전트 서비스나 Pageant 를 켜고 키를 넣으세요")),
+        }
+    }
+    #[cfg(unix)]
+    {
+        match AgentClient::connect_env().await {
+            Ok(a) => agent_try(handle, user, a).await.map(|r| r.unwrap_or(false)),
+            Err(_) => Err(err("AUTH_FAILED", "SSH 에이전트를 찾지 못했습니다(SSH_AUTH_SOCK) — ssh-agent 를 켜고 ssh-add 로 키를 넣으세요")),
+        }
+    }
+}
+
+/// 에이전트의 키를 하나씩 — 키가 없으면 None(다음 에이전트로)
+async fn agent_try<S>(handle: &mut Handle<Client>, user: &str, mut agent: russh::keys::agent::client::AgentClient<S>) -> R<Option<bool>>
+where
+    S: russh::keys::agent::client::AgentStream + Unpin + Send + 'static,
+{
+    let ids = agent.request_identities().await.map_err(|e| err("AUTH_FAILED", format!("SSH 에이전트: {e}")))?;
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let hash = handle.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
+    for id in ids {
+        let key = id.public_key().into_owned();
+        if let Ok(r) = handle.authenticate_publickey_with(user, key, hash, &mut agent).await {
+            if r.success() {
+                return Ok(Some(true));
+            }
+        }
+    }
+    Ok(Some(false))
 }
 
 async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, pw: &str) -> Result<bool, russh::Error> {
@@ -476,6 +702,7 @@ pub async fn ssh_test(store: State<'_, Store>, conns: State<'_, SshConns>, req: 
 
 #[tauri::command]
 pub async fn ssh_disconnect(conns: State<'_, SshConns>, conn: u32) -> R<()> {
+    crate::tunnel::stop_conn(conn).await;
     let c = conns.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
         let _ = c.sftp.close().await;
@@ -505,10 +732,20 @@ pub async fn ssh_shell_open(
     on_data: Channel<InvokeResponseBody>,
 ) -> R<u32> {
     let c = conns.get(conn)?;
+    // tmux 로 열기: 서버에 tmux 가 있으면 rbs-<빈 번호> 세션에 붙는다(없으면 만든다)
+    let use_tmux = c.tmux && tmux_available(&c).await;
     let ch = c.handle.channel_open_session().await.map_err(map_russh)?;
     ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(map_russh)?;
     ch.request_shell(true).await.map_err(map_russh)?;
-    let (mut read, write) = ch.split();
+    let (read, write) = ch.split();
+    let shell = c.next_shell.fetch_add(1, Ordering::Relaxed) + 1;
+    if use_tmux {
+        let n = c.tmux_alloc(shell);
+        let _ = write.data(tmux_line(n, cwd.as_deref()).as_bytes()).await;
+        c.shells.lock().await.insert(shell, write);
+        spawn_shell_reader(app, c.clone(), conn, shell, read, on_data);
+        return Ok(shell);
+    }
     // 셸 통합(bash) — 서버 파일은 바꾸지 않고 이 셸에만 PROMPT_COMMAND 를 얹는다. 프롬프트마다:
     //   OSC 133;D;종료코드(앞 명령 끝) · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작)
     //   (exit $__rb_s) 로 $? 를 되돌려 원래 PROMPT_COMMAND·PS1 이 같은 값을 본다. 끝맺음은 모두 BEL.
@@ -519,11 +756,20 @@ pub async fn ssh_shell_open(
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
         line.push_str(&format!("; cd '{}'", dir.replace('\'', "'\\''")));
     }
-    line.push_str("; clear\n");
+    line.push_str("; clear");
+    // tmux 로 열라고 했는데 서버에 없으면 이 연결에서 한 번만 알린다
+    if c.tmux && c.tmux_ok.compare_exchange(2, 3, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        line.push_str(r"; printf '\r\n[RuiBotte] 서버에 tmux 가 없어 일반 셸로 열었습니다. 끊기면 이어지지 않습니다(설치 예: sudo apt install tmux).\r\n'");
+    }
+    line.push('\n');
     let _ = write.data(line.as_bytes()).await;
-    let shell = c.next_shell.fetch_add(1, Ordering::Relaxed) + 1;
     c.shells.lock().await.insert(shell, write);
-    let conns_map = c.clone();
+    spawn_shell_reader(app, c.clone(), conn, shell, read, on_data);
+    Ok(shell)
+}
+
+/// 셸 출력을 화면으로 — 끝나면 채널·tmux 번호를 정리하고 알린다
+fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut read: russh::ChannelReadHalf, on_data: Channel<InvokeResponseBody>) {
     tauri::async_runtime::spawn(async move {
         let mut code = None;
         while let Some(msg) = read.wait().await {
@@ -541,10 +787,124 @@ pub async fn ssh_shell_open(
                 _ => {}
             }
         }
-        conns_map.shells.lock().await.remove(&shell);
+        c.shells.lock().await.remove(&shell);
+        c.tmux_used.lock().unwrap().remove(&shell);
         let _ = app.emit("ssh-shell-exit", ShellExit { conn, shell, code });
     });
-    Ok(shell)
+}
+
+impl Conn {
+    /// 지금 이 연결에서 안 쓰는 가장 작은 tmux 번호를 그 셸 몫으로 — 다시 연결해 터미널을 같은 순서로 열면 같은 세션에 붙는다
+    fn tmux_alloc(&self, shell: u32) -> u32 {
+        let mut used = self.tmux_used.lock().unwrap();
+        let n = free_number(used.values().copied());
+        used.insert(shell, n);
+        n
+    }
+}
+
+fn free_number(used: impl Iterator<Item = u32>) -> u32 {
+    let used: std::collections::HashSet<u32> = used.collect();
+    (1..).find(|n| !used.contains(n)).unwrap_or(1)
+}
+
+/// tmux 세션 이름 — 앱이 만든 것은 rbs-<번호>
+pub(crate) fn tmux_name(n: u32) -> String {
+    format!("rbs-{n}")
+}
+
+/// tmux 로 셸을 바꾸는 줄 — 앞 공백 = 셸 기록에 남지 않게. 세션이 있으면 붙고(-A) 없으면 만든다(-c 는 만들 때만)
+fn tmux_line(n: u32, cwd: Option<&str>) -> String {
+    let mut line = format!(" exec tmux new-session -A -s {}", tmux_name(n));
+    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+        line.push_str(&format!(" -c '{}'", dir.replace('\'', "'\\''")));
+    }
+    line.push('\n');
+    line
+}
+
+/// 서버에 tmux 가 있는지 — 연결마다 한 번만 본다
+pub(crate) async fn tmux_available(c: &Conn) -> bool {
+    match c.tmux_ok.load(Ordering::Relaxed) {
+        1 => return true,
+        2 | 3 => return false,
+        _ => {}
+    }
+    let out = exec_out(c, "sh -c 'command -v tmux'", Duration::from_secs(6)).await.unwrap_or_default();
+    let ok = out.trim().ends_with("tmux");
+    let _ = c.tmux_ok.compare_exchange(0, if ok { 1 } else { 2 }, Ordering::Relaxed, Ordering::Relaxed);
+    ok
+}
+
+/// 짧은 명령 하나 — 표준출력(1 MiB 상한)
+async fn exec_out(c: &Conn, cmd: &str, limit: Duration) -> R<String> {
+    let run = async {
+        let mut ch = c.handle.channel_open_session().await.map_err(map_russh)?;
+        ch.exec(true, cmd).await.map_err(map_russh)?;
+        let mut out = Vec::new();
+        while let Some(m) = ch.wait().await {
+            if let ChannelMsg::Data { data } = m {
+                out.extend_from_slice(&data);
+                if out.len() > 1024 * 1024 {
+                    break;
+                }
+            }
+        }
+        Ok::<_, SshError>(String::from_utf8_lossy(&out).into_owned())
+    };
+    tokio::time::timeout(limit, run).await.map_err(|_| err("NETWORK", "응답이 없습니다"))?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TmuxSession {
+    name: String,
+    windows: u32,
+    /// 지금 붙어 있는 클라이언트 수(이 앱의 터미널 포함)
+    attached: u32,
+    /// 만든 때(초)
+    created: Option<i64>,
+    /// 이 앱이 만든 세션(rbs-번호)
+    ours: bool,
+}
+
+fn parse_tmux_ls(out: &str) -> Vec<TmuxSession> {
+    out.lines()
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            let name = it.next()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let windows = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            let attached = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            let created = it.next().and_then(|x| x.trim().parse().ok());
+            let ours = name.strip_prefix("rbs-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            Some(TmuxSession { name, windows, attached, created, ours })
+        })
+        .collect()
+}
+
+/// 서버의 tmux 세션 목록 — tmux 가 없으면 None
+#[tauri::command]
+pub async fn ssh_tmux_list(conns: State<'_, SshConns>, conn: u32) -> R<Option<Vec<TmuxSession>>> {
+    let c = conns.get(conn)?;
+    let out = exec_out(&c, "sh -c 'command -v tmux >/dev/null 2>&1 || { echo __rb_no_tmux; exit 0; }; tmux ls -F \"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\" 2>/dev/null; true'", Duration::from_secs(8)).await?;
+    if out.contains("__rb_no_tmux") {
+        return Ok(None);
+    }
+    Ok(Some(parse_tmux_ls(&out)))
+}
+
+/// tmux 세션 하나 끝내기(그 안의 프로그램도 끝난다 — 화면이 먼저 묻는다)
+#[tauri::command]
+pub async fn ssh_tmux_kill(conns: State<'_, SshConns>, conn: u32, name: String) -> R<()> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+        return Err(err("OTHER", "이 이름의 세션은 여기서 지울 수 없습니다(영문·숫자·-_. 만)"));
+    }
+    let c = conns.get(conn)?;
+    exec_out(&c, &format!("tmux kill-session -t '={name}' 2>&1"), Duration::from_secs(8)).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -561,6 +921,19 @@ pub async fn ssh_shell_write(conns: State<'_, SshConns>, conn: u32, shell: u32, 
         }
         None => w.data(data.as_bytes()).await.map_err(map_russh),
     }
+}
+
+/// sudo 암호를 이 터미널에 넣는다(암호 묻는 줄에서) — 값은 화면으로 돌아가지 않는다. 넣을 암호가 없으면 false
+#[tauri::command]
+pub async fn ssh_shell_sudo_pw(conns: State<'_, SshConns>, conn: u32, shell: u32) -> R<bool> {
+    let c = conns.get(conn)?;
+    let Some(pw) = crate::sudo::password_of(&c) else {
+        return Ok(false);
+    };
+    let shells = c.shells.lock().await;
+    let w = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
+    w.data(format!("{pw}\n").as_bytes()).await.map_err(map_russh)?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -827,6 +1200,7 @@ pub(crate) async fn test_connect(store: &Store, conns: &SshConns, host: &str, po
         trust_fingerprint: trust,
         save_secret: false,
         jump_id: None,
+        account_id: None,
     };
     match connect(store, conns, req(None)).await {
         Ok(ok) => ok.conn_id,
@@ -873,6 +1247,7 @@ mod tests {
             trust_fingerprint: trust,
             save_secret: false,
             jump_id: None,
+            account_id: None,
         };
 
         // 1) 처음 → 지문 확인 요구
@@ -928,6 +1303,18 @@ mod tests {
     }
 
     #[test]
+    fn tmux_numbers_line_and_list() {
+        assert_eq!(free_number([].into_iter()), 1);
+        assert_eq!(free_number([1, 2, 4].into_iter()), 3);
+        assert_eq!(tmux_line(2, None), " exec tmux new-session -A -s rbs-2\n");
+        assert_eq!(tmux_line(1, Some("/srv/it's")), " exec tmux new-session -A -s rbs-1 -c '/srv/it'\\''s'\n");
+        let l = parse_tmux_ls("rbs-1\t2\t1\t1700000000\nwork\t1\t0\t1700000001\nrbs-x\t1\t0\t\n\n");
+        assert_eq!(l.len(), 3);
+        assert!(l[0].ours && l[0].windows == 2 && l[0].attached == 1 && l[0].created == Some(1_700_000_000));
+        assert!(!l[1].ours && !l[2].ours);
+    }
+
+    #[test]
     fn levels_add_algorithms() {
         assert!(!preferred("off").key.contains(&Algorithm::Rsa { hash: None }));
         assert!(preferred("rsa").key.contains(&Algorithm::Rsa { hash: None }));
@@ -958,7 +1345,8 @@ mod live_jump {
         let conns = SshConns::default();
         test_connect(&store, &conns, &host, port, "rbtest", &pw).await; // 점프 서버 키 고정
         let jid = crate::store::profile_save_core(&store, &host, port, "rbtest");
-        secrets::set(&format!("profile:{jid}"), &pw).unwrap();
+        let jacc = store.default_account(jid).unwrap().id.unwrap();
+        secrets::set(&secrets::account_key(jacc), &pw).unwrap();
         let req = |trust: Option<String>| ConnectReq {
             profile_id: None,
             host: th.into(),
@@ -971,6 +1359,7 @@ mod live_jump {
             trust_fingerprint: trust,
             save_secret: false,
             jump_id: Some(jid),
+            account_id: None,
         };
         let t = std::time::Instant::now();
         let ok = match connect(&store, &conns, req(None)).await {
@@ -983,7 +1372,7 @@ mod live_jump {
         println!("점프 거쳐 접속 {} ms, 대상 키 {} home {}", t.elapsed().as_millis(), ok.algorithm, ok.home);
         let l = list(&conns, ok.conn_id, ok.home.clone()).await.unwrap();
         assert!(l.iter().any(|e| e.name == "app"));
-        secrets::forget(&format!("profile:{jid}"));
+        secrets::forget(&secrets::account_key(jacc));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -16,6 +16,32 @@ const profiles: Record<string, any>[] = [
 	{ id: 5, kind: "db", name: "Oracle 회계", host: "10.0.0.12", port: 1521, username: "acc", engine: "oracle", color: "#8e8e93", favorite: false, auth: "password", legacy: "off", database: "ORCL", secretSaved: false },
 ];
 
+// 계정 — 서버 하나에 여럿(기본 계정이 앞)
+let accSeq = 100;
+const accounts: Record<string, any>[] = profiles.map((p) => ({
+	id: ++accSeq,
+	profileId: p.id,
+	label: null,
+	username: p.username,
+	auth: p.auth,
+	keyPath: p.keyPath ?? null,
+	sudo: p.kind === "ssh" ? "ask" : "off",
+	sudoUser: "root",
+	isDefault: true,
+	lastUsedAt: p.lastUsedAt ?? null,
+	secretSaved: p.secretSaved,
+	sudoSaved: false,
+}));
+accounts.push({ id: ++accSeq, profileId: 1, label: "운영 배포", username: "release", auth: "agent", keyPath: null, sudo: "nopasswd", sudoUser: "root", isDefault: false, lastUsedAt: (now - 600) * 1000, secretSaved: false, sudoSaved: false });
+accounts.push({ id: ++accSeq, profileId: 1, label: null, username: "postgres", auth: "password", keyPath: null, sudo: "saved", sudoUser: "postgres", isDefault: false, lastUsedAt: null, secretSaved: true, sudoSaved: true });
+const accsOf = (pid: number) =>
+	accounts.filter((a) => a.profileId === pid).sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0));
+const withAccs = (p: Record<string, any>) => {
+	const list = accsOf(p.id).map((a) => ({ ...a }));
+	const d = list[0];
+	return d ? { ...p, username: d.username, auth: d.auth, keyPath: d.keyPath, secretSaved: d.secretSaved, accounts: list } : { ...p, accounts: list };
+};
+
 function dir(path: string) {
 	const p = path.replace(/\/$/, "") || "";
 	if (p === "") return ["etc", "home", "opt", "usr", "var"].map((n) => ({ name: n, path: `/${n}`, kind: "dir", size: 4096, mtime: now }));
@@ -78,14 +104,63 @@ export function installMock() {
 				case "app_info":
 					return { name: "RuiBotte Shell", version: "0.6.0", os: "windows", arch: "x86_64", dataPath: "C:/Users/me/AppData/Roaming/RuiBotte Shell", portable: false, osBackdrop: false };
 				case "profiles_list":
-					return profiles.map((p) => ({ ...p }));
+					return profiles.map(withAccs);
 				case "profile_save": {
-					const p = (args as { p: Record<string, any> }).p;
+					const { accounts: _a, ...p } = (args as { p: Record<string, any> }).p;
 					const i = profiles.findIndex((x) => x.id === p.id);
 					if (i >= 0) profiles[i] = { ...profiles[i], ...p };
-					else profiles.push({ ...p, id: Math.max(0, ...profiles.map((x) => x.id)) + 1 });
+					else {
+						const id = Math.max(0, ...profiles.map((x) => x.id)) + 1;
+						profiles.push({ ...p, id });
+						accounts.push({ id: ++accSeq, profileId: id, label: null, username: p.username, auth: p.auth, keyPath: p.keyPath ?? null, sudo: "off", sudoUser: "root", isDefault: true, lastUsedAt: null, secretSaved: false, sudoSaved: false });
+					}
 					return p.id ?? profiles[profiles.length - 1].id;
 				}
+				case "accounts_list":
+					return accsOf(Number(args.profileId)).map((a) => ({ ...a }));
+				case "account_save": {
+					const a = (args as { a: Record<string, any> }).a;
+					const list = accsOf(a.profileId);
+					if (!String(a.username ?? "").trim()) throw "사용자명을 입력하세요";
+					let id = a.id;
+					if (id != null) {
+						const i = accounts.findIndex((x) => x.id === id);
+						accounts[i] = { ...accounts[i], ...a, sudoUser: a.sudoUser || "root" };
+					} else {
+						id = ++accSeq;
+						accounts.push({ ...a, id, sudoUser: a.sudoUser || "root", isDefault: list.length === 0, secretSaved: false, sudoSaved: false, lastUsedAt: null });
+					}
+					if (a.isDefault) for (const x of accounts) if (x.profileId === a.profileId) x.isDefault = x.id === id;
+					return id;
+				}
+				case "account_delete": {
+					const i = accounts.findIndex((x) => x.id === args.id);
+					const a = accounts[i];
+					if (accsOf(a.profileId).length <= 1) throw { code: "OTHER", message: "서버에 남은 마지막 계정이라 지울 수 없습니다. 서버째 지우려면 서버 설정에서 '지우기'를 쓰세요." };
+					accounts.splice(i, 1);
+					if (a.isDefault) accsOf(a.profileId)[0].isDefault = true;
+					return null;
+				}
+				case "account_set_default": {
+					const a = accounts.find((x) => x.id === args.id);
+					if (a) for (const x of accounts) if (x.profileId === a.profileId) x.isDefault = x.id === a.id;
+					return null;
+				}
+				case "account_secret_set": {
+					const a = accounts.find((x) => x.id === args.id);
+					if (a) a.secretSaved = !!args.secret;
+					return null;
+				}
+				case "account_sudo_secret_set": {
+					const a = accounts.find((x) => x.id === args.id);
+					if (a) {
+						a.sudoSaved = !!args.secret;
+						a.sudo = args.secret ? "saved" : a.sudo === "saved" ? "ask" : a.sudo;
+					}
+					return null;
+				}
+				case "host_key_get":
+					return args.host === "dev.example.com" ? { algorithm: "ssh-ed25519", fingerprint: "SHA256:Qm9vZGxlc2Ftc3BsZWZpbmdlcnByaW50MTIzNA", pinnedAt: Date.now() } : null;
 				case "profile_delete": {
 					const i = profiles.findIndex((x) => x.id === (args as { id: number }).id);
 					if (i >= 0) profiles.splice(i, 1);
@@ -104,8 +179,12 @@ export function installMock() {
 					return dir(String(args.path ?? "/"));
 				case "sftp_realpath":
 					return String(args.path ?? "/home/deploy");
-				case "ssh_connect":
-					return { connId: 1, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false, usedSavedSecret: true };
+				case "ssh_connect": {
+					const req = (args as { req: Record<string, any> }).req;
+					const a = accounts.find((x) => x.id === req.accountId);
+					if (a) a.lastUsedAt = Date.now();
+					return { connId: 1, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false, usedSavedSecret: true, accountId: a?.id ?? null, username: a?.username ?? req.username, sudo: a?.sudo ?? "ask", sudoUser: a?.sudoUser ?? "root" };
+				}
 				case "ssh_shell_open":
 				case "pty_open":
 					sendChannel(args.onData, banner);

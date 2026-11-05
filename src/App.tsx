@@ -9,11 +9,13 @@ import { Select } from "./components/Select";
 import { confirmOpenTx } from "./lib/dbTx";
 import { confirmDiscard, dirtyTitles } from "./lib/dirty";
 import { ConnectionsPane } from "./components/ConnectionsPane";
+import { KeysPane } from "./components/KeysPane";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
-import { type AppInfo, api, type ConnectOk, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm } from "./lib/ipc";
+import { agoMs, ServerCard } from "./components/ServerCard";
+import { type Account, accountName, type AppInfo, api, type ConnectOk, defaultAccount, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm, withAccount } from "./lib/ipc";
 import { installNow, startUpdater, useUpdate } from "./lib/updater";
 
 // 무거운 칸(xterm·편집기·표·사전)은 처음 열 때 받는다 — 첫 화면(홈)은 가볍게
@@ -23,7 +25,7 @@ const SettingsPane = lazy(() => import("./components/SettingsPane").then((m) => 
 const DbWorkbench = lazy(() => import("./components/DbWorkbench").then((m) => ({ default: m.DbWorkbench })));
 const CommandDictionaryPane = lazy(() => import("./components/CommandDictionary").then((m) => ({ default: m.CommandDictionaryPane })));
 
-type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict" | "settings" | "connections";
+type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict" | "settings" | "connections" | "keys";
 type DbInfo = { ok: DbConnectOk; profile: Profile; readOnly: boolean };
 type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean };
 type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; db?: DbInfo; color?: string | null };
@@ -37,16 +39,21 @@ const TAB_ICON: Record<TabKind, ReactNode> = {
 	dict: <BookOpen size={14} />,
 	settings: <SettingsIcon size={14} />,
 	connections: <ListTree size={14} />,
+	keys: <KeyRound size={14} />,
 };
-/** 마지막 접속 — 초(유닉스) → "3시간 전" */
-function ago(t: number) {
-	const s = Math.max(0, Date.now() / 1000 - t);
-	if (s < 60) return "방금";
-	if (s < 3600) return `${Math.floor(s / 60)}분 전`;
-	if (s < 86400) return `${Math.floor(s / 3600)}시간 전`;
-	if (s < 86400 * 30) return `${Math.floor(s / 86400)}일 전`;
-	return new Date(t * 1000).toLocaleDateString();
+/** 지난 세션 한 칸 — 서버와 그때 쓴 계정 */
+type SessionItem = { p: number; a?: number };
+function parseSession(v: string | null): SessionItem[] {
+	try {
+		const raw = v ? (JSON.parse(v) as unknown[]) : [];
+		// 예전 판은 서버 번호만 적었다
+		return raw.map((x) => (typeof x === "number" ? { p: x } : (x as SessionItem))).filter((x) => typeof x?.p === "number");
+	} catch {
+		return [];
+	}
 }
+/** 탭 제목 — 계정@서버 */
+const tabTitle = (p: Profile) => (p.username ? `${p.username}@${p.name}` : p.name);
 const LEVEL_BADGE: Record<string, string> = { rsa: "구형 SSH · RSA", sha1: "구형 SSH · SHA-1", weakest: "구형 SSH · 최후" };
 
 // 탭 번호는 겹치면 안 된다 — 모듈이 다시 읽혀(개발 중 새로 고침) 숫자가 처음으로 돌아가도 겹치지 않게 무작위 꼬리를 붙인다
@@ -69,6 +76,8 @@ export function App() {
 	const [profiles, setProfiles] = useState<Profile[]>([]);
 	const [sheet, setSheet] = useState<Profile | null>(null);
 	const [connecting, setConnecting] = useState<{ p: Profile; tabId?: string } | null>(null);
+	/** 서버 카드(누르면 계정 고르기) — 서버 번호 */
+	const [cardId, setCardId] = useState<number | null>(null);
 	const [dbConnecting, setDbConnecting] = useState<Profile | null>(null);
 	const [importing, setImporting] = useState(false);
 	const [exporting, setExporting] = useState(false);
@@ -80,24 +89,26 @@ export function App() {
 	const upd = useUpdate();
 
 	// 지난번 열려 있던 연결(앱을 다시 켜면 홈에서 한 번에 다시 열기)
-	const [lastSession, setLastSession] = useState<number[]>([]);
+	// 지난번 열려 있던 연결(서버 + 그때 쓴 계정) — 앱을 다시 켜면 홈에서 한 번에 다시 열기
+	const [lastSession, setLastSession] = useState<SessionItem[]>([]);
 	const sessionLoaded = useRef(false);
 	useEffect(() => {
 		void api.settingGet("session.open").then((v) => {
-			try {
-				setLastSession(v ? (JSON.parse(v) as number[]) : []);
-			} catch {
-				setLastSession([]);
-			}
+			setLastSession(parseSession(v));
 			sessionLoaded.current = true;
 		});
 	}, []);
 	useEffect(() => {
 		if (!sessionLoaded.current) return;
-		const ids = tabs.map((t) => t.ssh?.profile.id ?? t.db?.profile.id).filter((x): x is number => x != null);
-		if (ids.length) {
+		const items: SessionItem[] = [];
+		for (const t of tabs) {
+			const p = t.ssh?.profile ?? t.db?.profile;
+			if (p?.id == null) continue;
+			if (!items.some((x) => x.p === p.id && x.a === p.accountId)) items.push({ p: p.id, a: p.accountId });
+		}
+		if (items.length) {
 			setLastSession([]);
-			void api.settingSet("session.open", JSON.stringify([...new Set(ids)]));
+			void api.settingSet("session.open", JSON.stringify(items));
 		} else if (!lastSession.length) void api.settingSet("session.open", "[]");
 	}, [tabs, lastSession.length]);
 
@@ -159,7 +170,7 @@ export function App() {
 				setActive(tabId);
 				return;
 			}
-			open("ssh", p.name, false, { ssh: { ok, profile: p }, color: p.color });
+			open("ssh", tabTitle({ ...p, username: ok.username || p.username }), false, { ssh: { ok, profile: p }, color: p.color });
 		},
 		[open, reload],
 	);
@@ -170,7 +181,7 @@ export function App() {
 			const t = tabsRef.current.find((x) => x.ssh?.ok.connId === e.payload.conn);
 			if (!t?.ssh) return;
 			setTabs((ts) => ts.map((x) => (x.id === t.id && x.ssh ? { ...x, ssh: { ...x.ssh, closed: true } } : x)));
-			if (t.ssh.profile.secretSaved || t.ssh.profile.auth === "key") setConnecting({ p: t.ssh.profile, tabId: t.id });
+			if (t.ssh.profile.secretSaved || t.ssh.ok.usedSavedSecret || t.ssh.profile.auth !== "password") setConnecting({ p: t.ssh.profile, tabId: t.id });
 		});
 		return () => void un.then((f) => f());
 	}, []);
@@ -259,16 +270,18 @@ export function App() {
 		setSheet(p);
 	};
 	const profileMenu = (p: Profile): MenuItem[] => [
-		{ label: "접속", run: () => connect(p) },
+		{ label: "서버 카드(계정 고르기)…", run: () => connect(p) },
+		...(p.accounts ?? []).map((a) => ({ label: `${accountName(a)}${a.label?.trim() ? ` (${a.username})` : ""} 로 접속${a.isDefault ? " ★" : ""}`, run: () => connectAs(p, a) })),
+		{ sep: true as const },
 		{ label: "설정…", run: () => editProfile(p) },
 		{ label: "복제", run: () => editProfile({ ...p, id: undefined, name: `${p.name} 복사본`, secretSaved: false }) },
-		...(p.secretSaved ? [{ label: "저장한 암호 지우기", run: () => void invoke("secret_forget", { profileId: p.id }).then(reload) }] : []),
+		...(p.secretSaved ? [{ label: "기본 계정의 저장한 암호 지우기", run: () => void api.accountSecretSet(defaultAccount(p)?.id ?? -1, "").then(reload) }] : []),
 		{ sep: true as const },
 		{
 			label: "지우기",
 			danger: true,
 			run: () => {
-				if (p.id != null && confirm(`${p.name} 연결을 지울까요? 저장한 암호도 함께 지웁니다.`)) void api.profileDelete(p.id).then(reload);
+					if (p.id != null && confirm(`${p.name} 서버를 지울까요? 계정 ${p.accounts?.length ?? 1}개와 저장한 암호도 함께 지웁니다.`)) void api.profileDelete(p.id).then(reload);
 			},
 		},
 	];
@@ -298,15 +311,20 @@ export function App() {
 				setPmenu({ x: e.clientX, y: e.clientY, p });
 			}}
 		>
-			<button type="button" className="sb-item" title={`${p.kind === "db" ? `${p.engine} ` : ""}${p.username ? `${p.username}@` : ""}${p.host}:${p.port}${p.memo ? `\n${p.memo}` : ""} — 눌러 접속`} onClick={() => connect(p)}>
+				<button
+					type="button"
+					className="sb-item"
+					title={`${p.kind === "db" ? `${p.engine} ` : ""}${p.host}:${p.port} · 계정 ${p.accounts?.length ?? 1}개${p.memo ? `\n${p.memo}` : ""}\n눌러 서버 정보·계정 고르기`}
+					onClick={() => connect(p)}
+				>
 				<span className="dot" style={{ background: p.color ?? "var(--accent)" }} />
 				{p.kind === "ssh" ? <Server size={12} className="sb-kind" /> : <Database size={12} className="sb-kind" />}
 				<span className="sb-name">{p.name}</span>
 			</button>
 			<span className="sb-acts">
-				<button type="button" className="sb-act" title="접속" onClick={() => connect(p)}>
-					<Play size={12} />
-				</button>
+					<button type="button" className="sb-act" title={quickTitle(p)} onClick={() => connectAs(p)}>
+						<Play size={12} />
+					</button>
 				<button type="button" className="sb-act" title="설정" onClick={() => editProfile(p)}>
 					<Pencil size={12} />
 				</button>
@@ -314,6 +332,7 @@ export function App() {
 		</div>
 	);
 	const isWin = info?.os === "windows";
+	const sessionProfiles = lastSession.map((x) => ({ x, p: profiles.find((p) => p.id === x.p) })).filter((y): y is { x: SessionItem; p: Profile } => !!y.p);
 	const mod = info?.os === "macos" ? "⌘" : "Ctrl+";
 	const win = getCurrentWindow();
 	// 앱을 끌 때: 저장 안 한 편집기가 있으면 묻는다(창 단추·Alt+F4·작업 표시줄 모두)
@@ -359,13 +378,26 @@ export function App() {
 		return () => window.removeEventListener("keydown", onKey);
 	}, [sbRail]);
 
+	/** 서버를 누르면 — 바로 접속하지 않고 서버 카드(서버 정보·계정 고르기) */
 	const connect = (p: Profile) => {
+		if (p.id == null) return;
+		setCardId(p.id);
+	};
+	/** 그 계정으로(안 주면 기본 계정) 접속 */
+	const connectAs = (p: Profile, a?: Account) => {
+		const eff = withAccount(p, a ?? defaultAccount(p));
+		setCardId(null);
 		if (p.kind === "db") {
-			setDbConnecting(p);
+			setDbConnecting(eff);
 			return;
 		}
-		setConnecting({ p });
+		setConnecting({ p: eff });
 	};
+	const quickTitle = (p: Profile) => {
+		const a = defaultAccount(p);
+		return `기본 계정${a ? ` ${accountName(a)}${a.label?.trim() ? `(${a.username})` : ""}` : ""} 로 바로 접속${(p.accounts?.length ?? 0) > 1 ? ` — 계정 ${p.accounts?.length}개 중` : ""}`;
+	};
+	const card = cardId != null ? profiles.find((p) => p.id === cardId) : undefined;
 
 	// 원격·내 PC 백엔드는 탭마다 한 번만 만든다(다시 그릴 때 셸이 다시 열리지 않게)
 	const backends = useRef(new Map<string, { fs: ReturnType<typeof localFs>; term: typeof localTerm; local?: ReturnType<typeof localFs> }>());
@@ -407,6 +439,9 @@ export function App() {
 				</button>
 				<button type="button" className="sb-item" title="연결 관리" aria-current={activeKind === "connections"} onClick={() => open("connections", "연결 관리", true)}>
 					<ListTree size={16} /> 연결 관리
+				</button>
+				<button type="button" className="sb-item" title="SSH 키 관리" aria-current={activeKind === "keys"} onClick={() => open("keys", "키 관리", true)}>
+					<KeyRound size={16} /> 키 관리
 				</button>
 
 				<div className="sb-section">즐겨찾기</div>
@@ -459,6 +494,11 @@ export function App() {
 							>
 								{TAB_ICON[t.kind]}
 								<span>{t.title}</span>
+								{t.db?.profile.sshTunnelProfileId ? (
+									<span className="tab-via" title={`SSH 경유 — ${profiles.find((x) => x.id === t.db?.profile.sshTunnelProfileId)?.name ?? "SSH 서버"} 를 거쳐 접속`}>
+										⇄
+									</span>
+								) : null}
 								{tabs.length > 1 && (
 									<span
 										className="x"
@@ -501,23 +541,25 @@ export function App() {
 								<div className="home-inner">
 									<h1>{greeting()}</h1>
 									<p className="sub">어디에 접속할까요?</p>
-									{lastSession.length > 0 && profiles.some((p) => p.id != null && lastSession.includes(p.id)) && (
-										<div className="resume-bar">
-											<span>
-												지난번에 열려 있던 연결 —{" "}
-												{profiles
-													.filter((p) => p.id != null && lastSession.includes(p.id))
-													.map((p) => p.name)
-													.join(", ")}
-											</span>
+										{sessionProfiles.length > 0 && (
+											<div className="resume-bar">
+												<span>
+													지난번에 열려 있던 연결 —{" "}
+													{sessionProfiles
+														.map(({ x, p }) => {
+															const a = p.accounts?.find((y) => y.id === x.a) ?? defaultAccount(p);
+															return a ? `${a.username}@${p.name}` : p.name;
+														})
+														.join(", ")}
+												</span>
 											<button
 												type="button"
 												className="btn primary"
 												onClick={() => {
-													const list = profiles.filter((p) => p.id != null && lastSession.includes(p.id));
-													setLastSession([]);
-													// 하나씩(암호 창이 겹치지 않게) — 첫 것만 바로, 나머지는 잠깐씩 띄워서
-													list.forEach((p, i) => window.setTimeout(() => connect(p), i * 400));
+														const list = sessionProfiles;
+														setLastSession([]);
+														// 하나씩(암호 창이 겹치지 않게), 그때 쓴 계정으로(지워졌으면 기본 계정)
+														list.forEach(({ x, p }, i) => window.setTimeout(() => connectAs(p, p.accounts?.find((y) => y.id === x.a)), i * 400));
 												}}
 											>
 												다시 열기
@@ -641,7 +683,7 @@ export function App() {
 															<div
 																key={p.id}
 																className="pcard"
-																title={p.memo ?? undefined}
+																	title={`${p.memo ? `${p.memo}\n` : ""}눌러 서버 정보·계정 고르기`}
 																role="button"
 																tabIndex={0}
 																onClick={() => connect(p)}
@@ -669,22 +711,23 @@ export function App() {
 																		{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
 																	</b>
 																	<small>
-																		{p.secretSaved && <KeyRound size={10} style={{ marginRight: 4, verticalAlign: -1 }} />}
-																		{p.kind === "db" ? `${p.engine} · ` : ""}
-																		{p.username ? `${p.username}@` : ""}
-																		{p.host}:{p.port}
-																		{p.lastUsedAt ? <span className="last-used"> · {ago(p.lastUsedAt)}</span> : null}
+																			{p.secretSaved && <KeyRound size={10} style={{ marginRight: 4, verticalAlign: -1 }} />}
+																			{p.kind === "db" ? `${p.engine} · ` : ""}
+																			{p.username ? `${p.username}@` : ""}
+																			{p.host}:{p.port}
+																			{(p.accounts?.length ?? 0) > 1 && <span className="last-used"> · 계정 {p.accounts?.length}</span>}
+																			{p.lastUsedAt ? <span className="last-used"> · {agoMs(p.lastUsedAt)}</span> : null}
 																	</small>
 																	{p.memo && <small className="memo">{p.memo}</small>}
 																</div>
 																<button
 																	type="button"
-																	className="btn pc-connect"
-																	title="접속"
-																	onClick={(e) => {
-																		e.stopPropagation();
-																		connect(p);
-																	}}
+																		className="btn pc-connect"
+																		title={quickTitle(p)}
+																		onClick={(e) => {
+																			e.stopPropagation();
+																			connectAs(p);
+																		}}
 																>
 																	<Play size={12} /> 접속
 																</button>
@@ -731,13 +774,14 @@ export function App() {
 										local={backendFor(t).local}
 										term={backendFor(t).term}
 										layoutKey="layout.ssh"
-										profileId={t.ssh.profile.id}
-										peers={tabs
+										server={t.ssh.profile.id != null ? { profileId: t.ssh.profile.id, conn: t.ssh.ok.connId, tmux: !!profiles.find((x) => x.id === t.ssh?.profile.id)?.tmux, name: t.ssh.profile.name } : undefined}
+											sudo={{ mode: t.ssh.ok.sudo ?? "ask", user: t.ssh.ok.sudoUser ?? "root" }}
+											peers={tabs
 											.filter((x) => x.ssh && x.id !== t.id && !x.ssh.closed)
-											.map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.ssh?.profile.name ?? "", home: x.ssh?.ok.home ?? "/" }))}
-										syncInfo={{ user: t.ssh.profile.username, host: t.ssh.profile.host, port: t.ssh.profile.port }}
-										active={t.id === active}
-										label={`${t.ssh.profile.username}@${t.ssh.profile.host}`}
+												.map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.ssh ? tabTitle({ ...x.ssh.profile, username: x.ssh.ok.username || x.ssh.profile.username }) : "", home: x.ssh?.ok.home ?? "/" }))}
+											syncInfo={{ user: t.ssh.ok.username || t.ssh.profile.username, host: t.ssh.profile.host, port: t.ssh.profile.port }}
+											active={t.id === active}
+											label={`${t.ssh.ok.username || t.ssh.profile.username}@${t.ssh.profile.host}`}
 										startPath={t.ssh.profile.defaultPath ?? undefined}
 										badge={
 											t.ssh.profile.legacy !== "off" ? (
@@ -765,6 +809,13 @@ export function App() {
 								)}
 								{t.kind === "grid" && <ResultGridPane />}
 								{t.kind === "settings" && <SettingsPane info={info} />}
+								{t.kind === "keys" && (
+									<KeysPane
+										conns={tabs
+											.filter((x) => x.ssh && !x.ssh.closed)
+											.map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.title }))}
+									/>
+								)}
 								{t.kind === "connections" && (
 									<ConnectionsPane profiles={profiles} reload={reload} onConnect={connect} onImport={() => setImporting(true)} onExport={() => setExporting(true)} />
 								)}
@@ -790,6 +841,21 @@ export function App() {
 						reload();
 					}}
 					onDuplicate={(p) => editProfile(p)}
+					onAccountsChanged={reload}
+				/>
+			)}
+			{card && (
+				<ServerCard
+					profile={card}
+					via={card.sshTunnelProfileId ? (profiles.find((x) => x.id === card.sshTunnelProfileId)?.name ?? "지워진 SSH 서버") : undefined}
+					openConn={tabs.find((x) => x.ssh && !x.ssh.closed && x.ssh.profile.id === card.id)?.ssh?.ok.connId}
+					onClose={() => setCardId(null)}
+					onConnect={(a) => connectAs(card, a)}
+					onEditServer={() => {
+						setCardId(null);
+						editProfile(card);
+					}}
+					onChanged={reload}
 				/>
 			)}
 			{pmenu && <ContextMenu x={pmenu.x} y={pmenu.y} items={profileMenu(pmenu.p)} onClose={() => setPmenu(null)} />}
@@ -809,7 +875,7 @@ export function App() {
 						const p = dbConnecting;
 						setDbConnecting(null);
 						reload();
-						open("db", p.name, false, { db: { ok, profile: p, readOnly }, color: p.color });
+							open("db", tabTitle(p), false, { db: { ok, profile: p, readOnly }, color: p.color });
 					}}
 				/>
 			)}

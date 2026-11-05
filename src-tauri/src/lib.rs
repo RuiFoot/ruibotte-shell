@@ -5,17 +5,21 @@ mod db;
 mod grid;
 mod importer;
 mod jdbc;
+mod keys;
 mod localfs;
 mod monitor;
 mod pty;
 mod secrets;
+mod sessionlog;
 mod ssh;
 mod store;
 mod sudo;
 mod sync;
 mod textcodec;
 mod transfer;
+mod tunnel;
 mod viewer;
+mod zmodem;
 
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -85,10 +89,18 @@ pub fn run() {
         .manage(db::DbConns::default())
         .manage(viewer::Tails::default())
         .manage(sync::Watches::default())
+        .manage(sessionlog::SessionLogs::default())
+        .manage(zmodem::ZmFiles::default())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
-            app.manage(store::Store::open(dir, portable)?);
+            let st = store::Store::open(dir, portable)?;
+            // 예전 판 비밀(서버 기준)을 계정 키로 — 못 옮긴 것은 다음에 켤 때 다시
+            let (moved, failed) = st.migrate_secrets();
+            if failed > 0 {
+                eprintln!("비밀 옮기기: {moved}개 옮김, {failed}개는 다음에 다시");
+            }
+            app.manage(st);
             let glass = app.get_webview_window("main").map(|w| apply_backdrop(&w)).unwrap_or(false);
             app.manage(Backdrop(glass));
             Ok(())
@@ -110,6 +122,22 @@ pub fn run() {
             store::profiles_list,
             store::profile_save,
             store::profile_delete,
+            store::accounts_list,
+            store::account_save,
+            store::account_delete,
+            store::account_set_default,
+            store::account_secret_set,
+            store::account_sudo_secret_set,
+            store::host_key_get,
+            ssh::ssh_shell_sudo_pw,
+            ssh::ssh_tmux_list,
+            ssh::ssh_tmux_kill,
+            store::forward_list,
+            store::forward_save,
+            tunnel::forward_status,
+            tunnel::forward_start,
+            tunnel::forward_stop,
+            tunnel::forward_delete,
             store::setting_get,
             store::setting_set,
             store::snippets_list,
@@ -199,6 +227,21 @@ pub fn run() {
             viewer::local_tail_open,
             viewer::tail_close,
             viewer::ssh_download_targz,
+            sessionlog::session_log_open,
+            sessionlog::session_log_write,
+            sessionlog::session_log_close,
+            sessionlog::session_log_default_dir,
+            sessionlog::session_log_reveal,
+            zmodem::zm_save_open,
+            zmodem::zm_save_write,
+            zmodem::zm_save_close,
+            zmodem::zm_file_info,
+            keys::keys_dirs,
+            keys::keys_list,
+            keys::keys_inspect,
+            keys::keys_generate,
+            keys::keys_convert,
+            keys::keys_install,
         ])
         .run(tauri::generate_context!())
         .expect("RuiBotte Shell 을 시작하지 못했습니다");

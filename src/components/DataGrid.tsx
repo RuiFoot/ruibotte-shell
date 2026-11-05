@@ -24,8 +24,47 @@ export type GridApi = {
 	refresh: () => void;
 };
 
+/** 고른 칸들의 요약(숫자 칸만 합계·평균·최소·최대) */
+export type SelStats = { cells: number; count: number; nums: number; sum?: string; avg?: string; min?: string; max?: string; partial?: boolean };
+
+/** 요약할 칸 상한(넘으면 앞쪽만) */
+const STATS_MAX_CELLS = 500_000;
+
+/** 소수 자릿수를 맞춰 BigInt 로 정확히 더한다 */
+function summarize(vals: string[]): Pick<SelStats, "sum" | "avg" | "min" | "max"> {
+	if (!vals.length) return {};
+	let scale = 0;
+	for (const v of vals) {
+		const i = v.indexOf(".");
+		if (i >= 0) scale = Math.max(scale, v.length - i - 1);
+	}
+	scale = Math.min(scale, 12);
+	let sum = 0n;
+	let min = vals[0];
+	let max = vals[0];
+	for (const v of vals) {
+		const [i, f = ""] = v.split(".");
+		const neg = i.startsWith("-");
+		const digits = `${i.replace("-", "")}${f.slice(0, scale).padEnd(scale, "0")}`;
+		const n = BigInt(digits || "0");
+		sum += neg ? -n : n;
+		if (Number(v) < Number(min)) min = v;
+		if (Number(v) > Number(max)) max = v;
+	}
+	const fmt = (n: bigint) => {
+		const neg = n < 0n;
+		const a = (neg ? -n : n).toString().padStart(scale + 1, "0");
+		const t = scale ? `${a.slice(0, -scale)}.${a.slice(-scale).replace(/0+$/, "")}`.replace(/\.$/, "") : a;
+		return neg ? `-${t}` : t;
+	};
+	const sumStr = fmt(sum);
+	const avg = Number(sumStr) / vals.length;
+	const avgStr = Number.isInteger(avg) ? String(avg) : avg.toFixed(Math.min(6, Math.max(2, scale + 2))).replace(/0+$/, "").replace(/\.$/, "");
+	return { sum: sumStr, avg: avgStr, min, max };
+}
+
 /** 1234567.89 → 1,234,567.89 (자릿수 그대로) */
-function groupDigits(v: string) {
+export function groupDigits(v: string) {
 	const [i, f] = v.split(".");
 	const sign = i.startsWith("-") ? "-" : "";
 	const g = i.replace("-", "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
@@ -80,6 +119,7 @@ export function DataGrid({
 	onSort,
 	onCopyRows,
 	onBigEdit,
+	onStats,
 }: {
 	columns: GridCol[];
 	rowCount: number;
@@ -106,12 +146,17 @@ export function DataGrid({
 	onCopyRows?: (rows: number[]) => void;
 	/** Shift+Enter — 큰 편집기(긴 글·JSON) */
 	onBigEdit?: (r: number, c: number) => void;
+	/** 여러 칸(끌기·Shift+누르기·Shift+방향키)이나 여러 행을 고르면 요약, 하나면 null */
+	onStats?: (s: SelStats | null) => void;
 }) {
 	const scroller = useRef<HTMLDivElement>(null);
 	const pages = useRef(new Map<number, Cell[][]>());
 	const loading = useRef(new Set<number>());
 	const [, force] = useState(0);
 	const [sel, setSel] = useState<{ r: number; c: number } | null>(null);
+	/** 칸 범위의 다른 끝(sel 이 시작) */
+	const [rangeEnd, setRangeEnd] = useState<{ r: number; c: number } | null>(null);
+	const dragging = useRef(false);
 	const [rows, setRows] = useState<Set<number>>(new Set());
 	const anchor = useRef<number | null>(null);
 	const [editing, setEditing] = useState<{ r: number; c: number; seed?: string } | null>(null);
@@ -123,10 +168,18 @@ export function DataGrid({
 		pages.current.clear();
 		loading.current.clear();
 		setSel(null);
+		setRangeEnd(null);
 		setRows(new Set());
 		setEditing(null);
 		force((n) => n + 1);
 	}, [resetKey]);
+	useEffect(() => {
+		const up = () => {
+			dragging.current = false;
+		};
+		window.addEventListener("mouseup", up);
+		return () => window.removeEventListener("mouseup", up);
+	}, []);
 
 	// 열 너비: 처음엔 형식으로 짐작, 첫 묶음이 오면 내용에 맞추고, 머리 경계를 끌면 그 값으로
 	const [widths, setWidths] = useState<number[]>(() => columns.map(widthOf));
@@ -171,6 +224,71 @@ export function DataGrid({
 		return baseRow(r)?.[c];
 	};
 
+	/** 고른 칸 범위(두 칸 이상일 때) */
+	const range =
+		sel && rangeEnd && (rangeEnd.r !== sel.r || rangeEnd.c !== sel.c)
+			? { r0: Math.min(sel.r, rangeEnd.r), r1: Math.max(sel.r, rangeEnd.r), c0: Math.min(sel.c, rangeEnd.c), c1: Math.max(sel.c, rangeEnd.c) }
+			: null;
+	const inRange = (r: number, c: number) => !!range && r >= range.r0 && r <= range.r1 && c >= range.c0 && c <= range.c1;
+
+	/** 행들의 값(받지 않은 묶음은 받아서, 덧씌우기 반영) */
+	const valuesOf = async (rs: number[], cs: number[]) => {
+		const need = new Set<number>();
+		for (const r of rs) if (r < rowCount && !pages.current.has(Math.floor(r / PAGE))) need.add(Math.floor(r / PAGE));
+		const extra = new Map<number, Cell[][]>();
+		for (const pg of need) extra.set(pg, await fetchRows(pg * PAGE, pg * PAGE + PAGE));
+		return rs.map((r) =>
+			cs.map((c) => {
+				const o = overlay?.cell(r, c);
+				if (o !== undefined) return o;
+				const pg = Math.floor(r / PAGE);
+				const row = r >= rowCount ? added[r - rowCount] : (pages.current.get(pg) ?? extra.get(pg))?.[r % PAGE];
+				return row?.[c] ?? null;
+			}),
+		);
+	};
+
+	// 여러 칸 요약 — 고른 것이 바뀌면 다시(늦게 온 옛 계산은 버린다)
+	const statsSeq = useRef(0);
+	const rangeKey = range ? `${range.r0}:${range.r1}:${range.c0}:${range.c1}` : "";
+	const rowsKey = rows.size > 1 ? [...rows].join(",") : "";
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 고른 범위·행이 바뀔 때만
+	useEffect(() => {
+		const seq = ++statsSeq.current;
+		if (!onStats) return;
+		let rs: number[] = [];
+		const cs: number[] = [];
+		if (range) {
+			for (let r = range.r0; r <= range.r1; r++) rs.push(r);
+			for (let c = range.c0; c <= range.c1; c++) cs.push(c);
+		} else if (rows.size > 1) {
+			rs = [...rows].sort((a, b) => a - b);
+			for (let c = 0; c < columns.length; c++) cs.push(c);
+		} else {
+			onStats(null);
+			return;
+		}
+		const partial = rs.length * cs.length > STATS_MAX_CELLS;
+		if (partial) rs = rs.slice(0, Math.max(1, Math.floor(STATS_MAX_CELLS / cs.length)));
+		const t = window.setTimeout(() => {
+			void valuesOf(rs, cs).then((vals) => {
+				if (seq !== statsSeq.current) return;
+				let count = 0;
+				const nums: string[] = [];
+				for (const row of vals)
+					for (let j = 0; j < cs.length; j++) {
+						const v = row[j];
+						if (v == null || v === "") continue;
+						count++;
+						const k = columns[cs[j]]?.kind;
+						if ((k === "int" || k === "numeric") && /^-?\d+(\.\d+)?$/.test(v)) nums.push(v);
+					}
+				onStats({ cells: rs.length * cs.length, count, nums: nums.length, ...summarize(nums), partial });
+			});
+		}, 60);
+		return () => window.clearTimeout(t);
+	}, [rangeKey, rowsKey, resetKey]);
+
 	useImperativeHandle(
 		apiRef,
 		() => ({
@@ -213,6 +331,15 @@ export function DataGrid({
 				if (editing || !sel) return;
 				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
 					e.preventDefault();
+					if (range && !rows.size) {
+						// 칸 범위 — 값만 TSV(엑셀에 그대로)
+						const rs: number[] = [];
+						for (let r = range.r0; r <= range.r1; r++) rs.push(r);
+						const cs: number[] = [];
+						for (let c = range.c0; c <= range.c1; c++) cs.push(c);
+						void valuesOf(rs, cs).then((vals) => navigator.clipboard.writeText(vals.map((row) => row.map((x) => (x == null ? "" : x.replace(/[\t\n]/g, " "))).join("\t")).join("\n")));
+						return;
+					}
 					if (!rows.size) {
 						void navigator.clipboard.writeText(cellAt(sel.r, sel.c) ?? "");
 						return;
@@ -257,11 +384,23 @@ export function DataGrid({
 				}
 				const mv: Record<string, [number, number]> = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], Tab: [0, 1] };
 				const d = mv[e.key];
+				if (d && e.shiftKey && e.key !== "Tab") {
+					// Shift+방향키 — 칸 범위 늘이기
+					e.preventDefault();
+					const end = rangeEnd ?? sel;
+					const r = Math.min(count - 1, Math.max(0, end.r + d[0]));
+					const c = Math.min(columns.length - 1, Math.max(0, end.c + d[1]));
+					setRangeEnd({ r, c });
+					setRows(new Set());
+					v.scrollToIndex(r);
+					return;
+				}
 				if (d) {
 					e.preventDefault();
 					const r = Math.min(count - 1, Math.max(0, sel.r + d[0]));
 					const c = Math.min(columns.length - 1, Math.max(0, sel.c + (e.shiftKey && e.key === "Tab" ? -1 : d[1])));
 					setSel({ r, c });
+					setRangeEnd(null);
 					setRows(new Set());
 					v.scrollToIndex(r);
 				}
@@ -333,6 +472,7 @@ export function DataGrid({
 										if (!e.shiftKey) anchor.current = r;
 										setRows(n);
 										setSel({ r, c: 0 });
+										setRangeEnd(null);
 									}}
 									onContextMenu={(e) => {
 										e.preventDefault();
@@ -367,15 +507,32 @@ export function DataGrid({
 										<div
 											// biome-ignore lint/suspicious/noArrayIndexKey: 열 순서가 곧 정체
 											key={ci}
-											className={`${val === null ? "null" : c.kind === "int" || c.kind === "numeric" ? "num" : ""}${isSel ? " sel" : ""}${edited ? " edited" : ""}`}
-											onMouseDown={() => {
-												setSel({ r, c: ci });
+											className={`${val === null ? "null" : c.kind === "int" || c.kind === "numeric" ? "num" : ""}${isSel ? " sel" : ""}${inRange(r, ci) ? " in-range" : ""}${edited ? " edited" : ""}`}
+											onMouseDown={(e) => {
+												if (e.button !== 0) return;
 												setRows(new Set());
+												if (e.shiftKey && sel) {
+													e.preventDefault();
+													scroller.current?.focus({ preventScroll: true });
+													setRangeEnd({ r, c: ci });
+													return;
+												}
+												setSel({ r, c: ci });
+												setRangeEnd(null);
+												dragging.current = true;
+											}}
+											onMouseEnter={() => {
+												if (!dragging.current || !sel) return;
+												window.getSelection()?.removeAllRanges();
+												setRangeEnd({ r, c: ci });
 											}}
 											onDoubleClick={() => startEdit(r, ci)}
 											onContextMenu={(e) => {
 												e.preventDefault();
-												setSel({ r, c: ci });
+												if (!inRange(r, ci)) {
+													setSel({ r, c: ci });
+													setRangeEnd(null);
+												}
 												onContextMenu?.(e, r, ci);
 											}}
 											title={val && val.length > 40 ? val.slice(0, 2000) : undefined}
