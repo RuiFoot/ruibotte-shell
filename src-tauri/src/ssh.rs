@@ -51,11 +51,17 @@ pub struct SshError {
     suggest: Option<&'static str>,
 }
 
-fn err(code: &'static str, message: impl Into<String>) -> SshError {
+impl SshError {
+    pub(crate) fn message_owned(self) -> String {
+        self.message
+    }
+}
+
+pub(crate) fn err(code: &'static str, message: impl Into<String>) -> SshError {
     SshError { code, message: message.into(), ..Default::default() }
 }
 
-type R<T> = Result<T, SshError>;
+pub(crate) type R<T> = Result<T, SshError>;
 
 /// 서버가 내민 목록에서 켜야 할 가장 낮은 단계
 fn suggest_level(theirs: &[String]) -> Option<&'static str> {
@@ -131,7 +137,7 @@ fn preferred(level: &str) -> Preferred {
 
 // ── 클라이언트 처리기(호스트 키) ─────
 
-struct Client {
+pub(crate) struct Client {
     pinned: Option<PinnedKey>,
     trust: Option<String>,
     seen: Arc<Mutex<Option<PinnedKey>>>,
@@ -161,9 +167,9 @@ impl client::Handler for Client {
 
 // ── 연결 상태 ────────────────────────
 
-struct Conn {
+pub(crate) struct Conn {
     handle: Handle<Client>,
-    sftp: SftpSession,
+    pub(crate) sftp: SftpSession,
     shells: tokio::sync::Mutex<HashMap<u32, ChannelWriteHalf<Msg>>>,
     next_shell: AtomicU32,
 }
@@ -174,8 +180,14 @@ pub struct SshConns {
     map: Mutex<HashMap<u32, Arc<Conn>>>,
 }
 
+impl Conn {
+    pub(crate) fn handle_ref(&self) -> &Handle<Client> {
+        &self.handle
+    }
+}
+
 impl SshConns {
-    fn get(&self, id: u32) -> R<Arc<Conn>> {
+    pub(crate) fn get(&self, id: u32) -> R<Arc<Conn>> {
         self.map.lock().unwrap().get(&id).cloned().ok_or_else(|| err("CLOSED", "연결이 닫혔습니다"))
     }
 }
@@ -210,9 +222,31 @@ pub struct ConnectOk {
     used_saved_secret: bool,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Closed {
+    conn: u32,
+}
+
 #[tauri::command]
-pub async fn ssh_connect(store: State<'_, Store>, conns: State<'_, SshConns>, req: ConnectReq) -> R<ConnectOk> {
-    connect(&store, &conns, req).await
+pub async fn ssh_connect(app: AppHandle, store: State<'_, Store>, conns: State<'_, SshConns>, req: ConnectReq) -> R<ConnectOk> {
+    let ok = connect(&store, &conns, req).await?;
+    // 끊김 감시 — 서버가 끊거나 네트워크가 끊기면(keepalive 30초×4) 화면에 알린다
+    let id = ok.conn_id;
+    let c = conns.get(id)?;
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if Arc::strong_count(&c) <= 1 {
+                break; // 화면이 연결을 닫음
+            }
+            if c.handle.is_closed() {
+                let _ = app.emit("ssh-closed", Closed { conn: id });
+                break;
+            }
+        }
+    });
+    Ok(ok)
 }
 
 pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) -> R<ConnectOk> {
@@ -388,11 +422,16 @@ pub async fn ssh_shell_open(
     ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(map_russh)?;
     ch.request_shell(true).await.map_err(map_russh)?;
     let (mut read, write) = ch.split();
+    // 셸 통합(bash): 프롬프트마다 OSC 7 로 지금 폴더를 알려 트리가 따라오게. 서버 파일은 바꾸지 않는다.
+    // 앞 공백 = 셸 기록에 남지 않게(HISTCONTROL=ignorespace). 끝에 clear 로 이 줄을 화면에서 지운다.
+    let mut line = String::from(
+        " [ -n \"$BASH_VERSION\" ] && PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\" \"${HOSTNAME:-}\" \"$PWD\"'\"${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"",
+    );
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-        // 시작 폴더 — 앞 공백은 셸 기록에 남지 않게(HISTCONTROL=ignorespace 인 서버)
-        let line = format!(" cd '{}' && clear\n", dir.replace('\'', "'\\''"));
-        let _ = write.data(line.as_bytes()).await;
+        line.push_str(&format!("; cd '{}'", dir.replace('\'', "'\\''")));
     }
+    line.push_str("; clear\n");
+    let _ = write.data(line.as_bytes()).await;
     let shell = c.next_shell.fetch_add(1, Ordering::Relaxed) + 1;
     c.shells.lock().await.insert(shell, write);
     let conns_map = c.clone();
@@ -469,7 +508,7 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-fn sftp_err(e: russh_sftp::client::error::Error) -> SshError {
+pub(crate) fn sftp_err(e: russh_sftp::client::error::Error) -> SshError {
     let msg = e.to_string();
     let friendly = if msg.contains("Permission denied") || msg.contains("PermissionDenied") {
         "권한이 없습니다".to_string()
@@ -593,6 +632,64 @@ pub async fn sftp_write_text(
 pub async fn sftp_realpath(conns: State<'_, SshConns>, conn: u32, path: String) -> R<String> {
     let c = conns.get(conn)?;
     c.sftp.canonicalize(path).await.map_err(sftp_err)
+}
+
+// ── 파일 조작 ────────────────────────
+
+#[tauri::command]
+pub async fn sftp_mkdir(conns: State<'_, SshConns>, conn: u32, path: String) -> R<()> {
+    let c = conns.get(conn)?;
+    c.sftp.create_dir(path).await.map_err(sftp_err)
+}
+
+/// 빈 파일 만들기 — 이미 있으면 거절(덮어쓰지 않음)
+#[tauri::command]
+pub async fn sftp_touch(conns: State<'_, SshConns>, conn: u32, path: String) -> R<()> {
+    let c = conns.get(conn)?;
+    if c.sftp.try_exists(path.clone()).await.unwrap_or(false) {
+        return Err(err("SFTP", "같은 이름이 이미 있습니다"));
+    }
+    c.sftp.create(path).await.map_err(sftp_err)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn sftp_rename(conns: State<'_, SshConns>, conn: u32, from: String, to: String) -> R<()> {
+    let c = conns.get(conn)?;
+    if c.sftp.try_exists(to.clone()).await.unwrap_or(false) {
+        return Err(err("SFTP", "같은 이름이 이미 있습니다"));
+    }
+    c.sftp.rename(from, to).await.map_err(sftp_err)
+}
+
+/// 지우기 — 폴더면 안까지(화면이 먼저 확인을 받는다). 최상위(/)는 거절
+#[tauri::command]
+pub async fn sftp_remove(conns: State<'_, SshConns>, conn: u32, path: String) -> R<u32> {
+    if path.trim_end_matches('/').is_empty() {
+        return Err(err("SFTP", "최상위 폴더는 지울 수 없습니다"));
+    }
+    let c = conns.get(conn)?;
+    Box::pin(remove_rec(&c, path)).await
+}
+
+async fn remove_rec(c: &Conn, path: String) -> R<u32> {
+    let m = c.sftp.symlink_metadata(path.clone()).await.map_err(sftp_err)?;
+    if m.is_dir() {
+        let mut n = 0;
+        let kids: Vec<_> = c.sftp.read_dir(path.clone()).await.map_err(sftp_err)?.collect();
+        for k in kids {
+            let name = k.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            n += Box::pin(remove_rec(c, join(&path, &name))).await?;
+        }
+        c.sftp.remove_dir(path).await.map_err(sftp_err)?;
+        Ok(n + 1)
+    } else {
+        c.sftp.remove_file(path).await.map_err(sftp_err)?;
+        Ok(1)
+    }
 }
 
 #[cfg(test)]

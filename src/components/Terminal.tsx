@@ -5,7 +5,7 @@ import "@xterm/xterm/css/xterm.css";
 import { listen } from "@tauri-apps/api/event";
 import { Gauge, RotateCcw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { api, bytesChannel, type TermBackend } from "../lib/ipc";
+import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ipc";
 
 function themeFromCss() {
 	const s = getComputedStyle(document.documentElement);
@@ -31,6 +31,8 @@ export function TerminalView({
 	label,
 	showBench = false,
 	toolbar = true,
+	onShell,
+	onCwd,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -38,7 +40,16 @@ export function TerminalView({
 	label: string;
 	showBench?: boolean;
 	toolbar?: boolean;
+	/** 바깥(트리 "터미널에서 이 폴더로" 등)에서 셸에 글을 넣을 수 있게 */
+	onShell?: (h: ShellHandle | null) => void;
+	/** 셸이 알려 준 지금 폴더(OSC 7) */
+	onCwd?: (path: string) => void;
 }) {
+	const onCwdRef = useRef(onCwd);
+	onCwdRef.current = onCwd;
+	const waiters = useRef<{ re: RegExp; done: (ok: boolean) => void }[]>([]);
+	const onShellRef = useRef(onShell);
+	onShellRef.current = onShell;
 	const host = useRef<HTMLDivElement>(null);
 	const termRef = useRef<XTerm | null>(null);
 	const fitRef = useRef<FitAddon | null>(null);
@@ -76,7 +87,33 @@ export function TerminalView({
 
 		let disposed = false;
 		const started = performance.now();
-		const ch = bytesChannel((b) => term.write(b));
+		const decoder = new TextDecoder();
+		let tail = "";
+		const ch = bytesChannel((b) => {
+			term.write(b);
+			if (waiters.current.length) {
+				tail = (tail + decoder.decode(b, { stream: true })).slice(-400);
+				for (const w of waiters.current.slice()) {
+					if (w.re.test(tail)) {
+						waiters.current = waiters.current.filter((x) => x !== w);
+						tail = "";
+						w.done(true);
+					}
+				}
+			}
+		});
+		// OSC 7: file://호스트/경로 → 지금 폴더
+		const osc7 = term.parser.registerOscHandler(7, (data) => {
+			const m = /^file:\/\/[^/]*(\/.*)$/.exec(data);
+			if (m) {
+				try {
+					onCwdRef.current?.(decodeURIComponent(m[1]));
+				} catch {
+					onCwdRef.current?.(m[1]);
+				}
+			}
+			return true;
+		});
 		backend
 			.open(term.cols, term.rows, ch, cwd)
 			.then((id) => {
@@ -85,6 +122,22 @@ export function TerminalView({
 					return;
 				}
 				idRef.current = id;
+				onShellRef.current?.({
+					send: (s) => {
+						if (idRef.current != null) void backend.write(idRef.current, s);
+					},
+					expect: (re, ms) =>
+						new Promise<boolean>((res) => {
+							const w = { re, done: res };
+							waiters.current.push(w);
+							window.setTimeout(() => {
+								if (waiters.current.includes(w)) {
+									waiters.current = waiters.current.filter((x) => x !== w);
+									res(false);
+								}
+							}, ms);
+						}),
+				});
 				setStat({ label: `${label} · ${Math.round(performance.now() - started)} ms에 열림`, ok: true });
 			})
 			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${typeof e === "object" ? (e as { message?: string }).message : String(e)}` }));
@@ -113,6 +166,8 @@ export function TerminalView({
 
 		return () => {
 			disposed = true;
+			osc7.dispose();
+			onShellRef.current?.(null);
 			mq.removeEventListener("change", onScheme);
 			void unlisten.then((f) => f());
 			ro.disconnect();

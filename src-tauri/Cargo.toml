@@ -30,8 +30,10 @@ russh-sftp = "3"
 keyring = "4"
 encoding_rs = "0.8.35"
 chardetng = "1.0.0"
-tokio = { version = "1", features = ["sync", "time", "macros", "rt", "io-util"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "io-util", "fs"] }
 tauri-plugin-dialog = "2"
+trash = "5"
+urlencoding = "2"
 
 [profile.release]
 # 설치 크기·기동 우선
@@ -40,3 +42,6 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+[target."cfg(windows)".dependencies]
+winreg = "0.55"

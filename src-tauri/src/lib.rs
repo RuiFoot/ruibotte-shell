@@ -1,10 +1,16 @@
+// 명령 오류(SshError)는 화면에 그대로 넘기는 드문 경로라 크기를 줄이지 않는다
+#![allow(clippy::result_large_err)]
+
 mod grid;
+mod importer;
 mod localfs;
 mod pty;
 mod secrets;
 mod ssh;
 mod store;
+mod sudo;
 mod textcodec;
+mod transfer;
 
 use serde::Serialize;
 use tauri::{Manager, State};
@@ -67,6 +73,7 @@ pub fn run() {
         .manage(pty::Ptys::default())
         .manage(grid::Grids::default())
         .manage(ssh::SshConns::default())
+        .manage(transfer::Transfers::default())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
@@ -105,6 +112,23 @@ pub fn run() {
             localfs::local_list,
             localfs::local_read_text,
             localfs::local_write_text,
+            localfs::local_mkdir,
+            localfs::local_touch,
+            localfs::local_rename,
+            localfs::local_trash,
+            ssh::sftp_mkdir,
+            ssh::sftp_touch,
+            ssh::sftp_rename,
+            ssh::sftp_remove,
+            transfer::transfer_start,
+            sudo::sudo_check,
+            importer::import_candidates,
+            importer::export_ssh_config,
+            sudo::sudo_list,
+            sudo::sudo_read_text,
+            sudo::sudo_write_text,
+            sudo::sudo_op,
+            transfer::transfer_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("RuiBotte Shell 을 시작하지 못했습니다");

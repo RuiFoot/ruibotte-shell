@@ -97,13 +97,60 @@ export function asSshError(e: unknown): SshError {
 
 /** 트리·편집기가 보는 파일 시스템 — 원격(SFTP)과 내 PC 가 같은 모양 */
 export type FsBackend = {
+	/** remote = SFTP, local = 내 PC */
+	side: "remote" | "local";
+	/** 원격이면 연결 번호(전송용) */
+	conn?: number;
 	label: string;
 	home: string;
 	sep: "/";
 	list(path: string): Promise<FsEntry[]>;
 	read(path: string, encoding?: string): Promise<FileText>;
 	write(path: string, text: string, meta: TextMeta, expectMtime?: number | null): Promise<Saved>;
+	mkdir(path: string): Promise<void>;
+	touch(path: string): Promise<void>;
+	rename(from: string, to: string): Promise<void>;
+	/** 원격은 바로 지우고(폴더는 안까지), 내 PC 는 휴지통으로 */
+	remove(path: string): Promise<unknown>;
 };
+
+export type TransferProgress = {
+	id: number;
+	direction: "up" | "down";
+	name: string;
+	dest: string;
+	bytesDone: number;
+	bytesTotal: number;
+	filesDone: number;
+	filesTotal: number;
+	skipped: number;
+	state: "running" | "done" | "error" | "cancelled";
+	error?: string | null;
+	ms: number;
+};
+
+export const transfers = {
+	start: (conn: number, direction: "up" | "down", src: string, destDir: string, overwrite: boolean) =>
+		invoke<number>("transfer_start", { conn, direction, src, destDir, overwrite }),
+	cancel: (id: number) => invoke<void>("transfer_cancel", { id }),
+};
+
+/** 폴더 내용이 바뀌었음을 트리들에 알림(전송·파일 조작 뒤) */
+export function notifyFsChanged(side: "remote" | "local", dir: string, conn?: number) {
+	window.dispatchEvent(new CustomEvent("rb-fs-changed", { detail: { side, dir, conn } }));
+}
+
+export function parentDir(p: string): string {
+	const t = p.replace(/\/+$/, "");
+	const i = t.lastIndexOf("/");
+	if (i <= 0) return /^[A-Za-z]:/.test(t) ? `${t.slice(0, 2)}/` : "/";
+	const d = t.slice(0, i);
+	return /^[A-Za-z]:$/.test(d) ? `${d}/` : d;
+}
+
+export function joinPath(dir: string, name: string): string {
+	return dir.endsWith("/") ? dir + name : `${dir}/${name}`;
+}
 
 /** 터미널이 보는 셸 — 원격(SSH 채널)과 내 PC(PTY) 가 같은 모양 */
 export type TermBackend = {
@@ -118,12 +165,17 @@ export type TermBackend = {
 
 export function localFs(home: string): FsBackend {
 	return {
+		side: "local",
 		label: "내 PC",
 		home,
 		sep: "/",
 		list: (path) => invoke("local_list", { path }),
 		read: (path, encoding) => invoke("local_read_text", { path, encoding }),
 		write: (path, text, meta, expectMtime) => invoke("local_write_text", { path, text, meta, expectMtime }),
+		mkdir: (path) => invoke("local_mkdir", { path }),
+		touch: (path) => invoke("local_touch", { path }),
+		rename: (from, to) => invoke("local_rename", { from, to }),
+		remove: (path) => invoke("local_trash", { path }),
 	};
 }
 
@@ -138,14 +190,50 @@ export const localTerm: TermBackend = {
 
 export function sshFs(conn: number, label: string, home: string): FsBackend {
 	return {
+		side: "remote",
+		conn,
 		label,
 		home,
 		sep: "/",
 		list: (path) => invoke("sftp_list", { conn, path }),
 		read: (path, encoding) => invoke("sftp_read_text", { conn, path, encoding }),
 		write: (path, text, meta, expectMtime) => invoke("sftp_write_text", { conn, path, text, meta, expectMtime }),
+		mkdir: (path) => invoke("sftp_mkdir", { conn, path }),
+		touch: (path) => invoke("sftp_touch", { conn, path }),
+		rename: (from, to) => invoke("sftp_rename", { conn, from, to }),
+		remove: (path) => invoke("sftp_remove", { conn, path }),
 	};
 }
+
+/** sudo 로 다루는 원격 파일 시스템(같은 연결의 exec 채널) */
+export function sshSudoFs(conn: number, label: string, home: string, profileId?: number): FsBackend {
+	const op = (op: string, path: string, to?: string) => invoke<void>("sudo_op", { conn, profileId, op, path, to });
+	return {
+		side: "remote",
+		conn,
+		label: `${label} (sudo)`,
+		home,
+		sep: "/",
+		list: (path) => invoke("sudo_list", { conn, profileId, path }),
+		read: (path, encoding) => invoke("sudo_read_text", { conn, profileId, path, encoding }),
+		write: (path, text, meta, expectMtime) => invoke("sudo_write_text", { conn, profileId, path, text, meta, expectMtime }),
+		mkdir: (path) => op("mkdir", path),
+		touch: (path) => op("touch", path),
+		rename: (from, to) => op("rename", from, to),
+		remove: (path) => op("remove", path),
+	};
+}
+
+export const sudoApi = {
+	check: (conn: number, profileId: number | undefined, password: string | null, save: boolean) =>
+		invoke<boolean>("sudo_check", { conn, profileId, password, save }),
+};
+
+/** 바깥에서 셸을 다루는 손잡이 — 글 넣기, 출력에서 글귀 기다리기 */
+export type ShellHandle = {
+	send: (s: string) => void;
+	expect: (re: RegExp, ms: number) => Promise<boolean>;
+};
 
 export function sshTerm(conn: number): TermBackend {
 	return {
@@ -188,6 +276,8 @@ export const api = {
 	sshConnect: (req: ConnectReq) => invoke<ConnectOk>("ssh_connect", { req }),
 	sshDisconnect: (conn: number) => invoke<void>("ssh_disconnect", { conn }),
 	secretForget: (profileId: number) => invoke<void>("secret_forget", { profileId }),
+	settingGet: (key: string) => invoke<string | null>("setting_get", { key }),
+	settingSet: (key: string, value: string) => invoke<void>("setting_set", { key, value }),
 	profilesList: () => invoke<Profile[]>("profiles_list"),
 	profileSave: (p: Profile) => invoke<number>("profile_save", { p }),
 	profileDelete: (id: number) => invoke<void>("profile_delete", { id }),

@@ -115,3 +115,27 @@ pub fn local_write_text(path: String, text: String, meta: TextMeta, expect_mtime
     let m = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     Ok(Saved { size: m.len(), mtime: mtime(&m) })
 }
+
+#[tauri::command]
+pub fn local_mkdir(path: String) -> Result<(), String> {
+    std::fs::create_dir(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn local_touch(path: String) -> Result<(), String> {
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn local_rename(from: String, to: String) -> Result<(), String> {
+    if Path::new(&to).exists() {
+        return Err("같은 이름이 이미 있습니다".into());
+    }
+    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+}
+
+/// 내 PC 지우기는 휴지통으로(되살릴 수 있게)
+#[tauri::command]
+pub fn local_trash(path: String) -> Result<(), String> {
+    trash::delete(&path).map_err(|e| e.to_string())
+}

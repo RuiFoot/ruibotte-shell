@@ -1,132 +1,612 @@
-import { FileText, X } from "lucide-react";
-import { useCallback, useMemo, useRef, useState } from "react";
-import type { FsBackend, FsEntry, TermBackend } from "../lib/ipc";
+import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
+import "dockview-react/dist/styles/dockview.css";
+import { listen } from "@tauri-apps/api/event";
+import { ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, ShieldAlert, SquareTerminal, X } from "lucide-react";
+import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+	api,
+	asSshError,
+	type FsBackend,
+	type FsEntry,
+	joinPath,
+	notifyFsChanged,
+	parentDir,
+	type ShellHandle,
+	sshSudoFs,
+	sudoApi,
+	type TermBackend,
+	type TransferProgress,
+	transfers,
+} from "../lib/ipc";
 import { EditorView_ } from "./Editor";
-import { FileTree } from "./FileTree";
+import { type DragEntry, FileTree } from "./FileTree";
 import { TerminalView } from "./Terminal";
 
-type Doc = { path: string; name: string; dirty: boolean };
+/**
+ * IDE식 작업대 — 트리·편집기·터미널이 모두 도킹 칸이다.
+ * 탭을 끌어 위·아래·좌·우 어디에나 붙이거나 다른 칸에 합치고, 띄워 둘 수도 있다.
+ * 고정 칸(트리·터미널·내 PC 트리)의 배치는 작업대 종류별로 앱 DB 에 저장한다(편집기 탭은 저장하지 않음).
+ */
 
-/** 세로 분할선 — 끌어서 왼쪽 칸 너비를 바꾼다 */
-function Splitter({ onDrag }: { onDrag: (dx: number) => void }) {
-	const last = useRef(0);
+const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
+
+type Which = "remote" | "local";
+type Ctx = {
+	fs: FsBackend;
+	local?: FsBackend;
+	term: TermBackend;
+	label: string;
+	startPath?: string;
+	openFile: (which: Which, e: FsEntry) => void;
+	activePanel: string | null;
+	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string) => void;
+	sendTo: (from: Which, e: FsEntry) => void;
+	cd: (dir: string) => void;
+	registerShell: (panelId: string, h: ShellHandle | null) => void;
+	onCwd: (path: string) => void;
+	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
+	treeKey: string;
+};
+const WbCtx = createContext<Ctx | null>(null);
+const useWb = () => useContext(WbCtx) as Ctx;
+
+function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
+	const ctx = useWb();
+	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+	const [root, setRoot] = useState(props.params.which === "remote" ? ctx.startPath || fs.home : fs.home);
+	// 터미널을 따라가기: 원격 트리(또는 내 PC 작업대의 트리)만
+	useEffect(() => {
+		const follows = props.params.which === "remote" || !ctx.local;
+		if (!follows) return;
+		const on = (ev: Event) => setRoot((ev as CustomEvent<string>).detail);
+		window.addEventListener(`rb-cwd-${ctx.treeKey}`, on);
+		return () => window.removeEventListener(`rb-cwd-${ctx.treeKey}`, on);
+	}, [ctx.treeKey, ctx.local, props.params.which]);
 	return (
-		<div
-			className="splitter"
-			onPointerDown={(e) => {
-				last.current = e.clientX;
-				(e.target as HTMLElement).setPointerCapture(e.pointerId);
-			}}
-			onPointerMove={(e) => {
-				if (!(e.buttons & 1)) return;
-				const dx = e.clientX - last.current;
-				last.current = e.clientX;
-				if (dx) onDrag(dx);
-			}}
-		/>
+		<div className="panel-fill">
+			<FileTree
+				fs={fs}
+				root={root}
+				onRoot={setRoot}
+				onOpen={(e) => ctx.openFile(props.params.which, e)}
+				onDrop={(src, dir) => ctx.drop(src, fs.side, dir)}
+				onSend={ctx.local ? (e) => ctx.sendTo(props.params.which, e) : undefined}
+				sendLabel={props.params.which === "local" ? "서버로 올리기" : "내 PC로 받기"}
+				onCd={props.params.which === "remote" || !ctx.local ? ctx.cd : undefined}
+			/>
+		</div>
 	);
 }
 
-/**
- * 3칸 작업대 — 트리 · 편집기 · 터미널. 원격(SSH)과 내 PC 가 같은 화면을 쓴다.
- */
+function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string }>) {
+	const ctx = useWb();
+	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+	const onDirty = useCallback(
+		(dirty: boolean) => props.api.setTitle(`${dirty ? "● " : ""}${props.params.name}`),
+		[props.api, props.params.name],
+	);
+	return (
+		<div className="panel-fill">
+			<EditorView_ fs={fs} path={props.params.path} active={ctx.activePanel === props.api.id} onDirtyChange={onDirty} />
+		</div>
+	);
+}
+
+function TerminalPanel(props: IDockviewPanelProps<{ n: number }>) {
+	const ctx = useWb();
+	return (
+		<div className="panel-fill">
+			<TerminalView
+				backend={ctx.term}
+				active={ctx.activePanel === props.api.id}
+				cwd={ctx.startPath}
+				label={ctx.label}
+				toolbar={false}
+				onShell={(h) => ctx.registerShell(props.api.id, h)}
+				onCwd={ctx.onCwd}
+			/>
+		</div>
+	);
+}
+
+function Watermark() {
+	return (
+		<div className="dock-watermark">
+			<FileText size={28} strokeWidth={1.2} />
+			<p style={{ margin: 0, color: "var(--text-2)" }}>트리에서 파일을 누르면 여기서 열립니다</p>
+			<small>탭을 끌어 위·아래·좌·우로 옮기거나 다른 칸에 합칠 수 있습니다</small>
+		</div>
+	);
+}
+
+function fmtBytes(n: number) {
+	if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
+	if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
+	return `${(n / 1073741824).toFixed(2)} GB`;
+}
+
+/** 전송 칸 — 진행률·속도·취소, 끝나면 받은 쪽 트리를 새로 읽는다 */
+function TransfersPanel() {
+	const ctx = useWb();
+	const [list, setList] = useState<TransferProgress[]>([]);
+	useEffect(() => {
+		const un = listen<TransferProgress>("transfer", (e) => {
+			const p = e.payload;
+			setList((l) => {
+				const i = l.findIndex((x) => x.id === p.id);
+				if (i < 0) return [p, ...l].slice(0, 50);
+				const n = l.slice();
+				n[i] = p;
+				return n;
+			});
+			if (p.state === "done" || p.state === "cancelled") {
+				notifyFsChanged(p.direction === "up" ? "remote" : "local", parentDir(p.dest), ctx.fs.conn);
+			}
+		});
+		return () => void un.then((f) => f());
+	}, [ctx.fs.conn]);
+	if (!list.length) return <div className="dock-watermark">트리끼리 끌어 놓거나 우클릭 › 올리기·받기</div>;
+	return (
+		<div className="xfer">
+			{list.map((p) => {
+				const pct = p.bytesTotal ? Math.round((100 * p.bytesDone) / p.bytesTotal) : p.state === "done" ? 100 : 0;
+				const speed = p.ms > 0 ? p.bytesDone / (p.ms / 1000) : 0;
+				return (
+					<div key={p.id} className="xfer-row">
+						<span>
+							{p.direction === "up" ? "↑ 올리기" : "↓ 받기"} <b>{p.name}</b>
+						</span>
+						{p.state === "running" ? (
+							<button type="button" className="btn ghost icon" style={{ height: 20, width: 20 }} title="취소" onClick={() => void transfers.cancel(p.id)}>
+								<X size={12} />
+							</button>
+						) : (
+							<small>{p.state === "done" ? "완료" : p.state === "cancelled" ? "취소됨" : "실패"}</small>
+						)}
+						<div className={`bar ${p.state}`}>
+							<i style={{ width: `${pct}%` }} />
+						</div>
+						<small>
+							{fmtBytes(p.bytesDone)} / {fmtBytes(p.bytesTotal)} · 파일 {p.filesDone}/{p.filesTotal}
+							{p.skipped ? ` · 건너뜀 ${p.skipped}` : ""}
+							{p.error ? ` · ${p.error}` : ""}
+						</small>
+						<small>{speed ? `${fmtBytes(speed)}/s` : ""}</small>
+					</div>
+				);
+			})}
+		</div>
+	);
+}
+
+const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel };
+const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
+
+/** 기본 배치: 트리 왼쪽 · 편집기 가운데 · 터미널 오른쪽 */
+function defaultLayout(d: DockviewApi, hasLocal: boolean) {
+	d.clear();
+	d.addPanel({ id: "tree", component: "tree", title: "파일", params: { which: "remote" }, renderer: "always" });
+	d.addPanel({
+		id: "term-1",
+		component: "terminal",
+		title: "터미널",
+		params: { n: 1 },
+		renderer: "always",
+		position: { referencePanel: "tree", direction: "right" },
+	});
+	d.getPanel("tree")?.api.setSize({ width: 260 });
+	if (hasLocal) {
+		d.addPanel({
+			id: "localtree",
+			component: "tree",
+			title: "내 PC",
+			params: { which: "local" },
+			renderer: "always",
+			position: { referencePanel: "tree", direction: "below" },
+			inactive: true,
+		});
+	}
+}
+
+/** 저장용 배치 — 편집기 탭은 빼고 고정 칸만 */
+function stripEditors(json: ReturnType<DockviewApi["toJSON"]>) {
+	const j = structuredClone(json) as unknown as {
+		panels: Record<string, unknown>;
+		grid: { root: unknown };
+		activeGroup?: string;
+	};
+	for (const id of Object.keys(j.panels)) if (!FIXED.test(id)) delete j.panels[id];
+	const walk = (node: { type: string; data: unknown }): boolean => {
+		if (node.type === "leaf") {
+			const g = node.data as { views: string[]; activeView?: string };
+			g.views = g.views.filter((v) => FIXED.test(v));
+			if (g.activeView && !FIXED.test(g.activeView)) g.activeView = g.views[0];
+			return true;
+		}
+		const kids = node.data as { type: string; data: unknown }[];
+		for (const k of kids) walk(k);
+		return true;
+	};
+	walk(j.grid.root as { type: string; data: unknown });
+	return j as unknown as ReturnType<DockviewApi["toJSON"]>;
+}
+
 export function Workbench({
 	fs,
+	local,
 	term,
 	active,
 	label,
 	startPath,
 	badge,
+	layoutKey,
+	profileId,
 }: {
 	fs: FsBackend;
+	/** 원격 작업대일 때 내 PC 트리(전송용) */
+	local?: FsBackend;
 	term: TermBackend;
 	active: boolean;
 	label: string;
 	startPath?: string;
-	badge?: React.ReactNode;
+	badge?: ReactNode;
+	/** 배치 저장 이름(작업대 종류별) */
+	layoutKey: string;
+	/** 원격 프로필(저장한 sudo 암호용) */
+	profileId?: number;
 }) {
-	const [root, setRoot] = useState(startPath || fs.home);
-	const [docs, setDocs] = useState<Doc[]>([]);
-	const [current, setCurrent] = useState<string | null>(null);
-	const [treeW, setTreeW] = useState(260);
-	const [termW, setTermW] = useState(0.42); // 터미널 = 남은 폭의 비율
-	const body = useRef<HTMLDivElement>(null);
+	const [sudoOn, setSudoOn] = useState(false);
+	const [sudoMode, setSudoMode] = useState<"together" | "apart">("together");
+	const [follow, setFollow] = useState(true);
+	const [sudoAsk, setSudoAsk] = useState<{ error?: string } | null>(null);
+	const sudoPw = useRef<string | null>(null);
+	const instance = useRef(`wb${Math.random().toString(36).slice(2, 8)}`);
+	const sudoFs = useMemo(
+		() => (fs.side === "remote" && fs.conn != null ? sshSudoFs(fs.conn, fs.label, fs.home, profileId) : null),
+		[fs, profileId],
+	);
+	const fsNow = sudoOn && sudoFs ? sudoFs : fs;
+	const lastCwd = useRef<string | null>(null);
+	const dock = useRef<DockviewApi | null>(null);
+	const [activePanel, setActivePanel] = useState<string | null>(null);
+	const termSeq = useRef(1);
+	const saveTimer = useRef<number | undefined>(undefined);
 
-	const openFile = useCallback((e: FsEntry) => {
-		setDocs((ds) => (ds.some((d) => d.path === e.path) ? ds : [...ds, { path: e.path, name: e.name, dirty: false }]));
-		setCurrent(e.path);
+	const openFile = useCallback((which: Which, e: FsEntry) => {
+		const d = dock.current;
+		if (!d) return;
+		const id = `edit:${which}:${e.path}`;
+		const existing = d.getPanel(id);
+		if (existing) {
+			existing.api.setActive();
+			return;
+		}
+		// 편집기는 이미 열린 편집기 옆(같은 칸)에, 없으면 트리 오른쪽에
+		const anyEditor = d.panels.find((p) => p.id.startsWith("edit:"));
+		d.addPanel({
+			id,
+			component: "editor",
+			title: e.name,
+			params: { which, path: e.path, name: e.name },
+			renderer: "always",
+			position: anyEditor
+				? { referencePanel: anyEditor.id, direction: "within" }
+				: { referencePanel: d.getPanel("tree") ? "tree" : d.panels[0]?.id ?? "", direction: "right" },
+		});
 	}, []);
 
-	const closeDoc = (path: string) => {
-		const d = docs.find((x) => x.path === path);
-		if (d?.dirty && !confirm(`${d.name} 의 바뀐 내용을 저장하지 않고 닫을까요?`)) return;
-		const next = docs.filter((x) => x.path !== path);
-		setDocs(next);
-		if (current === path) setCurrent(next.at(-1)?.path ?? null);
+	const shells = useRef(new Map<string, ShellHandle>());
+	const registerShell = useCallback((id: string, h: ShellHandle | null) => {
+		if (h) shells.current.set(id, h);
+		else shells.current.delete(id);
+	}, []);
+	const visibleShell = () => {
+		const d = dock.current;
+		const termId = d?.panels.find((p) => p.id.startsWith("term-") && p.api.isVisible)?.id ?? [...shells.current.keys()][0];
+		return termId ? { id: termId, h: shells.current.get(termId) } : null;
 	};
 
-	const setDirty = useMemo(() => {
-		const cache = new Map<string, (dirty: boolean) => void>();
-		return (path: string) => {
-			let f = cache.get(path);
-			if (!f) {
-				f = (dirty: boolean) => setDocs((ds) => ds.map((d) => (d.path === path && d.dirty !== dirty ? { ...d, dirty } : d)));
-				cache.set(path, f);
-			}
-			return f;
-		};
-	}, []);
+	const onCwd = useCallback(
+		(path: string) => {
+			lastCwd.current = path;
+			if (follow) window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: path }));
+		},
+		[follow],
+	);
 
-	const total = () => body.current?.clientWidth ?? 1200;
+	/** sudo 켜기: 되는지 보고(암호가 필요하면 묻고), 같이 모드면 보이는 터미널도 root 셸로 */
+	const enableSudo = async (password: string | null, save: boolean) => {
+		if (fs.conn == null) return;
+		try {
+			await sudoApi.check(fs.conn, profileId, password, save);
+			if (password) sudoPw.current = password;
+			setSudoAsk(null);
+			setSudoOn(true);
+			if (sudoMode === "together") {
+				const s = visibleShell();
+				if (s?.h) {
+					s.h.send(" sudo -s\r");
+					if (await s.h.expect(/assword[^\n]*:\s*$/, 2500)) {
+						if (sudoPw.current) s.h.send(`${sudoPw.current}\r`);
+					}
+				}
+			}
+		} catch (e) {
+			const err = asSshError(e);
+			if (err.code === "NEED_SECRET" || err.code === "AUTH_FAILED") setSudoAsk({ error: err.code === "AUTH_FAILED" ? err.message : undefined });
+			else alert(err.message);
+		}
+	};
+	const disableSudo = () => {
+		setSudoOn(false);
+		if (sudoMode === "together") visibleShell()?.h?.send(" exit\r");
+	};
+
+	/** 터미널에서 그 폴더로 — 보이는(없으면 첫) 터미널에 */
+	const cd = useCallback(
+		(dir: string) => {
+			const d = dock.current;
+			const s = visibleShell();
+			const termId = s?.id;
+			const send = s?.h?.send;
+			if (!send) return;
+			// 원격은 POSIX 셸(작은따옴표), 내 PC 는 PowerShell/zsh 모두 받는 큰따옴표
+			const q = local ? `'${dir.replaceAll("'", "'\\''")}'` : `"${dir}"`;
+			send(` cd ${q}\r`);
+			if (termId) d?.getPanel(termId)?.api.setActive();
+		},
+		[local],
+	);
+
+	const showTransfers = () => {
+		const d = dock.current;
+		if (!d || d.getPanel("transfers")) return;
+		const ref = d.getPanel("localtree") ?? d.getPanel("tree");
+		d.addPanel({
+			id: "transfers",
+			component: "transfers",
+			title: "전송",
+			renderer: "always",
+			position: ref ? { referencePanel: ref.id, direction: "below" } : undefined,
+			inactive: true,
+		});
+	};
+
+	const fsOf = useCallback((side: "remote" | "local") => (side === "local" && local ? local : fs), [fs, local]);
+
+	const drop = useCallback(
+		async (src: DragEntry, destSide: "remote" | "local", destDir: string) => {
+			try {
+				if (src.side === destSide) {
+					// 같은 쪽 = 옮기기
+					if (parentDir(src.path) === destDir || destDir === src.path || destDir.startsWith(`${src.path}/`)) return;
+					if (!confirm(`${src.name} 을(를) ${destDir} 로 옮길까요?`)) return;
+					await fsOf(destSide).rename(src.path, joinPath(destDir, src.name));
+					notifyFsChanged(destSide, destDir, fs.conn);
+					notifyFsChanged(src.side, parentDir(src.path), fs.conn);
+					return;
+				}
+				if (fs.conn == null) return;
+				const existing = await fsOf(destSide).list(destDir);
+				let overwrite = false;
+				if (existing.some((x) => x.name === src.name)) {
+					overwrite = confirm(`${destDir} 에 ${src.name} 이(가) 이미 있습니다.\n확인 = 덮어쓰기, 취소 = 같은 이름 파일은 건너뛰기`);
+				}
+				showTransfers();
+				await transfers.start(fs.conn, src.side === "local" ? "up" : "down", src.path, destDir, overwrite);
+			} catch (e) {
+				alert(asSshError(e).message);
+			}
+		},
+		[fs, fsOf],
+	);
+
+	/** 우클릭 › 올리기/받기 — 반대편 홈 폴더로 */
+	const sendTo = useCallback(
+		(from: Which, e: FsEntry) => {
+			const destSide = from === "local" ? "remote" : "local";
+			const dest = destSide === "remote" ? fs.home : (local?.home ?? "");
+			void drop({ side: from === "local" ? "local" : "remote", conn: fs.conn, path: e.path, name: e.name, kind: e.kind }, destSide, dest);
+		},
+		[drop, fs, local],
+	);
+
+	const addTerminal = () => {
+		const d = dock.current;
+		if (!d) return;
+		termSeq.current += 1;
+		const n = termSeq.current;
+		const ref = d.panels.find((p) => p.id.startsWith("term-"));
+		d.addPanel({
+			id: `term-${n}`,
+			component: "terminal",
+			title: `터미널 ${n}`,
+			params: { n },
+			renderer: "always",
+			position: ref ? { referencePanel: ref.id, direction: "within" } : undefined,
+		});
+	};
+
+	const toggle = (id: "tree" | "localtree") => {
+		const d = dock.current;
+		if (!d) return;
+		const p = d.getPanel(id);
+		if (p) {
+			d.removePanel(p);
+			return;
+		}
+		d.addPanel({
+			id,
+			component: "tree",
+			title: id === "tree" ? "파일" : "내 PC",
+			params: { which: id === "tree" ? "remote" : "local" },
+			renderer: "always",
+			position: { direction: "left" },
+		});
+	};
+
+	const onReady = (e: DockviewReadyEvent) => {
+		dock.current = e.api;
+		void api.settingGet(layoutKey).then((saved) => {
+			let ok = false;
+			if (saved) {
+				try {
+					e.api.fromJSON(JSON.parse(saved));
+					ok = e.api.panels.some((p) => p.id.startsWith("term-")) || e.api.panels.some((p) => p.id === "tree");
+					for (const p of e.api.panels) {
+						const m = /^term-(\d+)$/.exec(p.id);
+						if (m) termSeq.current = Math.max(termSeq.current, Number(m[1]));
+					}
+				} catch {
+					ok = false;
+				}
+			}
+			if (!ok) defaultLayout(e.api, !!local);
+		});
+		e.api.onDidActivePanelChange((ev) => setActivePanel(ev.panel?.id ?? null));
+		e.api.onDidLayoutChange(() => {
+			window.clearTimeout(saveTimer.current);
+			saveTimer.current = window.setTimeout(() => {
+				if (dock.current) void api.settingSet(layoutKey, JSON.stringify(stripEditors(dock.current.toJSON())));
+			}, 600);
+		});
+	};
+
+	const ctx = useMemo<Ctx>(
+		() => ({
+			fs: fsNow,
+			local,
+			term,
+			label,
+			startPath,
+			openFile,
+			activePanel: active ? activePanel : null,
+			drop: (src: DragEntry, side: "remote" | "local", dir: string) => void drop(src, side, dir),
+			sendTo,
+			cd,
+			registerShell,
+			onCwd,
+			treeKey: instance.current,
+		}),
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd],
+	);
+
+	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
 
 	return (
-		<div className="wb" ref={body} style={{ gridTemplateColumns: `${treeW}px 4px 1fr 4px ${Math.round(termW * 100)}%` }}>
-			<FileTree fs={fs} root={root} onRoot={setRoot} onOpen={openFile} selected={current ?? undefined} />
-			<Splitter onDrag={(dx) => setTreeW((w) => Math.min(520, Math.max(170, w + dx)))} />
-			<div className="wb-center">
-				<div className="doc-tabs">
-					{docs.map((d) => (
-						<button key={d.path} type="button" className="doc-tab" aria-selected={d.path === current} onClick={() => setCurrent(d.path)} title={d.path}>
-							<span>{d.name}</span>
-							{d.dirty ? (
-								<span className="dirty" title="저장 안 됨" />
-							) : (
-								<span
-									className="x"
-									role="button"
-									aria-label="닫기"
-									onClick={(e) => {
-										e.stopPropagation();
-										closeDoc(d.path);
-									}}
-								>
-									<X size={11} />
-								</span>
-							)}
+		<WbCtx.Provider value={ctx}>
+			<div className="wb-dock-shell">
+				<div className="wb-bar">
+					<button type="button" className="btn ghost" onClick={() => toggle("tree")} title="파일 트리 보이기/숨기기">
+						<FolderTree size={14} /> 파일
+					</button>
+					{local && (
+						<button type="button" className="btn ghost" onClick={() => toggle("localtree")} title="내 PC 트리 — 끌어 놓아 주고받기">
+							<Monitor size={14} /> 내 PC
 						</button>
-					))}
+					)}
+					{local && (
+						<button type="button" className="btn ghost" onClick={showTransfers} title="전송 목록">
+							<ArrowDownUp size={14} /> 전송
+						</button>
+					)}
+					<button type="button" className="btn ghost" onClick={addTerminal} title="터미널 하나 더(같은 연결 위 새 채널)">
+						<SquareTerminal size={14} /> 터미널 +
+					</button>
+					<span className="sep" />
+					<button
+						type="button"
+						className={`btn ghost${follow ? " on" : ""}`}
+						title="트리가 터미널의 지금 폴더를 따라가기(같이) / 따로"
+						onClick={() => {
+							const next = !follow;
+							setFollow(next);
+							if (next && lastCwd.current) window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: lastCwd.current }));
+						}}
+					>
+						<Link size={14} /> {follow ? "같이" : "따로"}
+					</button>
+					{sudoFs && (
+						<>
+							<button
+								type="button"
+								className={`btn ghost${sudoOn ? " on" : ""}`}
+								style={sudoOn ? { color: "var(--danger)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" } : undefined}
+								title="root 권한으로 파일 보기·고치기"
+								onClick={() => (sudoOn ? disableSudo() : void enableSudo(null, false))}
+							>
+								<ShieldAlert size={14} /> sudo {sudoOn ? "켜짐" : ""}
+							</button>
+							<select
+								className="status-select"
+								value={sudoMode}
+								onChange={(e) => setSudoMode(e.target.value as "together" | "apart")}
+								title="같이 = 터미널도 root 셸로, 따로 = 파일만"
+								disabled={sudoOn}
+							>
+								<option value="together">터미널도 같이</option>
+								<option value="apart">파일만</option>
+							</select>
+						</>
+					)}
+					<span className="sep" />
+					<button
+						type="button"
+						className="btn ghost"
+						title="배치 초기화"
+						onClick={() => {
+							if (dock.current) {
+								termSeq.current = 1;
+								defaultLayout(dock.current, !!local);
+							}
+						}}
+					>
+						<LayoutTemplate size={14} /> 기본 배치
+					</button>
 					<span style={{ flex: 1 }} />
+					{local && (
+						<span className="badge" title="트리끼리 끌어 놓거나 우클릭으로 주고받기">
+							<ArrowLeftRight size={12} /> {local.label} ↔ {fs.label}
+						</span>
+					)}
 					{badge}
 				</div>
-				<div className="doc-body">
-					{docs.length === 0 && (
-						<div className="doc-empty">
-							<FileText size={28} strokeWidth={1.2} />
-							<p>왼쪽 트리에서 파일을 누르면 여기서 열립니다</p>
-							<small>Ctrl+S 저장 · 원래 인코딩·줄 끝을 그대로 지킵니다</small>
-						</div>
-					)}
-					{docs.map((d) => (
-						<div key={d.path} className="doc-pane" hidden={d.path !== current}>
-							<EditorView_ fs={fs} path={d.path} active={active && d.path === current} onDirtyChange={setDirty(d.path)} />
-						</div>
-					))}
+				{sudoAsk && (
+					<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && setSudoAsk(null)}>
+						<form
+							className="sheet"
+							onSubmit={(e) => {
+								e.preventDefault();
+								const f = new FormData(e.currentTarget);
+								void enableSudo(String(f.get("pw") ?? ""), f.get("save") === "on");
+							}}
+						>
+							<h3>sudo 암호</h3>
+							<p style={{ color: "var(--text-2)", marginTop: 0 }}>root 권한으로 파일을 읽고 씁니다. 저장하면 이 서버에서 다시 묻지 않습니다.</p>
+							<div className="field">
+								<input name="pw" type="password" autoFocus placeholder="sudo 암호" />
+							</div>
+							{sudoAsk.error && <p className="err">{sudoAsk.error}</p>}
+							{profileId != null && (
+								<label className="check">
+									<input name="save" type="checkbox" /> OS 자격 증명 저장소에 저장
+								</label>
+							)}
+							<div className="sheet-actions">
+								<button type="button" className="btn" onClick={() => setSudoAsk(null)}>
+									취소
+								</button>
+								<button type="submit" className="btn primary">
+									켜기
+								</button>
+							</div>
+						</form>
+					</div>
+				)}
+				<div className="wb-dock">
+					<DockviewReact theme={theme} components={components} watermarkComponent={Watermark} onReady={onReady} />
 				</div>
 			</div>
-			<Splitter onDrag={(dx) => setTermW((r) => Math.min(0.75, Math.max(0.2, r - dx / total())))} />
-			<div className="wb-term">
-				<TerminalView backend={term} active={active} cwd={startPath} label={label} toolbar={false} />
-			</div>
-		</div>
+		</WbCtx.Provider>
 	);
 }

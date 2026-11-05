@@ -1,8 +1,10 @@
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, Database, Download, House, Minus, Pencil, Plus, Search, Server, Square, SquareTerminal, Table2, X } from "lucide-react";
+import { BookOpen, Database, Download, FileDown, FileUp, House, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
+import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
 import { type AppInfo, api, type ConnectOk, localFs, localTerm, type Profile, sshFs, sshTerm } from "./lib/ipc";
 import { useUpdater } from "./lib/updater";
@@ -13,7 +15,7 @@ const ResultGridPane = lazy(() => import("./components/ResultGrid").then((m) => 
 const CommandDictionaryPane = lazy(() => import("./components/CommandDictionary").then((m) => ({ default: m.CommandDictionaryPane })));
 
 type TabKind = "home" | "local" | "ssh" | "grid" | "dict";
-type SshInfo = { ok: ConnectOk; profile: Profile };
+type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean };
 type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; color?: string | null };
 
 const TAB_ICON: Record<TabKind, ReactNode> = {
@@ -43,7 +45,9 @@ export function App() {
 	const [active, setActive] = useState(tabs[0].id);
 	const [profiles, setProfiles] = useState<Profile[]>([]);
 	const [sheet, setSheet] = useState<Profile | null>(null);
-	const [connecting, setConnecting] = useState<Profile | null>(null);
+	const [connecting, setConnecting] = useState<{ p: Profile; tabId?: string } | null>(null);
+	const [importing, setImporting] = useState(false);
+	const [exporting, setExporting] = useState(false);
 	const [q, setQ] = useState("");
 	const { state: upd, install } = useUpdater();
 
@@ -91,13 +95,31 @@ export function App() {
 	);
 
 	const onConnected = useCallback(
-		(ok: ConnectOk, p: Profile) => {
+		(ok: ConnectOk, p: Profile, tabId?: string) => {
 			setConnecting(null);
 			reload();
+			if (tabId) {
+				// 다시 연결 — 같은 탭에 새 연결(작업대는 새로 그려지고 배치는 저장본 그대로)
+				backends.current.delete(tabId);
+				setTabs((ts) => ts.map((t) => (t.id === tabId ? { ...t, ssh: { ok, profile: p } } : t)));
+				setActive(tabId);
+				return;
+			}
 			open("ssh", p.name, false, { ssh: { ok, profile: p }, color: p.color });
 		},
 		[open, reload],
 	);
+
+	// 연결 끊김 — 탭에 표시하고, 저장한 암호가 있으면 바로 다시 연결을 시도
+	useEffect(() => {
+		const un = listen<{ conn: number }>("ssh-closed", (e) => {
+			const t = tabsRef.current.find((x) => x.ssh?.ok.connId === e.payload.conn);
+			if (!t?.ssh) return;
+			setTabs((ts) => ts.map((x) => (x.id === t.id && x.ssh ? { ...x, ssh: { ...x.ssh, closed: true } } : x)));
+			if (t.ssh.profile.secretSaved || t.ssh.profile.auth === "key") setConnecting({ p: t.ssh.profile, tabId: t.id });
+		});
+		return () => void un.then((f) => f());
+	}, []);
 
 	// 단축키: ⌘/Ctrl+T 새 로컬 터미널, ⌘/Ctrl+W 탭 닫기, ⌘/Ctrl+K 찾기
 	useEffect(() => {
@@ -138,16 +160,16 @@ export function App() {
 			alert("DB 접속은 1단계 후반에 붙습니다.");
 			return;
 		}
-		setConnecting(p);
+		setConnecting({ p });
 	};
 
 	// 원격·내 PC 백엔드는 탭마다 한 번만 만든다(다시 그릴 때 셸이 다시 열리지 않게)
-	const backends = useRef(new Map<string, { fs: ReturnType<typeof localFs>; term: typeof localTerm }>());
+	const backends = useRef(new Map<string, { fs: ReturnType<typeof localFs>; term: typeof localTerm; local?: ReturnType<typeof localFs> }>());
 	const backendFor = (t: Tab) => {
 		let b = backends.current.get(t.id);
 		if (!b) {
 			b = t.ssh
-				? { fs: sshFs(t.ssh.ok.connId, t.ssh.profile.name, t.ssh.ok.home), term: sshTerm(t.ssh.ok.connId) }
+				? { fs: sshFs(t.ssh.ok.connId, t.ssh.profile.name, t.ssh.ok.home), term: sshTerm(t.ssh.ok.connId), local: localFs(localHome) }
 				: { fs: localFs(localHome), term: localTerm };
 			backends.current.set(t.id, b);
 		}
@@ -281,7 +303,15 @@ export function App() {
 										<QuickCard color="#5e5ce6" icon={<SquareTerminal size={18} />} title="내 PC 터미널" desc={`이 PC 폴더·셸 (${mod}T)`} onClick={() => open("local", "내 PC")} />
 										<QuickCard color="#ff9f0a" icon={<BookOpen size={18} />} title="명령어 사전" desc="358개 리눅스 명령 한국어" onClick={() => open("dict", "명령어 사전", true)} />
 									</div>
-									<h2>내 연결</h2>
+									<div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+										<h2 style={{ margin: 0, flex: 1 }}>내 연결</h2>
+										<button type="button" className="btn ghost" onClick={() => setImporting(true)} title="~/.ssh/config·PuTTY 에서">
+											<FileDown size={14} /> 가져오기
+										</button>
+										<button type="button" className="btn ghost" onClick={() => setExporting(true)} title="ssh config 로">
+											<FileUp size={14} /> 내보내기
+										</button>
+									</div>
 									{filtered.length ? (
 										<div className="plist">
 											{filtered.map((p) => (
@@ -335,12 +365,24 @@ export function App() {
 							)}
 							<Suspense fallback={null}>
 								{t.kind === "local" && localHome && (
-									<Workbench fs={backendFor(t).fs} term={backendFor(t).term} active={t.id === active} label="내 PC 셸" />
+									<Workbench fs={backendFor(t).fs} term={backendFor(t).term} active={t.id === active} label="내 PC 셸" layoutKey="layout.local" />
+								)}
+								{t.kind === "ssh" && t.ssh?.closed && (
+									<div className="closed-banner">
+										<Unplug size={15} /> 연결이 끊겼습니다. 열린 파일의 저장 안 된 내용은 다시 연결하면 사라집니다.
+										<button type="button" className="btn primary" onClick={() => t.ssh && setConnecting({ p: t.ssh.profile, tabId: t.id })}>
+											<RotateCcw size={13} /> 다시 연결
+										</button>
+									</div>
 								)}
 								{t.kind === "ssh" && t.ssh && (
 									<Workbench
+										key={t.ssh.ok.connId}
 										fs={backendFor(t).fs}
+										local={backendFor(t).local}
 										term={backendFor(t).term}
+										layoutKey="layout.ssh"
+										profileId={t.ssh.profile.id}
 										active={t.id === active}
 										label={`${t.ssh.profile.username}@${t.ssh.profile.host}`}
 										startPath={t.ssh.profile.defaultPath ?? undefined}
@@ -375,7 +417,24 @@ export function App() {
 					}}
 				/>
 			)}
-			{connecting && <ConnectDialog profile={connecting} onConnected={onConnected} onCancel={() => setConnecting(null)} onProfileChanged={reload} />}
+			{connecting && (
+				<ConnectDialog
+					profile={connecting.p}
+					onConnected={(ok, p) => onConnected(ok, p, connecting.tabId)}
+					onCancel={() => setConnecting(null)}
+					onProfileChanged={reload}
+				/>
+			)}
+			{importing && (
+				<ImportSheet
+					onClose={() => setImporting(false)}
+					onDone={() => {
+						setImporting(false);
+						reload();
+					}}
+				/>
+			)}
+			{exporting && <ExportSheet onClose={() => setExporting(false)} />}
 		</div>
 	);
 }
