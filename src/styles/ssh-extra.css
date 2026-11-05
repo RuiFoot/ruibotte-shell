@@ -1,0 +1,209 @@
+/* SSH 작업대 보탬 — 빠른 열기·비교 도구·압축 목록·같은 이름 묻기·사전 예시 편집·링크 대상 */
+
+/* ── 파일 빠른 열기(Alt+O) ─────────────── */
+.qo-head svg {
+	flex: none;
+	color: var(--text-3);
+}
+.qo-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	border-radius: 8px;
+	cursor: default;
+	min-width: 0;
+}
+.qo-item[aria-selected="true"] {
+	background: var(--accent);
+	color: #fff;
+}
+.qo-item svg {
+	flex: none;
+	opacity: 0.7;
+}
+.qo-item .qo-name {
+	flex: none;
+	max-width: 50%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qo-item .qo-dir {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	color: var(--text-3);
+}
+.qo-item[aria-selected="true"] .qo-dir {
+	color: rgb(255 255 255 / 0.75);
+}
+.qo-msg {
+	padding: 10px 12px;
+	color: var(--text-2);
+	font-size: 12.5px;
+}
+.qo-msg.err {
+	color: var(--danger);
+}
+.qo-spin {
+	flex: none;
+	font-size: 11px;
+	color: var(--text-3);
+}
+
+/* ── 비교 도구 ─────────────────────────── */
+.diff-tools {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	flex-wrap: wrap;
+	min-width: 0;
+}
+.diff-tools .btn {
+	height: 24px;
+	font-size: 12px;
+}
+.diff-tools .check {
+	padding: 0 6px;
+	font-size: 12px;
+	white-space: nowrap;
+}
+.diff-tools .sep {
+	width: 1px;
+	height: 14px;
+	margin: 0 4px;
+	background: var(--hairline);
+}
+
+/* ── 압축 목록 ─────────────────────────── */
+.arc-info {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--text-3);
+}
+
+/* ── 같은 이름이 있을 때 ───────────────── */
+.conflict-list {
+	max-height: 160px;
+	overflow: auto;
+	margin: 0 0 12px;
+	padding: 8px 10px;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	list-style: none;
+}
+.conflict-list li {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.sheet-actions.wrap {
+	flex-wrap: wrap;
+}
+
+/* ── 명령 사전: 예시 고치기 ─────────────── */
+.ex-edit {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 6px;
+}
+.ex-edit input {
+	flex: 1;
+	min-width: 0;
+	height: 28px;
+	padding: 0 8px;
+	border: 0;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	color: var(--text);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	outline: none;
+}
+.ex-edit input:focus {
+	box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.ex-edit .btn {
+	height: 28px;
+	white-space: nowrap;
+}
+
+/* ── 트리: 링크 대상 ───────────────────── */
+.tree-row .link-to {
+	flex: 0 1 auto;
+	min-width: 0;
+	color: var(--text-3);
+	font-size: 11.5px;
+	white-space: nowrap;
+}
+
+/* ── 실시간 보기: 줄바꿈 끔 ─────────────── */
+.term-host.nowrap {
+	overflow-x: auto;
+}
+.term-host.nowrap .xterm {
+	width: max-content;
+}
+.sheet-actions .btn.danger:not(.ghost) {
+	background: var(--danger);
+	color: #fff;
+}
+.sheet-actions .btn.danger:not(.ghost):hover {
+	background: color-mix(in srgb, var(--danger) 88%, black);
+}
+
+/* ── 도구 막대 묶음(칸 · 권한 · 배치) ───── */
+.wb-group {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+}
+.wb-group-label {
+	margin-right: 2px;
+	font-size: 10.5px;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	color: var(--text-3);
+	user-select: none;
+}
+.wb-bar .btn.on.danger-on {
+	background: color-mix(in srgb, var(--danger) 16%, transparent);
+	color: var(--danger);
+	font-weight: 600;
+}
+@container (max-width: 860px) {
+	.wb-group-label {
+		display: none;
+	}
+}
+
+/* ── 칸 머리 오른쪽(터미널 칸: 새 터미널·동시 입력·나누기) ── */
+.group-actions {
+	display: flex;
+	align-items: center;
+	gap: 1px;
+	height: 100%;
+	padding: 0 6px;
+}
+.group-actions .btn.icon {
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	color: var(--text-2);
+}
+.group-actions .btn.icon:disabled {
+	opacity: 0.35;
+}
+.group-actions .btn.bcast-on {
+	background: color-mix(in srgb, #ff9f0a 20%, transparent);
+	color: #c77700;
+}

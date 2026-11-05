@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ArrowDownToLine, ChevronDown, ChevronUp, Palette, Pause, Play, Trash2 } from "lucide-react";
+import { ArrowDownToLine, ChevronDown, ChevronUp, Palette, Pause, Play, Trash2, WrapText } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { bytesChannel, type FsBackend } from "../lib/ipc";
 import { Select } from "./Select";
@@ -13,7 +13,10 @@ import { Select } from "./Select";
  * 실시간 보기 — 원격은 `tail -n N -F`, 내 PC 는 늘어난 만큼 읽기. 화면은 읽기 전용 xterm 이라 로그 색(ANSI)이 그대로 보인다.
  * 멈춤(멈춘 동안 온 줄은 모아 두었다가 다시 켜면 한꺼번에)·찾기(일치 수)·인코딩·지우기·처음 줄 수·
  * 수준 색(ERROR 빨강·WARN 노랑·INFO 하늘·DEBUG 흐림 — 이미 색이 있는 줄은 그대로)·맨 아래로.
+ * 줄바꿈 켜고 끄기(끄면 긴 줄은 가로로 밀어 본다)·보관 줄 수 상한(넘으면 오래된 줄부터 버린다).
  */
+/** 줄바꿈을 끈 때 한 줄 너비(글자) */
+const NOWRAP_COLS = 1000;
 const ESC = "\x1b";
 /** 색이 없는 로그 줄에 수준·시각 색을 입힌다 */
 function colorize(text: string): string {
@@ -47,7 +50,22 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 	colorRef.current = color;
 	const [found, setFound] = useState<{ i: number; n: number } | null>(null);
 	const utf8 = useRef(new TextDecoder());
+	const [wrap, setWrap] = useState(true);
+	const wrapRef = useRef(true);
+	wrapRef.current = wrap;
+	const [keep, setKeep] = useState(50_000);
+	const fitRef = useRef<FitAddon | null>(null);
+	/** 칸 크기에 맞추기 — 줄바꿈을 끄면 너비는 넓게 두고 높이만 맞춘다 */
+	const layout = () => {
+		const t = termRef.current;
+		const f = fitRef.current;
+		if (!t || !f) return;
+		if (wrapRef.current) return f.fit();
+		const d = f.proposeDimensions();
+		if (d && Number.isFinite(d.rows)) t.resize(NOWRAP_COLS, Math.max(2, d.rows - 1));
+	};
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 줄바꿈·보관 줄 수는 아래에서 따로 적용(다시 열지 않는다)
 	useEffect(() => {
 		const el = host.current;
 		if (!el) return;
@@ -55,7 +73,7 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 		const term = new XTerm({
 			disableStdin: true,
 			convertEol: true,
-			scrollback: 50_000,
+			scrollback: keep,
 			fontFamily: s.getPropertyValue("--font-mono"),
 			fontSize: 12.5,
 			theme: { background: s.getPropertyValue("--term-bg").trim(), foreground: s.getPropertyValue("--term-fg").trim() },
@@ -66,10 +84,11 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 		term.loadAddon(search);
 		const res = search.onDidChangeResults((r) => setFound({ i: r.resultIndex + 1, n: r.resultCount }));
 		term.open(el);
-		fit.fit();
 		termRef.current = term;
+		fitRef.current = fit;
 		searchRef.current = search;
-		const ro = new ResizeObserver(() => el.offsetWidth > 0 && fit.fit());
+		layout();
+		const ro = new ResizeObserver(() => el.offsetWidth > 0 && layout());
 		ro.observe(el);
 		let count = 0;
 		const write = (b: Uint8Array) => {
@@ -107,8 +126,19 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 			ro.disconnect();
 			res.dispose();
 			term.dispose();
+			termRef.current = null;
+			fitRef.current = null;
 		};
 	}, [fs, path, initLines]);
+
+	// 줄바꿈 전환 — 이미 받은 줄도 다시 흘린다(xterm reflow)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: wrap 이 바뀔 때만
+	useEffect(() => {
+		layout();
+	}, [wrap]);
+	useEffect(() => {
+		if (termRef.current) termRef.current.options.scrollback = keep;
+	}, [keep]);
 
 	const toggle = () => {
 		if (paused.current) {
@@ -162,6 +192,16 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 				<button type="button" className={`btn ghost${color ? " on" : ""}`} title="수준 색 입히기(ERROR·WARN·INFO·DEBUG) — 이미 색이 있는 줄은 그대로" onClick={() => setColor((c) => !c)}>
 					<Palette size={13} />
 				</button>
+				<button type="button" className={`btn ghost${wrap ? " on" : ""}`} title={wrap ? "줄바꿈 켜짐 — 눌러 끄면 긴 줄을 가로로 밀어 봅니다" : "줄바꿈 꺼짐 — 눌러 켜기"} onClick={() => setWrap((w) => !w)}>
+					<WrapText size={13} />
+				</button>
+				<Select
+					size="sm"
+					value={keep}
+					onChange={setKeep}
+					title="보관 줄 수 — 넘으면 오래된 줄부터 버린다"
+					options={[5000, 20000, 50000, 100000, 200000].map((n) => ({ value: n, label: `보관 ${n.toLocaleString()}줄` }))}
+				/>
 				<Select
 					size="sm"
 					value={initLines}
@@ -182,12 +222,12 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 					]}
 				/>
 			</div>
-			<div className="term-host" ref={host} />
+			<div className={`term-host${wrap ? "" : " nowrap"}`} ref={host} />
 			<div className="statusbar">
 				<span className={state === "따라가는 중" ? "ok" : undefined}>
 					{isPaused ? "멈춤 — 새 줄을 모으는 중" : state}
 				</span>
-				<span>{lines.toLocaleString()}줄</span>
+				<span title="받은 줄 수(화면에는 보관 줄 수까지만 남는다)">{lines.toLocaleString()}줄</span>
 				<span style={{ marginLeft: "auto", fontFamily: "var(--font-mono)" }}>{path}</span>
 			</div>
 		</div>

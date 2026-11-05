@@ -109,11 +109,13 @@ pub async fn transfer_start(
     src: String,
     dest_dir: String,
     overwrite: bool,
+    // 받는 쪽 이름(같은 이름이 있어 "이름 바꿔 올리기" 를 고른 때) — 없으면 원래 이름
+    dest_name: Option<String>,
 ) -> R<u32> {
     let c = conns.get(conn)?;
     let id = transfers.next.fetch_add(1, Ordering::Relaxed) + 1;
     let up = direction == "up";
-    let name = base_name(&src);
+    let name = dest_name.filter(|n| !n.is_empty() && !n.contains('/') && !n.contains('\\')).unwrap_or_else(|| base_name(&src));
     let items = if up {
         let mut v = Vec::new();
         walk_local(Path::new(&src), &rjoin(&dest_dir, &name), &mut v).map_err(|e| err("OTHER", e.to_string()))?;

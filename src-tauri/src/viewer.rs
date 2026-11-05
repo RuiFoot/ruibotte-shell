@@ -20,12 +20,25 @@ fn q(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// 원격 파일 앞부분(최대 32 MiB) — 이미지·PDF·헥스 미리보기
+/// 원격 파일 일부(최대 32 MiB) — 이미지·PDF·헥스 미리보기, 압축 목록.
+/// offset: 이 자리부터(음수면 끝에서 그만큼 앞, 파일보다 길면 처음부터). 없으면 처음부터.
 #[tauri::command]
-pub async fn sftp_read_bytes(conns: State<'_, SshConns>, conn: u32, path: String, max: Option<u64>) -> R<Response> {
+pub async fn sftp_read_bytes(conns: State<'_, SshConns>, conn: u32, path: String, max: Option<u64>, offset: Option<i64>) -> R<Response> {
+    use tokio::io::AsyncSeekExt;
     let c = conns.get(conn)?;
     let max = max.unwrap_or(MAX_PREVIEW).min(MAX_PREVIEW);
+    let start = match offset {
+        Some(n) if n < 0 => {
+            let size = c.sftp.metadata(path.clone()).await.map_err(sftp_err)?.size.unwrap_or(0);
+            size.saturating_sub(n.unsigned_abs())
+        }
+        Some(n) => n as u64,
+        None => 0,
+    };
     let mut f = c.sftp.open(path).await.map_err(sftp_err)?;
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).await.map_err(|e| err("SFTP", e.to_string()))?;
+    }
     let mut out = Vec::new();
     let mut buf = vec![0u8; 256 * 1024];
     while (out.len() as u64) < max {
@@ -39,9 +52,19 @@ pub async fn sftp_read_bytes(conns: State<'_, SshConns>, conn: u32, path: String
 }
 
 #[tauri::command]
-pub fn local_read_bytes(path: String, max: Option<u64>) -> Result<Response, String> {
+pub fn local_read_bytes(path: String, max: Option<u64>, offset: Option<i64>) -> Result<Response, String> {
     let max = max.unwrap_or(MAX_PREVIEW).min(MAX_PREVIEW);
     let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    match offset {
+        Some(n) if n < 0 => {
+            let size = f.metadata().map_err(|e| e.to_string())?.len();
+            f.seek(SeekFrom::Start(size.saturating_sub(n.unsigned_abs()))).map_err(|e| e.to_string())?;
+        }
+        Some(n) if n > 0 => {
+            f.seek(SeekFrom::Start(n as u64)).map_err(|e| e.to_string())?;
+        }
+        _ => {}
+    }
     let mut out = Vec::new();
     (&mut f).take(max).read_to_end(&mut out).map_err(|e| e.to_string())?;
     Ok(Response::new(out))

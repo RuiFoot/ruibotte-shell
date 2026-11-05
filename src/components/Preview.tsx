@@ -3,18 +3,20 @@ import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { Maximize, Minus, Plus, Scan, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { type ArchiveListing, archiveFormat, listArchive, NotArchive } from "../lib/archive";
 import type { FsBackend } from "../lib/ipc";
 import { DataGrid } from "./DataGrid";
 import { Select } from "./Select";
 
 /** 확장자로 보기 방식 고르기 */
-export type PreviewKind = "image" | "pdf" | "hex" | "sheet" | "docx";
+export type PreviewKind = "image" | "pdf" | "hex" | "sheet" | "docx" | "archive";
 export function previewKind(path: string): PreviewKind | null {
 	const ext = path.split(".").pop()?.toLowerCase() ?? "";
 	if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "avif"].includes(ext)) return "image";
 	if (ext === "pdf") return "pdf";
 	if (["xlsx", "xlsm", "xls", "ods", "xlsb"].includes(ext)) return "sheet";
 	if (ext === "docx") return "docx";
+	if (archiveFormat(path)) return "archive";
 	if (["zip", "gz", "tgz", "jar", "war", "class", "so", "dll", "exe", "bin", "o", "a", "iso", "img", "db", "sqlite", "xz", "bz2", "7z"].includes(ext)) return "hex";
 	return null;
 }
@@ -41,11 +43,12 @@ const MIME: Record<string, string> = {
 	pdf: "application/pdf",
 };
 
-async function readBytes(fs: FsBackend, path: string, max?: number): Promise<Uint8Array<ArrayBuffer>> {
+/** offset: 이 자리부터(음수면 끝에서 그만큼 앞) */
+async function readBytes(fs: FsBackend, path: string, max?: number, offset?: number): Promise<Uint8Array<ArrayBuffer>> {
 	const buf =
 		fs.side === "remote"
-			? await invoke<ArrayBuffer>("sftp_read_bytes", { conn: fs.conn, path, max })
-			: await invoke<ArrayBuffer>("local_read_bytes", { path, max });
+			? await invoke<ArrayBuffer>("sftp_read_bytes", { conn: fs.conn, path, max, offset })
+			: await invoke<ArrayBuffer>("local_read_bytes", { path, max, offset });
 	return new Uint8Array(buf);
 }
 
@@ -54,7 +57,46 @@ export function BinaryPreview({ fs, path, kind }: { fs: FsBackend; path: string;
 	if (kind === "sheet") return <SheetPreview fs={fs} path={path} />;
 	if (kind === "docx") return <DocxPreview fs={fs} path={path} />;
 	if (kind === "image") return <ImagePreview fs={fs} path={path} />;
+	if (kind === "archive") return <ArchivePreview fs={fs} path={path} />;
 	return <BlobPreview fs={fs} path={path} kind={kind} />;
+}
+
+const two = (n: number) => String(n).padStart(2, "0");
+const fmtDate = (d: Date | null) => (d && !Number.isNaN(d.getTime()) ? `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}` : "");
+
+/** 압축 파일 목록(zip·jar·tar·tar.gz) — 풀지 않고 이름·크기·날짜만. 표에서 거르고 정렬한다 */
+function ArchivePreview({ fs, path }: { fs: FsBackend; path: string }) {
+	const [list, setList] = useState<ArchiveListing | null>(null);
+	const [info, setInfo] = useState("목록 읽는 중…");
+	const [notArchive, setNotArchive] = useState(false);
+	useEffect(() => {
+		const signal = { aborted: false };
+		const t0 = performance.now();
+		setList(null);
+		setNotArchive(false);
+		listArchive(path, (offset, max) => readBytes(fs, path, max, offset), signal)
+			.then((l) => {
+				if (signal.aborted) return;
+				setList(l);
+				setInfo(`${l.format} · ${l.entries.length.toLocaleString()}개${l.truncated ? " (앞부분만)" : ""} · 풀지 않고 목록만 · ${Math.round(performance.now() - t0)} ms`);
+			})
+			.catch((e) => {
+				if (signal.aborted) return;
+				if (e instanceof NotArchive) setNotArchive(true);
+				setInfo(`목록을 읽지 못했습니다: ${String(e?.message ?? e)}`);
+			});
+		return () => {
+			signal.aborted = true;
+		};
+	}, [fs, path]);
+	const rows = useMemo(
+		() => (list ? [["이름", "크기", "바뀐 날짜", "종류"], ...list.entries.map((e) => [e.link ? `${e.name} → ${e.link}` : e.name, e.dir ? "" : e.size.toLocaleString(), fmtDate(e.mtime), e.dir ? "폴더" : e.link ? "링크" : "파일"])] : []),
+		[list],
+	);
+	// gzip 이지만 tar 가 아닌 것 등 — 헥스로
+	if (notArchive) return <BlobPreview fs={fs} path={path} kind="hex" />;
+	if (!list) return <div className="panel-fill dock-watermark"><p>{info}</p></div>;
+	return <GridTable rows={rows} extra={<span className="arc-info" title={info}>{info}</span>} />;
 }
 
 function BlobPreview({ fs, path, kind }: { fs: FsBackend; path: string; kind: "pdf" | "hex" }) {

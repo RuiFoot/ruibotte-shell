@@ -11,7 +11,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type IMarker, Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { ChevronDown, ChevronUp, Gauge, RotateCcw, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ipc";
 import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -59,6 +59,9 @@ export function TerminalView({
 	shell,
 	shellOptions,
 	onShellChange,
+	onSplit,
+	onRootShell,
+	statusExtra,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -83,6 +86,12 @@ export function TerminalView({
 	/** 고를 수 있는 셸(내 PC) — 있으면 상태 줄에 고르기 */
 	shellOptions?: { value: string; label: string; hint?: string }[];
 	onShellChange?: (id: string) => void;
+	/** 우클릭 › 오른쪽·아래로 나누기(작업대가 옆에 새 터미널 칸) */
+	onSplit?: (dir: "right" | "below") => void;
+	/** 원격: 우클릭 › root 셸로(sudo -i)·나오기 */
+	onRootShell?: (on: boolean) => void;
+	/** 상태 줄 오른쪽에 덧붙일 것(원격: 작은 자원 표시) */
+	statusExtra?: ReactNode;
 }) {
 	const completionRef = useRef(completion);
 	completionRef.current = completion;
@@ -109,6 +118,8 @@ export function TerminalView({
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 	const [palette, setPalette] = useState(false);
 	const [last, setLast] = useState<{ code: number; ms: number } | null>(null);
+	/** 글꼴 크기(기본 13 이 아니면 상태 줄에) */
+	const [fontPx, setFontPx] = useState(13);
 	/** 명령 기록(셸 통합) — 명령과 출력 복사·명령 사이 이동 */
 	const cmds = useRef<{ start: IMarker; end?: IMarker; text: string; code?: number }[]>([]);
 	const [findCount, setFindCount] = useState<{ i: number; n: number } | null>(null);
@@ -201,6 +212,7 @@ export function TerminalView({
 			const n = Number(v);
 			if (n >= 8 && n <= 32) {
 				term.options.fontSize = n;
+				setFontPx(n);
 				fit.fit();
 			}
 		});
@@ -378,6 +390,7 @@ export function TerminalView({
 				const cur = term.options.fontSize ?? 13;
 				const next = e.key === "0" ? 13 : Math.min(32, Math.max(8, cur + (e.key === "-" ? -1 : 1)));
 				term.options.fontSize = next;
+				setFontPx(next);
 				fit.fit();
 				void api.settingSet("term.fontSize", String(next));
 				return false;
@@ -547,6 +560,14 @@ export function TerminalView({
 		{ sep: true },
 		{ label: encoding === "UTF-8" ? "인코딩: EUC-KR 로" : "인코딩: UTF-8 로", run: () => changeEncoding(encoding === "UTF-8" ? "EUC-KR" : "UTF-8") },
 		{ label: "셸 다시 열기", run: () => setGen((g) => g + 1) },
+		...(onSplit || onRootShell ? ([{ sep: true }] as MenuItem[]) : []),
+		...(onSplit
+			? ([
+					{ label: "오른쪽으로 나누기", run: () => onSplit("right") },
+					{ label: "아래로 나누기", run: () => onSplit("below") },
+				] as MenuItem[])
+			: []),
+		...(onRootShell ? [root ? { label: "root 셸에서 나오기", run: () => onRootShell(false) } : { label: "root 셸로(sudo -i)", danger: true, run: () => onRootShell(true) }] : []),
 	];
 
 	return (
@@ -628,12 +649,14 @@ export function TerminalView({
 					</span>
 				)}
 				{root && <span className="badge warn">root</span>}
+				{fontPx !== 13 && <span title="터미널 글꼴 — Ctrl+0 기본">글꼴 {fontPx}px</span>}
 				{here && (
 					<button type="button" className="env-chip" title="지금 폴더 — 눌러 경로 복사" onClick={() => void navigator.clipboard.writeText(here)}>
 						{here}
 					</button>
 				)}
 				<span style={{ marginLeft: "auto" }} />
+				{statusExtra}
 				{shellOptions && shellOptions.length > 1 && shell && (
 					<Select size="sm" value={shell} onChange={(v) => onShellChange?.(v)} title="셸 바꾸기(새로 연다)" options={shellOptions} />
 				)}

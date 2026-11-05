@@ -2,6 +2,7 @@ import { ChevronDown, ChevronRight, Database, FileDown, FileUp, Folder, FolderPl
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Profile } from "../lib/ipc";
 import { blankProfile, ProfileSheet } from "./ProfileSheet";
+import { askText } from "../lib/ask";
 
 type Sel = { kind: "id"; id: number } | { kind: "new"; p: Profile } | null;
 
@@ -83,8 +84,8 @@ export function ConnectionsPane({
 		for (const p of profiles.filter((x) => x.id != null && ids.includes(x.id))) if ((p.groupName?.trim() || "") !== g) await api.profileSave({ ...p, groupName: g || null });
 		reload();
 	};
-	const addGroup = () => {
-		const g = prompt("새 묶음 이름")?.trim();
+	const addGroup = async () => {
+		const g = (await askText({ title: "새 묶음", placeholder: "예: 운영 · 고객사 A", okLabel: "만들기" }))?.trim();
 		if (!g) return;
 		if (allGroups.includes(g)) return alert("이미 있는 묶음입니다");
 		saveEmpty([...emptyGroups, g]);
@@ -95,7 +96,7 @@ export function ConnectionsPane({
 		});
 	};
 	const renameGroup = async (g: string) => {
-		const to = prompt(`'${g}' 묶음의 새 이름`, g)?.trim();
+		const to = (await askText({ title: "묶음 이름 바꾸기", value: g, okLabel: "바꾸기", choices: allGroups.filter((x) => x !== g).map((x) => ({ value: x, label: `${x}(합치기)` })) }))?.trim();
 		if (!to || to === g) return;
 		if (allGroups.includes(to) && !confirm(`'${to}' 묶음이 이미 있습니다. 합칠까요?`)) return;
 		for (const p of inGroup(g)) await api.profileSave({ ...p, groupName: to });
@@ -119,7 +120,7 @@ export function ConnectionsPane({
 	const current = sel?.kind === "id" ? profiles.find((p) => p.id === sel.id) : sel?.kind === "new" ? sel.p : undefined;
 
 	const bulkMove = async () => {
-		const g = prompt(`고른 ${checked.size}개를 옮길 묶음(비우면 묶지 않음)${allGroups.length ? `\n있는 묶음: ${allGroups.join(", ")}` : ""}`);
+		const g = await askText({ title: `고른 ${checked.size}개 묶음 옮기기`, message: "옮길 묶음 이름(비우면 묶지 않음)", allowEmpty: true, okLabel: "옮기기", choices: allGroups.map((x) => ({ value: x })) });
 		if (g === null) return;
 		await moveTo([...checked], g.trim());
 		if (g.trim()) saveEmpty(emptyGroups.filter((x) => x !== g.trim()));
@@ -143,7 +144,7 @@ export function ConnectionsPane({
 					<button type="button" className="btn" onClick={() => go({ kind: "new", p: blankProfile("db") })}>
 						<Plus size={13} /> DB
 					</button>
-					<button type="button" className="btn ghost" title="새 묶음(연결을 끌어다 넣거나 체크 뒤 '묶음 옮기기')" onClick={addGroup}>
+					<button type="button" className="btn ghost" title="새 묶음(연결을 끌어다 넣거나 체크 뒤 '묶음 옮기기')" onClick={() => void addGroup()}>
 						<FolderPlus size={13} /> 묶음
 					</button>
 					<span style={{ flex: 1 }} />

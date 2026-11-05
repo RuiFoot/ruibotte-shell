@@ -3490,3 +3490,177 @@ h2 .count {
 	font-size: 11px;
 	color: var(--text-3);
 }
+
+/* 상태 줄 작은 자원 표시 */
+.mini-mon {
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+	height: 20px;
+	padding: 0 8px;
+	border: 0;
+	border-radius: 5px;
+	background: none;
+	color: var(--text-2);
+	font-size: 11px;
+	font-variant-numeric: tabular-nums;
+	cursor: pointer;
+}
+.mini-mon:hover {
+	background: var(--accent-soft);
+}
+.mm-item {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.mm-lbl {
+	color: var(--text-3);
+}
+.mm-spark {
+	color: var(--accent);
+}
+.mm-val {
+	min-width: 28px;
+	text-align: right;
+}
+.mm-item.warn .mm-val,
+.mm-item.warn .mm-spark {
+	color: #ff9f0a;
+}
+.mm-item.bad .mm-val,
+.mm-item.bad .mm-spark {
+	color: #ff453a;
+}
+
+/* 사이드바 접기(아이콘 막대) — 접속 화면에서 자동, Ctrl+B·단추로 펴기. 아이콘을 누르면 그 화면으로 바로 간다 */
+.sb-title {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.sb-pin {
+	display: grid;
+	place-items: center;
+	width: 24px;
+	height: 24px;
+	border: 0;
+	border-radius: 6px;
+	background: none;
+	color: var(--text-3);
+	flex: none;
+}
+.sb-pin:hover {
+	background: var(--accent-soft);
+	color: var(--text);
+}
+.app {
+	transition: grid-template-columns 0.18s ease;
+}
+.app[data-sb="rail"] {
+	grid-template-columns: 52px 1fr;
+}
+.app[data-sb="rail"] .sidebar {
+	position: relative;
+	z-index: 30;
+	width: 52px;
+	padding-left: 8px;
+	padding-right: 8px;
+	overflow: hidden;
+	transition:
+		width 0.16s ease,
+		box-shadow 0.16s ease;
+}
+.app[data-sb="rail"] .sidebar :is(.sb-section, .sb-hint, .sb-acts, .sb-title, .update-pill) {
+	visibility: hidden;
+}
+.app[data-sb="rail"] .sidebar .sb-section {
+	height: 1px;
+	margin: 6px 4px;
+	padding: 0;
+	overflow: hidden;
+	background: var(--hairline);
+}
+.app[data-sb="rail"] .sidebar .sb-hint {
+	display: none;
+}
+.app[data-sb="rail"] .sidebar-head {
+	padding-left: 2px;
+	padding-right: 0;
+}
+/* 접힌 막대: 머리는 로고 아래 펴기 단추, 항목은 아이콘만(글자는 폭 밖으로 밀어 숨김) */
+.app[data-sb="rail"] .sidebar .sidebar-head {
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 8px;
+	padding: 6px 0 8px 4px;
+}
+.app[data-sb="rail"] .sidebar .sb-title {
+	display: none;
+}
+.app[data-sb="rail"] .sidebar .sb-pin {
+	margin-left: -2px;
+}
+.app[data-sb="rail"] .sidebar .sb-item {
+	width: 36px;
+	padding: 0 10px;
+	gap: 16px;
+	text-overflow: clip;
+}
+.app[data-sb="rail"] .sidebar .sb-row .sb-item {
+	padding-left: 14px;
+}
+.app[data-sb="rail"] .sidebar :is(.sb-name, .sb-kind) {
+	visibility: hidden;
+}
+/* 접힌 막대가 잠깐 펼쳐질 때는 본문 위에 뜨므로 비치지 않게 */
+.app[data-sb="rail"] .sidebar {
+	background: var(--sidebar-solid);
+	-webkit-backdrop-filter: none;
+	backdrop-filter: none;
+}
+.mini-mon.off {
+	gap: 4px;
+	color: var(--text-3);
+}
+.mini-mon.err .mm-val {
+	color: var(--text-3);
+}
+.mm-slow {
+	color: var(--text-3);
+	font-size: 10px;
+}
+
+/* 앱 안 입력창(window.prompt 대신) */
+.ask-sheet {
+	width: min(420px, calc(100vw - 32px));
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.ask-sheet h3 {
+	margin: 0;
+	font-size: 15px;
+}
+.ask-msg {
+	margin: 0;
+	color: var(--text-2);
+	font-size: 12.5px;
+	white-space: pre-wrap;
+	line-height: 1.5;
+}
+.ask-chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.btn.danger-solid {
+	background: #ff3b30;
+	border-color: transparent;
+	color: #fff;
+}
+.btn.danger-solid:disabled {
+	opacity: 0.45;
+}

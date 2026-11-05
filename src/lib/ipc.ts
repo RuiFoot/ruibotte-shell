@@ -85,7 +85,15 @@ export type ConnectOk = {
 	usedSavedSecret: boolean;
 };
 
-export type FsEntry = { name: string; path: string; kind: "dir" | "file" | "link" | "other"; size: number; mtime?: number | null };
+export type FsEntry = {
+	name: string;
+	path: string;
+	kind: "dir" | "file" | "link" | "other";
+	size: number;
+	mtime?: number | null;
+	/** 심볼릭 링크면 가리키는 곳 */
+	target?: string | null;
+};
 export type TextMeta = { encoding: string; bom: boolean; eol: "LF" | "CRLF" | "CR"; guessed: boolean };
 export type FileText = {
 	path: string;
@@ -143,14 +151,15 @@ export type TransferProgress = {
 };
 
 /** 시작한 전송의 조건 — 실패·취소 뒤 "다시(이어서)" 에 쓴다 */
-export const transferArgs = new Map<number, { conn: number; direction: "up" | "down"; src: string; destDir: string }>();
+export const transferArgs = new Map<number, { conn: number; direction: "up" | "down"; src: string; destDir: string; destName?: string }>();
 /** 지금 도는 전송(앱을 끌 때 묻기) */
 export const runningTransfers = new Set<number>();
 
 export const transfers = {
-	start: async (conn: number, direction: "up" | "down", src: string, destDir: string, overwrite: boolean) => {
-		const id = await invoke<number>("transfer_start", { conn, direction, src, destDir, overwrite });
-		transferArgs.set(id, { conn, direction, src, destDir });
+	/** destName: 받는 쪽 이름(같은 이름이 있어 이름을 바꿔 보낼 때) */
+	start: async (conn: number, direction: "up" | "down", src: string, destDir: string, overwrite: boolean, destName?: string) => {
+		const id = await invoke<number>("transfer_start", { conn, direction, src, destDir, overwrite, destName });
+		transferArgs.set(id, { conn, direction, src, destDir, destName });
 		return id;
 	},
 	cancel: (id: number) => invoke<void>("transfer_cancel", { id }),

@@ -9,6 +9,16 @@ use serde::Serialize;
 use crate::textcodec::{self, TextMeta};
 
 const MAX_TEXT: u64 = 8 * 1024 * 1024;
+/// 너무 큰 파일은 앞부분만 이만큼 읽어 읽기 전용으로 보인다
+pub(crate) const HEAD_TEXT: u64 = 1024 * 1024;
+
+/// 앞부분만 읽은 바이트 — 마지막 줄바꿈까지만 남겨 글자가 중간에 잘리지 않게
+pub(crate) fn trim_head(mut b: Vec<u8>) -> Vec<u8> {
+    if let Some(i) = b.iter().rposition(|&x| x == b'\n') {
+        b.truncate(i + 1);
+    }
+    b
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +29,9 @@ pub struct FsEntry {
     size: u64,
     mtime: Option<u32>,
     mode: Option<u32>,
+    /// 심볼릭 링크면 가리키는 곳
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
 }
 
 fn mtime(m: &std::fs::Metadata) -> Option<u32> {
@@ -59,6 +72,7 @@ pub fn local_list(path: String) -> Result<Vec<FsEntry>, String> {
             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
             mtime: meta.as_ref().and_then(mtime),
             mode: None,
+            target: if ft.is_symlink() { std::fs::read_link(e.path()).ok().map(|t| path_str(&t)) } else { None },
         });
     }
     out.sort_by(|a, b| (a.kind != "dir").cmp(&(b.kind != "dir")).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
@@ -81,15 +95,12 @@ pub struct FileText {
 pub fn local_read_text(path: String, encoding: Option<String>) -> Result<FileText, String> {
     let m = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if m.len() > MAX_TEXT {
-        return Ok(FileText {
-            path,
-            size: m.len(),
-            mtime: mtime(&m),
-            text: None,
-            meta: TextMeta { encoding: "UTF-8".into(), bom: false, eol: "LF".into(), guessed: false },
-            binary: false,
-            too_large: true,
-        });
+        // 앞부분만 읽기 전용으로
+        use std::io::Read;
+        let mut head = Vec::new();
+        std::fs::File::open(&path).and_then(|f| f.take(HEAD_TEXT).read_to_end(&mut head)).map_err(|e| e.to_string())?;
+        let d = textcodec::decode(&trim_head(head), encoding.as_deref());
+        return Ok(FileText { path, size: m.len(), mtime: mtime(&m), text: d.text, meta: d.meta, binary: d.binary, too_large: true });
     }
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let d = textcodec::decode(&bytes, encoding.as_deref());
@@ -153,4 +164,62 @@ pub fn local_write_bytes(request: tauri::ipc::Request<'_>) -> Result<(), String>
         .map(crate::transfer::percent_decode)
         .ok_or("경로가 없습니다")?;
     std::fs::write(path, data).map_err(|e| e.to_string())
+}
+
+/// 파일 빠른 열기(Alt+O) — base 아래에서 이름에 query 가 든 파일(대소문자 무시, `*` 는 아무 글자).
+/// 깊이 8·200개까지, .git·node_modules 는 들어가지 않는다. 너무 오래 걸리면(3초·30만 항목) 거기까지만.
+#[tauri::command]
+pub async fn local_find(base: String, query: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || find_blocking(&base, &query)).await.map_err(|e| e.to_string())
+}
+
+fn name_matches(name: &str, parts: &[String]) -> bool {
+    let n = name.to_lowercase();
+    let mut at = 0;
+    for p in parts {
+        match n[at..].find(p.as_str()) {
+            Some(i) => at += i + p.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+fn find_blocking(base: &str, query: &str) -> Vec<String> {
+    let parts: Vec<String> = query.to_lowercase().split('*').filter(|x| !x.is_empty()).map(String::from).collect();
+    let mut out = Vec::new();
+    if parts.is_empty() {
+        return out;
+    }
+    let started = std::time::Instant::now();
+    let mut seen = 0usize;
+    let mut stack: Vec<(PathBuf, u32)> = vec![(PathBuf::from(base), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut subdirs = Vec::new();
+        for e in rd.flatten() {
+            seen += 1;
+            let Ok(ft) = e.file_type() else { continue };
+            let name = e.file_name().to_string_lossy().into_owned();
+            if ft.is_dir() {
+                if depth + 1 < 8 && name != ".git" && name != "node_modules" {
+                    subdirs.push(e.path());
+                }
+            } else if name_matches(&name, &parts) {
+                out.push(path_str(&e.path()));
+                if out.len() >= 200 {
+                    return out;
+                }
+            }
+        }
+        if seen > 300_000 || started.elapsed().as_secs() >= 3 {
+            break;
+        }
+        // 이름 순서대로 내려가도록 거꾸로 쌓는다(pop 이 앞 이름부터)
+        subdirs.sort();
+        for d in subdirs.into_iter().rev() {
+            stack.push((d, depth + 1));
+        }
+    }
+    out
 }

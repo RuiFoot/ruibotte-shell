@@ -1,0 +1,255 @@
+/* DB 작업대 덧붙임 — 트랜잭션·끊김 알림·실행 계획·CSV 가져오기·입력 시트 */
+
+.db-notice {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 12px;
+	font-size: 12.5px;
+	background: var(--accent-soft);
+	color: var(--text);
+	border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.db-notice.bad {
+	background: color-mix(in srgb, var(--danger) 12%, transparent);
+	border-bottom-color: color-mix(in srgb, var(--danger) 30%, transparent);
+}
+.db-notice .grow {
+	flex: 1;
+}
+
+.db-ask {
+	width: min(460px, calc(100vw - 32px));
+}
+.db-ask input {
+	width: 100%;
+	font-family: var(--font-mono);
+}
+.db-ask-msg {
+	margin: -6px 0 10px;
+	color: var(--text-2);
+	font-size: 12.5px;
+	white-space: pre-wrap;
+}
+.btn.danger {
+	background: var(--danger);
+	color: #fff;
+}
+.btn.danger:disabled,
+.btn.primary:disabled {
+	opacity: 0.45;
+}
+
+.page-bar {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.page-bar .btn {
+	height: 20px;
+	padding: 0 6px;
+}
+
+/* 실행 계획 */
+.plan-body {
+	flex: 1;
+	overflow: auto;
+	font-size: 12.5px;
+	padding: 4px 0;
+}
+.plan-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 24px;
+	padding-right: 10px;
+	border-left: 3px solid transparent;
+}
+.plan-row:hover {
+	background: color-mix(in srgb, var(--fill) 45%, transparent);
+}
+.plan-row.warm {
+	border-left-color: #ff9f0a;
+}
+.plan-row.hot {
+	border-left-color: var(--danger);
+	background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+.plan-toggle {
+	border: 0;
+	background: none;
+	color: var(--text-3);
+	padding: 0;
+	width: 14px;
+	display: inline-flex;
+	cursor: pointer;
+}
+.plan-label {
+	font-weight: 600;
+	white-space: nowrap;
+}
+.plan-sub {
+	color: var(--text-2);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.plan-nums {
+	margin-left: auto;
+	display: inline-flex;
+	gap: 12px;
+	color: var(--text-2);
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	white-space: nowrap;
+}
+.plan-share {
+	color: var(--text);
+	font-weight: 600;
+}
+.plan-row.hot .plan-share {
+	color: var(--danger);
+}
+.plan-props {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 14px;
+	color: var(--text-3);
+	font-size: 11.5px;
+	padding-bottom: 4px;
+	font-family: var(--font-mono);
+}
+.plan-props b {
+	color: var(--text-2);
+	font-weight: 500;
+}
+.plan-warn {
+	color: #c77700;
+	font-size: 12px;
+	padding-bottom: 2px;
+}
+.plan-raw {
+	margin: 0;
+	padding: 10px 12px;
+	font-family: var(--font-mono);
+	font-size: 12px;
+	white-space: pre;
+}
+
+/* CSV 가져오기 */
+.db-import {
+	width: min(820px, calc(100vw - 32px));
+	max-height: calc(100vh - 48px);
+	display: flex;
+	flex-direction: column;
+}
+.db-import-file {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 10px;
+}
+.db-import-path {
+	color: var(--text-2);
+	font-size: 12.5px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.db-import-opts {
+	display: flex;
+	gap: 18px;
+	margin-bottom: 8px;
+}
+.db-import-map {
+	display: grid;
+	grid-template-columns: 1fr;
+	gap: 4px;
+	max-height: 220px;
+	overflow: auto;
+	margin-bottom: 10px;
+}
+.db-import-maprow {
+	display: grid;
+	grid-template-columns: minmax(120px, 1fr) minmax(90px, 0.7fr) minmax(160px, 1.2fr);
+	gap: 8px;
+	align-items: center;
+}
+.db-import-maprow small {
+	color: var(--text-3);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.db-import-preview {
+	overflow: auto;
+	max-height: 170px;
+	border: 1px solid var(--border, color-mix(in srgb, var(--text) 12%, transparent));
+	border-radius: 6px;
+}
+.db-import-preview table {
+	border-collapse: collapse;
+	font-size: 12px;
+	font-family: var(--font-mono);
+	width: max-content;
+	min-width: 100%;
+}
+.db-import-preview th,
+.db-import-preview td {
+	padding: 3px 8px;
+	text-align: left;
+	white-space: nowrap;
+	max-width: 260px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	border-bottom: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
+}
+.db-import-preview th {
+	color: var(--text-2);
+	font-weight: 600;
+}
+.db-import-preview td.null {
+	color: var(--text-3);
+	font-style: italic;
+}
+.db-import-err {
+	color: var(--danger);
+	white-space: pre-wrap;
+	font-size: 12px;
+	margin: 8px 0 0;
+}
+
+/* SET 여러 개 고르기 */
+.cell-set {
+	position: absolute;
+	z-index: 30;
+	top: 100%;
+	left: 0;
+	min-width: 180px;
+	max-height: 240px;
+	overflow: auto;
+	background: var(--surface);
+	border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+	border-radius: 8px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+	padding: 4px;
+	display: flex;
+	flex-direction: column;
+}
+.cell-set label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 6px;
+	font-size: 12.5px;
+	border-radius: 5px;
+}
+.cell-set label:hover {
+	background: var(--accent-soft);
+}
+.cell-set .cell-set-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 6px;
+	padding: 4px 2px 2px;
+}

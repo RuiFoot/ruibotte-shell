@@ -166,3 +166,60 @@ export function sequencesSql(engine: string, schema: string | null): string | nu
 	if (engine === "oracle" || engine === "tibero") return `SELECT sequence_name AS 시퀀스, last_number AS 지금_값, increment_by AS 증가 FROM all_sequences WHERE sequence_owner = ${lit(s.toUpperCase())} ORDER BY 1`;
 	return null;
 }
+
+/** 세션 연결 끊기(쿼리만 멈추기가 아니라 세션째) */
+export function terminateSql(engine: string, id: string): string | null {
+	if (!/^\d+$/.test(id)) return null;
+	if (engine === "postgres") return `SELECT pg_terminate_backend(${id})`;
+	if (engine === "mariadb" || engine === "mysql") return `KILL ${id}`;
+	if (engine === "mssql") return `KILL ${id}`;
+	return null;
+}
+
+/** 읽기 전용 계정 만들기 SQL 틀 — 이름·암호·대상은 고쳐서 쓴다 */
+export function readOnlyUserSql(engine: string, schema: string | null): string | null {
+	const s = schema ?? "public";
+	if (engine === "postgres")
+		return `-- 읽기 전용 계정 만들기(PostgreSQL) — 이름·암호를 바꾸고 실행하세요
+CREATE ROLE readonly_user LOGIN PASSWORD '바꿀_암호';
+GRANT CONNECT ON DATABASE current_db_name TO readonly_user;
+GRANT USAGE ON SCHEMA ${s} TO readonly_user;
+GRANT SELECT ON ALL TABLES IN SCHEMA ${s} TO readonly_user;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${s} TO readonly_user;
+-- 앞으로 만들 표에도 SELECT 권한
+ALTER DEFAULT PRIVILEGES IN SCHEMA ${s} GRANT SELECT ON TABLES TO readonly_user;
+-- 세션도 읽기 전용으로
+ALTER ROLE readonly_user SET default_transaction_read_only = on;
+`;
+	if (engine === "mariadb" || engine === "mysql")
+		return `-- 읽기 전용 계정 만들기(MySQL·MariaDB) — 이름·암호·접속 주소를 바꾸고 실행하세요
+CREATE USER 'readonly_user'@'%' IDENTIFIED BY '바꿀_암호';
+GRANT SELECT, SHOW VIEW ON \`${schema ?? "db_name"}\`.* TO 'readonly_user'@'%';
+FLUSH PRIVILEGES;
+`;
+	if (engine === "mssql")
+		return `-- 읽기 전용 계정 만들기(SQL Server) — 이름·암호를 바꾸고 실행하세요
+CREATE LOGIN readonly_user WITH PASSWORD = '바꿀_암호!1';
+CREATE USER readonly_user FOR LOGIN readonly_user;
+ALTER ROLE db_datareader ADD MEMBER readonly_user;
+`;
+	if (engine === "oracle" || engine === "tibero")
+		return `-- 읽기 전용 계정 만들기(Oracle) — 이름·암호를 바꾸고 실행하세요
+CREATE USER readonly_user IDENTIFIED BY "바꿀_암호";
+GRANT CREATE SESSION TO readonly_user;
+-- 표마다: GRANT SELECT ON ${schema ?? "SCHEMA"}.표이름 TO readonly_user;
+`;
+	return null;
+}
+
+/** 표 보기 한 쪽 — WHERE·ORDER BY·쪽 나누기(엔진별 LIMIT/OFFSET · OFFSET FETCH) */
+export function pagedSelect(engine: string, table: string, opts: { where?: string; order?: string; offset: number; limit: number }): string {
+	let sql = `SELECT * FROM ${table}`;
+	if (opts.where?.trim()) sql += ` WHERE ${opts.where.trim()}`;
+	const { offset, limit } = opts;
+	if (engine === "mssql") return `${sql} ORDER BY ${opts.order ?? "(SELECT NULL)"} OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY`;
+	if (opts.order) sql += ` ORDER BY ${opts.order}`;
+	if (engine === "oracle" || engine === "tibero") return `${sql} OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY`;
+	if (engine === "cubrid" || engine === "altibase") return `${sql} LIMIT ${offset}, ${limit}`;
+	return `${sql} LIMIT ${limit} OFFSET ${offset}`;
+}

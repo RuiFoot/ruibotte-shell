@@ -78,6 +78,8 @@ export function DataGrid({
 	apiRef,
 	sort,
 	onSort,
+	onCopyRows,
+	onBigEdit,
 }: {
 	columns: GridCol[];
 	rowCount: number;
@@ -100,6 +102,10 @@ export function DataGrid({
 	sort?: { col: number; desc: boolean } | null;
 	/** 머리 누르기 — 정렬 바꾸기 */
 	onSort?: (col: number) => void;
+	/** 행을 고른 채 Ctrl+C — 받지 않은 행까지 부르는 쪽이 모아 복사(없으면 받아 둔 행만 TSV 로) */
+	onCopyRows?: (rows: number[]) => void;
+	/** Shift+Enter — 큰 편집기(긴 글·JSON) */
+	onBigEdit?: (r: number, c: number) => void;
 }) {
 	const scroller = useRef<HTMLDivElement>(null);
 	const pages = useRef(new Map<number, Cell[][]>());
@@ -205,9 +211,25 @@ export function DataGrid({
 			}}
 			onKeyDown={(e) => {
 				if (editing || !sel) return;
-				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && !rows.size) {
+				if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
 					e.preventDefault();
-					void navigator.clipboard.writeText(cellAt(sel.r, sel.c) ?? "");
+					if (!rows.size) {
+						void navigator.clipboard.writeText(cellAt(sel.r, sel.c) ?? "");
+						return;
+					}
+					// 고른 행 — 머리 + 행(TSV, 엑셀에 바로 붙여 넣기)
+					const picked = [...rows].sort((a, b) => a - b);
+					if (onCopyRows) onCopyRows(picked);
+					else {
+						const esc = (v: Cell | undefined) => (v == null ? "" : v.replace(/[\t\n]/g, " "));
+						const text = [columns.map((c) => c.name).join("\t"), ...picked.map((r) => columns.map((_, c) => esc(cellAt(r, c))).join("\t"))].join("\n");
+						void navigator.clipboard.writeText(text);
+					}
+					return;
+				}
+				if (e.key === "Enter" && e.shiftKey && onBigEdit) {
+					e.preventDefault();
+					onBigEdit(sel.r, sel.c);
 					return;
 				}
 				if (e.key === "F2" || e.key === "Enter") {

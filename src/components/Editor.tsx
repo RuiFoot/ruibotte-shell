@@ -11,6 +11,8 @@ import { codeHighlight } from "../lib/cmTheme";
 import { api, asSshError, type FileText, type FsBackend, type TextMeta } from "../lib/ipc";
 import { detectLang, LANGS, loadLang } from "../lib/languages";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
+import { jsonPathAt } from "../lib/jsonPath";
+import { DiffTools, navChunk, trackSide, wsConfig } from "./DiffView";
 import { altView, BinaryPreview, MarkdownView, TableView } from "./Preview";
 import { Select } from "./Select";
 
@@ -116,7 +118,11 @@ export function EditorView_({
 					});
 				}
 				const ms = Math.round(performance.now() - t0);
-				if (f.tooLarge) setStatus({ text: `${(f.size / 1048576).toFixed(1)} MiB — 너무 커서 편집기로 열지 않았습니다`, tone: "warn" });
+				if (f.tooLarge)
+					setStatus({
+						text: `${(f.size / 1048576).toFixed(1)} MiB 라 앞부분(${(text.length / 1048576).toFixed(1)} MiB)만 읽기 전용으로 열었습니다 — 끝부분은 "실시간"으로 보세요`,
+						tone: "warn",
+					});
 				else if (f.binary) setStatus({ text: "바이너리 파일 — 편집할 수 없습니다", tone: "warn" });
 				else if (f.meta.guessed) setStatus({ text: `인코딩을 확신할 수 없어 읽기 전용(${f.meta.encoding}로 추측). 오른쪽에서 인코딩을 골라 다시 여세요.`, tone: "warn" });
 				else setStatus({ text: `${ms} ms에 열림` });
@@ -283,6 +289,7 @@ export function EditorView_({
 		}
 	};
 	const canTidy = /\.(json|xml|xsd|pom|svg|xhtml)$/i.test(path) || langId === "json" || langId === "xml";
+	const isJson = /\.(json|jsonc|json5)$/i.test(path) || langId === "json";
 
 	const changeMeta = (patch: Partial<TextMeta>) => {
 		if (!saveMeta || readOnly) return;
@@ -330,6 +337,17 @@ export function EditorView_({
 			{ label: "찾기·바꾸기  Ctrl+F", run: () => openSearchPanel(v) },
 			{ label: "줄로 가기  Ctrl+G", run: () => gotoLine(v) },
 			{ label: showWs ? "공백 숨기기" : "공백 보이기", run: () => toggleWs() },
+			...(isJson
+				? [
+						{
+							label: "JSON 경로 복사",
+							run: () => {
+								const p = jsonPathAt(v.state.doc.toString(), v.state.selection.main.head);
+								void navigator.clipboard.writeText(p).then(() => setStatus({ text: `복사했습니다 — ${p}`, tone: "ok" }));
+							},
+						},
+					]
+				: []),
 			...(canTidy && !ro2 ? [{ label: "들여쓰기 정리", run: tidy }] : []),
 			{ sep: true },
 			{ label: "바뀐 곳 보기", disabled: !dirty, run: () => setDiffOf({ title: "저장 전 바뀐 곳", a: original.current, b: v.state.doc.toString(), aLabel: "열었을 때", bLabel: "지금" }) },
@@ -417,6 +435,16 @@ export function EditorView_({
 					</>
 				)}
 				<span style={{ marginLeft: "auto" }} />
+				{file?.tooLarge && !file.binary && (
+					<>
+						<span>읽기 전용 · 앞부분만</span>
+						{onTail && (
+							<button type="button" className="btn ghost" style={{ height: 20 }} onClick={onTail} title="실시간 보기(tail -F) — 끝부분을 보고 새 줄을 따라간다">
+								⟳ 실시간
+							</button>
+						)}
+					</>
+				)}
 				{file && !file.binary && !file.tooLarge && saveMeta && (
 					<>
 						{dirty && changed > 0 && (
@@ -506,20 +534,42 @@ export function EditorView_({
 /** 두 글 나란히 비교(읽기 전용) — 저장 전 바뀐 곳·서버와 충돌·초안 */
 function DiffSheet({ title, a, b, aLabel, bLabel, onClose }: { title: string; a: string; b: string; aLabel: string; bLabel: string; onClose: () => void }) {
 	const host = useRef<HTMLDivElement>(null);
+	const mv = useRef<MergeView | null>(null);
+	const side = useRef<"a" | "b">("b");
+	const [ignoreWs, setIgnoreWs] = useState(false);
+	const [count, setCount] = useState(0);
 	useEffect(() => {
 		if (!host.current) return;
-		const ext = [lineNumbers(), codeHighlight, theme, EditorState.readOnly.of(true), EditorView.editable.of(false)];
-		const mv = new MergeView({ parent: host.current, a: { doc: a, extensions: ext }, b: { doc: b, extensions: ext }, highlightChanges: true, gutter: true });
-		return () => mv.destroy();
+		// 읽기 전용이지만 커서는 둘 수 있게(차이 이동)
+		const ext = [lineNumbers(), codeHighlight, theme, EditorState.readOnly.of(true)];
+		const m = new MergeView({ parent: host.current, a: { doc: a, extensions: ext }, b: { doc: b, extensions: ext }, highlightChanges: true, gutter: true });
+		mv.current = m;
+		setCount(m.chunks.length);
+		const untrack = trackSide(m, (s) => {
+			side.current = s;
+		});
+		return () => {
+			untrack();
+			m.destroy();
+			mv.current = null;
+		};
 	}, [a, b]);
+	useEffect(() => {
+		const m = mv.current;
+		if (!m) return;
+		m.reconfigure({ diffConfig: wsConfig(ignoreWs) });
+		requestAnimationFrame(() => mv.current && setCount(mv.current.chunks.length));
+	}, [ignoreWs]);
 	return (
 		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === "Escape" && onClose()}>
 			<div className="sheet" style={{ width: "min(1100px, calc(100vw - 32px))" }}>
 				<div className="sheet-title">
 					<h3>{title}</h3>
 					<small style={{ color: "var(--text-3)" }}>
-						왼쪽 {aLabel} · 오른쪽 {bLabel}
+						왼쪽 {aLabel} · 오른쪽 {bLabel} · 바뀐 곳 {count}군데
 					</small>
+					<span style={{ flex: 1 }} />
+					<DiffTools ignoreWs={ignoreWs} onIgnoreWs={setIgnoreWs} onNav={(d) => navChunk(side.current === "a" ? mv.current?.a : mv.current?.b, d)} />
 				</div>
 				<div className="diff-sheet" ref={host} />
 				<div className="sheet-actions">

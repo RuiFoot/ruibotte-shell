@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, ListTree, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, ListTree, PanelLeftClose, PanelLeftOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
 import { Select } from "./components/Select";
+import { confirmOpenTx } from "./lib/dbTx";
 import { confirmDiscard, dirtyTitles } from "./lib/dirty";
 import { ConnectionsPane } from "./components/ConnectionsPane";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
@@ -48,8 +49,9 @@ function ago(t: number) {
 }
 const LEVEL_BADGE: Record<string, string> = { rsa: "구형 SSH · RSA", sha1: "구형 SSH · SHA-1", weakest: "구형 SSH · 최후" };
 
+// 탭 번호는 겹치면 안 된다 — 모듈이 다시 읽혀(개발 중 새로 고침) 숫자가 처음으로 돌아가도 겹치지 않게 무작위 꼬리를 붙인다
 let seq = 0;
-const newTab = (kind: TabKind, title: string, extra?: Partial<Tab>): Tab => ({ id: `${kind}-${++seq}`, kind, title, ...extra });
+const newTab = (kind: TabKind, title: string, extra?: Partial<Tab>): Tab => ({ id: `${kind}-${++seq}-${Math.random().toString(36).slice(2, 7)}`, kind, title, ...extra });
 
 function greeting(): string {
 	const h = new Date().getHours();
@@ -135,6 +137,7 @@ export function App() {
 			if (ts.length === 1) return;
 			if (!confirmDiscard(dirtyTitles(id), "이 탭을 닫으면")) return;
 			const t = ts.find((x) => x.id === id);
+			if (t?.db && !confirmOpenTx([t.db.ok.connId], "이 탭을 닫으면")) return;
 			if (t?.ssh) void api.sshDisconnect(t.ssh.ok.connId);
 			if (t?.db) void invoke("db_disconnect", { conn: t.db.ok.connId });
 			const i = ts.findIndex((x) => x.id === id);
@@ -320,7 +323,11 @@ export function App() {
 				e.preventDefault();
 				return;
 			}
-			if (!confirmDiscard(dirtyTitles(), "앱을 끄면")) e.preventDefault();
+			if (!confirmDiscard(dirtyTitles(), "앱을 끄면")) {
+				e.preventDefault();
+				return;
+			}
+			if (!confirmOpenTx(null, "앱을 끄면")) e.preventDefault();
 		});
 		// 도는 전송 세기
 		const unT = listen<{ id: number; state: string }>("transfer", (ev) => {
@@ -333,6 +340,24 @@ export function App() {
 		};
 	}, [win]);
 	const activeKind = tabs.find((t) => t.id === active)?.kind;
+	// 사이드바: 홈에서만 펼치고, 그 밖의 화면에서는 아이콘 막대로 접어 둔다(화면을 옮겨도 왔다 갔다 하지 않음).
+	// 단추·Ctrl+B 로 손수 펴면 홈으로 돌아올 때까지 그대로 편 채로 둔다. 아이콘을 누르면 그 화면으로 바로 간다(이름은 툴팁).
+	const onHome = activeKind === "home" || activeKind === undefined;
+	const [sbManual, setSbManual] = useState<boolean | null>(null);
+	useEffect(() => {
+		if (onHome) setSbManual(null);
+	}, [onHome]);
+	const sbRail = onHome ? sbManual === true : (sbManual ?? true);
+	useEffect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.code === "KeyB") {
+				e.preventDefault();
+				setSbManual(!sbRail);
+			}
+		};
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
+	}, [sbRail]);
 
 	const connect = (p: Profile) => {
 		if (p.kind === "db") {
@@ -356,22 +381,31 @@ export function App() {
 	};
 
 	return (
-		<div className="app">
+		<div className="app" data-sb={sbRail ? "rail" : "open"}>
 			<aside className="sidebar" data-tauri-drag-region>
 				<div className="sidebar-head" data-tauri-drag-region>
 					<img src={iconUrl} alt="" />
-					RuiBotte Shell
+					<span className="sb-title">RuiBotte Shell</span>
+					<button
+						type="button"
+						className="sb-pin"
+						title={sbRail ? "사이드바 펴기(Ctrl+B)" : "사이드바 접기(Ctrl+B) — 접속 화면에서는 저절로 접힘"}
+						aria-label={sbRail ? "사이드바 펴기" : "사이드바 접기"}
+						onClick={() => setSbManual(!sbRail)}
+					>
+						{sbRail ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+					</button>
 				</div>
-				<button type="button" className="sb-item" aria-current={activeKind === "home"} onClick={() => open("home", "홈", true)}>
+				<button type="button" className="sb-item" title="홈" aria-current={activeKind === "home"} onClick={() => open("home", "홈", true)}>
 					<House size={16} /> 홈
 				</button>
-				<button type="button" className="sb-item" aria-current={activeKind === "local"} onClick={() => open("local", "내 PC")}>
+				<button type="button" className="sb-item" title="내 PC 터미널" aria-current={activeKind === "local"} onClick={() => open("local", "내 PC")}>
 					<SquareTerminal size={16} /> 내 PC 터미널
 				</button>
-				<button type="button" className="sb-item" aria-current={activeKind === "dict"} onClick={() => open("dict", "명령어 사전", true)}>
+				<button type="button" className="sb-item" title="명령어 사전" aria-current={activeKind === "dict"} onClick={() => open("dict", "명령어 사전", true)}>
 					<BookOpen size={16} /> 명령어 사전
 				</button>
-				<button type="button" className="sb-item" aria-current={activeKind === "connections"} onClick={() => open("connections", "연결 관리", true)}>
+				<button type="button" className="sb-item" title="연결 관리" aria-current={activeKind === "connections"} onClick={() => open("connections", "연결 관리", true)}>
 					<ListTree size={16} /> 연결 관리
 				</button>
 
@@ -387,10 +421,10 @@ export function App() {
 						{recent.map((p) => sbRow(p))}
 					</>
 				)}
-				<button type="button" className="sb-item sb-more" onClick={() => open("connections", "연결 관리", true)}>
+				<button type="button" className="sb-item sb-more" title="모든 연결 — 연결 관리" onClick={() => open("connections", "연결 관리", true)}>
 					<ListTree size={14} /> 모든 연결 {profiles.length ? `(${profiles.length})` : ""}
 				</button>
-				<button type="button" className="sb-item sb-more" onClick={() => setSheet(blankProfile("ssh"))}>
+				<button type="button" className="sb-item sb-more" title="새 연결" onClick={() => setSheet(blankProfile("ssh"))}>
 					<Plus size={14} /> 새 연결
 				</button>
 
@@ -403,7 +437,7 @@ export function App() {
 					{(upd.phase === "downloading" || upd.phase === "installing") && (
 						<span className="update-pill">{upd.phase === "installing" ? "설치 중…" : `받는 중… ${upd.pct ?? 0}%`}</span>
 					)}
-					<button type="button" className="sb-item" aria-current={activeKind === "settings"} onClick={() => open("settings", "설정", true)}>
+					<button type="button" className="sb-item" title="설정" aria-current={activeKind === "settings"} onClick={() => open("settings", "설정", true)}>
 						<SettingsIcon size={16} /> 설정 <span style={{ marginLeft: "auto", color: "var(--text-3)", fontSize: 11 }}>{info ? `v${info.version}${info.portable ? " · 포터블" : ""}` : ""}</span>
 					</button>
 				</div>
@@ -683,7 +717,7 @@ export function App() {
 								)}
 								{t.kind === "ssh" && t.ssh?.closed && (
 									<div className="closed-banner">
-										<Unplug size={15} /> 연결이 끊겼습니다. 열린 파일의 저장 안 된 내용은 다시 연결하면 사라집니다.
+										<Unplug size={15} /> 연결이 끊겼습니다. 다시 연결하면 열려 있던 파일을 다시 엽니다 — 저장 안 한 고친 내용은 초안으로 남아 열 때 되살릴 수 있습니다.
 										<button type="button" className="btn primary" onClick={() => t.ssh && setConnecting({ p: t.ssh.profile, tabId: t.id })}>
 											<RotateCcw size={13} /> 다시 연결
 										</button>

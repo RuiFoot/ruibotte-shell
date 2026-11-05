@@ -5,7 +5,7 @@
 //! - 취소: PG CancelRequest, MySQL 은 다른 연결로 KILL QUERY.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use futures_util::{pin_mut, StreamExt, TryStreamExt};
 use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tiberius::FromSql;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
@@ -65,12 +65,15 @@ fn my_err(x: mysql_async::Error) -> DbError {
             1045 => e("AUTH_FAILED", s.message.clone()),
             1317 => e("CANCELLED", "취소했습니다"),
             1792 => e("READ_ONLY", "읽기 전용 연결입니다"),
+            // MariaDB max_statement_time · MySQL max_execution_time
+            1969 | 3024 => e("TIMEOUT", "시간 상한을 넘겨 멈췄습니다"),
             _ => e("SQL", format!("{} ({})", s.message, s.code)),
         },
         mysql_async::Error::Driver(mysql_async::DriverError::MysqlOldPasswordDisabled) => {
             e("AUTH_FAILED", "아주 오래된 MySQL 암호 방식(old_password)입니다. 프로필 고급에서 구형 호환을 켜세요.")
         }
         mysql_async::Error::Io(_) => e("NETWORK", x.to_string()),
+        mysql_async::Error::Driver(mysql_async::DriverError::ConnectionClosed) => e("CLOSED", "연결이 끊겼습니다"),
         _ => e("OTHER", x.to_string()),
     }
 }
@@ -106,7 +109,7 @@ type MsClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStrea
 #[allow(clippy::large_enum_variant)]
 enum Engine {
     Pg { client: tokio_postgres::Client, cancel: tokio_postgres::CancelToken, tls: Option<tokio_postgres_rustls::MakeRustlsConnect> },
-    My { conn: tokio::sync::Mutex<mysql_async::Conn>, opts: mysql_async::Opts, thread: u32 },
+    My { conn: tokio::sync::Mutex<mysql_async::Conn>, opts: mysql_async::Opts, thread: u32, mariadb: bool },
     Ms { client: tokio::sync::Mutex<MsClient> },
     Jdbc { side: crate::jdbc::Sidecar },
 }
@@ -127,7 +130,104 @@ pub(crate) struct DbConn {
     read_only: bool,
     busy: tokio::sync::Mutex<()>,
     /// 수동 트랜잭션이 열려 있는지
-    in_tx: std::sync::atomic::AtomicBool,
+    in_tx: AtomicBool,
+    /// 수동 커밋 모드 — 쓰기 문장 앞에서 트랜잭션을 저절로 연다(커밋·되돌리기 뒤에도 유지)
+    manual: AtomicBool,
+    /// 열린 트랜잭션 안에서 실행한 문장 수
+    tx_stmts: AtomicU32,
+    /// 서버 세션에 걸어 둔 문장 시간 상한(ms, 0 = 없음, u64::MAX = 모름)
+    timeout_set: AtomicU64,
+    /// 다시 연결·데이터베이스 바꾸기용 접속 정보(암호는 메모리에만)
+    req: DbConnectReq,
+    /// 같은 번호로 다시 연결하면 바뀐다 — 옛 연결의 끊김 알림을 거르기 위해
+    gen: u64,
+    /// 끊김을 이미 알렸는지
+    closed: AtomicBool,
+}
+
+static GEN: AtomicU64 = AtomicU64::new(1);
+
+impl DbConn {
+    fn new(engine: Engine, req: DbConnectReq, gen: u64) -> Self {
+        DbConn {
+            engine,
+            read_only: req.read_only,
+            busy: Default::default(),
+            in_tx: Default::default(),
+            manual: Default::default(),
+            tx_stmts: Default::default(),
+            timeout_set: AtomicU64::new(0),
+            req,
+            gen,
+            closed: Default::default(),
+        }
+    }
+    fn is_mysql(&self) -> bool {
+        matches!(self.engine, Engine::My { .. })
+    }
+    fn tx_state(&self) -> TxState {
+        TxState { in_tx: self.in_tx.load(Ordering::Relaxed), stmts: self.tx_stmts.load(Ordering::Relaxed), manual: self.manual.load(Ordering::Relaxed) }
+    }
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct TxState {
+    in_tx: bool,
+    stmts: u32,
+    manual: bool,
+}
+
+/// 연결이 끊겼다고 화면에 알린다(같은 연결로 한 번만, 다시 연결한 뒤의 옛 연결 소식은 거른다)
+fn notify_closed(app: &AppHandle, id: u32, gen: u64) {
+    let dbs = app.state::<DbConns>();
+    let c = dbs.map.lock().unwrap().get(&id).cloned();
+    if let Some(c) = c {
+        if c.gen == gen && !c.closed.swap(true, Ordering::Relaxed) {
+            let _ = app.emit("db-closed", json!({ "conn": id }));
+        }
+    }
+}
+
+/// 살아 있는지 1분마다 확인(유휴 끊김 방지도 겸함) — 연결이 없어지면 끝난다
+fn spawn_keepalive(app: AppHandle, id: u32) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let c = {
+                let dbs = app.state::<DbConns>();
+                let got = dbs.map.lock().unwrap().get(&id).cloned();
+                got
+            };
+            let Some(c) = c else { return };
+            if c.closed.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Ok(guard) = c.busy.try_lock() else { continue };
+            let r = tokio::time::timeout(Duration::from_secs(15), ping(&c)).await;
+            drop(guard);
+            let dead = match r {
+                Err(_) => true,
+                Ok(Err(x)) => matches!(x.code, "CLOSED" | "NETWORK"),
+                Ok(Ok(())) => false,
+            };
+            if dead {
+                notify_closed(&app, id, c.gen);
+            }
+        }
+    });
+}
+
+async fn ping(c: &DbConn) -> R<()> {
+    match &c.engine {
+        Engine::Pg { client, .. } => client.simple_query("SELECT 1").await.map(|_| ()).map_err(pg_err),
+        Engine::My { conn, .. } => conn.lock().await.ping().await.map_err(my_err),
+        Engine::Ms { client } => {
+            client.lock().await.simple_query("SELECT 1").await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+            Ok(())
+        }
+        Engine::Jdbc { .. } => Ok(()),
+    }
 }
 
 #[derive(Default)]
@@ -166,7 +266,7 @@ pub struct Col {
     kind: &'static str,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DbConnectReq {
     profile_id: Option<i64>,
@@ -222,10 +322,38 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
             s
         }
     };
+    let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
+    let gen = GEN.fetch_add(1, Ordering::Relaxed);
+    let (engine, version) = open_engine(&req, pw.clone(), app, id, gen).await?;
+    if let Some(pid) = req.profile_id {
+        let mut saved = None;
+        if req.save_secret && !used_saved {
+            if let Some(p) = &pw {
+                saved = Some(secrets::set(&format!("profile:{pid}"), p).is_ok());
+            }
+        }
+        store.mark_used(pid, saved);
+    }
+    let features = engine.features();
+    let database = req.database.clone();
+    let mut keep = req;
+    keep.password = pw;
+    keep.save_secret = false;
+    dbs.map.lock().unwrap().insert(id, Arc::new(DbConn::new(engine, keep, gen)));
+    if let Some(a) = app {
+        spawn_keepalive(a.clone(), id);
+    }
+    Ok(DbConnectOk { conn_id: id, features, version, database, used_saved_secret: used_saved })
+}
+
+/// 엔진 하나 열기 — 처음 연결·다시 연결·데이터베이스 바꾸기가 함께 쓴다
+async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHandle>, id: u32, gen: u64) -> R<(Engine, String)> {
     let timeout = Duration::from_secs(12);
-    let (engine, version) = if req.engine == "postgres" {
+    let watch = app.cloned();
+    let out = if req.engine == "postgres" {
         let mut cfg = tokio_postgres::Config::new();
         cfg.host(&req.host).port(req.port).user(&req.username).connect_timeout(timeout).application_name("RuiBotte Shell");
+        cfg.keepalives(true).keepalives_idle(Duration::from_secs(60));
         cfg.dbname(req.database.as_deref().filter(|d| !d.is_empty()).unwrap_or("postgres"));
         if let Some(p) = &pw {
             cfg.password(p);
@@ -237,9 +365,27 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
             "require" | "verify" => tokio_postgres::config::SslMode::Require,
             _ => tokio_postgres::config::SslMode::Prefer,
         });
+        // 연결 일꾼이 끝나면(서버가 끊음·망 끊김) 화면에 알린다
+        let on_end = move || {
+            if let Some(a) = &watch {
+                notify_closed(a, id, gen);
+            }
+        };
         let res = match &tls {
-            Some(t) => cfg.connect(t.clone()).await.map(|(c, conn)| (c, tauri::async_runtime::spawn(async move { let _ = conn.await; }))),
-            None => cfg.connect(tokio_postgres::NoTls).await.map(|(c, conn)| (c, tauri::async_runtime::spawn(async move { let _ = conn.await; }))),
+            Some(t) => cfg.connect(t.clone()).await.map(|(c, conn)| {
+                let task = tauri::async_runtime::spawn(async move {
+                    let _ = conn.await;
+                    on_end();
+                });
+                (c, task)
+            }),
+            None => cfg.connect(tokio_postgres::NoTls).await.map(|(c, conn)| {
+                let task = tauri::async_runtime::spawn(async move {
+                    let _ = conn.await;
+                    on_end();
+                });
+                (c, task)
+            }),
         };
         let (client, _task) = match res {
             Ok(x) => x,
@@ -319,48 +465,95 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app
             "verify" => Some(mysql_async::SslOpts::default()),
             _ => None,
         };
-        let opts: mysql_async::Opts = mysql_async::OptsBuilder::default()
-            .ssl_opts(ssl)
-            .ip_or_hostname(req.host.clone())
-            .tcp_port(req.port)
-            .user(Some(req.username.clone()))
-            .pass(pw.clone())
-            .db_name(req.database.clone().filter(|d| !d.is_empty()))
-            .prefer_socket(false)
-            .secure_auth(!req.legacy)
-            .into();
-        let mut conn = match tokio::time::timeout(timeout, mysql_async::Conn::new(opts.clone())).await {
-            Err(_) => return Err(e("NETWORK", format!("{}:{} 에 닿지 못했습니다", req.host, req.port))),
-            Ok(Err(x)) => {
-                let err = my_err(x);
+        let build = |ssl: Option<mysql_async::SslOpts>| -> mysql_async::Opts {
+            mysql_async::OptsBuilder::default()
+                .ssl_opts(ssl)
+                .ip_or_hostname(req.host.clone())
+                .tcp_port(req.port)
+                .user(Some(req.username.clone()))
+                .pass(pw.clone())
+                .db_name(req.database.clone().filter(|d| !d.is_empty()))
+                .prefer_socket(false)
+                .secure_auth(!req.legacy)
+                .into()
+        };
+        let open = |opts: mysql_async::Opts| async move {
+            match tokio::time::timeout(timeout, mysql_async::Conn::new(opts)).await {
+                Err(_) => Err(e("NETWORK", format!("{}:{} 에 닿지 못했습니다", req.host, req.port))),
+                Ok(Err(x)) => Err(my_err(x)),
+                Ok(Ok(c)) => Ok(c),
+            }
+        };
+        let mut opts = build(ssl);
+        let mut first = open(opts.clone()).await;
+        // "되면 사용(prefer)" — TLS 를 못 하는 서버면 평문으로 한 번 더(인증 실패·시간 초과는 그대로)
+        if mode == "prefer" {
+            if let Err(x) = &first {
+                let m = x.message.to_lowercase();
+                if x.code != "AUTH_FAILED" && !m.contains("닿지 못했습니다") {
+                    opts = build(None);
+                    first = open(opts.clone()).await;
+                }
+            }
+        }
+        let mut conn = match first {
+            Err(err) => {
                 if pw.is_none() && err.code == "AUTH_FAILED" {
                     return Err(e("NEED_SECRET", "암호를 입력하세요"));
                 }
                 return Err(err);
             }
-            Ok(Ok(c)) => c,
+            Ok(c) => c,
         };
         if req.read_only {
             conn.query_drop("SET SESSION TRANSACTION READ ONLY").await.map_err(my_err)?;
         }
         let v: Option<String> = conn.query_first("SELECT VERSION()").await.map_err(my_err)?;
         let thread = conn.id();
-        (Engine::My { conn: tokio::sync::Mutex::new(conn), opts, thread }, v.unwrap_or_default())
+        let version = v.unwrap_or_default();
+        let mariadb = version.to_lowercase().contains("mariadb");
+        (Engine::My { conn: tokio::sync::Mutex::new(conn), opts, thread, mariadb }, version)
     };
+    Ok(out)
+}
 
-    if let Some(id) = req.profile_id {
-        let mut saved = None;
-        if req.save_secret && !used_saved {
-            if let Some(p) = &pw {
-                saved = Some(secrets::set(&format!("profile:{id}"), p).is_ok());
-            }
-        }
-        store.mark_used(id, saved);
+/// 같은 연결 번호로 다시 연결 — 끊긴 뒤 다시 잇기, PostgreSQL 데이터베이스 바꾸기(database 를 줄 때).
+/// 열린 트랜잭션은 사라진다(화면이 먼저 묻는다).
+#[tauri::command]
+pub async fn db_reconnect(app: AppHandle, dbs: State<'_, DbConns>, conn: u32, database: Option<String>) -> R<DbConnectOk> {
+    let old = dbs.get(conn)?;
+    let mut req = old.req.clone();
+    if let Some(d) = database.filter(|d| !d.is_empty()) {
+        req.database = Some(d);
     }
+    let gen = GEN.fetch_add(1, Ordering::Relaxed);
+    let (engine, version) = open_engine(&req, req.password.clone(), Some(&app), conn, gen).await?;
     let features = engine.features();
-    let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
-    dbs.map.lock().unwrap().insert(id, Arc::new(DbConn { engine, read_only: req.read_only, busy: Default::default(), in_tx: Default::default() }));
-    Ok(DbConnectOk { conn_id: id, features, version, database: req.database, used_saved_secret: used_saved })
+    let db = req.database.clone();
+    let prev = dbs.map.lock().unwrap().insert(conn, Arc::new(DbConn::new(engine, req, gen)));
+    if let Some(p) = prev {
+        // 옛 연결은 기다리지 않고 정리(끊긴 연결이면 오래 걸릴 수 있다)
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), shutdown(&p)).await;
+        });
+    }
+    Ok(DbConnectOk { conn_id: conn, features, version, database: db, used_saved_secret: false })
+}
+
+/// PostgreSQL 데이터베이스 목록(바꾸기 고르기용)
+#[tauri::command]
+pub async fn db_databases(dbs: State<'_, DbConns>, conn: u32) -> R<Vec<String>> {
+    let c = dbs.get(conn)?;
+    let sql = match &c.engine {
+        Engine::Pg { .. } => "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1",
+        Engine::My { .. } => "SHOW DATABASES",
+        Engine::Ms { .. } => "SELECT name FROM sys.databases WHERE state = 0 ORDER BY name",
+        Engine::Jdbc { .. } => return Ok(Vec::new()),
+    };
+    let Ok(_busy) = c.busy.try_lock() else {
+        return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
+    };
+    Ok(rows_of(&c, sql).await?.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
 }
 
 #[derive(Serialize)]
@@ -391,15 +584,19 @@ pub async fn db_disconnect(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
 async fn close(dbs: &DbConns, conn: u32) {
     let c = dbs.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
-        match &c.engine {
-            Engine::My { conn, .. } => {
-                let _ = conn.lock().await.query_drop("DO 0").await;
-            }
-            Engine::Jdbc { side } => {
-                let _ = side.call(json!({"op": "close"})).await;
-            }
-            _ => {}
+        shutdown(&c).await;
+    }
+}
+
+async fn shutdown(c: &DbConn) {
+    match &c.engine {
+        Engine::My { conn, .. } => {
+            let _ = conn.lock().await.query_drop("DO 0").await;
         }
+        Engine::Jdbc { side } => {
+            let _ = side.call(json!({"op": "close"})).await;
+        }
+        _ => {}
     }
 }
 
@@ -422,7 +619,249 @@ fn first_word(sql: &str) -> String {
     s.chars().take_while(|c| c.is_ascii_alphabetic()).collect::<String>().to_lowercase()
 }
 
-const READ_WORDS: &[&str] = &["select", "show", "explain", "describe", "desc", "with", "values", "table", "help"];
+/// 낱말 읽기 결과 — 단어(대문자)·여는 괄호·닫는 괄호·그 밖
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    Open,
+    Close,
+    Other,
+}
+
+/// 주석·문자열·따옴표 이름·PostgreSQL $$ 글을 건너뛰고 단어와 괄호만 낸다
+fn tokens(sql: &str, mysql: bool) -> Vec<Tok> {
+    let b: Vec<char> = sql.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let n = b.len();
+    let skip_quoted = |i: &mut usize, q: char, backslash: bool| {
+        *i += 1;
+        while *i < n {
+            let c = b[*i];
+            if backslash && c == '\\' {
+                *i += 2;
+                continue;
+            }
+            if c == q {
+                if *i + 1 < n && b[*i + 1] == q {
+                    *i += 2;
+                    continue;
+                }
+                *i += 1;
+                return;
+            }
+            *i += 1;
+        }
+    };
+    while i < n {
+        let c = b[i];
+        if c == '-' && i + 1 < n && b[i + 1] == '-' || (mysql && c == '#') {
+            while i < n && b[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && i + 1 < n && b[i + 1] == '*' {
+            i += 2;
+            while i < n && !(b[i] == '*' && i + 1 < n && b[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c == '\'' {
+            skip_quoted(&mut i, '\'', mysql);
+            out.push(Tok::Other);
+        } else if c == '"' {
+            skip_quoted(&mut i, '"', false);
+            out.push(Tok::Other);
+        } else if c == '`' {
+            skip_quoted(&mut i, '`', false);
+            out.push(Tok::Other);
+        } else if c == '$' && !mysql {
+            // $태그$ … $태그$
+            let mut j = i + 1;
+            while j < n && (b[j].is_alphanumeric() || b[j] == '_') {
+                j += 1;
+            }
+            if j < n && b[j] == '$' {
+                let tag: String = b[i..=j].iter().collect();
+                let rest: String = b[j + 1..].iter().collect();
+                match rest.find(&tag) {
+                    Some(k) => i = j + 1 + rest[..k].chars().count() + tag.chars().count(),
+                    None => i = n,
+                }
+                out.push(Tok::Other);
+            } else {
+                i += 1;
+                out.push(Tok::Other);
+            }
+        } else if c == '(' {
+            out.push(Tok::Open);
+            i += 1;
+        } else if c == ')' {
+            out.push(Tok::Close);
+            i += 1;
+        } else if c.is_alphabetic() || c == '_' {
+            let s = i;
+            while i < n && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '$' || b[i] == '#') {
+                i += 1;
+            }
+            out.push(Tok::Word(b[s..i].iter().collect::<String>().to_uppercase()));
+        } else if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_digit() {
+            while i < n && (b[i].is_alphanumeric() || b[i] == '.') {
+                i += 1;
+            }
+        } else {
+            out.push(Tok::Other);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 문장 판정 — 원본 Orbit SqlSplitter.classify 와 같은 규칙
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Classified {
+    /// read | dml | ddl | tx | set | explain | other | empty
+    kind: &'static str,
+    keyword: String,
+    /// 데이터·스키마를 바꿀 수 있는 문장
+    writes: bool,
+    /// 한 번 더 확인할 문장(DDL·GRANT·WHERE 없는 UPDATE/DELETE·쓰기 EXPLAIN ANALYZE)
+    dangerous: bool,
+    reason: String,
+    explain_analyze: bool,
+    /// 읽기 전용 연결에서 실행해도 되는가
+    read_only_safe: bool,
+}
+
+const DML_WORDS: &[&str] = &["INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "UPSERT", "LOAD"];
+const DDL_WORDS: &[&str] = &["CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "GRANT", "REVOKE", "COMMENT"];
+const TX_WORDS: &[&str] = &["BEGIN", "START", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "END", "ABORT"];
+const READ_WORDS: &[&str] = &["SELECT", "SHOW", "DESCRIBE", "DESC", "VALUES", "TABLE", "USE", "HELP", "PRAGMA"];
+const MAIN_AFTER_WITH: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE"];
+
+fn cls(kind: &'static str, keyword: &str, writes: bool, dangerous: bool, reason: impl Into<String>) -> Classified {
+    let read_only_safe = matches!(kind, "read" | "empty");
+    Classified { kind, keyword: keyword.into(), writes, dangerous, reason: reason.into(), explain_analyze: false, read_only_safe }
+}
+
+pub(crate) fn classify(sql: &str, mysql: bool) -> Classified {
+    let toks = tokens(sql, mysql);
+    let mut top: Vec<String> = Vec::new();
+    let mut paren_first: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    let mut after_open = false;
+    for t in &toks {
+        match t {
+            Tok::Open => {
+                depth += 1;
+                after_open = true;
+            }
+            Tok::Close => {
+                depth = depth.saturating_sub(1);
+                after_open = false;
+            }
+            Tok::Word(w) => {
+                if after_open {
+                    paren_first.push(w.clone());
+                    after_open = false;
+                }
+                if depth == 0 || top.is_empty() {
+                    top.push(w.clone());
+                }
+            }
+            Tok::Other => after_open = false,
+        }
+    }
+    let Some(first) = top.first().cloned() else {
+        return cls("empty", "", false, false, "");
+    };
+    let explain_like = first == "EXPLAIN" || (first == "ANALYZE" && mysql && top.len() > 1 && (MAIN_AFTER_WITH.contains(&top[1].as_str()) || top[1] == "FORMAT"));
+    if explain_like {
+        let analyze = first == "ANALYZE" || top.iter().take(6).any(|w| w == "ANALYZE");
+        // 안쪽 문장 — 첫 본 문장 낱말부터
+        let at = top.iter().position(|w| ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE", "REPLACE"].contains(&w.as_str()));
+        let inner_writes = at
+            .map(|_| {
+                let upper = sql.to_ascii_uppercase();
+                let mut best: Option<usize> = None;
+                for k in ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE", "REPLACE"] {
+                    if let Some(i) = word_index(&upper, k) {
+                        best = Some(best.map_or(i, |b: usize| b.min(i)));
+                    }
+                }
+                best.map(|i| classify(&sql[i..], mysql).writes).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let w = analyze && inner_writes;
+        return Classified {
+            kind: "explain",
+            keyword: "EXPLAIN".into(),
+            writes: w,
+            dangerous: w,
+            reason: if w { "EXPLAIN ANALYZE 는 쓰기 문장을 실제로 실행합니다".into() } else { String::new() },
+            explain_analyze: analyze,
+            read_only_safe: !w,
+        };
+    }
+    let mut keyword = first.clone();
+    if first == "WITH" {
+        keyword = top.iter().skip(1).find(|w| MAIN_AFTER_WITH.contains(&w.as_str())).cloned().unwrap_or_else(|| "SELECT".into());
+        let writable_cte = paren_first.iter().any(|w| DML_WORDS.contains(&w.as_str()));
+        if writable_cte && keyword == "SELECT" {
+            return cls("dml", "WITH", true, false, "WITH 안에서 행을 바꿉니다");
+        }
+    }
+    let k = keyword.as_str();
+    if READ_WORDS.contains(&k) {
+        if k == "SELECT" && top.iter().any(|w| w == "INTO") {
+            return cls("ddl", "SELECT INTO", true, true, "SELECT INTO 는 새 표·변수에 씁니다");
+        }
+        return cls("read", k, false, false, "");
+    }
+    if DML_WORDS.contains(&k) {
+        let bulk = (k == "UPDATE" || k == "DELETE") && !top.iter().any(|w| w == "WHERE");
+        return cls("dml", k, true, bulk, if bulk { format!("{k} 에 WHERE 가 없습니다 — 표의 모든 행이 바뀝니다") } else { String::new() });
+    }
+    if DDL_WORDS.contains(&k) {
+        let why = if k == "GRANT" || k == "REVOKE" { format!("권한을 바꾸는 문장({k})입니다") } else { format!("스키마를 바꾸는 문장({k})입니다") };
+        return cls("ddl", k, true, true, why);
+    }
+    if TX_WORDS.contains(&k) {
+        return cls("tx", k, false, false, "");
+    }
+    if k == "SET" {
+        // 읽기 전용을 풀 수 있는 SET 은 읽기 문장이 아니다
+        let escape = top.iter().any(|w| ["READ", "TRANSACTION", "CHARACTERISTICS", "ROLE", "SESSION_AUTHORIZATION", "TX_READ_ONLY", "TRANSACTION_READ_ONLY"].contains(&w.as_str()));
+        return cls(if escape { "other" } else { "set" }, "SET", escape, false, "");
+    }
+    cls("other", k, true, false, "")
+}
+
+/// 낱말 경계에 맞는 첫 위치(바이트)
+fn word_index(upper: &str, word: &str) -> Option<usize> {
+    let bytes = upper.as_bytes();
+    let mut from = 0;
+    while let Some(off) = upper[from..].find(word) {
+        let i = from + off;
+        let left = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let e = i + word.len();
+        let right = e >= bytes.len() || !(bytes[e].is_ascii_alphanumeric() || bytes[e] == b'_');
+        if left && right {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// 문장들 판정(실행 전 확인 창용) — 실제 막기는 db_query 가 같은 규칙으로 한다
+#[tauri::command]
+pub fn db_classify(sqls: Vec<String>, engine: String) -> Vec<Classified> {
+    let my = engine == "mysql" || engine == "mariadb";
+    sqls.iter().map(|s| classify(s, my)).collect()
+}
 
 // ── 실행 ────────────────────────────
 
@@ -437,6 +876,7 @@ pub struct QueryOk {
     truncated: bool,
     ms: u64,
     first_row_ms: Option<u64>,
+    tx: TxState,
 }
 
 fn my_kind(t: mysql_async::consts::ColumnType) -> &'static str {
@@ -531,22 +971,208 @@ fn kind_of(s: &str) -> &'static str {
     }
 }
 
-/// 문장 하나 실행. 행은 max_rows 까지만 받고 넘으면 서버 쪽 취소
+/// 문장 하나 실행. 행은 max_rows 까지만 받고 넘으면 서버 쪽 취소.
+/// timeout_ms — 문장 시간 상한(PostgreSQL statement_timeout · MySQL max_execution_time · MariaDB max_statement_time, 그 밖은 앱이 재다가 취소)
 #[tauri::command]
-pub async fn db_query(dbs: State<'_, DbConns>, conn: u32, sql: String, max_rows: Option<usize>) -> R<QueryOk> {
-    query(&dbs, conn, sql, max_rows).await
+pub async fn db_query(app: AppHandle, dbs: State<'_, DbConns>, conn: u32, sql: String, max_rows: Option<usize>, timeout_ms: Option<u64>) -> R<QueryOk> {
+    let r = query_opts(&dbs, conn, sql, max_rows, timeout_ms, Some(&app)).await;
+    if let Err(x) = &r {
+        if matches!(x.code, "CLOSED" | "NETWORK") {
+            if let Ok(c) = dbs.get(conn) {
+                notify_closed(&app, conn, c.gen);
+            }
+        }
+    }
+    r
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Option<usize>) -> R<QueryOk> {
+    query_opts(dbs, conn, sql, max_rows, None, None).await
+}
+
+struct Got {
+    columns: Vec<Col>,
+    rows: Vec<Vec<Option<String>>>,
+    affected: Option<u64>,
+    truncated: bool,
+    has_set: bool,
+    first_row_ms: Option<u64>,
+}
+
+/// 서버 세션에 문장 시간 상한을 건다 — 서버가 맡으면 true(아니면 앱이 잰다)
+async fn set_server_timeout(c: &DbConn, ms: u64) -> bool {
+    let sql = match &c.engine {
+        Engine::Pg { .. } => format!("SET statement_timeout = {ms}"),
+        Engine::My { mariadb: true, .. } => format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0),
+        Engine::My { .. } => format!("SET SESSION max_execution_time = {ms}"),
+        _ => return false,
+    };
+    if c.timeout_set.load(Ordering::Relaxed) == ms {
+        return true;
+    }
+    let ok = match &c.engine {
+        Engine::Pg { client, .. } => client.batch_execute(&sql).await.is_ok(),
+        Engine::My { conn, .. } => conn.lock().await.query_drop(sql.as_str()).await.is_ok(),
+        _ => false,
+    };
+    c.timeout_set.store(if ok { ms } else { u64::MAX }, Ordering::Relaxed);
+    // MySQL max_execution_time 은 SELECT 에만 듣는다 — 나머지는 앱이 재다가 취소
+    ok
+}
+
+/// 실행 중인 문장 취소(엔진별)
+async fn cancel_conn(c: &DbConn) -> R<()> {
+    match &c.engine {
+        Engine::Pg { cancel, tls, .. } => match tls {
+            Some(t) => cancel.cancel_query(t.clone()).await.map_err(pg_err),
+            None => cancel.cancel_query(tokio_postgres::NoTls).await.map_err(pg_err),
+        },
+        Engine::My { opts, thread, .. } => {
+            let mut k = mysql_async::Conn::new(opts.clone()).await.map_err(my_err)?;
+            k.query_drop(format!("KILL QUERY {thread}")).await.map_err(my_err)?;
+            let _ = k.disconnect().await;
+            Ok(())
+        }
+        Engine::Ms { .. } => Err(e("OTHER", "SQL Server 는 아직 실행 중 취소를 지원하지 않습니다")),
+        Engine::Jdbc { side } => {
+            side.call(json!({"op": "cancel"})).await.map_err(|m| e("CLOSED", m))?;
+            Ok(())
+        }
+    }
+}
+
+/// 트랜잭션 열기 — 바쁨 잠금은 부르는 쪽이 쥐고 있다
+async fn tx_raw(c: &DbConn, op: &str) -> R<()> {
+    let sql = match (op, &c.engine) {
+        ("begin", Engine::Ms { .. }) => "BEGIN TRANSACTION",
+        ("begin", Engine::My { .. }) => "START TRANSACTION",
+        ("begin", _) => "BEGIN",
+        ("commit", Engine::Ms { .. }) => "IF @@TRANCOUNT > 0 COMMIT TRANSACTION",
+        ("commit", _) => "COMMIT",
+        ("rollback", Engine::Ms { .. }) => "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+        ("rollback", _) => "ROLLBACK",
+        _ => return Err(e("OTHER", "알 수 없는 작업")),
+    };
+    match &c.engine {
+        Engine::Pg { client, .. } => client.batch_execute(sql).await.map_err(pg_err)?,
+        Engine::My { conn, .. } => conn.lock().await.query_drop(sql).await.map_err(my_err)?,
+        Engine::Ms { client } => {
+            client.lock().await.simple_query(sql).await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+        }
+        Engine::Jdbc { side } => {
+            let v = side.call(json!({"op": "tx", "action": op})).await.map_err(|m| e("CLOSED", m))?;
+            if v["type"] == "error" {
+                return Err(jdbc_err(&v));
+            }
+        }
+    }
+    let open = op == "begin";
+    c.in_tx.store(open, Ordering::Relaxed);
+    c.tx_stmts.store(0, Ordering::Relaxed);
+    if op == "rollback" {
+        // 트랜잭션 안에서 건 SET 은 되돌려진다
+        c.timeout_set.store(u64::MAX, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// 사용자가 친 BEGIN·COMMIT·ROLLBACK 도 트랜잭션 표시에 반영
+fn track_tx(c: &DbConn, cl: &Classified, sql: &str) {
+    if cl.kind == "tx" {
+        let up = sql.to_ascii_uppercase();
+        match cl.keyword.as_str() {
+            "BEGIN" | "START" => {
+                // MySQL BEGIN … END 블록이 아닌 경우만(문장 하나로 오면 트랜잭션 시작)
+                c.in_tx.store(true, Ordering::Relaxed);
+                c.tx_stmts.store(0, Ordering::Relaxed);
+            }
+            "COMMIT" | "END" | "ABORT" => {
+                c.in_tx.store(false, Ordering::Relaxed);
+                c.tx_stmts.store(0, Ordering::Relaxed);
+            }
+            "ROLLBACK" if word_index(&up, "TO").is_none() => {
+                c.in_tx.store(false, Ordering::Relaxed);
+                c.tx_stmts.store(0, Ordering::Relaxed);
+                c.timeout_set.store(u64::MAX, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    } else if c.in_tx.load(Ordering::Relaxed) {
+        c.tx_stmts.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: Option<usize>, timeout_ms: Option<u64>, app: Option<&AppHandle>) -> R<QueryOk> {
     let c = dbs.get(conn)?;
     let max = max_rows.unwrap_or(100_000).clamp(1, 1_000_000);
-    if c.read_only && !READ_WORDS.contains(&first_word(&sql).as_str()) {
-        return Err(e("READ_ONLY", "읽기 전용 연결이라 조회 문장만 실행합니다"));
+    let cl = classify(&sql, c.is_mysql());
+    // 읽기 전용은 앱 화면이 아니라 여기서 막는다(화면을 거치지 않는 호출도)
+    if c.read_only && !cl.read_only_safe {
+        let why = if cl.reason.is_empty() { format!("{} 문장", cl.keyword) } else { cl.reason.clone() };
+        return Err(e("READ_ONLY", format!("읽기 전용 연결이라 조회 문장만 실행합니다 — {why}")));
     }
     let Ok(_busy) = c.busy.try_lock() else {
         return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
     };
+    // 수동 커밋 — 쓰기 문장 앞에서 트랜잭션을 연다
+    if c.manual.load(Ordering::Relaxed) && !c.in_tx.load(Ordering::Relaxed) && cl.writes && cl.kind != "tx" {
+        tx_raw(&c, "begin").await?;
+    }
+    let limit = timeout_ms.filter(|ms| *ms > 0);
+    let server_side = match limit {
+        Some(ms) => set_server_timeout(&c, ms).await && !(matches!(c.engine, Engine::My { mariadb: false, .. }) && cl.keyword != "SELECT"),
+        None => {
+            if c.timeout_set.load(Ordering::Relaxed) != 0 {
+                set_server_timeout(&c, 0).await;
+            }
+            true
+        }
+    };
     let started = Instant::now();
+    let fut = exec(&c, &sql, max, started);
+    pin_mut!(fut);
+    let got = match limit {
+        Some(ms) if !server_side => {
+            tokio::select! {
+                r = &mut fut => r,
+                _ = tokio::time::sleep(Duration::from_millis(ms)) => {
+                    if matches!(c.engine, Engine::Ms { .. }) {
+                        // SQL Server 는 실행 중 취소가 없어 연결을 버린다(다시 연결 단추로 잇는다)
+                        if let Some(a) = app {
+                            notify_closed(a, conn, c.gen);
+                        }
+                        Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다. SQL Server 는 연결을 끊어 멈추므로 다시 연결하세요", ms / 1000)))
+                    } else {
+                        let _ = cancel_conn(&c).await;
+                        match fut.await {
+                            Err(x) if x.code == "CANCELLED" => Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다", ms / 1000))),
+                            other => other,
+                        }
+                    }
+                }
+            }
+        }
+        _ => fut.await,
+    };
+    let got = match got {
+        Err(x) if x.code == "CANCELLED" && limit.is_some_and(|ms| started.elapsed().as_millis() as u64 + 100 >= ms) => Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다", limit.unwrap_or(0) / 1000))),
+        other => other,
+    };
+    track_tx(&c, &cl, &sql);
+    let Got { columns, rows, affected, truncated, has_set, first_row_ms } = got?;
+    let row_count = rows.len();
+    let result_id = if has_set {
+        let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
+        dbs.results.lock().unwrap().insert(id, Arc::new(ResultSet { columns: columns.clone(), rows, view: Mutex::new(None) }));
+        Some(id)
+    } else {
+        None
+    };
+    Ok(QueryOk { result_id, columns, row_count, affected, truncated, ms: started.elapsed().as_millis() as u64, first_row_ms, tx: c.tx_state() })
+}
+
+async fn exec(c: &DbConn, sql: &str, max: usize, started: Instant) -> R<Got> {
     let mut first_row_ms = None;
     let mut columns: Vec<Col> = Vec::new();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
@@ -555,7 +1181,7 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
     let mut has_set = false;
     match &c.engine {
         Engine::Pg { client, cancel, tls } => {
-            let stream = client.simple_query_raw(&sql).await.map_err(pg_err)?;
+            let stream = client.simple_query_raw(sql).await.map_err(pg_err)?;
             pin_mut!(stream);
             while let Some(m) = stream.next().await {
                 match m {
@@ -600,7 +1226,7 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
         }
         Engine::My { conn, .. } => {
             let mut g = conn.lock().await;
-            let mut res = g.query_iter(sql.as_str()).await.map_err(my_err)?;
+            let mut res = g.query_iter(sql).await.map_err(my_err)?;
             let cols = res.columns_ref().to_vec();
             if !cols.is_empty() {
                 has_set = true;
@@ -621,9 +1247,9 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
         }
         Engine::Ms { client } => {
             let mut g = client.lock().await;
-            let fw = first_word(&sql);
+            let fw = first_word(sql);
             if READ_WORDS.contains(&fw.as_str()) || fw == "exec" || fw == "execute" || fw == "sp_help" {
-                let mut stream = g.simple_query(sql.as_str()).await.map_err(ms_err)?;
+                let mut stream = g.simple_query(sql).await.map_err(ms_err)?;
                 let mut set: Option<usize> = None;
                 while let Some(item) = stream.try_next().await.map_err(ms_err)? {
                     match item {
@@ -650,7 +1276,7 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
                     }
                 }
             } else {
-                let res = g.execute(sql.as_str(), &[]).await.map_err(ms_err)?;
+                let res = g.execute(sql, &[]).await.map_err(ms_err)?;
                 affected = Some(res.total());
             }
         }
@@ -689,37 +1315,13 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
             outcome?;
         }
     }
-    let row_count = rows.len();
-    let result_id = if has_set {
-        let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
-        dbs.results.lock().unwrap().insert(id, Arc::new(ResultSet { columns: columns.clone(), rows, view: Mutex::new(None) }));
-        Some(id)
-    } else {
-        None
-    };
-    Ok(QueryOk { result_id, columns, row_count, affected, truncated, ms: started.elapsed().as_millis() as u64, first_row_ms })
+    Ok(Got { columns, rows, affected, truncated, has_set, first_row_ms })
 }
 
 #[tauri::command]
 pub async fn db_cancel(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
     let c = dbs.get(conn)?;
-    match &c.engine {
-        Engine::Pg { cancel, tls, .. } => match tls {
-            Some(t) => cancel.cancel_query(t.clone()).await.map_err(pg_err),
-            None => cancel.cancel_query(tokio_postgres::NoTls).await.map_err(pg_err),
-        },
-        Engine::My { opts, thread, .. } => {
-            let mut k = mysql_async::Conn::new(opts.clone()).await.map_err(my_err)?;
-            k.query_drop(format!("KILL QUERY {thread}")).await.map_err(my_err)?;
-            let _ = k.disconnect().await;
-            Ok(())
-        }
-        Engine::Ms { .. } => Err(e("OTHER", "SQL Server 는 아직 실행 중 취소를 지원하지 않습니다")),
-        Engine::Jdbc { side } => {
-            side.call(json!({"op": "cancel"})).await.map_err(|m| e("CLOSED", m))?;
-            Ok(())
-        }
-    }
+    cancel_conn(&c).await
 }
 
 #[tauri::command]
@@ -806,12 +1408,28 @@ pub fn db_result_close(dbs: State<'_, DbConns>, result: u32) {
     dbs.results.lock().unwrap().remove(&result);
 }
 
-/// 결과를 파일로 — csv(UTF-8 BOM, 엑셀이 한글을 바로 읽게) · tsv · json
+/// 결과를 파일로 — csv(UTF-8 BOM, 엑셀이 한글을 바로 읽게) · tsv · json · sql(INSERT 문 — insert_prefix 는 화면이 엔진에 맞게 만든 `INSERT INTO 표 (열…) VALUES `)
 #[tauri::command]
-pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: String) -> R<usize> {
+pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: String, insert_prefix: Option<String>, mysql: Option<bool>) -> R<usize> {
     let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
     let mut out = String::new();
     match format.as_str() {
+        "sql" => {
+            let prefix = insert_prefix.unwrap_or_default();
+            let my = mysql.unwrap_or(false);
+            for row in r.visible() {
+                let vals: Vec<String> = row
+                    .iter()
+                    .zip(&r.columns)
+                    .map(|(v, c)| match v {
+                        None => "NULL".to_string(),
+                        Some(x) if matches!(c.kind, "int" | "numeric") && x.trim().parse::<f64>().is_ok() => x.trim().to_string(),
+                        Some(x) => lit(x, my),
+                    })
+                    .collect();
+                out.push_str(&format!("{prefix}({});\n", vals.join(", ")));
+            }
+        }
         "json" => {
             let arr: Vec<serde_json::Map<String, serde_json::Value>> = r
                 .visible()
@@ -850,6 +1468,170 @@ pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: Str
     }
     std::fs::write(&path, out).map_err(|x| e("OTHER", x.to_string()))?;
     Ok(r.visible().len())
+}
+
+// ── 실행 계획 ───────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainOk {
+    /// pg-json | my-json | text
+    format: &'static str,
+    plan: String,
+    ms: u64,
+    /// 쓰기 문장을 ANALYZE 로 실제 실행한 뒤 되돌렸는지
+    rolled_back: bool,
+}
+
+/// 실행 계획 — PostgreSQL EXPLAIN (FORMAT JSON), MySQL EXPLAIN FORMAT=JSON, MariaDB ANALYZE FORMAT=JSON,
+/// SQL Server SHOWPLAN_TEXT(글). analyze 면 실제로 실행한다 — 쓰기 문장이면 실행 뒤 되돌린다.
+#[tauri::command]
+pub async fn db_explain(dbs: State<'_, DbConns>, conn: u32, sql: String, analyze: bool) -> R<ExplainOk> {
+    let c = dbs.get(conn)?;
+    let inner = classify(&sql, c.is_mysql());
+    if c.read_only && (!inner.read_only_safe || (analyze && inner.writes)) {
+        return Err(e("READ_ONLY", "읽기 전용 연결이라 쓰기 문장의 실행 계획은 볼 수 없습니다"));
+    }
+    let Ok(_busy) = c.busy.try_lock() else {
+        return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
+    };
+    let started = Instant::now();
+    let body = sql.trim().trim_end_matches(';').to_string();
+    let wrap = analyze && inner.writes;
+    let in_tx = c.in_tx.load(Ordering::Relaxed);
+    let first_col = |rows: Vec<Vec<Option<String>>>| rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect::<Vec<_>>().join("\n");
+    let (format, plan) = match &c.engine {
+        Engine::Pg { client, .. } => {
+            let q = if analyze { format!("EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS, VERBOSE) {body}") } else { format!("EXPLAIN (FORMAT JSON, VERBOSE, COSTS) {body}") };
+            if wrap {
+                client.batch_execute(if in_tx { "SAVEPOINT rb_explain" } else { "BEGIN" }).await.map_err(pg_err)?;
+            }
+            let r = rows_of(&c, &q).await;
+            if wrap {
+                client.batch_execute(if in_tx { "ROLLBACK TO SAVEPOINT rb_explain; RELEASE SAVEPOINT rb_explain" } else { "ROLLBACK" }).await.map_err(pg_err)?;
+            }
+            ("pg-json", first_col(r?))
+        }
+        Engine::My { conn, mariadb, .. } => {
+            let (q, f) = match (analyze, *mariadb) {
+                (false, _) => (format!("EXPLAIN FORMAT=JSON {body}"), "my-json"),
+                (true, true) => (format!("ANALYZE FORMAT=JSON {body}"), "my-json"),
+                (true, false) => (format!("EXPLAIN ANALYZE {body}"), "text"),
+            };
+            if wrap {
+                conn.lock().await.query_drop(if in_tx { "SAVEPOINT rb_explain" } else { "START TRANSACTION" }).await.map_err(my_err)?;
+            }
+            let r = rows_of(&c, &q).await;
+            if wrap {
+                conn.lock().await.query_drop(if in_tx { "ROLLBACK TO SAVEPOINT rb_explain" } else { "ROLLBACK" }).await.map_err(my_err)?;
+            }
+            (f, first_col(r?))
+        }
+        Engine::Ms { client } => {
+            if analyze {
+                return Err(e("OTHER", "SQL Server 는 예상 계획(SHOWPLAN)만 봅니다"));
+            }
+            let mut g = client.lock().await;
+            g.simple_query("SET SHOWPLAN_TEXT ON").await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+            let r = match g.simple_query(body.as_str()).await {
+                Ok(st) => st.into_results().await.map_err(ms_err),
+                Err(x) => Err(ms_err(x)),
+            };
+            // 오류여도 반드시 끈다(안 끄면 다음 문장이 실행되지 않고 계획만 나온다)
+            g.simple_query("SET SHOWPLAN_TEXT OFF").await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
+            let sets = r?;
+            let text = sets.into_iter().flatten().filter_map(|row| row.into_iter().next().and_then(ms_value)).collect::<Vec<_>>().join("\n");
+            ("text", text)
+        }
+        Engine::Jdbc { .. } => return Err(e("OTHER", "이 엔진은 계획 트리를 지원하지 않습니다")),
+    };
+    Ok(ExplainOk { format, plan, ms: started.elapsed().as_millis() as u64, rolled_back: wrap })
+}
+
+// ── CSV 가져오기 ─────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CsvData {
+    rows: Vec<Vec<String>>,
+    /// 쉼표·탭·세미콜론
+    delimiter: String,
+    encoding: String,
+}
+
+/// CSV 한 덩이 나누기(RFC 4180 — 따옴표 안 줄바꿈·"" 이스케이프)
+pub(crate) fn parse_csv(text: &str, delim: char) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut row = Vec::new();
+    let mut cell = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    let mut any = false;
+    while let Some(ch) = chars.next() {
+        any = true;
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    cell.push('"');
+                    chars.next();
+                } else {
+                    quoted = false;
+                }
+            } else {
+                cell.push(ch);
+            }
+        } else if ch == '"' && cell.is_empty() {
+            quoted = true;
+        } else if ch == delim {
+            row.push(std::mem::take(&mut cell));
+        } else if ch == '\r' {
+            // \r\n 은 \n 에서 끊는다
+        } else if ch == '\n' {
+            row.push(std::mem::take(&mut cell));
+            out.push(std::mem::take(&mut row));
+            any = false;
+        } else {
+            cell.push(ch);
+        }
+    }
+    if any || !cell.is_empty() || !row.is_empty() {
+        row.push(cell);
+        out.push(row);
+    }
+    out
+}
+
+/// CSV 파일 읽기 — 인코딩(UTF-8·EUC-KR 등)과 구분자를 짐작한다. 행 상한 100만
+#[tauri::command]
+pub fn db_read_csv(path: String) -> R<CsvData> {
+    let bytes = std::fs::read(&path).map_err(|x| e("OTHER", x.to_string()))?;
+    let d = crate::textcodec::decode(&bytes, None);
+    let Some(text) = d.text else {
+        return Err(e("OTHER", "글 파일이 아닙니다"));
+    };
+    let head = text.lines().next().unwrap_or("");
+    let delim = [('\t', head.matches('\t').count()), (';', head.matches(';').count()), (',', head.matches(',').count())]
+        .into_iter()
+        .max_by_key(|x| x.1)
+        .filter(|x| x.1 > 0)
+        .map(|x| x.0)
+        .unwrap_or(',');
+    let mut rows = parse_csv(&text, delim);
+    rows.truncate(1_000_000);
+    Ok(CsvData { rows, delimiter: delim.to_string(), encoding: d.meta.encoding })
+}
+
+/// 바이너리 칸 저장 — 16진 글(0x… 또는 \x…)을 바이트로 바꿔 파일에 쓴다
+#[tauri::command]
+pub fn db_save_hex(path: String, hex: String) -> R<usize> {
+    let h = hex.trim();
+    let h = h.strip_prefix("0x").or_else(|| h.strip_prefix("0X")).or_else(|| h.strip_prefix("\\x")).unwrap_or(h);
+    if h.len() % 2 != 0 {
+        return Err(e("OTHER", "16진 글 길이가 홀수입니다"));
+    }
+    let bytes = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16)).collect::<Result<Vec<u8>, _>>().map_err(|_| e("OTHER", "16진 글이 아닙니다"))?;
+    std::fs::write(&path, &bytes).map_err(|x| e("OTHER", x.to_string()))?;
+    Ok(bytes.len())
 }
 
 // ── 객체 트리 ───────────────────────
@@ -932,30 +1714,83 @@ pub(crate) async fn tree(dbs: &DbConns, conn: u32, path: Vec<String>) -> R<Vec<D
             Ok(rows_of(&c, sql).await?.iter().map(|r| DbNode { name: s(r, 0), kind: "schema", detail: None }).collect())
         }
         [schema] => {
-            let sql = format!(
-                "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = {} ORDER BY table_type, table_name",
-                lit(schema, my)
-            );
+            // PostgreSQL 은 카탈로그로 — 구체화 뷰·분할 표·외부 표까지
+            let sql = if !my && !ms {
+                format!(
+                    "SELECT c.relname, CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATVIEW' WHEN 'p' THEN 'PARTITIONED' WHEN 'f' THEN 'FOREIGN' ELSE 'TABLE' END
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = {} AND c.relkind IN ('r','p','v','m','f')
+                     ORDER BY CASE WHEN c.relkind IN ('r','p','f') THEN 0 ELSE 1 END, c.relname",
+                    lit(schema, false)
+                )
+            } else {
+                format!("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = {} ORDER BY table_type, table_name", lit(schema, my))
+            };
             Ok(rows_of(&c, &sql)
                 .await?
                 .iter()
-                .map(|r| DbNode { name: s(r, 0), kind: if s(r, 1).contains("VIEW") { "view" } else { "table" }, detail: None })
+                .map(|r| {
+                    let t = s(r, 1);
+                    let (kind, detail) = match t.as_str() {
+                        "MATVIEW" => ("view", Some("구체화 뷰".to_string())),
+                        "PARTITIONED" => ("table", Some("분할 표".to_string())),
+                        "FOREIGN" => ("table", Some("외부 표".to_string())),
+                        x if x.contains("VIEW") => ("view", None),
+                        _ => ("table", None),
+                    };
+                    DbNode { name: s(r, 0), kind, detail }
+                })
                 .collect())
         }
         [schema, table] => {
-            let sql = format!(
-                "SELECT column_name, {}, is_nullable FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
-                if my { "column_type" } else { "data_type" },
-                lit(schema, my),
-                lit(table, my)
-            );
+            // 열 — 형식·NOT NULL·PK·인덱스(4번째 칸: PK | IDX | 빈칸)
+            let sql = if my {
+                format!(
+                    "SELECT column_name, column_type, is_nullable, CASE column_key WHEN 'PRI' THEN 'PK' WHEN '' THEN '' ELSE 'IDX' END
+                     FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+                    lit(schema, true),
+                    lit(table, true)
+                )
+            } else if ms {
+                format!(
+                    "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE,
+                            CASE WHEN EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                                              WHERE i.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)) AND i.is_primary_key = 1 AND COL_NAME(ic.object_id, ic.column_id) = c.COLUMN_NAME) THEN 'PK'
+                                 WHEN EXISTS (SELECT 1 FROM sys.index_columns ic
+                                              WHERE ic.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)) AND COL_NAME(ic.object_id, ic.column_id) = c.COLUMN_NAME) THEN 'IDX'
+                                 ELSE '' END
+                     FROM INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_SCHEMA = {} AND c.TABLE_NAME = {} ORDER BY c.ORDINAL_POSITION",
+                    lit(schema, false),
+                    lit(table, false)
+                )
+            } else {
+                // information_schema 는 구체화 뷰 열을 안 보여 줘서 pg_attribute 로
+                format!(
+                    "SELECT a.attname, format_type(a.atttypid, a.atttypmod), CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END,
+                            CASE WHEN EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = cl.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) THEN 'PK'
+                                 WHEN EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = cl.oid AND a.attnum = ANY(i.indkey)) THEN 'IDX' ELSE '' END
+                     FROM pg_attribute a JOIN pg_class cl ON cl.oid = a.attrelid JOIN pg_namespace n ON n.oid = cl.relnamespace
+                     WHERE n.nspname = {} AND cl.relname = {} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    lit(schema, false),
+                    lit(table, false)
+                )
+            };
             Ok(rows_of(&c, &sql)
                 .await?
                 .iter()
                 .map(|r| DbNode {
                     name: s(r, 0),
                     kind: "column",
-                    detail: Some(format!("{}{}", s(r, 1), if s(r, 2) == "NO" { " · NOT NULL" } else { "" })),
+                    detail: Some(format!(
+                        "{}{}{}",
+                        s(r, 1),
+                        if s(r, 2) == "NO" { " · NOT NULL" } else { "" },
+                        match s(r, 3).as_str() {
+                            "PK" => " · PK",
+                            "IDX" => " · 인덱스",
+                            _ => "",
+                        }
+                    )),
                 })
                 .collect())
         }
@@ -1072,6 +1907,7 @@ pub struct EditStmt {
 pub struct ApplyOk {
     affected: Vec<u64>,
     in_tx: bool,
+    tx: TxState,
 }
 
 /// 표 편집 반영 — 한 트랜잭션(수동 트랜잭션이 열려 있으면 그 안의 세이브포인트)
@@ -1088,6 +1924,10 @@ pub(crate) async fn apply(dbs: &DbConns, conn: u32, stmts: Vec<EditStmt>) -> R<A
     let Ok(_busy) = c.busy.try_lock() else {
         return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
     };
+    // 수동 커밋 — 트랜잭션을 열고 그 안의 세이브포인트로 반영
+    if c.manual.load(Ordering::Relaxed) && !c.in_tx.load(Ordering::Relaxed) && !stmts.is_empty() {
+        tx_raw(&c, "begin").await?;
+    }
     let in_tx = c.in_tx.load(Ordering::Relaxed);
     let mut affected = Vec::new();
     let one = |n: u64, i: usize, st: &EditStmt| -> R<()> {
@@ -1194,46 +2034,43 @@ pub(crate) async fn apply(dbs: &DbConns, conn: u32, stmts: Vec<EditStmt>) -> R<A
             affected = v["affected"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
         }
     }
-    Ok(ApplyOk { affected, in_tx })
+    if in_tx {
+        c.tx_stmts.fetch_add(stmts.len() as u32, Ordering::Relaxed);
+    }
+    Ok(ApplyOk { affected, in_tx, tx: c.tx_state() })
 }
 
 /// 수동 트랜잭션 — begin | commit | rollback
 #[tauri::command]
-pub async fn db_tx(dbs: State<'_, DbConns>, conn: u32, op: String) -> R<bool> {
-    tx(&dbs, conn, op).await
+pub async fn db_tx(dbs: State<'_, DbConns>, conn: u32, op: String) -> R<TxState> {
+    tx_state_op(&dbs, conn, op).await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn tx(dbs: &DbConns, conn: u32, op: String) -> R<bool> {
+    Ok(tx_state_op(dbs, conn, op).await?.in_tx)
+}
+
+async fn tx_state_op(dbs: &DbConns, conn: u32, op: String) -> R<TxState> {
     let c = dbs.get(conn)?;
     let Ok(_busy) = c.busy.try_lock() else {
         return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
     };
-    let sql = match (op.as_str(), &c.engine) {
-        ("begin", Engine::Ms { .. }) => "BEGIN TRANSACTION",
-        ("begin", Engine::My { .. }) => "START TRANSACTION",
-        ("begin", _) => "BEGIN",
-        ("commit", Engine::Ms { .. }) => "IF @@TRANCOUNT > 0 COMMIT TRANSACTION",
-        ("commit", _) => "COMMIT",
-        ("rollback", Engine::Ms { .. }) => "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
-        ("rollback", _) => "ROLLBACK",
-        _ => return Err(e("OTHER", "알 수 없는 작업")),
-    };
-    match &c.engine {
-        Engine::Pg { client, .. } => client.batch_execute(sql).await.map_err(pg_err)?,
-        Engine::My { conn, .. } => conn.lock().await.query_drop(sql).await.map_err(my_err)?,
-        Engine::Ms { client } => {
-            client.lock().await.simple_query(sql).await.map_err(ms_err)?.into_results().await.map_err(ms_err)?;
-        }
-        Engine::Jdbc { side } => {
-            let v = side.call(json!({"op": "tx", "action": op})).await.map_err(|m| e("CLOSED", m))?;
-            if v["type"] == "error" {
-                return Err(jdbc_err(&v));
-            }
-        }
-    }
-    let open = op == "begin";
-    c.in_tx.store(open, Ordering::Relaxed);
-    Ok(open)
+    tx_raw(&c, &op).await?;
+    Ok(c.tx_state())
+}
+
+/// 수동 커밋 모드 켜기·끄기(끄면 열린 트랜잭션은 그대로 — 화면이 먼저 커밋·되돌리기를 묻는다)
+#[tauri::command]
+pub fn db_tx_mode(dbs: State<'_, DbConns>, conn: u32, manual: bool) -> R<TxState> {
+    let c = dbs.get(conn)?;
+    c.manual.store(manual, Ordering::Relaxed);
+    Ok(c.tx_state())
+}
+
+#[tauri::command]
+pub fn db_tx_state(dbs: State<'_, DbConns>, conn: u32) -> R<TxState> {
+    Ok(dbs.get(conn)?.tx_state())
 }
 
 #[cfg(test)]
@@ -1245,6 +2082,43 @@ mod tests {
         assert_eq!(first_word("  -- hi\n /* x */ (SELECT 1)"), "select");
         assert_eq!(first_word("update t set a=1"), "update");
         assert_eq!(first_word("WITH x AS (select 1) select * from x"), "with");
+    }
+
+    #[test]
+    fn classify_rules() {
+        let c = |s: &str| classify(s, false);
+        let m = |s: &str| classify(s, true);
+        assert!(c("select 1").read_only_safe);
+        assert!(c("  -- x\n (SELECT 1)").read_only_safe);
+        assert!(!c("GRANT SELECT ON t TO u").read_only_safe);
+        assert!(c("REVOKE ALL ON t FROM u").dangerous);
+        let w = c("WITH x AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT * FROM x");
+        assert!(w.writes && !w.read_only_safe);
+        assert_eq!(c("WITH x AS (SELECT 1) UPDATE t SET a = 1").keyword, "UPDATE");
+        assert!(c("WITH x AS (SELECT 1) DELETE FROM t").dangerous);
+        assert!(c("EXPLAIN SELECT * FROM t").read_only_safe);
+        assert!(c("EXPLAIN ANALYZE SELECT * FROM t").read_only_safe);
+        let ea = c("EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t WHERE id = 1");
+        assert!(ea.writes && ea.dangerous && !ea.read_only_safe);
+        assert!(m("ANALYZE FORMAT=JSON UPDATE t SET a = 1 WHERE id = 2").writes);
+        assert!(c("UPDATE t SET a = 1").dangerous);
+        assert!(!c("UPDATE t SET a = 1 WHERE id = 2").dangerous);
+        assert!(c("SELECT * INTO new_t FROM t").writes);
+        assert!(!c("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").read_only_safe);
+        assert_eq!(c("SET search_path = x").kind, "set");
+        // 문자열·주석·$$ 안의 낱말은 보지 않는다
+        assert!(c("SELECT 'delete from t' /* drop */ FROM t").read_only_safe);
+        assert!(c("SELECT $$ insert $$, $a$ x $a$").read_only_safe);
+        assert!(m("SELECT 1 # drop table").read_only_safe);
+        assert_eq!(c("").kind, "empty");
+        assert_eq!(c("COMMIT").kind, "tx");
+    }
+
+    #[test]
+    fn csv_parse() {
+        let r = parse_csv("a,b\r\n\"x,1\",\"say \"\"hi\"\"\"\n3,\"멀티\n줄\"\n", ',');
+        assert_eq!(r, vec![vec!["a", "b"], vec!["x,1", "say \"hi\""], vec!["3", "멀티\n줄"]]);
+        assert_eq!(parse_csv("a\tb", '\t'), vec![vec!["a", "b"]]);
     }
 
     #[test]

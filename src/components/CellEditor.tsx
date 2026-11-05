@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { type Cell, type ColMeta, type FieldKind, fieldKind, validate } from "../lib/edits";
+import { type Cell, type ColMeta, type FieldKind, fieldKind, setValues, validate } from "../lib/edits";
 import { Select } from "./Select";
 
 /** 참/거짓 고르기에서 NULL 을 나타내는 값 */
@@ -9,7 +9,20 @@ const NULL_KEY = "\u0000";
  * 칸 안 형식별 입력기 — 날짜·날짜시각·시각, 참/거짓(3상태), enum, 숫자(검사), JSON·긴 글(여러 줄), UUID(새로 만들기).
  * Enter 확정(여러 줄은 Ctrl+Enter), Tab 확정 후 다음 칸, Esc 취소, NULL 단추(허용 열), 틀린 값은 빨간 테두리로 막는다.
  */
-export function CellEditor({ meta, value, onDone, seeded }: { meta?: ColMeta; value: Cell; onDone: (v: Cell | undefined, move?: "next" | "down") => void; seeded?: boolean }) {
+export function CellEditor({
+	meta,
+	value,
+	onDone,
+	seeded,
+	onDefault,
+}: {
+	meta?: ColMeta;
+	value: Cell;
+	onDone: (v: Cell | undefined, move?: "next" | "down") => void;
+	seeded?: boolean;
+	/** 새 행 — 이 열은 넣지 않고 기본값(DEFAULT)을 쓰기 */
+	onDefault?: () => void;
+}) {
 	const kind: FieldKind = fieldKind(meta);
 	const [v, setV] = useState<Cell>(value);
 	const [err, setErr] = useState<string | null>(null);
@@ -95,6 +108,45 @@ export function CellEditor({ meta, value, onDone, seeded }: { meta?: ColMeta; va
 				options={(meta?.enumValues ?? []).map((x) => ({ value: x, label: x }))}
 			/>
 		);
+	} else if (kind === "set") {
+		// MySQL SET — 여러 개 고르기(쉼표로 이어 붙인다)
+		const all = setValues(meta) ?? [];
+		const picked = new Set((v ?? "").split(",").filter(Boolean));
+		input = (
+			<div
+				className="cell-set"
+				onKeyDown={(e) => {
+					e.stopPropagation();
+					if (e.key === "Escape") onDone(undefined);
+					if (e.key === "Enter") commit(all.filter((x) => picked.has(x)).join(","));
+				}}
+			>
+				{all.map((x, i) => (
+					<label key={x}>
+						<input
+							type="checkbox"
+							autoFocus={i === 0}
+							checked={picked.has(x)}
+							onChange={(e) => {
+								const n = new Set(picked);
+								if (e.target.checked) n.add(x);
+								else n.delete(x);
+								setV(all.filter((y) => n.has(y)).join(","));
+							}}
+						/>
+						{x}
+					</label>
+				))}
+				<div className="cell-set-actions">
+					<button type="button" className="btn" onMouseDown={(e) => (e.preventDefault(), onDone(undefined))}>
+						취소
+					</button>
+					<button type="button" className="btn primary" onMouseDown={(e) => (e.preventDefault(), commit(v ?? ""))}>
+						확정
+					</button>
+				</div>
+			</div>
+		);
 	} else if (kind === "json" || kind === "longtext") {
 		input = (
 			<textarea
@@ -159,6 +211,19 @@ export function CellEditor({ meta, value, onDone, seeded }: { meta?: ColMeta; va
 					}}
 				>
 					지금
+				</button>
+			)}
+			{onDefault && (
+				<button
+					type="button"
+					className="cell-null"
+					title={`넣지 않고 기본값을 씀${meta?.default ? `: ${meta.default}` : ""}`}
+					onMouseDown={(e) => {
+						e.preventDefault();
+						onDefault();
+					}}
+				>
+					기본값
 				</button>
 			)}
 			{nullBtn}

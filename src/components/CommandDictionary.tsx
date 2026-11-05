@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, BookOpen, Copy, Search, SquareTerminal, Star } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, BookOpen, Copy, CornerDownLeft, Search, SquareTerminal, Star } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { activeTerminal, DANGER } from "../lib/activeTerm";
 
 import { type Dict, type DictCmd, loadDict } from "../lib/dict";
@@ -59,8 +59,14 @@ export function CommandDictionaryPane() {
 		setNote(t);
 		window.setTimeout(() => setNote(""), 2500);
 	};
-	/** {{자리}} 를 이름만 남기고 */
-	const plain = (c: string) => c.replace(/\{\{([^}]*)\}\}/g, "$1");
+	const plain = fillPlaceholders;
+	/** 터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널 */
+	const insert = (text: string) => {
+		const t = activeTerminal();
+		if (!t) return flash("먼저 터미널을 한 번 눌러 두세요");
+		t.write(text);
+		flash(`${t.label} 터미널에 넣었습니다 — 확인한 뒤 Enter`);
+	};
 
 	useEffect(() => {
 		void loadDict().then(setDict);
@@ -138,12 +144,7 @@ export function CommandDictionaryPane() {
 												type="button"
 												className="btn ghost icon"
 												title="터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널, 자리표시자는 이름만 남김"
-												onClick={() => {
-													const t = activeTerminal();
-													if (!t) return flash("먼저 터미널을 한 번 눌러 두세요");
-													t.write(plain(c));
-													flash(`${t.label} 터미널에 넣었습니다 — 자리표시자를 고친 뒤 Enter`);
-												}}
+												onClick={() => insert(plain(c))}
 											>
 												<SquareTerminal size={13} />
 											</button>
@@ -164,6 +165,7 @@ export function CommandDictionaryPane() {
 											</button>
 										</span>
 									</div>
+									<ExampleEdit key={c} command={c} cmdName={cur} onInsert={insert} />
 								</div>
 							))}
 							{cmd.o?.slice(0, 60).map(([f, d]) => (
@@ -186,6 +188,60 @@ export function CommandDictionaryPane() {
 				</div>
 			</div>
 		</>
+	);
+}
+
+const PLACEHOLDER = /\{\{(.*?)\}\}/g;
+
+/** 자리표시자를 셸에 넣을 글자로 — {{[-r|--recursive]}} 는 첫 갈래, {{경로}} 는 안의 글자 */
+function fillPlaceholders(command: string): string {
+	return command.replace(/\{\{\[([^|\]]+)\|[^\]]*\]\}\}/g, "$1").replace(PLACEHOLDER, "$1");
+}
+
+/**
+ * 예시 고치기 — {{자리}} 를 Tab·Shift+Tab 으로 옮겨 다니며(그 자리를 통째로 골라 바로 덮어쓰기) 채우고, Enter 로 터미널에 넣는다(실행하지 않음).
+ * 남은 {{자리}} 는 안의 글자만 남긴다.
+ */
+function ExampleEdit({ command, cmdName, onInsert }: { command: string; cmdName: string; onInsert: (text: string) => void }) {
+	const [value, setValue] = useState(command);
+	const input = useRef<HTMLInputElement>(null);
+	/** 다음(Shift 면 이전) 자리표시자를 고른다 — 없으면 false(Tab 은 원래대로) */
+	const jump = (back: boolean) => {
+		const el = input.current;
+		if (!el) return false;
+		const spots = [...value.matchAll(PLACEHOLDER)].map((m): [number, number] => [m.index ?? 0, (m.index ?? 0) + m[0].length]);
+		if (!spots.length) return false;
+		const cur = el.selectionStart ?? 0;
+		const next = back
+			? ([...spots].reverse().find(([s]) => s < cur) ?? spots[spots.length - 1])
+			: (spots.find(([s]) => s > cur || (s === cur && el.selectionEnd === cur)) ?? spots[0]);
+		if (!next) return false;
+		el.setSelectionRange(next[0], next[1]);
+		return true;
+	};
+	return (
+		<div className="ex-edit">
+			<input
+				ref={input}
+				value={value}
+				spellCheck={false}
+				autoComplete="off"
+				aria-label={`${cmdName} 예시 고치기 — Tab 으로 자리표시자 이동, Enter 로 터미널에 넣기`}
+				title="Tab·Shift+Tab: 다음·이전 자리 · Enter: 터미널에 넣기(실행하지 않음)"
+				onChange={(e) => setValue(e.target.value)}
+				onFocus={() => window.setTimeout(() => jump(false), 0)}
+				onKeyDown={(e) => {
+					if (e.key === "Tab" && jump(e.shiftKey)) e.preventDefault();
+					else if (e.key === "Enter") {
+						e.preventDefault();
+						onInsert(fillPlaceholders(value));
+					} else if (e.key === "Escape") setValue(command);
+				}}
+			/>
+			<button type="button" className="btn ghost" title="고친 명령을 터미널 입력 줄에 넣기(실행하지 않음)" onClick={() => onInsert(fillPlaceholders(value))}>
+				<CornerDownLeft size={13} /> 터미널에 넣기
+			</button>
+		</div>
 	);
 }
 

@@ -2,7 +2,9 @@ import { ArrowLeft, ArrowRight, ChevronRight, Plus, File, FileCode, FileText, Fo
 import { memo, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { asSshError, type FsBackend, type FsEntry, joinPath, notifyFsChanged, parentDir } from "../lib/ipc";
+import { freeName, useConflictAsk } from "./ConflictSheet";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
+import { askText } from "../lib/ask";
 
 const CODE = /\.(js|ts|tsx|jsx|json|py|java|go|rs|sh|sql|xml|yml|yaml|html|css|jsp|php|rb|c|h|cpp|kt)$/i;
 export const DRAG_MIME = "application/x-rbshell-entry";
@@ -112,6 +114,7 @@ export const FileTree = memo(function FileTree({
 	const [shown, setShown] = useState<Record<string, number>>({});
 	/** 탐색기에서 끌어 놓아 올리는 중 */
 	const [upload, setUpload] = useState<{ done: number; total: number; name: string } | null>(null);
+	const conflict = useConflictAsk();
 	const bodyRef = useRef<HTMLDivElement>(null);
 
 	// 폴더 이동 기록 — 뒤로·앞으로(단추·마우스 옆 단추·Alt+←/→). 터미널 따라가기로 바뀐 것도 기록한다
@@ -245,11 +248,11 @@ export const FileTree = memo(function FileTree({
 		}
 	};
 
-	const renameEntry = (e: FsEntry) => {
-		const name = prompt("새 이름", e.name);
+	const renameEntry = async (e: FsEntry) => {
+		const name = await askText({ title: "이름 바꾸기", value: e.name, okLabel: "바꾸기" });
 		if (name && name !== e.name) void act(() => fs.rename(e.path, joinPath(parentDir(e.path), name)), parentDir(e.path));
 	};
-	const removeEntry = (e: FsEntry) => {
+	const removeEntry = async (e: FsEntry) => {
 		if (PROTECTED.test(e.path)) {
 			flash(`${e.path} 는 지울 수 없게 막아 두었습니다`);
 			return;
@@ -258,20 +261,20 @@ export const FileTree = memo(function FileTree({
 		const ok =
 			fs.side === "local"
 				? confirm(`${what}을(를) 휴지통으로 보낼까요?`)
-				: prompt(`서버에서 ${what}을(를) 지웁니다. 되살릴 수 없습니다.\n지우려면 이름을 그대로 치세요: ${e.name}`) === e.name;
+				: (await askText({ title: "서버에서 지우기", message: `${what}을(를) 지웁니다. 되살릴 수 없습니다.\n지우려면 이름을 그대로 치세요: ${e.name}`, mustEqual: e.name, danger: true, okLabel: "지우기" })) === e.name;
 		if (ok) void act(() => fs.remove(e.path), parentDir(e.path));
 	};
-	const copyEntry = (e: FsEntry) => {
+	const copyEntry = async (e: FsEntry) => {
 		if (!fs.copy) return;
 		const dot = e.kind === "file" ? e.name.lastIndexOf(".") : -1;
 		const def = dot > 0 ? `${e.name.slice(0, dot)} 복사본${e.name.slice(dot)}` : `${e.name} 복사본`;
-		const to = prompt("복사해 둘 경로(같은 폴더면 이름만)", def);
+		const to = await askText({ title: "복사", message: "복사해 둘 경로(같은 폴더면 이름만)", value: def, okLabel: "복사" });
 		if (!to) return;
 		const dest = to.includes("/") ? to : joinPath(parentDir(e.path), to);
 		void act(() => fs.copy?.(e.path, dest) ?? Promise.resolve(), parentDir(dest));
 	};
-	const moveEntry = (e: FsEntry) => {
-		const to = prompt("옮길 폴더", parentDir(e.path));
+	const moveEntry = async (e: FsEntry) => {
+		const to = await askText({ title: "옮기기", message: `${e.name} 을(를) 옮길 폴더`, value: parentDir(e.path), okLabel: "옮기기" });
 		if (!to || to === parentDir(e.path)) return;
 		void act(async () => {
 			await fs.rename(e.path, joinPath(to, e.name));
@@ -311,7 +314,30 @@ export const FileTree = memo(function FileTree({
 		if (!jobs.length && !dirs.length) return;
 		const existing = new Set((nodes[dir]?.entries ?? []).map((x) => x.name));
 		const clash = entries.filter((en) => existing.has(en.name)).map((en) => en.name);
-		if (clash.length && !confirm(`${dir} 에 같은 이름이 있습니다: ${clash.slice(0, 5).join(", ")}${clash.length > 5 ? " …" : ""}\n덮어쓸까요?`)) return;
+		if (clash.length) {
+			// 덮어쓰기·건너뛰기·이름 바꿔 올리기(name (1).ext) — 끌어 놓은 맨 위 항목 기준
+			const choice = await conflict.ask(clash, dir);
+			if (!choice) return;
+			if (choice !== "overwrite") {
+				const taken = new Set(existing);
+				for (const name of clash) {
+					const from = joinPath(dir, name);
+					const outside = (p: string) => p !== from && !p.startsWith(`${from}/`);
+					if (choice === "skip") {
+						for (let i = jobs.length - 1; i >= 0; i--) if (!outside(jobs[i].dest)) jobs.splice(i, 1);
+						for (let i = dirs.length - 1; i >= 0; i--) if (!outside(dirs[i])) dirs.splice(i, 1);
+						continue;
+					}
+					const fresh = freeName(name, taken);
+					taken.add(fresh);
+					const to = joinPath(dir, fresh);
+					const move = (p: string) => (outside(p) ? p : to + p.slice(from.length));
+					for (const j of jobs) j.dest = move(j.dest);
+					for (let i = 0; i < dirs.length; i++) dirs[i] = move(dirs[i]);
+				}
+				if (!jobs.length && !dirs.length) return;
+			}
+		}
 		const total = jobs.reduce((a, j) => a + j.file.size, 0);
 		let done = 0;
 		try {
@@ -341,15 +367,15 @@ export const FileTree = memo(function FileTree({
 		const items: MenuItem[] = [
 			{
 				label: "새 파일…",
-				run: () => {
-					const name = prompt("새 파일 이름");
+				run: async () => {
+					const name = await askText({ title: "새 파일", placeholder: "이름", okLabel: "만들기" });
 					if (name) void act(() => fs.touch(joinPath(dir, name)), dir);
 				},
 			},
 			{
 				label: "새 폴더…",
-				run: () => {
-					const name = prompt("새 폴더 이름");
+				run: async () => {
+					const name = await askText({ title: "새 폴더", placeholder: "이름", okLabel: "만들기" });
 					if (name) void act(() => fs.mkdir(joinPath(dir, name)), dir);
 				},
 			},
@@ -459,7 +485,7 @@ export const FileTree = memo(function FileTree({
 					data-cur={cur === e.path ? "on" : undefined}
 					data-path={e.path}
 					style={{ paddingLeft: 6 + depth * 14 }}
-					title={`${e.path}${e.kind === "file" ? ` · ${fmtSize(e.size)}` : ""}`}
+					title={`${e.path}${e.target ? ` → ${e.target}` : ""}${e.kind === "file" ? ` · ${fmtSize(e.size)}` : ""}`}
 					draggable
 					onDragStart={(ev) => {
 						const d: DragEntry = { side: fs.side, conn: fs.conn, path: e.path, name: e.name, kind: e.kind };
@@ -484,6 +510,7 @@ export const FileTree = memo(function FileTree({
 					<ChevronRight size={12} className="chev" style={{ visibility: e.kind === "dir" ? "visible" : "hidden", transform: isOpen ? "rotate(90deg)" : undefined }} />
 					{icon(e, isOpen)}
 					<span className={e.name.startsWith(".") ? "dim" : undefined}>{e.name}</span>
+					{e.target && <span className="link-to">→ {e.target}</span>}
 				</button>,
 			);
 			if (e.kind === "dir" && isOpen) walk(e.path, depth + 1);
@@ -631,6 +658,7 @@ export const FileTree = memo(function FileTree({
 			</div>
 			{msg && <div className="tree-toast">{msg}</div>}
 			{menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+			{conflict.element}
 		</div>
 	);
 });

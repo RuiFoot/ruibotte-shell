@@ -163,15 +163,10 @@ pub async fn sudo_read_text(conns: State<'_, SshConns>, conn: u32, profile_id: O
     let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
     let mtime: Option<u32> = it.next().and_then(|x| x.parse().ok());
     if size as usize > MAX_TEXT {
-        return Ok(FileText {
-            path,
-            size,
-            mtime,
-            text: None,
-            meta: TextMeta { encoding: "UTF-8".into(), bom: false, eol: "LF".into(), guessed: false },
-            binary: false,
-            too_large: true,
-        });
+        // 앞부분만 읽기 전용으로
+        let o = sudo(&c, pw.as_deref(), &format!("head -c {} -- {}", crate::localfs::HEAD_TEXT, q(&path)), None).await?;
+        let d = textcodec::decode(&crate::localfs::trim_head(o.stdout), encoding.as_deref());
+        return Ok(FileText { path, size, mtime, text: d.text, meta: d.meta, binary: d.binary, too_large: true });
     }
     let o = sudo(&c, pw.as_deref(), &format!("cat -- {}", q(&path)), None).await?;
     let d = textcodec::decode(&o.stdout, encoding.as_deref());

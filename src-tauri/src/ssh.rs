@@ -595,6 +595,9 @@ pub struct FsEntry {
     size: u64,
     mtime: Option<u32>,
     mode: Option<u32>,
+    /// 심볼릭 링크면 가리키는 곳
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -642,6 +645,7 @@ pub(crate) async fn list(conns: &SshConns, conn: u32, path: String) -> R<Vec<FsE
             "other"
         };
         let full = join(&path, &name);
+        let target = if kind == "link" { c.sftp.read_link(full.clone()).await.ok() } else { None };
         if kind == "link" {
             // 링크가 가리키는 것이 폴더면 폴더처럼 펼친다
             if let Ok(t) = c.sftp.metadata(full.clone()).await {
@@ -650,7 +654,7 @@ pub(crate) async fn list(conns: &SshConns, conn: u32, path: String) -> R<Vec<FsE
                 }
             }
         }
-        out.push(FsEntry { name, path: full, kind, size: m.size.unwrap_or(0), mtime: m.mtime, mode: m.permissions });
+        out.push(FsEntry { name, path: full, kind, size: m.size.unwrap_or(0), mtime: m.mtime, mode: m.permissions, target });
     }
     out.sort_by(|a, b| (a.kind != "dir").cmp(&(b.kind != "dir")).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(out)
@@ -678,15 +682,13 @@ pub(crate) async fn read_text(conns: &SshConns, conn: u32, path: String, encodin
     let m = c.sftp.metadata(path.clone()).await.map_err(sftp_err)?;
     let size = m.size.unwrap_or(0);
     if size > MAX_TEXT {
-        return Ok(FileText {
-            path,
-            size,
-            mtime: m.mtime,
-            text: None,
-            meta: TextMeta { encoding: "UTF-8".into(), bom: false, eol: "LF".into(), guessed: false },
-            binary: false,
-            too_large: true,
-        });
+        // 앞부분만 읽기 전용으로(끝부분은 실시간 보기로)
+        use tokio::io::AsyncReadExt;
+        let f = c.sftp.open(path.clone()).await.map_err(sftp_err)?;
+        let mut head = Vec::new();
+        f.take(crate::localfs::HEAD_TEXT).read_to_end(&mut head).await.map_err(|e| err("SFTP", e.to_string()))?;
+        let d = textcodec::decode(&crate::localfs::trim_head(head), encoding.as_deref());
+        return Ok(FileText { path, size, mtime: m.mtime, text: d.text, meta: d.meta, binary: d.binary, too_large: true });
     }
     let bytes = c.sftp.read(path.clone()).await.map_err(sftp_err)?;
     let d = textcodec::decode(&bytes, encoding.as_deref());

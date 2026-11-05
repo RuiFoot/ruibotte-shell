@@ -1,8 +1,17 @@
-import { DockviewDefaultTab, DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelHeaderProps, type IDockviewPanelProps } from "dockview-react";
+import {
+	DockviewDefaultTab,
+	DockviewReact,
+	type DockviewApi,
+	type DockviewReadyEvent,
+	type DockviewTheme,
+	type IDockviewHeaderActionsProps,
+	type IDockviewPanelHeaderProps,
+	type IDockviewPanelProps,
+} from "dockview-react";
 import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
+import { Activity, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, LayoutTemplate, Monitor, Plus, Radio, RefreshCcw, Rows2, ShieldAlert, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -26,7 +35,11 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
+import { freeName, useConflictAsk } from "./ConflictSheet";
 import { ContextMenu } from "./ContextMenu";
+import { MiniMonitor } from "./MiniMonitor";
+import { QuickOpen } from "./QuickOpen";
+import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
 import { MonitorPanel } from "./MonitorPanel";
 import { Select } from "./Select";
 import { SyncPanel } from "./SyncPanel";
@@ -35,6 +48,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CompletionSource } from "../lib/termComplete";
 import { type DragEntry, FileTree } from "./FileTree";
 import { TerminalView } from "./Terminal";
+import { askText } from "../lib/ask";
 
 /**
  * IDE식 작업대 — 트리·편집기·터미널이 모두 도킹 칸이다.
@@ -91,6 +105,19 @@ type Ctx = {
 	/** 원격 프로필(sudo 암호)·sudo 켜짐 — 자원 칸의 du·kill 용 */
 	profileId?: number;
 	sudoOn: boolean;
+	/** 이 터미널 옆(오른쪽·아래)에 새 터미널 */
+	splitTerminal: (panelId: string, dir: "right" | "below") => void;
+	/** 원격 작업대: 이 터미널을 root 셸로(sudo -i)·나오기 */
+	rootShell?: (panelId: string, on: boolean) => void;
+	/** 배치 잠금 — 구조 칸(트리·터미널·전송 등)은 닫지 못한다 */
+	locked: boolean;
+	/** 동시 입력 켜짐(터미널 칸 머리에서 켜고 끈다) */
+	broadcastOn: boolean;
+	setBroadcast: (v: boolean) => void;
+	/** 그 터미널과 같은 칸에 새 터미널 탭 */
+	addTerminalNear: (panelId?: string) => void;
+	/** 큰 자원 칸 열기 */
+	openMonitor: () => void;
 };
 const WbCtx = createContext<Ctx | null>(null);
 const useWb = () => useContext(WbCtx) as Ctx;
@@ -185,6 +212,12 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 	useEffect(() => {
 		if (!shell && ctx.localShells && ctx.defaultShell) setShell(ctx.defaultShell);
 	}, [ctx.defaultShell, ctx.localShells, shell]);
+	// 보이는 터미널에만 작은 자원 표시(가려진 탭은 서버에 묻지 않는다)
+	const [visible, setVisible] = useState(props.api.isVisible);
+	useEffect(() => {
+		const d = props.api.onDidVisibilityChange((e) => setVisible(e.isVisible));
+		return () => d.dispose();
+	}, [props.api]);
 	const info = ctx.localShells?.find((s) => s.id === shell);
 	const kind = info ? (info.kind === "pwsh" ? "pwsh" : info.kind === "cmd" ? "cmd" : "linux") : "linux";
 	const completion = useMemo(() => ({ ...ctx.completion, key: `${ctx.completion.key}:${kind}`, shellKind: kind as "linux" | "pwsh" | "cmd" }), [ctx.completion, kind]);
@@ -212,6 +245,9 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 				}}
 				defaultEncoding={ctx.termEncoding}
 				onOpenPath={(p) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 })}
+				onSplit={(dir) => ctx.splitTerminal(props.api.id, dir)}
+				statusExtra={visible && ctx.fs.side === "remote" && ctx.fs.conn != null ? <MiniMonitor conn={ctx.fs.conn} onOpen={ctx.openMonitor} /> : undefined}
+				onRootShell={ctx.rootShell ? (on) => ctx.rootShell?.(props.api.id, on) : undefined}
 			/>
 		</div>
 	);
@@ -252,12 +288,49 @@ function MonitorDock(props: IDockviewPanelProps) {
 }
 
 /** 탭 — 저장 안 한 편집기는 닫기 전에 묻는다 */
+/** 터미널 칸 머리 오른쪽 — 이 칸에 새 터미널·동시 입력·나누기(대상이 이 칸이라 도구 막대가 아니라 여기에) */
+function GroupActions(props: IDockviewHeaderActionsProps) {
+	const ctx = useWb();
+	const terms = props.panels.filter((p) => p.id.startsWith("term-"));
+	if (!terms.length) return null;
+	const target = props.activePanel?.id.startsWith("term-") ? props.activePanel.id : terms[0].id;
+	return (
+		<div className="group-actions" onMouseDown={(e) => e.stopPropagation()}>
+			<button type="button" className="btn ghost icon" title="이 칸에 새 터미널 탭(같은 연결 위 새 채널)" onClick={() => ctx.addTerminalNear(target)}>
+				<Plus size={13} />
+			</button>
+			<button
+				type="button"
+				className={`btn ghost icon${ctx.broadcastOn ? " on bcast-on" : ""}`}
+				aria-pressed={ctx.broadcastOn}
+				title={ctx.broadcastOn ? "동시 입력 켜짐 — 한 터미널에 친 것이 이 작업대의 모든 터미널(탭에 ⇉ 표시)에 갑니다. 눌러 끄기" : "동시 입력 — 한 터미널에 친 것을 이 작업대의 모든 터미널에"}
+				onClick={() => ctx.setBroadcast(!ctx.broadcastOn)}
+			>
+				<Radio size={13} />
+			</button>
+			<button type="button" className="btn ghost icon" title={ctx.locked ? "배치가 잠겨 있어 나눌 수 없습니다" : "오른쪽으로 나누기 — 이 터미널 옆에 새 터미널 칸"} disabled={ctx.locked} onClick={() => ctx.splitTerminal(target, "right")}>
+				<Columns2 size={13} />
+			</button>
+			<button type="button" className="btn ghost icon" title={ctx.locked ? "배치가 잠겨 있어 나눌 수 없습니다" : "아래로 나누기 — 이 터미널 아래에 새 터미널 칸"} disabled={ctx.locked} onClick={() => ctx.splitTerminal(target, "below")}>
+				<Rows2 size={13} />
+			</button>
+		</div>
+	);
+}
+
+/** 문서 칸(편집기·tail·비교) — 배치를 잠가도 닫을 수 있다 */
+const isDoc = (id: string) => /^(edit|tail|diff):/.test(id);
+
 function GuardedTab(props: IDockviewPanelHeaderProps) {
 	const ctx = useWb();
+	// 잠금: 구조 칸은 같은 칸에 다른 탭이 있을 때만 닫을 수 있다(칸이 없어지지 않게)
+	const noClose = ctx.locked && !isDoc(props.api.id) && props.api.group.panels.length <= 1;
 	return (
 		<DockviewDefaultTab
 			{...props}
+			hideClose={noClose}
 			closeActionOverride={() => {
+				if (noClose) return;
 				if (isDirty(ctx.owner, props.api.id) && !confirmDiscard([props.api.title?.replace(/^● /, "") ?? props.api.id], "이 탭을 닫으면")) return;
 				props.api.close();
 			}}
@@ -360,7 +433,7 @@ function TransfersPanel() {
 										title="다시 — 다 받은 파일은 건너뛰고, 받다 만 파일(.rbpart)은 이어서"
 										onClick={() => {
 											const a = transferArgs.get(p.id);
-											if (a) void transfers.start(a.conn, a.direction, a.src, a.destDir, false).catch((e) => alert(asSshError(e).message));
+											if (a) void transfers.start(a.conn, a.direction, a.src, a.destDir, false, a.destName).catch((e) => alert(asSshError(e).message));
 										}}
 									>
 										다시(이어서)
@@ -475,6 +548,15 @@ function stripEditors(json: ReturnType<DockviewApi["toJSON"]>) {
 	return j as unknown as ReturnType<DockviewApi["toJSON"]>;
 }
 
+/**
+ * 열려 있던 편집기 탭(앱 탭별) — 연결이 끊겨 다시 연결하면 작업대가 새로 그려지는데, 그때 같은 파일들을 다시 연다.
+ * 저장 안 한 고친 내용은 편집기 초안으로 남아 다시 열 때 되살릴지 묻는다.
+ */
+/** 동시 입력이 켜졌을 때 터미널 탭 이름 앞 표시 */
+const BCAST = "⇉ ";
+
+const openEditors = new Map<string, { which: Which; path: string; name: string }[]>();
+
 export function Workbench({
 	fs,
 	local,
@@ -528,6 +610,22 @@ export function Workbench({
 			.catch(() => undefined);
 	}, [fs]);
 	const [help, setHelp] = useState(false);
+	const [locked, setLocked] = useLayoutLock(layoutKey);
+	const lockedRef = useRef(locked);
+	lockedRef.current = locked;
+	const [lockNote, setLockNote] = useState(false);
+	/** 지금 열린 칸 id(도구 막대 단추 켜짐 표시) */
+	const [shownIds, setShownIds] = useState("");
+	const has = (id: string) => shownIds.split("|").includes(id);
+	/** 잠겨 있으면 알리고 true */
+	const blockedByLock = () => {
+		if (!lockedRef.current) return false;
+		setLockNote(true);
+		window.setTimeout(() => setLockNote(false), 2500);
+		return true;
+	};
+	const [quickOpen, setQuickOpen] = useState(false);
+	const conflict = useConflictAsk();
 	// 내 PC 셸 목록·기본 셸·관리자 여부
 	const [shellList, setShellList] = useState<ShellInfo[] | undefined>(undefined);
 	const [defaultShell, setDefaultShell] = useState<string | undefined>(undefined);
@@ -593,6 +691,17 @@ export function Workbench({
 		}
 		addDoc(d, { id, component: "editor", title: e.name, params: { which, path: e.path, name: e.name } });
 	}, []);
+
+	// 동시 입력: 받는 터미널 탭에 ⇉ 표시
+	useEffect(() => {
+		const d = dock.current;
+		if (!d) return;
+		for (const p of d.panels) {
+			if (!p.id.startsWith("term-")) continue;
+			const t = (p.title ?? "").replace(/^⇉ /, "");
+			p.api.setTitle(broadcastOn ? `${BCAST}${t}` : t);
+		}
+	}, [broadcastOn]);
 
 	const shells = useRef(new Map<string, ShellHandle>());
 	const registerShell = useCallback((id: string, h: ShellHandle | null) => {
@@ -694,16 +803,21 @@ export function Workbench({
 				if (fs.conn == null) return;
 				const existing = await fsOf(destSide).list(destDir);
 				let overwrite = false;
+				let destName: string | undefined;
 				if (existing.some((x) => x.name === src.name)) {
-					overwrite = confirm(`${destDir} 에 ${src.name} 이(가) 이미 있습니다.\n확인 = 덮어쓰기, 취소 = 같은 이름 파일은 건너뛰기`);
+					// 덮어쓰기·건너뛰기(폴더면 안의 같은 이름만)·이름 바꿔 보내기(name (1).ext)
+					const choice = await conflict.ask([src.name], destDir, destSide === "local");
+					if (!choice) return;
+					overwrite = choice === "overwrite";
+					if (choice === "rename") destName = freeName(src.name, new Set(existing.map((x) => x.name)));
 				}
 				showTransfers();
-				await transfers.start(fs.conn, src.side === "local" ? "up" : "down", src.path, destDir, overwrite);
+				await transfers.start(fs.conn, src.side === "local" ? "up" : "down", src.path, destDir, overwrite, destName);
 			} catch (e) {
 				alert(asSshError(e).message);
 			}
 		},
-		[fs, fsOf],
+		[fs, fsOf, conflict.ask],
 	);
 
 	/** 우클릭 › 올리기/받기 — 반대편 홈 폴더로 */
@@ -790,9 +904,9 @@ export function Workbench({
 			const pick =
 				peers.length === 1
 					? peers[0]
-					: peers[Number(prompt(`보낼 서버 번호\n${peers.map((p, i) => `${i + 1}. ${p.label}`).join("\n")}`, "1")) - 1];
+					: peers[Number((await askText({ title: "어느 서버로 보낼까요?", choiceOnly: true, choices: peers.map((p, i) => ({ value: String(i), label: p.label })) })) ?? -1)];
 			if (!pick) return;
-			const dest = prompt(`${pick.label} 의 어느 폴더로 보낼까요?`, pick.home);
+			const dest = await askText({ title: `${pick.label} 로 보내기`, message: "받을 폴더", value: pick.home, okLabel: "보내기" });
 			if (!dest) return;
 			showTransfers();
 			try {
@@ -811,24 +925,26 @@ export function Workbench({
 		addBottom(d, { id: "sync", component: "sync", title: "동기화" }, true);
 	};
 
+	const openMonitorRef = useRef<() => void>(() => {});
 	const openMonitor = () => {
 		const d = dock.current;
 		if (!d) return;
 		if (d.getPanel("monitor")) return void d.getPanel("monitor")?.api.setActive();
 		addDoc(d, { id: "monitor", component: "monitor", title: "자원" });
 	};
+	openMonitorRef.current = openMonitor;
 
-	const addTerminalRef = useRef<(cwd?: string, shell?: string) => void>(() => {});
-	const addTerminal = (cwd?: string, shell?: string) => {
+	const addTerminalRef = useRef<(cwd?: string, shell?: string, near?: string) => void>(() => {});
+	const addTerminal = (cwd?: string, shell?: string, near?: string) => {
 		const d = dock.current;
 		if (!d) return;
 		termSeq.current += 1;
 		const n = termSeq.current;
-		const ref = d.panels.find((p) => p.id.startsWith("term-"));
+		const ref = (near ? d.getPanel(near) : undefined) ?? d.panels.find((p) => p.id.startsWith("term-"));
 		d.addPanel({
 			id: `term-${n}`,
 			component: "terminal",
-			title: cwd ? `터미널 ${n} · ${cwd.split("/").filter(Boolean).pop() ?? "/"}` : `터미널 ${n}`,
+			title: `${broadcastRef.current ? BCAST : ""}${cwd ? `터미널 ${n} · ${cwd.split("/").filter(Boolean).pop() ?? "/"}` : `터미널 ${n}`}`,
 			params: { n, cwd, shell },
 			renderer: "always",
 			position: ref ? { referencePanel: ref.id, direction: "within" } : undefined,
@@ -836,9 +952,43 @@ export function Workbench({
 	};
 	addTerminalRef.current = addTerminal;
 
+	/** 터미널 나누기 — 그 터미널 오른쪽·아래에 새 칸(지금 폴더에서) */
+	const splitTerminal = useCallback((panelId: string, dir: "right" | "below") => {
+		const d = dock.current;
+		if (!d || blockedByLock()) return;
+		termSeq.current += 1;
+		const n = termSeq.current;
+		const cwd = lastCwd.current ?? undefined;
+		const ref = d.getPanel(panelId);
+		d.addPanel({
+			id: `term-${n}`,
+			component: "terminal",
+			title: `${broadcastRef.current ? BCAST : ""}터미널 ${n}`,
+			params: { n, cwd },
+			renderer: "always",
+			position: ref ? { referencePanel: ref.id, direction: dir } : undefined,
+		});
+	}, []);
+
+	/** 이 터미널을 root 셸로(sudo -i) — 저장해 둔(이번에 넣은) sudo 암호가 있으면 프롬프트에 넣는다 */
+	const rootShell = useCallback(async (panelId: string, on: boolean) => {
+		const h = shells.current.get(panelId);
+		if (!h) return;
+		if (h.idle && !h.idle()) {
+			alert("터미널이 명령을 실행 중입니다. 끝난 뒤 다시 하세요.");
+			return;
+		}
+		if (!on) {
+			h.send(" exit\r");
+			return;
+		}
+		h.send(" sudo -i\r");
+		if (sudoPw.current && (await h.expect(/assword[^\n]*:\s*$/, 2500))) h.send(`${sudoPw.current}\r`);
+	}, []);
+
 	const toggle = (id: "tree" | "localtree") => {
 		const d = dock.current;
-		if (!d) return;
+		if (!d || blockedByLock()) return;
 		const p = d.getPanel(id);
 		if (p) {
 			d.removePanel(p);
@@ -858,8 +1008,10 @@ export function Workbench({
 
 	// 기본 배치가 바뀌면(v2: 트리·문서·아래 터미널) 옛 저장 배치는 쓰지 않는다
 	const savedKey = `${layoutKey}.v2`;
+	const gone = useRef(false);
 	const onReady = (e: DockviewReadyEvent) => {
 		dock.current = e.api;
+		gone.current = false;
 		void api.settingGet(savedKey).then((saved) => {
 			let ok = false;
 			if (saved) {
@@ -869,18 +1021,32 @@ export function Workbench({
 					for (const p of e.api.panels) {
 						const m = /^term-(\d+)$/.exec(p.id);
 						if (m) termSeq.current = Math.max(termSeq.current, Number(m[1]));
+						// 동시 입력 표시는 저장본에 남기지 않는다(다시 열면 꺼진 상태)
+						if (m && p.title?.startsWith(BCAST)) p.api.setTitle(p.title.slice(BCAST.length));
 					}
 				} catch {
 					ok = false;
 				}
 			}
 			if (!ok) defaultLayout(e.api);
+			// 다시 연결한 뒤: 끊기기 전에 열려 있던 편집기 탭을 다시 연다(초안은 편집기가 되살리기를 묻는다)
+			for (const x of openEditors.get(owner) ?? []) {
+				if (!e.api.getPanel(`edit:${x.which}:${x.path}`)) addDoc(e.api, { id: `edit:${x.which}:${x.path}`, component: "editor", title: x.name, params: x });
+			}
 		});
 		e.api.onDidActivePanelChange((ev) => setActivePanel(ev.panel?.id ?? null));
 		e.api.onDidLayoutChange(() => {
+			if (gone.current) return;
+			setShownIds(e.api.panels.map((p) => p.id).join("|"));
 			window.clearTimeout(saveTimer.current);
 			saveTimer.current = window.setTimeout(() => {
-				if (dock.current) void api.settingSet(savedKey, JSON.stringify(stripEditors(dock.current.toJSON())));
+				const d = dock.current;
+				if (!d || gone.current) return;
+				void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
+				openEditors.set(
+					owner,
+					d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string }),
+				);
 			}, 600);
 		});
 	};
@@ -921,11 +1087,24 @@ export function Workbench({
 			owner,
 			profileId,
 			sudoOn: sudoOn && !!sudoFs,
+			splitTerminal,
+			locked,
+			broadcastOn,
+			setBroadcast: setBroadcastOn,
+			addTerminalNear: (id?: string) => addTerminalRef.current(undefined, undefined, id),
+			openMonitor: () => openMonitorRef.current(),
+			rootShell: fs.side === "remote" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn],
 	);
 
-	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
+	useEffect(() => {
+		gone.current = false;
+		return () => {
+			gone.current = true;
+			window.clearTimeout(saveTimer.current);
+		};
+	}, []);
 
 	return (
 		<WbCtx.Provider value={ctx}>
@@ -951,101 +1130,112 @@ export function Workbench({
 						if (e.key === "1") focusPanel((id) => id === "tree" || id === "localtree");
 						if (e.key === "2") focusPanel((id) => /^(edit|tail|diff):/.test(id) || id === "monitor");
 						if (e.key === "3") focusPanel((id) => id.startsWith("term-"));
+					} else if (e.ctrlKey && e.altKey && !e.shiftKey && e.code === "KeyL") {
+						// 배치 잠그기·풀기
+						e.preventDefault();
+						e.stopPropagation();
+						setLocked(!lockedRef.current);
+					} else if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.code === "KeyO") {
+						// 파일 빠른 열기 — 터미널에 Alt+O 가 가지 않게
+						e.preventDefault();
+						e.stopPropagation();
+						setQuickOpen(true);
 					} else if (e.key === "F1") {
 						e.preventDefault();
 						setHelp(true);
 					}
 				}}
 			>
-				<div className="wb-bar">
-					<button type="button" className="btn ghost" onClick={() => toggle("tree")} title="파일 트리 보이기/숨기기">
-						<FolderTree size={14} /> <span className="lbl">파일</span>
-					</button>
-					{local && (
-						<button type="button" className="btn ghost" onClick={() => toggle("localtree")} title="내 PC 트리 — 끌어 놓아 주고받기">
-							<Monitor size={14} /> <span className="lbl">내 PC</span>
+				<div className="wb-bar" role="toolbar" aria-label="작업대 도구">
+					<span className="wb-group" role="group" aria-label="칸 열기">
+						<span className="wb-group-label">칸</span>
+						<button type="button" className={`btn ghost${has("tree") ? " on" : ""}`} onClick={() => toggle("tree")} title={`파일 칸 — ${fs.side === "remote" ? "서버" : "내 PC"} 파일 트리 ${has("tree") ? "닫기" : "열기"}`} aria-pressed={has("tree")}>
+							<FolderTree size={14} /> <span className="lbl">파일</span>
 						</button>
+						{local && (
+							<button type="button" className={`btn ghost${has("localtree") ? " on" : ""}`} onClick={() => toggle("localtree")} title={`내 PC 칸 — 내 PC 파일 트리 ${has("localtree") ? "닫기" : "열기"}(서버 트리와 끌어 놓아 주고받기)`} aria-pressed={has("localtree")}>
+								<Monitor size={14} /> <span className="lbl">내 PC</span>
+							</button>
+						)}
+						{local && (
+							<button type="button" className={`btn ghost${has("transfers") ? " on" : ""}`} onClick={() => showTransfers(true)} title="전송 칸 — 올리기·받기 진행 목록(터미널 칸의 탭으로)">
+								<ArrowDownUp size={14} /> <span className="lbl">전송</span>
+							</button>
+						)}
+						{fs.side === "remote" && fs.conn != null && (
+							<button type="button" className={`btn ghost${has("monitor") ? " on" : ""}`} onClick={openMonitor} title="자원 칸 — 이 서버의 CPU·메모리·디스크·네트워크·프로세스(문서 칸의 탭으로)">
+								<Activity size={14} /> <span className="lbl">자원</span>
+							</button>
+						)}
+						{local && syncInfo && (
+							<button type="button" className={`btn ghost${has("sync") ? " on" : ""}`} onClick={openSync} title="동기화 칸 — 내 PC 폴더 ↔ 이 서버 폴더(rsync 모드)·자동 반영">
+								<RefreshCcw size={14} /> <span className="lbl">동기화</span>
+							</button>
+						)}
+					</span>
+					{(sudoFs || fs.side === "local") && <span className="sep" />}
+					{(sudoFs || fs.side === "local") && (
+						<span className="wb-group" role="group" aria-label="권한">
+							<span className="wb-group-label">권한</span>
+							{fs.side === "local" && (
+								<button
+									type="button"
+									className={`btn ghost${isAdmin ? " on danger-on" : ""}`}
+									title={isAdmin ? "앱 전체가 관리자 권한으로 돌고 있습니다(내 PC 셸·파일 모두)" : "관리자 권한 — 관리자 셸을 앱 안·새 창에 열거나 앱을 관리자로 다시 열기"}
+									onClick={(e) => {
+										const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+										setAdminMenu({ x: r.left, y: r.bottom + 4 });
+									}}
+								>
+									<ShieldAlert size={14} /> <span className="lbl keep">{isAdmin ? "관리자" : "관리자로…"}</span>
+								</button>
+							)}
+							{sudoFs && (
+								<>
+									<button
+										type="button"
+										className={`btn ghost${sudoOn ? " on danger-on" : ""}`}
+										aria-pressed={sudoOn}
+										title={sudoOn ? `sudo 켜짐 — 파일 트리·편집기가 root 권한${sudoMode === "together" ? ", 보이는 터미널도 root 셸" : ""}. 눌러 끄기` : `sudo — 파일 작업(트리·편집기)에 root 권한${sudoMode === "together" ? ", 보이는 터미널도 root 셸로" : ""}. 눌러 켜기`}
+										onClick={() => (sudoOn ? disableSudo() : void enableSudo(null, false))}
+									>
+										<ShieldAlert size={14} /> <span className="lbl keep">{sudoOn ? "sudo 켜짐" : "sudo"}</span>
+									</button>
+									<Select<"together" | "apart">
+										size="sm"
+										value={sudoMode}
+										onChange={setSudoMode}
+										title="sudo 를 어디에 — 켜기 전에 고릅니다"
+										disabled={sudoOn}
+										options={[
+											{ value: "together", label: "파일 + 터미널", hint: "보이는 터미널도 sudo -s" },
+											{ value: "apart", label: "파일만", hint: "터미널은 그대로" },
+										]}
+									/>
+								</>
+							)}
+						</span>
 					)}
-					{local && (
-						<button type="button" className="btn ghost" onClick={() => showTransfers(true)} title="전송 목록">
-							<ArrowDownUp size={14} /> <span className="lbl">전송</span>
-						</button>
-					)}
-					{fs.side === "remote" && fs.conn != null && (
-						<button type="button" className="btn ghost" onClick={openMonitor} title="서버 자원 — CPU·메모리·디스크·네트워크·프로세스">
-							<Activity size={14} /> <span className="lbl">자원</span>
-						</button>
-					)}
-					{local && syncInfo && (
-						<button type="button" className="btn ghost" onClick={openSync} title="폴더 동기화(rsync 모드)·자동 반영">
-							<RefreshCcw size={14} /> <span className="lbl">동기화</span>
-						</button>
-					)}
-					<button
-						type="button"
-						className={`btn ghost${broadcastOn ? " on" : ""}`}
-						style={broadcastOn ? { color: "#c77700", background: "color-mix(in srgb, #ff9f0a 18%, transparent)" } : undefined}
-						title="동시 입력 — 한 터미널에 친 것을 이 작업대의 모든 터미널에"
-						onClick={() => setBroadcastOn((b) => !b)}
-					>
-						<Radio size={14} /> <span className="lbl">동시 입력{broadcastOn ? " 켜짐" : ""}</span>
-					</button>
-					<button type="button" className="btn ghost" onClick={() => addTerminal()} title="터미널 하나 더(같은 연결 위 새 채널)">
-						<SquareTerminal size={14} /> <span className="lbl">터미널 +</span>
-					</button>
-					{fs.side === "local" && (
+					<span className="sep" />
+					<span className="wb-group" role="group" aria-label="배치">
+						<span className="wb-group-label">배치</span>
 						<button
 							type="button"
-							className={`btn ghost${isAdmin ? " on" : ""}`}
-							style={isAdmin ? { color: "var(--danger)" } : undefined}
-							title={isAdmin ? "앱이 관리자 권한으로 돌고 있습니다" : "관리자 권한으로 셸 열기"}
-							onClick={(e) => {
-								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-								setAdminMenu({ x: r.left, y: r.bottom + 4 });
+							className="btn ghost"
+							title={locked ? "배치가 잠겨 있어 초기화할 수 없습니다" : "기본 배치 — 이 작업대의 칸을 왼쪽 트리·가운데 문서·아래 터미널로 되돌리기"}
+							disabled={locked}
+							onClick={() => {
+								if (dock.current && !blockedByLock()) {
+									termSeq.current = 1;
+									defaultLayout(dock.current);
+								}
 							}}
 						>
-							<ShieldAlert size={14} /> <span className="lbl keep">{isAdmin ? "관리자" : "관리자로…"}</span>
+							<LayoutTemplate size={14} /> <span className="lbl">기본 배치</span>
 						</button>
-					)}
-					<span className="sep" />
-					{sudoFs && (
-						<>
-							<button
-								type="button"
-								className={`btn ghost${sudoOn ? " on" : ""}`}
-								style={sudoOn ? { color: "var(--danger)", background: "color-mix(in srgb, var(--danger) 14%, transparent)" } : undefined}
-								title="root 권한으로 파일 보기·고치기"
-								onClick={() => (sudoOn ? disableSudo() : void enableSudo(null, false))}
-							>
-								<ShieldAlert size={14} /> <span className="lbl keep">sudo{sudoOn ? " 켜짐" : ""}</span>
-							</button>
-							<Select<"together" | "apart">
-								size="sm"
-								value={sudoMode}
-								onChange={setSudoMode}
-								title="같이 = 터미널도 root 셸로, 따로 = 파일만"
-								disabled={sudoOn}
-								options={[
-									{ value: "together", label: "터미널도 같이", hint: "root 셸" },
-									{ value: "apart", label: "파일만" },
-								]}
-							/>
-						</>
-					)}
-					<span className="sep" />
-					<button
-						type="button"
-						className="btn ghost"
-						title="배치 초기화"
-						onClick={() => {
-							if (dock.current) {
-								termSeq.current = 1;
-								defaultLayout(dock.current);
-							}
-						}}
-					>
-						<LayoutTemplate size={14} /> <span className="lbl">기본 배치</span>
-					</button>
+						<LayoutLockButton locked={locked} onChange={setLocked} />
+					</span>
+					{lockNote && <span className="badge warn">배치가 잠겨 있습니다 — 자물쇠(Ctrl+Alt+L)로 푸세요</span>}
 					<span style={{ flex: 1 }} />
 					{local && (
 						<span className="badge wb-chip" title="트리끼리 끌어 놓거나 우클릭으로 주고받기">
@@ -1087,10 +1277,31 @@ export function Workbench({
 					</div>
 				)}
 				<div className="wb-dock">
-					<DockviewReact theme={theme} components={components} watermarkComponent={Watermark} defaultTabComponent={GuardedTab} onReady={onReady} />
+					<DockviewReact
+						theme={theme}
+						components={components}
+						watermarkComponent={Watermark}
+						defaultTabComponent={GuardedTab}
+						onReady={onReady}
+						rightHeaderActionsComponent={GroupActions}
+						disableDnd={locked}
+						locked={locked}
+					/>
 				</div>
 			</div>
-			{help && <ShortcutHelp onClose={() => setHelp(false)} />}
+			{help && <ShortcutHelp locked={locked} onClose={() => setHelp(false)} />}
+			{quickOpen && (
+				<QuickOpen
+					fs={fsNow}
+					base={(lastCwd.current ?? fs.home).replace(/\\/g, "/")}
+					onClose={() => setQuickOpen(false)}
+					onOpen={(path) => {
+						setQuickOpen(false);
+						openFile("remote", { name: path.split("/").pop() ?? path, path, kind: "file", size: 0 });
+					}}
+				/>
+			)}
+			{conflict.element}
 			{adminMenu && (
 				<ContextMenu
 					x={adminMenu.x}
@@ -1111,11 +1322,13 @@ export function Workbench({
 }
 
 /** F1 — 단축키 모음 */
-function ShortcutHelp({ onClose }: { onClose: () => void }) {
+function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => void }) {
 	const rows: [string, string][] = [
 		["작업대", ""],
 		["Alt+1 · 2 · 3", "트리 · 문서 · 터미널로"],
 		["Ctrl+`", "터미널 칸 숨기기·보이기"],
+		["Alt+O", "파일 빠른 열기(이름으로 찾기 · /경로 바로 열기)"],
+		["Ctrl+Alt+L", `배치 잠그기·풀기 — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`],
 		["F1", "이 도움말"],
 		["파일 트리", ""],
 		["↑ ↓ ← → · Enter", "옮기기 · 접고 펴기 · 열기"],
