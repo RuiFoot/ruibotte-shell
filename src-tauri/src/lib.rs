@@ -1,6 +1,7 @@
 // 명령 오류(SshError)는 화면에 그대로 넘기는 드문 경로라 크기를 줄이지 않는다
 #![allow(clippy::result_large_err)]
 
+mod db;
 mod grid;
 mod importer;
 mod localfs;
@@ -74,6 +75,7 @@ pub fn run() {
         .manage(grid::Grids::default())
         .manage(ssh::SshConns::default())
         .manage(transfer::Transfers::default())
+        .manage(db::DbConns::default())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
@@ -123,6 +125,14 @@ pub fn run() {
             transfer::transfer_start,
             sudo::sudo_check,
             importer::import_candidates,
+            db::db_connect,
+            db::db_disconnect,
+            db::db_query,
+            db::db_cancel,
+            db::db_rows,
+            db::db_result_close,
+            db::db_export,
+            db::db_tree,
             importer::export_ssh_config,
             sudo::sudo_list,
             sudo::sudo_read_text,

@@ -34,6 +34,9 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt", "io-util", 
 tauri-plugin-dialog = "2"
 trash = "5"
 urlencoding = "2"
+tokio-postgres = { version = "0.7", features = ["runtime"] }
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
+futures-util = "0.3"
 
 [profile.release]
 # 설치 크기·기동 우선

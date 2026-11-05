@@ -1,9 +1,11 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { BookOpen, Database, Download, FileDown, FileUp, House, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
+import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
 import { type AppInfo, api, type ConnectOk, localFs, localTerm, type Profile, sshFs, sshTerm } from "./lib/ipc";
@@ -12,16 +14,19 @@ import { useUpdater } from "./lib/updater";
 // 무거운 칸(xterm·편집기·표·사전)은 처음 열 때 받는다 — 첫 화면(홈)은 가볍게
 const Workbench = lazy(() => import("./components/Workbench").then((m) => ({ default: m.Workbench })));
 const ResultGridPane = lazy(() => import("./components/ResultGrid").then((m) => ({ default: m.ResultGridPane })));
+const DbWorkbench = lazy(() => import("./components/DbWorkbench").then((m) => ({ default: m.DbWorkbench })));
 const CommandDictionaryPane = lazy(() => import("./components/CommandDictionary").then((m) => ({ default: m.CommandDictionaryPane })));
 
-type TabKind = "home" | "local" | "ssh" | "grid" | "dict";
+type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict";
+type DbInfo = { ok: DbConnectOk; profile: Profile; readOnly: boolean };
 type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean };
-type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; color?: string | null };
+type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; db?: DbInfo; color?: string | null };
 
 const TAB_ICON: Record<TabKind, ReactNode> = {
 	home: <House size={14} />,
 	local: <SquareTerminal size={14} />,
 	ssh: <Server size={14} />,
+	db: <Database size={14} />,
 	grid: <Table2 size={14} />,
 	dict: <BookOpen size={14} />,
 };
@@ -46,6 +51,7 @@ export function App() {
 	const [profiles, setProfiles] = useState<Profile[]>([]);
 	const [sheet, setSheet] = useState<Profile | null>(null);
 	const [connecting, setConnecting] = useState<{ p: Profile; tabId?: string } | null>(null);
+	const [dbConnecting, setDbConnecting] = useState<Profile | null>(null);
 	const [importing, setImporting] = useState(false);
 	const [exporting, setExporting] = useState(false);
 	const [q, setQ] = useState("");
@@ -86,6 +92,7 @@ export function App() {
 			if (ts.length === 1) return;
 			const t = ts.find((x) => x.id === id);
 			if (t?.ssh) void api.sshDisconnect(t.ssh.ok.connId);
+			if (t?.db) void invoke("db_disconnect", { conn: t.db.ok.connId });
 			const i = ts.findIndex((x) => x.id === id);
 			const next = ts.filter((x) => x.id !== id);
 			setTabs(next);
@@ -157,7 +164,7 @@ export function App() {
 
 	const connect = (p: Profile) => {
 		if (p.kind === "db") {
-			alert("DB 접속은 1단계 후반에 붙습니다.");
+			setDbConnecting(p);
 			return;
 		}
 		setConnecting({ p });
@@ -399,6 +406,16 @@ export function App() {
 										}
 									/>
 								)}
+								{t.kind === "db" && t.db && (
+									<DbWorkbench
+										conn={t.db.ok.connId}
+										engine={t.db.profile.engine ?? "postgres"}
+										readOnly={t.db.readOnly}
+										version={t.db.ok.version}
+										profileId={t.db.profile.id}
+										active={t.id === active}
+									/>
+								)}
 								{t.kind === "grid" && <ResultGridPane />}
 								{t.kind === "dict" && <CommandDictionaryPane />}
 							</Suspense>
@@ -423,6 +440,18 @@ export function App() {
 					onConnected={(ok, p) => onConnected(ok, p, connecting.tabId)}
 					onCancel={() => setConnecting(null)}
 					onProfileChanged={reload}
+				/>
+			)}
+			{dbConnecting && (
+				<DbConnectDialog
+					profile={dbConnecting}
+					onCancel={() => setDbConnecting(null)}
+					onConnected={(ok, readOnly) => {
+						const p = dbConnecting;
+						setDbConnecting(null);
+						reload();
+						open("db", p.name, false, { db: { ok, profile: p, readOnly }, color: p.color });
+					}}
 				/>
 			)}
 			{importing && (
