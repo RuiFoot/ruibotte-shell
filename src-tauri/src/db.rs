@@ -1311,7 +1311,7 @@ mod live_edit {
             let ok = connect(&store, &dbs, DbConnectReq { profile_id: None, engine: engine.into(), host: "127.0.0.1".into(), port, username: user.into(), password: Some(p), database: Some(db.into()), read_only: false, save_secret: false, legacy: false }, None).await.unwrap();
             let c = ok.conn_id;
             let (ph, cast) = match engine { "postgres" => ("$", true), "mssql" => ("@P", false), _ => ("?", false) };
-            let a = |n: usize, ty: &str| if ph == "?" { "?".to_string() } else if cast { format!("$" ) + &n.to_string() + "::text::" + ty } else { format!("@P{n}") };
+            let a = |n: usize, ty: &str| if ph == "?" { "?".to_string() } else if cast { format!("${n}::text::{ty}") } else { format!("@P{n}") };
             let _ = query(&dbs, c, "DROP TABLE rb_e".into(), None).await;
             let vc = if engine == "mssql" { "nvarchar" } else { "varchar" };
             query(&dbs, c, format!("CREATE TABLE rb_e (id int PRIMARY KEY, name {vc}(20), amt decimal(8,2), memo {vc}(20))"), None).await.unwrap();
