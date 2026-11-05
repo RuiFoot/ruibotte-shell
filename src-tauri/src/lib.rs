@@ -127,6 +127,7 @@ pub fn run() {
             ssh::ssh_exec,
             ssh::ssh_test,
             db::db_test,
+            db::db_view,
             secrets::secret_set,
             monitor::ssh_stats,
             monitor::ssh_du,

@@ -146,6 +146,17 @@ impl DbConns {
 pub(crate) struct ResultSet {
     columns: Vec<Col>,
     rows: Vec<Vec<Option<String>>>,
+    /// 정렬·거르기 보기 — 화면 행 번호 → 원래 행 번호. None 이면 받은 순서 그대로
+    view: Mutex<Option<Vec<usize>>>,
+}
+
+impl ResultSet {
+    fn visible(&self) -> Vec<&Vec<Option<String>>> {
+        match &*self.view.lock().unwrap() {
+            Some(v) => v.iter().filter_map(|&i| self.rows.get(i)).collect(),
+            None => self.rows.iter().collect(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -660,7 +671,7 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
     let row_count = rows.len();
     let result_id = if has_set {
         let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
-        dbs.results.lock().unwrap().insert(id, Arc::new(ResultSet { columns: columns.clone(), rows }));
+        dbs.results.lock().unwrap().insert(id, Arc::new(ResultSet { columns: columns.clone(), rows, view: Mutex::new(None) }));
         Some(id)
     } else {
         None
@@ -696,8 +707,67 @@ pub(crate) fn db_rows_core(dbs: &DbConns, result: u32, from: usize, to: usize) -
     let Some(r) = dbs.results.lock().unwrap().get(&result).cloned() else {
         return Vec::new();
     };
-    let to = to.min(r.rows.len());
-    r.rows[from.min(to)..to].to_vec()
+    let view = r.view.lock().unwrap();
+    match &*view {
+        Some(v) => {
+            let to = to.min(v.len());
+            v[from.min(to)..to].iter().filter_map(|&i| r.rows.get(i).cloned()).collect()
+        }
+        None => {
+            let to = to.min(r.rows.len());
+            r.rows[from.min(to)..to].to_vec()
+        }
+    }
+}
+
+/// 받은 행을 정렬·거르기 — 서버에 다시 묻지 않는다. 숫자 열은 숫자로, NULL 은 늘 맨 뒤.
+/// 거르기: 낱말을 띄어 쓰면 모두 들어간 행(대소문자 무시, 아무 열). 돌려주는 값은 보이는 행 수
+pub(crate) fn view_core(r: &ResultSet, sort: Option<usize>, desc: bool, filter: Option<&str>) -> usize {
+    let words: Vec<String> = filter.unwrap_or("").split_whitespace().map(|w| w.to_lowercase()).collect();
+    if sort.is_none() && words.is_empty() {
+        *r.view.lock().unwrap() = None;
+        return r.rows.len();
+    }
+    let mut idx: Vec<usize> = (0..r.rows.len())
+        .filter(|&i| {
+            words.is_empty() || {
+                let hay: String = r.rows[i].iter().map(|v| v.as_deref().unwrap_or("null").to_lowercase()).collect::<Vec<_>>().join("");
+                words.iter().all(|w| hay.contains(w.as_str()))
+            }
+        })
+        .collect();
+    if let Some(c) = sort.filter(|c| *c < r.columns.len()) {
+        let numeric = matches!(r.columns[c].kind, "int" | "numeric");
+        let key = |i: usize| r.rows[i].get(c).cloned().flatten();
+        idx.sort_by(|&a, &b| {
+            use std::cmp::Ordering;
+            match (key(a), key(b)) {
+                (None, None) => Ordering::Equal,
+                (None, _) => Ordering::Greater,
+                (_, None) => Ordering::Less,
+                (Some(x), Some(y)) => {
+                    let o = if numeric {
+                        match (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
+                            (Ok(p), Ok(q)) => p.partial_cmp(&q).unwrap_or(Ordering::Equal),
+                            _ => x.cmp(&y),
+                        }
+                    } else {
+                        x.to_lowercase().cmp(&y.to_lowercase())
+                    };
+                    if desc { o.reverse() } else { o }
+                }
+            }
+        });
+    }
+    let n = idx.len();
+    *r.view.lock().unwrap() = Some(idx);
+    n
+}
+
+#[tauri::command]
+pub fn db_view(dbs: State<'_, DbConns>, result: u32, sort: Option<usize>, desc: bool, filter: Option<String>) -> R<usize> {
+    let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
+    Ok(view_core(&r, sort, desc, filter.as_deref()))
 }
 
 #[allow(dead_code)]
@@ -720,8 +790,8 @@ pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: Str
     match format.as_str() {
         "json" => {
             let arr: Vec<serde_json::Map<String, serde_json::Value>> = r
-                .rows
-                .iter()
+                .visible()
+                .into_iter()
                 .map(|row| {
                     r.columns
                         .iter()
@@ -748,14 +818,14 @@ pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: Str
             }
             out.push_str(&r.columns.iter().map(|c| cell(&c.name)).collect::<Vec<_>>().join(&sep.to_string()));
             out.push_str("\r\n");
-            for row in &r.rows {
+            for row in r.visible() {
                 out.push_str(&row.iter().map(|v| v.as_deref().map(cell).unwrap_or_default()).collect::<Vec<_>>().join(&sep.to_string()));
                 out.push_str("\r\n");
             }
         }
     }
     std::fs::write(&path, out).map_err(|x| e("OTHER", x.to_string()))?;
-    Ok(r.rows.len())
+    Ok(r.visible().len())
 }
 
 // ── 객체 트리 ───────────────────────
@@ -1368,5 +1438,32 @@ mod live_edit {
             query(&dbs, c, "DROP TABLE rb_e".into(), None).await.unwrap();
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn sort_and_filter() {
+        let col = |n: &str, k: &'static str| Col { name: n.into(), kind: k };
+        let row = |a: Option<&str>, b: &str| vec![a.map(str::to_string), Some(b.to_string())];
+        let r = ResultSet {
+            columns: vec![col("n", "int"), col("s", "text")],
+            rows: vec![row(Some("10"), "Kim"), row(None, "lee"), row(Some("9"), "Park"), row(Some("100"), "kimchi")],
+            view: Mutex::new(None),
+        };
+        assert_eq!(view_core(&r, Some(0), false, None), 4);
+        let got: Vec<_> = r.visible().iter().map(|x| x[0].clone()).collect();
+        assert_eq!(got, vec![Some("9".into()), Some("10".into()), Some("100".into()), None]);
+        assert_eq!(view_core(&r, Some(0), true, None), 4);
+        assert_eq!(r.visible()[0][0].as_deref(), Some("100"));
+        assert_eq!(r.visible()[3][0], None);
+        assert_eq!(view_core(&r, None, false, Some("KIM")), 2);
+        assert_eq!(view_core(&r, Some(1), false, Some("kim 10")), 2);
+        assert_eq!(view_core(&r, None, false, Some("null")), 1);
+        assert_eq!(view_core(&r, None, false, None), 4);
+        assert!(r.view.lock().unwrap().is_none());
     }
 }

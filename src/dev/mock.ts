@@ -131,6 +131,8 @@ export function installMock() {
 					const to = Number(args.to);
 					return Array.from({ length: Math.max(0, Math.min(240, to) - from) }, (_, i) => [String(from + i + 1), `고객 ${from + i + 1}`, "2026-11-05 09:00:00", i % 7 === 0 ? null : "active"]);
 				}
+				case "db_view":
+					return args.filter ? 37 : 240;
 				case "db_table_meta":
 					return [
 						{ name: "id", dataType: "bigint", nullable: false, pk: true },

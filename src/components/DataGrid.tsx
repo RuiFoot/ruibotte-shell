@@ -65,6 +65,8 @@ export function DataGrid({
 	onCellNull,
 	onContextMenu,
 	apiRef,
+	sort,
+	onSort,
 }: {
 	columns: GridCol[];
 	rowCount: number;
@@ -77,6 +79,10 @@ export function DataGrid({
 	onCellNull?: (r: number, c: number) => void;
 	onContextMenu?: (e: React.MouseEvent, r: number, c: number) => void;
 	apiRef?: React.Ref<GridApi>;
+	/** 지금 정렬(머리에 ▲▼) */
+	sort?: { col: number; desc: boolean } | null;
+	/** 머리 누르기 — 정렬 바꾸기 */
+	onSort?: (col: number) => void;
 }) {
 	const scroller = useRef<HTMLDivElement>(null);
 	const pages = useRef(new Map<number, Cell[][]>());
@@ -206,8 +212,17 @@ export function DataGrid({
 					<div style={{ textAlign: "right", color: "var(--text-3)" }}>#</div>
 					{columns.map((c, i) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: 같은 이름 열이 있을 수 있다
-						<div key={`${c.name}-${i}`} title={c.kind} className="gh">
+						<div
+							key={`${c.name}-${i}`}
+							title={`${c.kind}${onSort ? " — 눌러 정렬(오름 → 내림 → 원래대로)" : ""}`}
+							className={`gh${onSort ? " sortable" : ""}`}
+							onClick={(ev) => {
+								if ((ev.target as HTMLElement).classList.contains("col-resize")) return;
+								onSort?.(i);
+							}}
+						>
 							{c.name}
+							{sort?.col === i && <span className="sort-mark">{sort.desc ? "▼" : "▲"}</span>}
 							<span
 								className="col-resize"
 								onMouseDown={(e) => {

@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
-import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, LayoutTemplate, Lock, Play, PlayCircle, Square, Table } from "lucide-react";
+import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, LayoutTemplate, Lock, Play, PlayCircle, Search, Square, Table, WrapText } from "lucide-react";
 import { createContext, lazy, type ReactElement, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ComparePanel, HistoryPanel } from "./DbPanels";
 
@@ -26,6 +26,7 @@ import { SnippetPalette } from "./SnippetPalette";
 import { codeHighlight } from "../lib/cmTheme";
 import { editingExtensions } from "../lib/cmEditing";
 import { dbCompletionSource } from "../lib/sqlComplete";
+import { formatSqlIn } from "../lib/sqlFormat";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
@@ -118,6 +119,8 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 	const host = useRef<HTMLDivElement>(null);
 	const runRef = useRef(ctx.run);
 	runRef.current = ctx.run;
+	const engineRef = useRef(ctx.engine);
+	engineRef.current = ctx.engine;
 	useEffect(() => {
 		if (!host.current) return;
 		const key = `${ctx.draftKey}.${props.params.n}`;
@@ -146,6 +149,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					keymap.of([
 						{ key: "Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, false)), true) },
 						{ key: "Shift-Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, true)), true) },
+						{ key: "Shift-Alt-f", preventDefault: true, run: (view) => (void formatSqlIn(view, engineRef.current), true) },
 						indentWithTab,
 						...defaultKeymap,
 						...historyKeymap,
@@ -189,7 +193,21 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const [busy, setBusy] = useState(false);
 	const ok = p.ok;
 	const rid = ok?.resultId ?? null;
-	const fetchRows = useCallback((from: number, to: number) => (rid ? db.rows(rid, from, to) : Promise.resolve([])), [rid]);
+	// 받은 행 정렬·거르기(서버에 다시 묻지 않음) — 보이는 행 수와 다시 그리기 번호
+	const [sort, setSort] = useState<{ col: number; desc: boolean } | null>(null);
+	const [filter, setFilter] = useState("");
+	const [viewCount, setViewCount] = useState<number | null>(null);
+	const [viewSeq, setViewSeq] = useState(0);
+	const [valueView, setValueView] = useState<{ col: string; value: string | null } | null>(null);
+	const filterTimer = useRef<number | undefined>(undefined);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 새 결과면 보기를 처음으로
+	useEffect(() => {
+		setSort(null);
+		setFilter("");
+		setViewCount(null);
+	}, [rid]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 보기가 바뀌면(viewSeq) 다시 받는다
+	const fetchRows = useCallback((from: number, to: number) => (rid ? db.rows(rid, from, to) : Promise.resolve([])), [rid, viewSeq]);
 
 	// 표 보기면 열 정보를 받아 편집을 켠다(PK 가 결과에 다 있을 때만)
 	useEffect(() => {
@@ -242,12 +260,13 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					? "결과에 PK 열이 다 있어야 고칠 수 있습니다"
 					: null;
 	const table = p.source ? qualified(ctx.engine, p.source.schema, p.source.table) : "";
+	const total = viewCount ?? ok.rowCount;
 	const changeCount = [...edits.keys()].filter((r) => !deleted.has(r)).length + deleted.size + added.length;
 
 	const overlay: GridOverlay = {
 		added,
-		cell: (r, c) => (r >= ok.rowCount ? undefined : edits.get(r)?.get(c)),
-		cellEdited: (r, c) => r < ok.rowCount && !!edits.get(r)?.has(c),
+		cell: (r, c) => (r >= total ? undefined : edits.get(r)?.get(c)),
+		cellEdited: (r, c) => r < total && !!edits.get(r)?.has(c),
 		rowState: (r) => (r >= ok.rowCount ? "added" : deleted.has(r) ? "deleted" : edits.has(r) ? "edited" : undefined),
 	};
 
@@ -334,6 +353,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 		const items: MenuItem[] = [];
 		if (c >= 0) {
 			const val = grid.current?.row(r)?.[c] ?? null;
+			items.push({ label: "값 보기…", run: () => setValueView({ col: cols[c].name, value: val }) });
 			items.push({ label: "값 복사", run: () => void navigator.clipboard.writeText(val ?? "") });
 			if (p.source) {
 				const col = quoteIdentFor(ctx.engine, cols[c].name);
@@ -403,6 +423,22 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 		setMenu({ x: e.clientX, y: e.clientY, items });
 	};
 
+	async function applyView(next: { sort: { col: number; desc: boolean } | null; filter: string }) {
+		if (!rid || !ok) return;
+		if (changeCount > 0) {
+			setMsg("고친 것을 반영하거나 되돌린 뒤에 정렬·거를 수 있습니다");
+			return;
+		}
+		const n = await invoke<number>("db_view", { result: rid, sort: next.sort?.col ?? null, desc: !!next.sort?.desc, filter: next.filter.trim() || null });
+		setViewCount(!next.sort && !next.filter.trim() ? null : n);
+		setViewSeq((x) => x + 1);
+	}
+	const onSort = (c: number) => {
+		const next = sort?.col !== c ? { col: c, desc: false } : !sort.desc ? { col: c, desc: true } : null;
+		setSort(next);
+		void applyView({ sort: next, filter });
+	};
+
 	async function doExport(format: "csv" | "tsv" | "json") {
 		if (!rid) return;
 		const path = await saveDialog({ defaultPath: `result.${format}`, filters: [{ name: format.toUpperCase(), extensions: [format] }] });
@@ -449,9 +485,11 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				<DataGrid
 					apiRef={grid}
 					columns={cols}
-					rowCount={ok.rowCount}
+					rowCount={total}
 					fetchRows={fetchRows}
-					resetKey={rid}
+					resetKey={`${rid}:${viewSeq}`}
+					sort={sort}
+					onSort={onSort}
 					overlay={overlay}
 					editable={() => canEdit}
 					onCellNull={(r, c) => metaOf(c)?.nullable !== false && void setCell(r, c, null)}
@@ -474,7 +512,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 			)}
 			<div className="statusbar">
 				<span className="ok">
-					{rid ? `${ok.rowCount.toLocaleString()}행` : "완료"}
+					{rid ? (viewCount != null ? `${viewCount.toLocaleString()} / ${ok.rowCount.toLocaleString()}행` : `${ok.rowCount.toLocaleString()}행`) : "완료"}
 					{ok.truncated ? " (상한에서 멈춤)" : ""}
 				</span>
 				<span>{ok.ms.toLocaleString()} ms</span>
@@ -484,6 +522,26 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				<span style={{ marginLeft: "auto" }} />
 				{rid ? (
 					<>
+						<label className="res-filter" title="받은 행에서 거르기 — 띄어 쓰면 모두 들어간 행, 대소문자 무시, Esc 로 지우기">
+							<Search size={11} />
+							<input
+								value={filter}
+								placeholder="결과에서 거르기"
+								spellCheck={false}
+								onChange={(e) => {
+									const v = e.target.value;
+									setFilter(v);
+									window.clearTimeout(filterTimer.current);
+									filterTimer.current = window.setTimeout(() => void applyView({ sort, filter: v }), 220);
+								}}
+								onKeyDown={(e) => {
+									if (e.key === "Escape" && filter) {
+										setFilter("");
+										void applyView({ sort, filter: "" });
+									}
+								}}
+							/>
+						</label>
 						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void doExport("csv")}>
 							<Download size={12} /> CSV
 						</button>
@@ -497,6 +555,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				) : null}
 			</div>
 			{menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+			{valueView && <ValueSheet col={valueView.col} value={valueView.value} onClose={() => setValueView(null)} />}
 			{preview !== null && (
 				<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && setPreview(null)}>
 					<div className="sheet" style={{ width: "min(760px, calc(100vw - 32px))" }}>
@@ -966,6 +1025,17 @@ export function DbWorkbench({
 					</button>
 					<span className="sep" />
 					<Select size="sm" value={maxRows} onChange={setMaxRows} title="결과 행 상한" options={[1000, 10_000, 100_000, 1_000_000].map((n) => ({ value: n, label: `최대 ${n.toLocaleString()}행` }))} />
+					<button
+						type="button"
+						className="btn ghost"
+						title="SQL 정렬(Shift+Alt+F) — 고른 글만, 없으면 전체"
+						onClick={() => {
+							const v = currentEditor();
+							if (v) void formatSqlIn(v, engine).then((ok) => !ok && alert("정렬하지 못했습니다 — 이 방언이 읽지 못하는 문장이 있습니다"));
+						}}
+					>
+						<WrapText size={14} /> <span className="lbl">정렬</span>
+					</button>
 					<button type="button" className="btn ghost" onClick={addSql} title="SQL 편집기 하나 더">
 						<FilePlus size={14} /> SQL +
 					</button>
@@ -1022,5 +1092,49 @@ export function DbWorkbench({
 				)}
 			</div>
 		</DbCtx.Provider>
+	);
+}
+
+/** 칸 값 보기 — 긴 글·JSON(정리해 보기)·NULL 과 빈 문자열 구분, 복사 */
+function ValueSheet({ col, value, onClose }: { col: string; value: string | null; onClose: () => void }) {
+	const [pretty, setPretty] = useState(true);
+	let json: string | null = null;
+	if (value && /^\s*[[{]/.test(value)) {
+		try {
+			json = JSON.stringify(JSON.parse(value), null, 2);
+		} catch {
+			json = null;
+		}
+	}
+	const shown = value === null ? "" : json && pretty ? json : value;
+	return (
+		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === "Escape" && onClose()}>
+			<div className="sheet" style={{ width: "min(760px, calc(100vw - 32px))" }}>
+				<div className="sheet-title">
+					<h3 style={{ fontFamily: "var(--font-mono)" }}>{col}</h3>
+					<small style={{ color: "var(--text-3)" }}>
+						{value === null ? "NULL" : value === "" ? "빈 문자열" : `${[...value].length.toLocaleString()}자${json ? " · JSON" : ""}`}
+					</small>
+				</div>
+				{value === null ? (
+					<p className="null-note">NULL — 값이 없습니다(빈 문자열과 다름)</p>
+				) : (
+					<textarea className="fp value-view" readOnly autoFocus value={shown} spellCheck={false} />
+				)}
+				<div className="sheet-actions">
+					{json && (
+						<label className="check" style={{ margin: 0, marginRight: "auto" }}>
+							<input type="checkbox" checked={pretty} onChange={(e) => setPretty(e.target.checked)} /> JSON 정리해 보기
+						</label>
+					)}
+					<button type="button" className="btn" disabled={value === null} onClick={() => void navigator.clipboard.writeText(shown)}>
+						복사
+					</button>
+					<button type="button" className="btn primary" onClick={onClose}>
+						닫기
+					</button>
+				</div>
+			</div>
+		</div>
 	);
 }
