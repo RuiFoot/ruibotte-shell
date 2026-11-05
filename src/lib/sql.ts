@@ -4,6 +4,12 @@
  */
 export type Stmt = { from: number; to: number; text: string };
 
+/** PL/SQL·T-SQL 블록(BEGIN·DECLARE·CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER) — 안의 ; 로 나누지 않고 / 줄(또는 GO·끝)까지 */
+function inBlock(head: string): boolean {
+	const t = head.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "").trimStart();
+	return /^(begin\b(?!\s+(tran|transaction|work)\b)|declare\b|create\s+(or\s+replace\s+)?(editionable\s+)?(procedure|function|package|trigger|type\s+body)\b)/i.test(t);
+}
+
 export function splitSql(src: string): Stmt[] {
 	const out: Stmt[] = [];
 	let start = 0;
@@ -17,6 +23,16 @@ export function splitSql(src: string): Stmt[] {
 	};
 	while (i < n) {
 		const c = src[i];
+		// 줄 머리의 GO(SQL Server)·/(Oracle) 만 있는 줄은 문장 나누기
+		if (i === 0 || src[i - 1] === "\n") {
+			const m = /^[ \t]*(?:go|\/)[ \t]*(?:\r?\n|$)/i.exec(src.slice(i, i + 24));
+			if (m) {
+				push(i);
+				i += m[0].length;
+				start = i;
+				continue;
+			}
+		}
 		if (c === "'" || c === '"' || c === "`") {
 			i++;
 			while (i < n) {
@@ -46,7 +62,7 @@ export function splitSql(src: string): Stmt[] {
 				const e = src.indexOf(m[0], i + m[0].length);
 				i = e < 0 ? n : e + m[0].length;
 			} else i++;
-		} else if (c === ";") {
+		} else if (c === ";" && !inBlock(src.slice(start, i))) {
 			push(i);
 			start = i + 1;
 			i++;

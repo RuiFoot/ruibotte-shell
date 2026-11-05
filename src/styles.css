@@ -3082,3 +3082,52 @@ input[type="radio"] {
 	border: 0.5px solid var(--hairline-strong);
 	padding: 3px 6px;
 }
+/* DB: 방금 실행한 문장·메시지·오류 머리 */
+.cm-ran {
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	border-radius: 2px;
+}
+.msg-list {
+	flex: 1;
+	overflow: auto;
+	font-size: 12px;
+}
+.msg-row {
+	display: grid;
+	grid-template-columns: auto auto auto 1fr auto;
+	align-items: center;
+	gap: 10px;
+	padding: 3px 10px;
+	border-bottom: 0.5px solid var(--hairline);
+}
+.msg-row:hover {
+	background: var(--fill);
+}
+.msg-at,
+.msg-ms {
+	color: var(--text-3);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+.msg-res {
+	color: var(--ok);
+	white-space: nowrap;
+	max-width: 420px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.msg-row.bad .msg-res {
+	color: var(--danger);
+}
+.msg-sql {
+	font-family: var(--font-mono);
+	color: var(--text-2);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.db-error-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}

@@ -2,8 +2,8 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirro
 import { bracketMatching } from "@codemirror/language";
 import { MSSQL, MySQL, PLSQL, PostgreSQL, StandardSQL, sql } from "@codemirror/lang-sql";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
-import { EditorState } from "@codemirror/state";
-import { drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
+import { EditorState, StateEffect, StateField } from "@codemirror/state";
+import { Decoration, type DecorationSet, drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
@@ -17,7 +17,7 @@ import { api } from "../lib/ipc";
 import { type Cell, type ColMeta, type EditStmt, buildDelete, buildInsert, buildUpdate, formatRows, previewSql, qualified } from "../lib/edits";
 import { ddlSql, explainSql, killSql, queryRows, searchSql, type Tool, toolSql } from "../lib/dbtools";
 import { quoteIdentFor, selectTop } from "../lib/engines";
-import { splitSql, statementAt } from "../lib/sql";
+import { type Stmt, splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { CellEditor } from "./CellEditor";
 import { DataGrid, type GridApi, type GridCol, type GridOverlay } from "./DataGrid";
@@ -58,7 +58,30 @@ type Ctx = {
 	insertText: (s: string) => void;
 	registerEditor: (id: string, v: EditorView | null) => void;
 	draftKey: string;
+	/** 실행 계획(커서 문장) */
+	explain: () => void;
+	/** 실행 중이면 멈추기 */
+	cancel: () => void;
+	running: boolean;
+	/** 메시지(실행 기록) */
+	messages: Msg[];
+	clearMessages: () => void;
 };
+type Msg = { at: number; sql: string; ok: boolean; text: string; ms?: number };
+
+/** 방금 실행한 문장 칠하기 — 글을 고치면 지운다 */
+const ranEffect = StateEffect.define<{ from: number; to: number }[]>();
+const ranField = StateField.define<DecorationSet>({
+	create: () => Decoration.none,
+	update(deco, tr) {
+		let d = tr.docChanged ? Decoration.none : deco.map(tr.changes);
+		for (const e of tr.effects) {
+			if (e.is(ranEffect)) d = Decoration.set(e.value.filter((r) => r.to > r.from).map((r) => Decoration.mark({ class: "cm-ran" }).range(r.from, r.to)));
+		}
+		return d;
+	},
+	provide: (f) => EditorView.decorations.from(f),
+});
 const DbCtx = createContext<Ctx | null>(null);
 const useDb = () => useContext(DbCtx) as Ctx;
 
@@ -105,13 +128,18 @@ const sqlTheme = EditorView.theme({
 });
 
 /** 실행할 문장들 — 고른 글이 있으면 그것, 아니면 커서 문장(all 이면 전체) */
-function pickStatements(v: EditorView, all: boolean): string[] {
+function pickRanges(v: EditorView, all: boolean): Stmt[] {
 	const doc = v.state.doc.toString();
 	const sel = v.state.selection.main;
-	if (!sel.empty) return splitSql(doc.slice(sel.from, sel.to)).map((s) => s.text);
-	if (all) return splitSql(doc).map((s) => s.text);
+	if (!sel.empty) return splitSql(doc.slice(sel.from, sel.to)).map((s) => ({ ...s, from: s.from + sel.from, to: s.to + sel.from }));
+	if (all) return splitSql(doc);
 	const s = statementAt(doc, sel.head);
-	return s ? [s.text] : [];
+	return s ? [s] : [];
+}
+function pickStatements(v: EditorView, all: boolean): string[] {
+	const r = pickRanges(v, all);
+	v.dispatch({ effects: ranEffect.of(r.map((x) => ({ from: x.from, to: x.to }))) });
+	return r.map((s) => s.text);
 }
 
 function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
@@ -121,6 +149,8 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 	runRef.current = ctx.run;
 	const engineRef = useRef(ctx.engine);
 	engineRef.current = ctx.engine;
+	const ctxRef = useRef(ctx);
+	ctxRef.current = ctx;
 	useEffect(() => {
 		if (!host.current) return;
 		const key = `${ctx.draftKey}.${props.params.n}`;
@@ -138,6 +168,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					highlightSelectionMatches(),
 					search({ top: true }),
 					codeHighlight,
+					ranField,
 					...editingExtensions(),
 					// DB 이름(스키마·표·열·별칭) 완성 — 키워드 완성은 sql() 이 함께 낸다
 					EditorState.languageData.of(() => [{ autocomplete: completionFor(ctx.conn) }]),
@@ -148,6 +179,15 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					}),
 					keymap.of([
 						{ key: "Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, false)), true) },
+						{ key: "Mod-e", preventDefault: true, run: () => (ctxRef.current.explain(), true) },
+						{
+							key: "Escape",
+							run: () => {
+								if (!ctxRef.current.running) return false;
+								ctxRef.current.cancel();
+								return true;
+							},
+						},
 						{ key: "Shift-Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, true)), true) },
 						{ key: "Shift-Alt-f", preventDefault: true, run: (view) => (void formatSqlIn(view, engineRef.current), true) },
 						indentWithTab,
@@ -236,7 +276,17 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	if (p.state === "error")
 		return (
 			<div className="db-error selectable">
-				<b>{p.error?.code === "CANCELLED" ? "취소했습니다" : "오류"}</b>
+				<div className="db-error-head">
+					<b>{p.error?.code === "CANCELLED" ? "취소했습니다" : "오류"}</b>
+					{p.error?.code && p.error.code !== "CANCELLED" && <span className="badge">{p.error.code}</span>}
+					<span style={{ flex: 1 }} />
+					<button type="button" className="btn ghost" onClick={() => void navigator.clipboard.writeText(`${p.error?.message ?? ""}\n\n${p.sql}`)}>
+						오류·SQL 복사
+					</button>
+					<button type="button" className="btn ghost" onClick={() => ctx.openSql(p.sql, "고칠 SQL")}>
+						편집기로
+					</button>
+				</div>
 				<pre>{p.error?.message}</pre>
 				<details>
 					<summary>실행한 SQL</summary>
@@ -724,7 +774,85 @@ function CompareDock(props: IDockviewPanelProps<{ a: string; b: string }>) {
 	return <ComparePanel conn={ctx.conn} a={props.params.a} b={props.params.b} />;
 }
 
-const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock };
+/** 메시지 — 실행한 문장마다 시각·결과·걸린 시간 */
+function MessagesPanel() {
+	const ctx = useDb();
+	return (
+		<div className="panel-fill">
+			<div className="msg-list selectable">
+				{ctx.messages.length === 0 && <div className="panel-hint">실행하면 여기에 시각·결과·걸린 시간이 쌓입니다.</div>}
+				{ctx.messages.map((m, i) => (
+					// biome-ignore lint/suspicious/noArrayIndexKey: 시간 순 기록
+					<div key={i} className={`msg-row${m.ok ? "" : " bad"}`} title={m.sql}>
+						<span className="msg-at">{new Date(m.at).toLocaleTimeString()}</span>
+						<span className="msg-res">{m.ok ? "✓" : "✗"} {m.text}</span>
+						{m.ms != null && <span className="msg-ms">{m.ms.toLocaleString()} ms</span>}
+						<code className="msg-sql">{m.sql.replace(/\s+/g, " ").slice(0, 200)}</code>
+						<button type="button" className="btn ghost icon" title="편집기로" onClick={() => ctx.openSql(m.sql)}>
+							<Play size={12} />
+						</button>
+					</div>
+				))}
+			</div>
+			<div className="statusbar">
+				<span>{ctx.messages.length}개</span>
+				<span style={{ marginLeft: "auto" }} />
+				<button type="button" className="btn ghost" style={{ height: 20 }} onClick={ctx.clearMessages}>
+					지우기
+				</button>
+			</div>
+		</div>
+	);
+}
+
+/** 파라미터 한 화면 — :이름·? 값을 모두 받는다(값은 이 창에서 기억) */
+const lastParams: Record<string, string> = {};
+function ParamSheet({ names, qCount, onDone }: { names: string[]; qCount: number; onDone: (v: Record<string, string> | null) => void }) {
+	const keys = [...names.map((n) => n), ...Array.from({ length: qCount }, (_, i) => `?${i + 1}`)];
+	const [vals, setVals] = useState<Record<string, string>>(() => Object.fromEntries(keys.map((k) => [k, lastParams[k] ?? ""])));
+	return (
+		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onDone(null)}>
+			<form
+				className="sheet"
+				onSubmit={(e) => {
+					e.preventDefault();
+					Object.assign(lastParams, vals);
+					onDone(vals);
+				}}
+				onKeyDown={(e) => e.key === "Escape" && onDone(null)}
+			>
+				<h3>파라미터</h3>
+				<p className="hint" style={{ margin: "-8px 0 12px" }}>문자는 그대로(따옴표 없이), 숫자는 숫자로, 비우면 NULL</p>
+				{keys.map((k, i) => (
+					<div key={k} className="field">
+						<label htmlFor={`pa-${i}`}>{k.startsWith("?") ? `${k.slice(1)}번째 ?` : `:${k}`}</label>
+						<input id={`pa-${i}`} autoFocus={i === 0} value={vals[k] ?? ""} onChange={(e) => setVals((v) => ({ ...v, [k]: e.target.value }))} spellCheck={false} />
+					</div>
+				))}
+				<div className="sheet-actions">
+					<button type="button" className="btn" onClick={() => onDone(null)}>
+						취소
+					</button>
+					<button type="submit" className="btn primary">
+						실행
+					</button>
+				</div>
+			</form>
+		</div>
+	);
+}
+
+/** 자동 LIMIT — LIMIT·TOP·FETCH·ROWNUM 이 없는 SELECT 에만 붙인다(SQL Server 는 건드리지 않음) */
+function withLimit(engine: string, sql: string, n: number): string {
+	const b = bare(sql).trim();
+	if (!/^(select|with)\b/i.test(b) || /\b(limit|top|fetch\s+first|rownum|offset)\b/i.test(b) || /\binto\b/i.test(b)) return sql;
+	const body = sql.replace(/;\s*$/, "");
+	if (engine === "postgres" || engine === "mysql" || engine === "mariadb" || engine === "cubrid") return `${body}\nLIMIT ${n}`;
+	if (engine === "oracle" || engine === "tibero") return `${body}\nFETCH FIRST ${n} ROWS ONLY`;
+	return sql;
+}
+
+const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock, messages: MessagesPanel };
 const FIXED = /^(objects|sql-\d+)$/;
 
 function defaultLayout(d: DockviewApi) {
@@ -758,6 +886,26 @@ export function DbWorkbench({
 	const lastEditor = useRef<string | null>(null);
 	const [maxRows, setMaxRows] = useState(10_000);
 	const [running, setRunning] = useState(false);
+	const [paramAsk, setParamAsk] = useState<{ names: string[]; qCount: number; resolve: (v: Record<string, string> | null) => void } | null>(null);
+	const [messages, setMessages] = useState<Msg[]>([]);
+	const addMsg = useCallback((m: Msg) => {
+		setMessages((l) => [m, ...l].slice(0, 500));
+		const d = dock.current;
+		if (d && !d.getPanel("messages")) {
+			const ref = d.panels.find((p) => p.id.startsWith("res-"));
+			if (ref) d.addPanel({ id: "messages", component: "messages", title: "메시지", position: { referencePanel: ref.id, direction: "within" }, inactive: true });
+		}
+	}, []);
+	const [autoLimit, setAutoLimit] = useState(false);
+	const [confirmWrites, setConfirmWrites] = useState(false);
+	const autoLimitRef = useRef(false);
+	autoLimitRef.current = autoLimit;
+	const confirmWritesRef = useRef(false);
+	confirmWritesRef.current = confirmWrites;
+	useEffect(() => {
+		void api.settingGet("db.autoLimit").then((v) => setAutoLimit(v === "1"));
+		void api.settingGet("db.confirmWrites").then((v) => setConfirmWrites(v === "1"));
+	}, []);
 	const [inTx, setInTx] = useState(false);
 	const historyScope = `db:${profileId ?? "adhoc"}`;
 	const [toolsMenu, setToolsMenu] = useState<{ x: number; y: number } | null>(null);
@@ -792,19 +940,30 @@ export function DbWorkbench({
 		async (input: string[], source?: Source, tool?: string) => {
 			const d = dock.current;
 			if (!d || !input.length) return;
-			// :이름 파라미터 — 문자열·주석 밖, ::형변환 제외
+			// 파라미터 — :이름(문자열·주석 밖, ::형변환 제외)과 ?(PostgreSQL 은 JSON 연산자라 빼고) 를 한 화면에서
 			const names = [...new Set(input.flatMap((x) => [...bare(x).matchAll(/(?<![:\w]):([A-Za-z_][\w]*)/g)].map((m) => m[1])))];
-			const values: Record<string, string> = {};
-			for (const n of names) {
-				const v = prompt(`파라미터 :${n} 값(문자는 그대로, 숫자는 숫자로, 비우면 NULL)`);
-				if (v === null) return;
-				values[n] = v;
+			const qCount = engine === "postgres" || tool ? 0 : input.reduce((a, x) => a + (bare(x).match(/\?/g)?.length ?? 0), 0);
+			let values: Record<string, string> = {};
+			if (names.length || qCount) {
+				const got = await new Promise<Record<string, string> | null>((resolve) => setParamAsk({ names, qCount, resolve }));
+				setParamAsk(null);
+				if (!got) return;
+				values = got;
 			}
-			const stmts = input.map((x) =>
-				names.length
-					? x.replace(/(?<![:\w]):([A-Za-z_][\w]*)/g, (m, n) => (n in values ? (values[n] === "" ? "NULL" : /^-?\d+(\.\d+)?$/.test(values[n]) ? values[n] : `'${values[n].replace(/'/g, "''")}'`) : m))
-					: x,
-			);
+			const lit = (v: string) => (v === "" ? "NULL" : /^-?\d+(\.\d+)?$/.test(v) ? v : `'${v.replace(/'/g, "''")}'`);
+			let qi = 0;
+			let stmts = input.map((x) => {
+				let y = names.length ? x.replace(/(?<![:\w]):([A-Za-z_][\w]*)/g, (m, n) => (n in values ? lit(values[n]) : m)) : x;
+				if (qCount) y = y.replace(/\?/g, () => lit(values[`?${++qi}`] ?? ""));
+				return y;
+			});
+			// 자동 LIMIT — LIMIT·TOP·FETCH 없는 SELECT 에 행 상한을 서버 쪽에도
+			if (autoLimitRef.current && !tool) stmts = stmts.map((x) => withLimit(engine, x, maxRef.current));
+			// 모든 쓰기 문장 확인(설정)
+			if (confirmWritesRef.current && !tool) {
+				const writes = stmts.filter((x) => !/^(select|with|show|explain|describe|desc|values|pragma)\b/i.test(bare(x).trim()));
+				if (writes.length && !confirm(`쓰기 문장 ${writes.length}개를 실행합니다.\n\n${writes.map((x) => x.slice(0, 160)).join("\n\n")}`)) return;
+			}
 			// 쓰기 확인 — DDL, WHERE 없는 UPDATE·DELETE
 			const risky = stmts.filter((x) => {
 				const b = bare(x).trim().toLowerCase();
@@ -844,9 +1003,11 @@ export function DbWorkbench({
 				try {
 					const ok = await db.query(conn, stmts[i], maxRef.current);
 					panel.api.updateParameters({ ...params, state: "ok", ok });
+					addMsg({ at: Date.now(), sql: stmts[i], ok: true, ms: ok.ms, text: ok.resultId ? `${ok.rowCount.toLocaleString()}행${ok.truncated ? "(상한에서 멈춤)" : ""}` : ok.affected != null ? `${ok.affected.toLocaleString()}행 반영` : "완료" });
 					if (!tool) void invoke("history_add", { scope: historyScope, item: { sql: stmts[i], ms: ok.ms, rows: ok.rowCount, ok: true } }).then(() => window.dispatchEvent(new Event("rb-history")));
 				} catch (e) {
 					panel.api.updateParameters({ ...params, state: "error", error: e as DbError });
+					addMsg({ at: Date.now(), sql: stmts[i], ok: false, text: (e as DbError).message ?? String(e) });
 					if (!tool) void invoke("history_add", { scope: historyScope, item: { sql: stmts[i], ok: false } }).then(() => window.dispatchEvent(new Event("rb-history")));
 					// 여러 문장이면 첫 오류에서 멈춘다
 					for (const rest of d.panels.filter((p) => p.id.startsWith("res-") && Number(p.id.slice(4)) > i + 1)) d.removePanel(rest);
@@ -856,7 +1017,7 @@ export function DbWorkbench({
 			setRunning(false);
 			currentEditor()?.focus();
 		},
-		[conn, historyScope],
+		[conn, historyScope, engine, addMsg],
 	);
 
 	const insertText = useCallback((s: string) => {
@@ -902,6 +1063,9 @@ export function DbWorkbench({
 		const sqls = st ? explainSql(engine, st) : null;
 		if (sqls) void run(sqls, undefined, "explain");
 	};
+
+	const explainRef = useRef(explain);
+	explainRef.current = explain;
 
 	const addSql = () => {
 		const d = dock.current;
@@ -981,8 +1145,13 @@ export function DbWorkbench({
 			openPanel,
 			historyScope,
 			draftKey: `sql.draft.${profileId ?? "adhoc"}`,
+			explain: () => explainRef.current(),
+			cancel: () => void db.cancel(conn),
+			running,
+			messages,
+			clearMessages: () => setMessages([]),
 		}),
-		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId],
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, running, messages],
 	);
 
 	return (
@@ -1024,6 +1193,28 @@ export function DbWorkbench({
 						★ SQL
 					</button>
 					<span className="sep" />
+					<button
+						type="button"
+						className={`btn ghost${autoLimit ? " on" : ""}`}
+						title="자동 LIMIT — LIMIT 없는 SELECT 에 행 상한을 서버 쪽에도 붙인다(PostgreSQL·MySQL·MariaDB·Oracle)"
+						onClick={() => {
+							setAutoLimit((x) => !x);
+							void api.settingSet("db.autoLimit", autoLimit ? "0" : "1");
+						}}
+					>
+						<span className="lbl keep">LIMIT</span>
+					</button>
+					<button
+						type="button"
+						className={`btn ghost${confirmWrites ? " on" : ""}`}
+						title="쓰기 확인 — INSERT·UPDATE·DELETE·DDL 을 실행 전에 모두 묻는다"
+						onClick={() => {
+							setConfirmWrites((x) => !x);
+							void api.settingSet("db.confirmWrites", confirmWrites ? "0" : "1");
+						}}
+					>
+						<Lock size={13} /> <span className="lbl">쓰기 확인</span>
+					</button>
 					<Select size="sm" value={maxRows} onChange={setMaxRows} title="결과 행 상한" options={[1000, 10_000, 100_000, 1_000_000].map((n) => ({ value: n, label: `최대 ${n.toLocaleString()}행` }))} />
 					<button
 						type="button"
@@ -1091,6 +1282,7 @@ export function DbWorkbench({
 					/>
 				)}
 			</div>
+			{paramAsk && <ParamSheet names={paramAsk.names} qCount={paramAsk.qCount} onDone={paramAsk.resolve} />}
 		</DbCtx.Provider>
 	);
 }
