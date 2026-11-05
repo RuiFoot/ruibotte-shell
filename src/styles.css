@@ -2890,3 +2890,29 @@ input[type="radio"] {
 	color: var(--text-3);
 	font-style: italic;
 }
+/* 편집기: 초안 띠·비교 시트 */
+.draft-bar {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 12px;
+	background: color-mix(in srgb, #ff9f0a 14%, var(--surface));
+	border-bottom: 0.5px solid var(--hairline);
+	font-size: 12.5px;
+	flex: none;
+}
+.draft-bar span {
+	margin-right: auto;
+}
+.draft-bar .btn {
+	height: 24px;
+}
+.diff-sheet {
+	height: min(62vh, 560px);
+	overflow: auto;
+	border-radius: var(--r-sm);
+	border: 0.5px solid var(--hairline);
+}
+.btn.ghost.danger {
+	color: var(--danger);
+}

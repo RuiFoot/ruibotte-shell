@@ -1,4 +1,5 @@
-import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
+import { DockviewDefaultTab, DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelHeaderProps, type IDockviewPanelProps } from "dockview-react";
+import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
 import { Activity, ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
@@ -66,6 +67,8 @@ type Ctx = {
 	broadcast: (fromPanel: string, data: string) => void;
 	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
 	treeKey: string;
+	/** 저장 안 한 편집기 기록의 주인(앱 탭) */
+	owner: string;
 	/** 원격 프로필(sudo 암호)·sudo 켜짐 — 자원 칸의 du·kill 용 */
 	profileId?: number;
 	sudoOn: boolean;
@@ -110,9 +113,13 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 	const ctx = useWb();
 	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
 	const onDirty = useCallback(
-		(dirty: boolean) => props.api.setTitle(`${dirty ? "● " : ""}${props.params.name}`),
-		[props.api, props.params.name],
+		(dirty: boolean) => {
+			setDirty(ctx.owner, props.api.id, props.params.name, dirty);
+			props.api.setTitle(`${dirty ? "● " : ""}${props.params.name}`);
+		},
+		[props.api, props.params.name, ctx.owner],
 	);
+	useEffect(() => () => setDirty(ctx.owner, props.api.id, "", false), [ctx.owner, props.api.id]);
 	const kind = previewKind(props.params.path);
 	return (
 		<div className="panel-fill">
@@ -176,6 +183,20 @@ function MonitorDock(props: IDockviewPanelProps) {
 	}, [props.api]);
 	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return <div className="panel-fill mon-empty"><p>원격 서버 작업대에서만 볼 수 있습니다</p></div>;
 	return <MonitorPanel conn={ctx.fs.conn} profileId={ctx.profileId} sudoOn={ctx.sudoOn} visible={visible} />;
+}
+
+/** 탭 — 저장 안 한 편집기는 닫기 전에 묻는다 */
+function GuardedTab(props: IDockviewPanelHeaderProps) {
+	const ctx = useWb();
+	return (
+		<DockviewDefaultTab
+			{...props}
+			closeActionOverride={() => {
+				if (isDirty(ctx.owner, props.api.id) && !confirmDiscard([props.api.title?.replace(/^● /, "") ?? props.api.id], "이 탭을 닫으면")) return;
+				props.api.close();
+			}}
+		/>
+	);
 }
 
 function Watermark() {
@@ -372,6 +393,7 @@ export function Workbench({
 	profileId,
 	peers = [],
 	syncInfo,
+	ownerId,
 }: {
 	fs: FsBackend;
 	/** 원격 작업대일 때 내 PC 트리(전송용) */
@@ -388,6 +410,8 @@ export function Workbench({
 	/** 열려 있는 다른 SSH 연결(중계 대상) */
 	peers?: { conn: number; label: string; home: string }[];
 	syncInfo?: { user: string; host: string; port: number };
+	/** 앱 탭 이름 — 저장 안 한 편집기를 앱 탭 단위로 묻기 위해 */
+	ownerId?: string;
 }) {
 	const [sudoOn, setSudoOn] = useState(false);
 	const [sudoMode, setSudoMode] = useState<"together" | "apart">("together");
@@ -398,6 +422,8 @@ export function Workbench({
 	const [sudoAsk, setSudoAsk] = useState<{ error?: string } | null>(null);
 	const sudoPw = useRef<string | null>(null);
 	const instance = useRef(`wb${Math.random().toString(36).slice(2, 8)}`);
+	const owner = ownerId ?? instance.current;
+	useEffect(() => () => forgetOwner(owner), [owner]);
 	const sudoFs = useMemo(
 		() => (fs.side === "remote" && fs.conn != null ? sshSudoFs(fs.conn, fs.label, fs.home, profileId) : null),
 		[fs, profileId],
@@ -724,10 +750,11 @@ export function Workbench({
 			showTransfers: () => showTransfers(true),
 			syncInfo,
 			treeKey: instance.current,
+			owner,
 			profileId,
 			sudoOn: sudoOn && !!sudoFs,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -863,7 +890,7 @@ export function Workbench({
 					</div>
 				)}
 				<div className="wb-dock">
-					<DockviewReact theme={theme} components={components} watermarkComponent={Watermark} onReady={onReady} />
+					<DockviewReact theme={theme} components={components} watermarkComponent={Watermark} defaultTabComponent={GuardedTab} onReady={onReady} />
 				</div>
 			</div>
 		</WbCtx.Provider>

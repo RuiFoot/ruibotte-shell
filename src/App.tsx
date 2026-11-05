@@ -5,6 +5,7 @@ import { BookOpen, ChevronDown, ChevronRight, Database, Download, Settings as Se
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
+import { confirmDiscard, dirtyTitles } from "./lib/dirty";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
@@ -98,6 +99,7 @@ export function App() {
 		(id: string) => {
 			const ts = tabsRef.current;
 			if (ts.length === 1) return;
+			if (!confirmDiscard(dirtyTitles(id), "이 탭을 닫으면")) return;
 			const t = ts.find((x) => x.id === id);
 			if (t?.ssh) void api.sshDisconnect(t.ssh.ok.connId);
 			if (t?.db) void invoke("db_disconnect", { conn: t.db.ok.connId });
@@ -231,6 +233,13 @@ export function App() {
 	const isWin = info?.os === "windows";
 	const mod = info?.os === "macos" ? "⌘" : "Ctrl+";
 	const win = getCurrentWindow();
+	// 앱을 끌 때: 저장 안 한 편집기가 있으면 묻는다(창 단추·Alt+F4·작업 표시줄 모두)
+	useEffect(() => {
+		const un = win.onCloseRequested((e) => {
+			if (!confirmDiscard(dirtyTitles(), "앱을 끄면")) e.preventDefault();
+		});
+		return () => void un.then((f) => f());
+	}, [win]);
 	const activeKind = tabs.find((t) => t.id === active)?.kind;
 
 	const connect = (p: Profile) => {
@@ -454,7 +463,7 @@ export function App() {
 							)}
 							<Suspense fallback={null}>
 								{t.kind === "local" && localHome && (
-									<Workbench fs={backendFor(t).fs} term={backendFor(t).term} active={t.id === active} label="내 PC 셸" layoutKey="layout.local" />
+									<Workbench ownerId={t.id} fs={backendFor(t).fs} term={backendFor(t).term} active={t.id === active} label="내 PC 셸" layoutKey="layout.local" />
 								)}
 								{t.kind === "ssh" && t.ssh?.closed && (
 									<div className="closed-banner">
@@ -466,6 +475,7 @@ export function App() {
 								)}
 								{t.kind === "ssh" && t.ssh && (
 									<Workbench
+										ownerId={t.id}
 										key={t.ssh.ok.connId}
 										fs={backendFor(t).fs}
 										local={backendFor(t).local}
