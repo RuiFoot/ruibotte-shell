@@ -1,7 +1,7 @@
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent, type DockviewTheme, type IDockviewPanelProps } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
+import { Activity, ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -22,6 +22,7 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
+import { MonitorPanel } from "./MonitorPanel";
 import { SyncPanel } from "./SyncPanel";
 import { TailView } from "./TailView";
 import { invoke } from "@tauri-apps/api/core";
@@ -64,6 +65,9 @@ type Ctx = {
 	broadcast: (fromPanel: string, data: string) => void;
 	/** 바뀔 때마다 트리가 다시 그려지도록(sudo 켜고 끄기) */
 	treeKey: string;
+	/** 원격 프로필(sudo 암호)·sudo 켜짐 — 자원 칸의 du·kill 용 */
+	profileId?: number;
+	sudoOn: boolean;
 };
 const WbCtx = createContext<Ctx | null>(null);
 const useWb = () => useContext(WbCtx) as Ctx;
@@ -162,6 +166,17 @@ function SyncDock() {
 	return <SyncPanel conn={ctx.fs.conn} remoteHome={ctx.fs.home} user={ctx.syncInfo.user} host={ctx.syncInfo.host} port={ctx.syncInfo.port} onRun={ctx.showTransfers} />;
 }
 
+function MonitorDock(props: IDockviewPanelProps) {
+	const ctx = useWb();
+	const [visible, setVisible] = useState(props.api.isVisible);
+	useEffect(() => {
+		const d = props.api.onDidVisibilityChange((e) => setVisible(e.isVisible));
+		return () => d.dispose();
+	}, [props.api]);
+	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return <div className="panel-fill mon-empty"><p>원격 서버 작업대에서만 볼 수 있습니다</p></div>;
+	return <MonitorPanel conn={ctx.fs.conn} profileId={ctx.profileId} sudoOn={ctx.sudoOn} visible={visible} />;
+}
+
 function Watermark() {
 	return (
 		<div className="dock-watermark">
@@ -258,7 +273,7 @@ function TransfersPanel() {
 	);
 }
 
-const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel, sync: SyncDock };
+const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel, sync: SyncDock, monitor: MonitorDock };
 const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
 
 /** 기본 배치: 트리 왼쪽 · 편집기 가운데 · 터미널 오른쪽 */
@@ -596,6 +611,14 @@ export function Workbench({
 		d.addPanel({ id: "sync", component: "sync", title: "동기화", renderer: "always", position: ref ? { referencePanel: ref.id, direction: "below" } : undefined });
 	};
 
+	const openMonitor = () => {
+		const d = dock.current;
+		if (!d) return;
+		if (d.getPanel("monitor")) return void d.getPanel("monitor")?.api.setActive();
+		const ref = d.panels.find((p) => p.id.startsWith("edit:") || p.id.startsWith("tail:") || p.id.startsWith("diff:"));
+		d.addPanel({ id: "monitor", component: "monitor", title: "자원", position: ref ? { referencePanel: ref.id, direction: "within" } : { direction: "right" } });
+	};
+
 	const addTerminal = () => {
 		const d = dock.current;
 		if (!d) return;
@@ -682,8 +705,10 @@ export function Workbench({
 			showTransfers,
 			syncInfo,
 			treeKey: instance.current,
+			profileId,
+			sudoOn: sudoOn && !!sudoFs,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -703,6 +728,11 @@ export function Workbench({
 					{local && (
 						<button type="button" className="btn ghost" onClick={showTransfers} title="전송 목록">
 							<ArrowDownUp size={14} /> 전송
+						</button>
+					)}
+					{fs.side === "remote" && fs.conn != null && (
+						<button type="button" className="btn ghost" onClick={openMonitor} title="서버 자원 — CPU·메모리·디스크·네트워크·프로세스">
+							<Activity size={14} /> 자원
 						</button>
 					)}
 					{local && syncInfo && (

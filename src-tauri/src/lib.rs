@@ -6,6 +6,7 @@ mod grid;
 mod importer;
 mod jdbc;
 mod localfs;
+mod monitor;
 mod pty;
 mod secrets;
 mod ssh;
@@ -124,6 +125,9 @@ pub fn run() {
             ssh::sftp_write_text,
             ssh::sftp_realpath,
             ssh::ssh_exec,
+            monitor::ssh_stats,
+            monitor::ssh_du,
+            monitor::ssh_kill,
             localfs::local_home,
             localfs::local_list,
             localfs::local_read_text,

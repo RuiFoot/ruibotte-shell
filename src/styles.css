@@ -1867,3 +1867,253 @@ html[data-os="macos"] .sidebar {
 .sync-row.delete code {
 	color: var(--danger);
 }
+
+/* ── 서버 자원 ─────────────────────── */
+.mon {
+	overflow: auto;
+	padding: 12px 16px 20px;
+	gap: 14px;
+	font-size: 12.5px;
+	--warn: #ff9f0a;
+}
+.mon-empty {
+	align-items: center;
+	justify-content: center;
+	color: var(--text-2);
+}
+.mon-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+.mon-head b {
+	font-size: 15px;
+	font-weight: 600;
+	margin-right: 10px;
+}
+.mon-head small,
+.mon-muted {
+	color: var(--text-3);
+}
+.mon-ctl {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.mon-ctl select {
+	font-size: 12px;
+}
+.mon-cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+	gap: 10px;
+}
+.mon-card {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 10px 12px;
+	border-radius: var(--r-md);
+	background: var(--surface-2);
+	box-shadow: var(--shadow-card);
+	min-height: 108px;
+}
+.mon-card small {
+	color: var(--text-3);
+	font-size: 11px;
+}
+.mon-k {
+	color: var(--text-2);
+	font-size: 11.5px;
+	font-weight: 500;
+}
+.mon-v {
+	font-size: 24px;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	letter-spacing: -0.02em;
+	line-height: 1.1;
+}
+.mon-v.small {
+	font-size: 14px;
+	line-height: 1.35;
+}
+.mon .warn {
+	color: var(--warn);
+}
+.mon .crit {
+	color: var(--danger);
+}
+.mon-spark {
+	width: 100%;
+	height: 32px;
+	display: block;
+}
+.mon-cores {
+	display: flex;
+	gap: 2px;
+	height: 28px;
+	align-items: flex-end;
+	padding: 0 2px;
+}
+.mon-core {
+	flex: 1;
+	max-width: 18px;
+	height: 100%;
+	border-radius: 3px;
+	background: var(--fill);
+	display: flex;
+	align-items: flex-end;
+	overflow: hidden;
+}
+.mon-core > div {
+	width: 100%;
+	background: var(--accent);
+	transition: height 0.4s ease;
+}
+.mon-core > div.warn {
+	background: var(--warn);
+}
+.mon-core > div.crit {
+	background: var(--danger);
+}
+.mon-sec h4 {
+	margin: 0 0 6px;
+	font-size: 12.5px;
+	font-weight: 600;
+}
+.mon-sec-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 6px;
+}
+.mon-sec-head h4 {
+	margin: 0;
+	margin-right: auto;
+}
+.mon-filter {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	padding: 3px 8px;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	color: var(--text-3);
+}
+.mon-filter input {
+	border: 0;
+	background: transparent;
+	outline: none;
+	color: var(--text);
+	width: 140px;
+	font-size: 12px;
+}
+.mon-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-variant-numeric: tabular-nums;
+}
+.mon-table th {
+	text-align: left;
+	font-weight: 500;
+	color: var(--text-3);
+	font-size: 11px;
+	padding: 3px 6px;
+	border-bottom: 0.5px solid var(--hairline);
+}
+.mon-table td {
+	padding: 3px 6px;
+	border-bottom: 0.5px solid var(--hairline);
+	white-space: nowrap;
+}
+.mon-table .num {
+	text-align: right;
+}
+.mon-table .dim {
+	color: var(--text-3);
+}
+.mon-table .name {
+	font-family: var(--font-mono);
+	max-width: 320px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.mon-table .root {
+	color: var(--danger);
+}
+.mon-table tr.click {
+	cursor: pointer;
+}
+.mon-table tr.click:hover td {
+	background: var(--fill);
+}
+.mon-table tr.total td {
+	font-weight: 600;
+}
+.mon-table .barcell {
+	width: 34%;
+	min-width: 120px;
+}
+.mon-table .barcell .mon-bar {
+	display: inline-block;
+	vertical-align: middle;
+	width: calc(100% - 46px);
+}
+.mon-pct {
+	display: inline-block;
+	width: 42px;
+	text-align: right;
+	color: var(--text-2);
+}
+.mon-table .acts {
+	text-align: right;
+	opacity: 0;
+}
+.mon-table tr:hover .acts {
+	opacity: 1;
+}
+.mon-bar {
+	height: 6px;
+	border-radius: 3px;
+	background: var(--fill);
+	overflow: hidden;
+}
+.mon-bar > div {
+	height: 100%;
+	border-radius: 3px;
+	background: var(--accent);
+}
+.mon-bar.warn > div {
+	background: var(--warn);
+}
+.mon-bar.crit > div {
+	background: var(--danger);
+}
+.mon-tag {
+	margin-left: 6px;
+	padding: 0 5px;
+	border-radius: 4px;
+	font-family: var(--font-ui);
+	font-size: 10.5px;
+	background: color-mix(in srgb, var(--warn) 18%, transparent);
+	color: var(--warn);
+}
+.mon-du-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+.mon-du-head code {
+	font-family: var(--font-mono);
+	margin-right: auto;
+}
+.btn.tiny {
+	padding: 2px 5px;
+	min-height: 0;
+}
+.btn.ghost.danger {
+	color: var(--danger);
+}

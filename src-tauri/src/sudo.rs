@@ -13,17 +13,17 @@ use crate::textcodec::{self, TextMeta};
 
 const MAX_TEXT: usize = 8 * 1024 * 1024;
 
-struct Out {
-    code: Option<u32>,
-    stdout: Vec<u8>,
-    stderr: String,
+pub(crate) struct Out {
+    pub(crate) code: Option<u32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: String,
 }
 
-fn q(s: &str) -> String {
+pub(crate) fn q(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-async fn exec(c: &Conn, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
+pub(crate) async fn exec(c: &Conn, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
     let mut ch = c.handle_ref().channel_open_session().await.map_err(|e| err("OTHER", e.to_string()))?;
     ch.exec(true, cmd).await.map_err(|e| err("OTHER", e.to_string()))?;
     if let Some(input) = stdin {
@@ -52,7 +52,7 @@ fn needs_password(o: &Out) -> bool {
 }
 
 /// `sudo -n <cmd>` — 암호가 필요하면 저장/입력한 암호로 한 번 인증하고 다시
-async fn sudo(c: &Conn, password: Option<&str>, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
+pub(crate) async fn sudo(c: &Conn, password: Option<&str>, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
     let full = format!("sudo -n -- {cmd}");
     let o = exec(c, &full, stdin).await?;
     if !needs_password(&o) {
@@ -79,7 +79,7 @@ fn check(o: Out) -> R<Out> {
     Err(err("SFTP", msg))
 }
 
-fn pw_for(profile_id: Option<i64>, password: Option<String>) -> Option<String> {
+pub(crate) fn pw_for(profile_id: Option<i64>, password: Option<String>) -> Option<String> {
     password.filter(|p| !p.is_empty()).or_else(|| profile_id.and_then(|id| secrets::get(&format!("profile:{id}:sudo"))))
 }
 

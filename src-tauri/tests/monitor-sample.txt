@@ -1,0 +1,124 @@
+@host
+cd326f9af504
+Linux 6.6.87.2-microsoft-standard-WSL2
+4096
+@stat
+cpu  230625 1337 228598 78534531 46280 0 64246 0 0 0
+cpu0 29581 44 32705 9804129 8944 0 31050 0 0 0
+cpu1 28112 424 24936 9823208 5889 0 14340 0 0 0
+cpu2 30884 4 31776 9810651 7999 0 6030 0 0 0
+cpu3 27096 226 26231 9823752 3608 0 4535 0 0 0
+cpu4 29492 0 30921 9810008 7254 0 2574 0 0 0
+cpu5 26795 0 24973 9826230 3556 0 2389 0 0 0
+cpu6 30018 545 31728 9809489 6167 0 1682 0 0 0
+cpu7 28644 92 25326 9827061 2859 0 1643 0 0 0
+procs_running 2
+procs_blocked 1
+@mem
+MemTotal:       16234712 kB
+MemFree:        14220204 kB
+MemAvailable:   15079472 kB
+Buffers:           36564 kB
+Cached:           699472 kB
+SwapCached:            0 kB
+Active:           216568 kB
+Inactive:         906384 kB
+Active(anon):      38860 kB
+Inactive(anon):   498688 kB
+Active(file):     177708 kB
+Inactive(file):   407696 kB
+Unevictable:           0 kB
+Mlocked:               0 kB
+SwapTotal:       4194304 kB
+SwapFree:        4194304 kB
+Dirty:               168 kB
+Writeback:             0 kB
+AnonPages:        387344 kB
+Mapped:           428236 kB
+Shmem:            150372 kB
+KReclaimable:     521936 kB
+Slab:             632312 kB
+SReclaimable:     521936 kB
+SUnreclaim:       110376 kB
+KernelStack:        7364 kB
+PageTables:         9388 kB
+SecPageTables:         0 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:    12311660 kB
+Committed_AS:    3034196 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:       36528 kB
+VmallocChunk:          0 kB
+Percpu:             4352 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:         0 kB
+FilePmdMapped:         0 kB
+Unaccepted:            0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
+DirectMap4k:      142336 kB
+DirectMap2M:    13342720 kB
+DirectMap1G:    11534336 kB
+@load
+0.03 0.06 0.06 2/456 14
+98982.27 785345.34
+@net
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0
+  eth0:     238       3    0    0    0     0          0         0       42       1    0    0    0     0       0          0
+@df
+Filesystem     Type    1024-blocks     Used Available Capacity Mounted on
+overlay        overlay  1055762868 48091264 953968132       5% /
+tmpfs          tmpfs         65536        0     65536       0% /dev
+shm            tmpfs         65536        0     65536       0% /dev/shm
+/dev/sdd       ext4     1055762868 48091264 953968132       5% /etc/hosts
+tmpfs          tmpfs             4        0         4       0% /proc/acpi
+@io
+   1       0 ram0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       1 ram1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       2 ram2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       3 ram3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       4 ram4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       5 ram5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       6 ram6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       7 ram7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       8 ram8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1       9 ram9 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1      10 ram10 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1      11 ram11 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1      12 ram12 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1      13 ram13 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1      14 ram14 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   1      15 ram15 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   7       0 loop0 291 0 47668 145 0 0 0 0 0 148 145 0 0 0 0 0 0
+   7       1 loop1 21837 0 3937994 14222 0 0 0 0 0 2267192 14222 0 0 0 0 0 0
+   7       2 loop2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   7       3 loop3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   7       4 loop4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   7       5 loop5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   7       6 loop6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   7       7 loop7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+   8      16 sdb 354 70 32402 217 0 0 0 0 0 1126928 217 0 0 0 0 0 0
+   8       0 sda 1842 429 186786 863 0 0 0 0 0 720 863 0 0 0 0 0 0
+   8      32 sdc 98 0 4456 18 2 0 8 6 0 20 29 0 0 0 0 1 4
+   8      48 sdd 163079 39197 8741466 64244 100293 88117 19724199 1543447 0 384004 1812724 8824 774 2036611640 614 54416 204418
+   8      64 sde 889 102 103396 689 132 2 266 401 0 288 1162 3 0 3080 0 10 70
+   8      80 sdf 105356 28005 7419554 54659 120648 71099 4242792 669735 0 342148 788102 7003 595 26105656 1397 11962 62310
+@ps
+1	16	640	S	sh
+7	0	640	S	sleep
+8	3	640	S	sh
+@user
+1 root
+7 root
+8 root
