@@ -16,6 +16,7 @@ import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ip
 import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { SnippetPalette } from "./SnippetPalette";
+import { DANGER, setActiveTerminal } from "../lib/activeTerm";
 import { Select } from "./Select";
 
 function themeFromCss() {
@@ -38,8 +39,6 @@ type Pending = { marker: IMarker; start: number; text: string };
  * 검색(Ctrl+Shift+F)·링크·글꼴(Ctrl+=/−/0)·복사/붙여넣기(Ctrl+Shift+C/V, 우클릭)·여러 줄 붙여넣기 확인·
  * 스크롤백 저장·인코딩(UTF-8/EUC-KR)·스니펫(Alt+P).
  */
-/** 붙여넣기 전에 한 번 더 보게 할 명령 */
-const DANGER = /(\brm\s+(-[a-z]*[rf][a-z]*\s+)+\/?(\s|$|\*)|\brm\s+-[a-z]*r[a-z]*f|\bmkfs\b|\bdd\s+[^|]*of=\/dev\/|>\s*\/dev\/sd|\b(shutdown|reboot|poweroff|halt|init\s+0)\b|\bchmod\s+-R\s+777\s+\/|:\(\)\s*\{\s*:\|:&\s*\};:|\bDROP\s+(DATABASE|TABLE)\b|\btruncate\s+table\b)/i;
 
 /** 출력의 경로 — 절대 경로(/…, C:/…)와 뒤에 붙은 :줄 */
 const PATH_RE = /(?:^|[\s'"(=:])((?:\/|[A-Za-z]:[\\/])[\w.@+~\-\\/]*[\w])(?::(\d+))?/g;
@@ -391,6 +390,9 @@ export function TerminalView({
 		});
 		// 여러 줄 붙여넣기 확인 — xterm 이 받기 전에 가로챈다
 		const ta = term.textarea;
+		// 사전에서 "터미널에 넣기" 할 대상 — 마지막으로 포커스를 받은 터미널
+		const onFocusIn = () => setActiveTerminal({ write: (s) => write(s), label });
+		ta?.addEventListener("focus", onFocusIn);
 		const onPaste = (ev: ClipboardEvent) => {
 			const text = ev.clipboardData?.getData("text/plain") ?? "";
 			if (text.replace(/\r?\n$/, "").includes("\n")) {
@@ -422,6 +424,7 @@ export function TerminalView({
 			disposed = true;
 			completer?.dispose();
 			ta?.removeEventListener("paste", onPaste, true);
+			ta?.removeEventListener("focus", onFocusIn);
 			osc133.dispose();
 			osc7.dispose();
 			osc6974.dispose();

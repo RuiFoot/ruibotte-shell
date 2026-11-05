@@ -1,5 +1,7 @@
-import { BookOpen, Search } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { AlertTriangle, BookOpen, Copy, Search, SquareTerminal, Star } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { activeTerminal, DANGER } from "../lib/activeTerm";
 
 import { type Dict, type DictCmd, loadDict } from "../lib/dict";
 
@@ -15,11 +17,27 @@ const SYN: string[][] = [
 	["폴더", "디렉터리", "디렉토리"],
 ];
 
+/** 한글 초성(ㄱ~ㅎ) — "ㅇㅊ" 로 "압축" 찾기 */
+const CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ";
+function initials(s: string) {
+	let out = "";
+	for (const ch of s) {
+		const c = ch.charCodeAt(0) - 0xac00;
+		out += c >= 0 && c < 11172 ? CHO[Math.floor(c / 588)] : ch;
+	}
+	return out;
+}
+const isCho = (w: string) => /^[ㄱ-ㅎ]+$/.test(w);
+
 function score(name: string, c: DictCmd, words: string[]): number {
 	let s = 0;
 	for (const w of words) {
 		const alts = [w, ...(SYN.find((g) => g.includes(w))?.filter((x) => x !== w) ?? [])];
 		let hit = 0;
+		if (isCho(w)) {
+			if (c.k.some((k) => initials(k).includes(w))) hit = 30;
+			else if (initials(c.d).includes(w)) hit = 15;
+		}
 		for (const a of alts) {
 			if (name === a) hit = Math.max(hit, 100);
 			else if (name.startsWith(a)) hit = Math.max(hit, 60);
@@ -36,6 +54,13 @@ export function CommandDictionaryPane() {
 	const [dict, setDict] = useState<Dict | null>(null);
 	const [q, setQ] = useState("");
 	const [sel, setSel] = useState<string | null>(null);
+	const [note, setNote] = useState("");
+	const flash = (t: string) => {
+		setNote(t);
+		window.setTimeout(() => setNote(""), 2500);
+	};
+	/** {{자리}} 를 이름만 남기고 */
+	const plain = (c: string) => c.replace(/\{\{([^}]*)\}\}/g, "$1");
 
 	useEffect(() => {
 		void loadDict().then(setDict);
@@ -68,7 +93,7 @@ export function CommandDictionaryPane() {
 							setQ(e.target.value);
 							setSel(null);
 						}}
-						placeholder="명령 이름 또는 하고 싶은 일(예: 교체, 압축 풀기)"
+						placeholder="명령 이름·하고 싶은 일(예: 교체, 압축 풀기)·초성(ㅇㅊ)"
 						style={{ fontSize: 13 }}
 					/>
 				</div>
@@ -95,10 +120,50 @@ export function CommandDictionaryPane() {
 									</span>
 								))}
 							</div>
+							{note && <div className="tree-note" style={{ margin: "0 0 10px" }}>{note}</div>}
 							{cmd.x?.map(([d, c]) => (
-								<div key={c} className="ex">
-									<p>{d}</p>
-									<code>{withSlots(c)}</code>
+								<div key={c} className={`ex${DANGER.test(c) ? " danger" : ""}`}>
+									<p>
+										{DANGER.test(c) && (
+											<span className="danger-tag">
+												<AlertTriangle size={12} /> 되돌리기 어려움
+											</span>
+										)}
+										{d}
+									</p>
+									<div className="ex-row">
+										<code>{withSlots(c)}</code>
+										<span className="ex-acts">
+											<button
+												type="button"
+												className="btn ghost icon"
+												title="터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널, 자리표시자는 이름만 남김"
+												onClick={() => {
+													const t = activeTerminal();
+													if (!t) return flash("먼저 터미널을 한 번 눌러 두세요");
+													t.write(plain(c));
+													flash(`${t.label} 터미널에 넣었습니다 — 자리표시자를 고친 뒤 Enter`);
+												}}
+											>
+												<SquareTerminal size={13} />
+											</button>
+											<button type="button" className="btn ghost icon" title="복사" onClick={() => void navigator.clipboard.writeText(plain(c)).then(() => flash("복사했습니다"))}>
+												<Copy size={13} />
+											</button>
+											<button
+												type="button"
+												className="btn ghost icon"
+												title="내 스니펫으로 저장(Alt+P 로 꺼내 쓰기)"
+												onClick={() =>
+													void invoke("snippet_save", { s: { kind: "shell", name: `${cur} — ${d}`.slice(0, 80), body: plain(c) } })
+														.then(() => flash("스니펫으로 저장했습니다(터미널에서 Alt+P)"))
+														.catch((e) => flash(String(e)))
+												}
+											>
+												<Star size={13} />
+											</button>
+										</span>
+									</div>
 								</div>
 							))}
 							{cmd.o?.slice(0, 60).map(([f, d]) => (

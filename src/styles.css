@@ -3255,3 +3255,35 @@ input[type="radio"] {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+/* 사전: 예시 단추·위험 표시 */
+.ex-row {
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+}
+.ex-row code {
+	flex: 1;
+	min-width: 0;
+}
+.ex-acts {
+	display: flex;
+	gap: 2px;
+	opacity: 0.55;
+}
+.ex:hover .ex-acts {
+	opacity: 1;
+}
+.ex.danger code {
+	box-shadow: inset 3px 0 0 var(--danger);
+}
+.danger-tag {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	margin-right: 6px;
+	padding: 0 6px;
+	border-radius: 5px;
+	background: color-mix(in srgb, var(--danger) 14%, transparent);
+	color: var(--danger);
+	font-size: 11px;
+}
