@@ -8,8 +8,9 @@
  */
 import { dictNow } from "./dict";
 import type { FsEntry } from "./ipc";
+import { SPECS } from "./specs";
 
-export type Candidate = { insert: string; label: string; desc?: string; kind: "cmd" | "sub" | "opt" | "path" | "hist" };
+export type Candidate = { insert: string; label: string; desc?: string; kind: "cmd" | "sub" | "opt" | "path" | "hist"; dir?: boolean };
 
 export type CompleteCtx = {
 	/** 서버(또는 내 PC) 명령 목록 — compgen -c */
@@ -20,6 +21,10 @@ export type CompleteCtx = {
 	listDir: (dir: string) => FsEntry[] | null;
 	cwd: string | null;
 	home: string | null;
+	/** systemd 유닛 이름(systemctl·journalctl 인자) — 받아 둔 것 */
+	units?: string[];
+	/** 컨테이너 이름(docker 인자) — 받아 둔 것 */
+	containers?: string[];
 };
 
 /** 셸 낱말 나누기 — 따옴표·역슬래시 존중, 마지막 낱말은 끝까지(빈 낱말 포함) */
@@ -64,6 +69,32 @@ function rank(list: Candidate[], q: string, limit = 60): Candidate[] {
 		.map(([c]) => c);
 }
 
+const fmtSize = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(1)} GB`);
+const fmtDate = (t?: number | null) => {
+	if (!t) return "";
+	const d = new Date(t * 1000);
+	const now = new Date();
+	const p = (x: number) => String(x).padStart(2, "0");
+	return d.getFullYear() === now.getFullYear() ? `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}` : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+/** 옵션 목록 — 직접 적은 스펙을 먼저, 사전 것을 뒤에(같은 깃발은 한 번) */
+function optionsOf(cmdName: string, subName: string | undefined, dictOpts: readonly (readonly [string, string, ...unknown[]])[]): [string, string][] {
+	const spec = SPECS[cmdName];
+	const sub = subName ? spec?.subs?.[subName] : undefined;
+	const out: [string, string][] = [];
+	const seen = new Set<string>();
+	for (const [f, d, arg] of [...(sub?.opts ?? []), ...(spec?.opts ?? []), ...dictOpts] as (readonly [string, string, unknown?])[]) {
+		for (const one of f.split("|")) {
+			if (seen.has(one)) continue;
+			seen.add(one);
+			// 인자를 받는 옵션은 이름을 붙여 보인다(-n ‹줄 수›)
+			out.push([one, typeof arg === "string" && arg ? `${d} ‹${arg}›` : d]);
+		}
+	}
+	return out;
+}
+
 const esc = (s: string) => s.replace(/([ '"\\$`!*?&;|<>(){}[\]])/g, "\\$1");
 
 /** 후보 계산 — line 은 프롬프트 뒤 입력(커서까지). 바꿀 낱말 길이(replace)와 후보 */
@@ -86,25 +117,50 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 		}
 		const names = new Set<string>([...Object.keys(dict?.c ?? {}), ...ctx.commands]);
 		const cmds: Candidate[] = [];
-		for (const n of names) cmds.push({ insert: n, label: n, desc: dict?.c[n]?.d, kind: "cmd" });
+		for (const n of Object.keys(SPECS)) names.add(n);
+		for (const n of names) cmds.push({ insert: n, label: n, desc: SPECS[n]?.desc ?? dict?.c[n]?.d, kind: "cmd" });
 		return { replace: cur.length, items: [...items, ...rank(cmds, cur)].slice(0, 60) };
 	}
 	// 2) 옵션
-	const sub = cmd?.s && ws.length > 2 ? cmd.s[ws[1]] : undefined;
-	if (cur.startsWith("-") && cmd) {
-		const opts = [...(sub?.o ?? []), ...(cmd.o ?? [])];
-		const items: Candidate[] = [];
-		for (const [flags, desc] of opts) for (const f of flags.split("|")) items.push({ insert: f, label: f, desc, kind: "opt" });
+	const spec = SPECS[cmdName];
+	const subName = ws.length > 2 ? ws[1] : undefined;
+	const sub = cmd?.s && subName ? cmd.s[subName] : undefined;
+	const specSub = subName ? spec?.subs?.[subName] : undefined;
+	if (cur.startsWith("-") && (cmd || spec)) {
+		const opts = optionsOf(cmdName, subName, [...(sub?.o ?? []), ...(cmd?.o ?? [])]);
+		const items: Candidate[] = opts.map(([f, desc]) => ({ insert: `${f}${f.endsWith("=") ? "" : " "}`, label: f, desc, kind: "opt" }));
+		// 짧은 옵션 묶음(-al, -xzvf) — 글자마다 뜻을 풀어 보인다
+		if (/^-[A-Za-z]{2,}$/.test(cur)) {
+			const short = new Map(opts.filter(([f]) => /^-[A-Za-z]$/.test(f)).map(([f, d]) => [f[1], d]));
+			const parts = [...cur.slice(1)].map((c) => (short.has(c) ? `${c} ${short.get(c)}` : null));
+			if (parts.every(Boolean)) return { replace: cur.length, items: [{ insert: `${cur} `, label: cur, desc: parts.join(" · "), kind: "opt" }, ...rank(items, cur)] };
+		}
 		return { replace: cur.length, items: rank(items, cur) };
 	}
 	// 3) 하위 명령
-	if (ws.length === 2 && cmd?.s) {
-		const items = Object.entries(cmd.s).map(([n, s]) => ({ insert: n, label: n, desc: s.d, kind: "sub" as const }));
+	if (ws.length === 2 && (cmd?.s || spec?.subs)) {
+		const seen = new Set<string>();
+		const items: Candidate[] = [];
+		for (const [n, s] of Object.entries(spec?.subs ?? {})) {
+			seen.add(n);
+			items.push({ insert: `${n} `, label: n, desc: s.desc, kind: "sub" });
+		}
+		for (const [n, s] of Object.entries(cmd?.s ?? {})) if (!seen.has(n)) items.push({ insert: `${n} `, label: n, desc: s.d, kind: "sub" });
 		const ranked = rank(items, cur);
 		if (ranked.length || !cur) return { replace: cur.length, items: ranked };
 	}
+	// 3-1) systemd 유닛·컨테이너 이름
+	const argKind = specSub?.args ?? spec?.args;
+	if (argKind === "unit" && ctx.units?.length) {
+		const items: Candidate[] = ctx.units.map((u) => ({ insert: `${u} `, label: u, desc: "유닛", kind: "sub" }));
+		return { replace: cur.length, items: rank(items, cur, 80) };
+	}
+	if (argKind === "container" && ctx.containers?.length) {
+		const items: Candidate[] = ctx.containers.map((u) => ({ insert: `${u} `, label: u, desc: "컨테이너", kind: "sub" }));
+		return { replace: cur.length, items: rank(items, cur, 80) };
+	}
 	// 4) 경로
-	const onlyDirs = cmdName === "cd" || cmdName === "pushd" || cmd?.a === "dir" || sub?.a === "dir";
+	const onlyDirs = cmdName === "cd" || cmdName === "pushd" || cmd?.a === "dir" || sub?.a === "dir" || argKind === "dir";
 	const slash = cur.lastIndexOf("/");
 	const dirPart = slash >= 0 ? cur.slice(0, slash + 1) : "";
 	const namePart = slash >= 0 ? cur.slice(slash + 1) : cur;
@@ -117,7 +173,13 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 	const items: Candidate[] = list
 		.filter((e) => !onlyDirs || e.kind === "dir")
 		.filter((e) => namePart.startsWith(".") || !e.name.startsWith("."))
-		.map((e) => ({ insert: esc(e.name) + (e.kind === "dir" ? "/" : " "), label: e.name + (e.kind === "dir" ? "/" : ""), kind: "path" as const }));
+		.map((e) => ({
+			insert: esc(e.name) + (e.kind === "dir" ? "/" : " "),
+			label: e.name + (e.kind === "dir" ? "/" : ""),
+			desc: e.kind === "dir" ? fmtDate(e.mtime) : `${fmtSize(e.size)}  ${fmtDate(e.mtime)}`,
+			kind: "path" as const,
+			dir: e.kind === "dir",
+		}));
 	return { replace: namePart.length, items: rank(items, namePart, 80) };
 }
 

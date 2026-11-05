@@ -1,5 +1,7 @@
 /**
- * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 로 받기)과 Tab 목록(Tab·↓ 다음, Shift+Tab·↑ 이전, Enter·→ 받기, Esc 닫기).
+ * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 받기, Ctrl+→ 한 낱말)과 Tab 목록.
+ * Tab(이전 판과 같은 규칙): 후보 하나면 바로 넣기, 여럿이면 공통 앞부분까지 채우고 목록, 목록에서 Tab·Enter 는 넣기, 폴더를 넣으면 그 안을 다시 보인다(연타로 파고들기).
+ * ↑↓ 고르기, Esc 닫기, Ctrl+Space 열기. 방식(설정): 흐린 제안+Tab / 치다 멈추면 목록 / Tab 만 / 끔.
  * 키 입력 경로를 막지 않도록 React 상태 없이 DOM 을 직접 그린다. 프롬프트(OSC 133 A) 뒤 입력에서만 켜진다.
  * 목록이 비면 Tab 은 원래대로 셸(bash 완성)에 넘긴다. 지난 명령은 서버별로 앱 DB 에 500개까지.
  */
@@ -14,6 +16,10 @@ export type CompletionSource = {
 	listDir: (dir: string) => Promise<FsEntry[]>;
 	commands: () => Promise<string[]>;
 	home?: string;
+	/** systemd 유닛 이름(원격만) */
+	units?: () => Promise<string[]>;
+	/** 컨테이너 이름(원격만) */
+	containers?: () => Promise<string[]>;
 };
 
 export type Completer = {
@@ -41,6 +47,17 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	});
 	let commands: string[] = [];
 	let commandsAsked = false;
+	let units: string[] = [];
+	let containers: string[] = [];
+	let unitsAsked = false;
+	let containersAsked = false;
+	/** 방식: ghost(흐린 제안+Tab) · auto(멈추면 목록) · tab(Tab 만) · off */
+	let mode = "ghost";
+	void api.settingGet("term.completeMode").then((v) => {
+		if (v) mode = v;
+	});
+	let autoTimer: number | undefined;
+	let drilling = false;
 	const dirCache = new Map<string, { at: number; list: FsEntry[] }>();
 	let cwd: string | null = null;
 	let inputStart: { x: number; y: number } | null = null;
@@ -88,7 +105,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		return null;
 	};
 
-	const ctx = () => ({ commands, history, listDir: listDirCached, cwd, home: src.home ?? null });
+	const ctx = () => ({ commands, history, listDir: listDirCached, cwd, home: src.home ?? null, units, containers });
 
 	const hideGhost = () => {
 		ghostEl.textContent = "";
@@ -110,7 +127,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 
 	const renderGhost = () => {
 		const line = currentInput();
-		if (line === null || !pop.hidden || !atLineEnd()) return hideGhost();
+		if (line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
 		const g = ghost(line, history);
 		ghostEl.textContent = g;
 		if (g) placeAtCursor(ghostEl, false);
@@ -123,7 +140,23 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			const row = document.createElement("div");
 			row.className = `term-pop-item${i === sel ? " sel" : ""}`;
 			const l = document.createElement("b");
-			l.textContent = c.label;
+			// 친 글자와 맞은 곳을 굵게(앞부분이면 그 길이만큼, 아니면 차례로)
+			const q = query.toLowerCase();
+			const low = c.label.toLowerCase();
+			const hits = new Set<number>();
+			if (q && low.startsWith(q)) for (let k = 0; k < q.length; k++) hits.add(k);
+			else if (q) {
+				let k = 0;
+				for (let j = 0; j < low.length && k < q.length; j++) if (low[j] === q[k]) {
+					hits.add(j);
+					k++;
+				}
+			}
+			for (let j = 0; j < c.label.length; j++) {
+				const ch = document.createElement(hits.has(j) ? "mark" : "span");
+				ch.textContent = c.label[j];
+				l.append(ch);
+			}
 			const d = document.createElement("span");
 			d.textContent = c.desc ?? (c.kind === "path" ? "" : c.kind === "hist" ? "지난 명령" : "");
 			row.append(l, d);
@@ -136,7 +169,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		});
 		const foot = document.createElement("div");
 		foot.className = "term-pop-more";
-		foot.textContent = `${Math.min(sel + 1, items.length)}/${items.length > MAX_POP ? `${MAX_POP}+` : items.length} · Tab 다음 · Enter 넣기 · Esc 닫기`;
+		foot.textContent = `${Math.min(sel + 1, items.length)}/${items.length > MAX_POP ? `${MAX_POP}+` : items.length} · ↑↓ 고르기 · Tab·Enter 넣기 · Esc 닫기`;
 		pop.append(foot);
 		pop.hidden = false;
 		// 커서 위·아래 중 넓은 쪽으로 열고, 그 높이 안에서 스크롤(칸 경계에 잘리지 않게)
@@ -162,11 +195,57 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		if (!c) return closePop();
 		send("\x7f".repeat(replace) + c.insert);
 		closePop();
+		if (c.dir) drill();
+	};
+	/** 폴더를 넣었으면 셸이 받아 그린 뒤 그 안을 다시 보인다 */
+	const drill = () => {
+		drilling = true;
+		window.setTimeout(() => {
+			drilling = false;
+			void compute(true);
+		}, 140);
+	};
+	/** Tab(목록 닫힘): 하나면 바로, 여럿이면 공통 앞부분 채우고 목록 */
+	const tabOpen = async () => {
+		const has = await compute(false, true);
+		if (!has) {
+			send("\t"); // 후보가 없으면 셸 완성으로
+			return;
+		}
+		const real = items.filter((x) => x.kind !== "hist");
+		if (real.length === 1 && items.length === 1) {
+			sel = 0;
+			accept();
+			return;
+		}
+		const ins = real.map((x) => x.insert.replace(/[ /]$/, ""));
+		let p = ins[0] ?? "";
+		for (const s of ins) while (p && !s.startsWith(p)) p = p.slice(0, -1);
+		if (p.length > query.length && p.toLowerCase().startsWith(query.toLowerCase())) {
+			send("\x7f".repeat(replace) + p);
+			replace = p.length;
+			query = p;
+		}
+		renderPop();
 	};
 
-	const compute = async (open: boolean): Promise<boolean> => {
+	let query = "";
+	const compute = async (open: boolean, quiet = false): Promise<boolean> => {
 		const line = currentInput();
 		if (line === null) return false;
+		const first = line.trimStart().split(/\s+/)[0] ?? "";
+		if (!unitsAsked && src.units && /^(systemctl|journalctl|service)$/.test(first)) {
+			unitsAsked = true;
+			void src.units().then((u) => {
+				units = u;
+			}).catch(() => {});
+		}
+		if (!containersAsked && src.containers && /^(docker|podman)$/.test(first)) {
+			containersAsked = true;
+			void src.containers().then((c) => {
+				containers = c;
+			}).catch(() => {});
+		}
 		if (!commandsAsked) {
 			commandsAsked = true;
 			void src
@@ -186,11 +265,12 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			}
 			r = complete(line, ctx());
 		}
-		if (!open && pop.hidden) return false;
+		if (!open && !quiet && pop.hidden) return false;
 		items = r.items;
 		replace = r.replace;
+		query = line.slice(line.length - r.replace);
 		sel = 0;
-		renderPop();
+		if (!quiet) renderPop();
 		return items.length > 0;
 	};
 
@@ -200,6 +280,13 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			if (!pop.hidden) void compute(false);
 			renderGhost();
 		}, 60);
+		if (mode === "auto") {
+			window.clearTimeout(autoTimer);
+			autoTimer = window.setTimeout(() => {
+				const l = currentInput();
+				if (l && l.trim() && pop.hidden && atLineEnd()) void compute(true);
+			}, 350);
+		}
 	};
 
 	const remember = (cmd: string) => {
@@ -247,17 +334,21 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			cwd = p;
 		},
 		key: (e) => {
-			if (e.type !== "keydown" || !promptOn) return true;
+			if (e.type !== "keydown" || !promptOn || mode === "off") return true;
+			if (drilling && e.key === "Tab") return false; // 파고드는 중에 온 Tab 은 삼킨다
 			if (!pop.hidden) {
-				// 목록이 열려 있으면 Tab 은 셸처럼 다음 후보로(포커스가 다른 칸으로 넘어가지 않게 화면 쪽에서 기본 동작을 막는다)
 				const n = Math.min(items.length, MAX_POP);
-				if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Tab") {
-					const back = e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey);
-					sel = (sel + (back ? -1 : 1) + n) % n;
+				if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+					sel = (sel + (e.key === "ArrowUp" ? -1 : 1) + n) % n;
 					renderPop();
 					return false;
 				}
-				if (e.key === "Enter" || e.key === "ArrowRight") {
+				if (e.key === "Tab" && e.shiftKey) {
+					sel = (sel - 1 + n) % n;
+					renderPop();
+					return false;
+				}
+				if (e.key === "Tab" || e.key === "Enter") {
 					accept();
 					return false;
 				}
@@ -268,19 +359,25 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 				}
 				return true;
 			}
-			if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey) {
+			const openKey = (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey) || (e.ctrlKey && e.code === "Space");
+			if (openKey) {
 				if (!inputStart) {
 					const b = term.buffer.active;
 					inputStart = { x: b.cursorX, y: b.cursorY + b.baseY };
 				}
-				void compute(true).then((has) => {
-					if (!has) send("\t"); // 후보가 없으면 셸 완성으로
-				});
+				if (e.key === "Tab") void tabOpen();
+				else void compute(true);
 				return false;
 			}
 			if (e.key === "ArrowRight" && !e.ctrlKey && ghostEl.textContent && atLineEnd()) {
 				send(ghostEl.textContent);
 				hideGhost();
+				return false;
+			}
+			if (e.key === "ArrowRight" && e.ctrlKey && ghostEl.textContent && atLineEnd()) {
+				// 흐린 제안에서 한 낱말만
+				const m = /^\s*\S+/.exec(ghostEl.textContent);
+				if (m) send(m[0]);
 				return false;
 			}
 			return true;

@@ -3019,3 +3019,12 @@ input[type="radio"] {
 	background: color-mix(in srgb, #ff9f0a 16%, transparent);
 	font-size: 11.5px;
 }
+.term-pop-item b mark {
+	background: none;
+	color: var(--accent);
+	font-weight: 700;
+}
+.term-pop-item.sel b mark {
+	color: #fff;
+	text-decoration: underline;
+}

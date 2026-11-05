@@ -486,6 +486,20 @@ export function Workbench({
 				const out = await invoke<string>("ssh_exec", { conn: fs.conn, cmd: "bash -lc 'compgen -c' 2>/dev/null | sort -u | head -5000" });
 				return out.split("\n").filter((x) => /^[\w.+-]+$/.test(x));
 			},
+			units:
+				fs.side === "remote" && fs.conn != null
+					? async () => {
+							const out = await invoke<string>("ssh_exec", { conn: fs.conn, cmd: "systemctl list-units --all --no-legend --plain 2>/dev/null | awk '{print $1}' | head -3000" });
+							return out.split("\n").filter((x) => /^[\w@.:-]+$/.test(x));
+						}
+					: undefined,
+			containers:
+				fs.side === "remote" && fs.conn != null
+					? async () => {
+							const out = await invoke<string>("ssh_exec", { conn: fs.conn, cmd: "docker ps -a --format '{{.Names}}' 2>/dev/null | head -500" });
+							return out.split("\n").filter(Boolean);
+						}
+					: undefined,
 		}),
 		[fs, label],
 	);
