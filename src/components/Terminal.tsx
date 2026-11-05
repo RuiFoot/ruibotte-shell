@@ -228,11 +228,15 @@ export function TerminalView({
 
 		// ── 셸 통합 ──
 		let atPrompt = false;
+		let promptSeen = false;
+		let typedAtPrompt = false;
 		let pending: Pending | null = null;
 		const osc133 = term.parser.registerOscHandler(133, (data) => {
 			const [kind, arg] = data.split(";");
 			if (kind === "A") {
 				atPrompt = true;
+				promptSeen = true;
+				typedAtPrompt = false;
 				completer?.prompt();
 			}
 			if (kind === "D" && pending) {
@@ -290,6 +294,7 @@ export function TerminalView({
 				}
 				idRef.current = id;
 				onShellRef.current?.({
+					idle: () => !promptSeen || (atPrompt && !typedAtPrompt),
 					send: (s) => write(s),
 					expect: (re, ms) =>
 						new Promise<boolean>((res) => {
@@ -308,6 +313,7 @@ export function TerminalView({
 			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${typeof e === "object" ? (e as { message?: string }).message : String(e)}` }));
 
 		const onData = term.onData((d) => {
+			if (atPrompt && d !== "\r") typedAtPrompt = true;
 			if (d === "\r") completer?.submitted();
 			else if (d.length === 1 && d >= " ") completer?.typed();
 			if (atPrompt && d.includes("\r")) {

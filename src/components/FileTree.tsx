@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, ChevronRight, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronRight, Plus, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw } from "lucide-react";
 import { memo, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { asSshError, type FsBackend, type FsEntry, joinPath, notifyFsChanged, parentDir } from "../lib/ipc";
@@ -55,6 +55,11 @@ export const FileTree = memo(function FileTree({
 	onUploadPick,
 	onDownloadTo,
 	onNewTerminal,
+	reveal,
+	onSelectDir,
+	sync,
+	onSyncChange,
+	note,
 }: {
 	fs: FsBackend;
 	root: string;
@@ -83,6 +88,15 @@ export const FileTree = memo(function FileTree({
 	onDownloadTo?: (e: FsEntry) => void;
 	/** 이 폴더에서 새 터미널 */
 	onNewTerminal?: (dir: string) => void;
+	/** 이 폴더까지 펼쳐 고르기(터미널 cd) — 뿌리는 그대로 */
+	reveal?: { path: string; nonce: number } | null;
+	/** 사용자가 폴더를 골랐다(같이면 터미널이 따라간다) */
+	onSelectDir?: (dir: string) => void;
+	/** 터미널과 동기화 — 같이 / 따로 */
+	sync?: "together" | "apart";
+	onSyncChange?: (m: "together" | "apart") => void;
+	/** 머리 아래 잠깐 보이는 알림 */
+	note?: string | null;
 }) {
 	const [nodes, setNodes] = useState<Record<string, Node>>({});
 	const [open, setOpen] = useState<Set<string>>(() => new Set([root]));
@@ -133,11 +147,11 @@ export const FileTree = memo(function FileTree({
 	};
 
 	const load = useCallback(
-		(path: string) => {
-			fs.list(path)
+		(path: string) =>
+			fs
+				.list(path)
 				.then((entries) => setNodes((n) => ({ ...n, [path]: { entries } })))
-				.catch((e) => setNodes((n) => ({ ...n, [path]: { error: asSshError(e).message } })));
-		},
+				.catch((e) => setNodes((n) => ({ ...n, [path]: { error: asSshError(e).message } }))),
 		[fs],
 	);
 
@@ -147,6 +161,46 @@ export const FileTree = memo(function FileTree({
 		setNodes({});
 		load(root);
 	}, [root, load]);
+
+	// 터미널 cd·처음 시작 폴더 — 뿌리에서 그 폴더까지 차례로 펼치고 고른다(뿌리 밖이면 뿌리를 / 로)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reveal 이 바뀔 때만
+	useEffect(() => {
+		if (!reveal) return;
+		const target = reveal.path.replace(/\/+$/, "") || "/";
+		const base = root.replace(/\/+$/, "");
+		const inside = target === root || target.startsWith(`${base}/`) || root === "/";
+		if (!inside) {
+			onRoot(/^[A-Za-z]:/.test(target) ? `${target.slice(0, 2)}/` : "/");
+			return; // 뿌리가 바뀐 뒤 같은 reveal 로 다시 온다
+		}
+		let gone = false;
+		const chain: string[] = [];
+		let p = target;
+		while (p && p !== root && p.length > base.length) {
+			chain.unshift(p);
+			const up = parentDir(p);
+			if (up === p) break;
+			p = up;
+		}
+		void (async () => {
+			for (const dir of [root, ...chain.slice(0, -1)]) {
+				if (gone) return;
+				if (!nodes[dir]?.entries) await load(dir);
+			}
+			if (gone) return;
+			setOpen((s) => new Set([...s, root, ...chain.slice(0, -1)]));
+			setShown((s) => {
+				const n = { ...s };
+				for (const d of [root, ...chain.slice(0, -1)]) n[d] = Number.MAX_SAFE_INTEGER;
+				return n;
+			});
+			setCur(target);
+			requestAnimationFrame(() => bodyRef.current?.querySelector<HTMLElement>(`[data-path="${CSS.escape(target)}"]`)?.scrollIntoView({ block: "nearest" }));
+		})();
+		return () => {
+			gone = true;
+		};
+	}, [reveal, root]);
 
 	// 전송·조작 뒤 그 폴더를 다시 읽는다(열려 있을 때만)
 	useEffect(() => {
@@ -413,10 +467,12 @@ export const FileTree = memo(function FileTree({
 					}}
 					onClick={() => {
 						setCur(e.path);
-						if (e.kind === "dir") toggle(e.path);
-						else onOpen(e);
+						if (e.kind === "dir") {
+							toggle(e.path);
+							onSelectDir?.(e.path);
+						} else onOpen(e);
 					}}
-					onDoubleClick={() => e.kind === "dir" && onRoot(e.path)}
+					onDoubleClick={() => e.kind === "dir" && (onCd ? onCd(e.path) : onRoot(e.path))}
 					onContextMenu={(ev) => {
 						ev.preventDefault();
 						ev.stopPropagation();
@@ -468,6 +524,33 @@ export const FileTree = memo(function FileTree({
 				}
 			}}
 		>
+			{(onSyncChange || onUploadPick) && (
+				<div className="tree-bar">
+					{onSyncChange && sync && (
+						<div className="seg tiny" role="group" title="터미널과 동기화 — 같이: 터미널 cd 를 트리가 따라가고, 트리에서 고른 폴더로 터미널이 cd / 따로: 각자 움직임">
+							<button type="button" aria-pressed={sync === "together"} onClick={() => onSyncChange("together")}>
+								같이
+							</button>
+							<button type="button" aria-pressed={sync === "apart"} onClick={() => onSyncChange("apart")}>
+								따로
+							</button>
+						</div>
+					)}
+					<span style={{ flex: 1 }} />
+					<button
+						type="button"
+						className="btn ghost icon"
+						title="새 파일·폴더, 올리기"
+						onClick={(ev) => {
+							const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+							setMenu({ x: r.left, y: r.bottom + 4, items: menuFor(null, cur && nodes[cur] ? cur : root) });
+						}}
+					>
+						<Plus size={14} />
+					</button>
+				</div>
+			)}
+			{note && <div className="tree-note">{note}</div>}
 			<div className="tree-head">
 				<button type="button" className="btn ghost icon" title="뒤로 (Alt+← · 마우스 뒤로 단추)" onClick={goBack} disabled={!hist.current.back.length}>
 					<ArrowLeft size={14} />

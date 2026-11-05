@@ -2,7 +2,7 @@ import { DockviewDefaultTab, DockviewReact, type DockviewApi, type DockviewReady
 import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Link, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
+import { Activity, ArrowDownUp, ArrowLeftRight, FileText, FolderTree, LayoutTemplate, Monitor, Radio, RefreshCcw, ShieldAlert, SquareTerminal, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -51,9 +51,11 @@ type Ctx = {
 	activePanel: string | null;
 	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string) => void;
 	sendTo: (from: Which, e: FsEntry) => void;
-	cd: (dir: string) => void;
+	/** 지금 터미널을 그 폴더로 — 프롬프트가 아니면 보내지 않고 false */
+	cd: (dir: string, quiet?: boolean) => boolean;
 	/** 트리↔터미널 같이(따라가기) */
 	follow: boolean;
+	setFollow: (v: boolean) => void;
 	/** 올리기(파일·폴더 고르기) — 원격 작업대만 */
 	uploadPick?: (dir: string, folder: boolean) => void;
 	/** 받을 곳 골라 받기 — 원격 작업대만 */
@@ -89,18 +91,25 @@ const useWb = () => useContext(WbCtx) as Ctx;
 function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 	const ctx = useWb();
 	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
-	const [root, setRoot] = useState(props.params.which === "remote" ? ctx.startPath || fs.home : fs.home);
+	// 원격 트리는 / 를 뿌리로 두고 시작 폴더(또는 홈)를 펼쳐 보인다 — 이전 판과 같은 틀
+	const start = props.params.which === "remote" ? ctx.startPath || fs.home : fs.home;
+	const [root, setRoot] = useState(fs.side === "remote" ? "/" : fs.home);
+	const [reveal, setReveal] = useState<{ path: string; nonce: number } | null>(() => (fs.side === "remote" ? { path: start, nonce: 1 } : null));
 	const follows = props.params.which === "remote" || !ctx.local;
-	// 트리에서 폴더를 바꾸면(같이 켜짐) 터미널도 그 폴더로 — 터미널에서 온 변경은 되돌려 보내지 않는다
-	const goRoot = (p: string) => {
-		setRoot(p);
-		if (ctx.follow && follows && p !== root) ctx.cd(p);
+	const [note, setNote] = useState<string | null>(null);
+	// 트리에서 폴더를 고르면(같이) 터미널이 그 폴더로 — 프롬프트가 아니면 알리고 보내지 않는다
+	const onSelectDir = (dir: string) => {
+		if (!ctx.follow || !follows) return;
+		if (!ctx.cd(dir, true)) {
+			setNote("터미널이 명령을 실행 중이라 cd 하지 않았습니다");
+			window.setTimeout(() => setNote(null), 3000);
+		}
 	};
 	// 터미널을 따라가기: 원격 트리(또는 내 PC 작업대의 트리)만
 	useEffect(() => {
 		const follows = props.params.which === "remote" || !ctx.local;
 		if (!follows) return;
-		const on = (ev: Event) => setRoot((ev as CustomEvent<string>).detail);
+		const on = (ev: Event) => setReveal({ path: (ev as CustomEvent<string>).detail, nonce: Date.now() });
 		window.addEventListener(`rb-cwd-${ctx.treeKey}`, on);
 		return () => window.removeEventListener(`rb-cwd-${ctx.treeKey}`, on);
 	}, [ctx.treeKey, ctx.local, props.params.which]);
@@ -109,7 +118,12 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 			<FileTree
 				fs={fs}
 				root={root}
-				onRoot={goRoot}
+				onRoot={setRoot}
+				reveal={reveal}
+				onSelectDir={onSelectDir}
+				sync={follows ? (ctx.follow ? "together" : "apart") : undefined}
+				onSyncChange={follows ? (m) => ctx.setFollow(m === "together") : undefined}
+				note={note}
 				onOpen={(e) => ctx.openFile(props.params.which, e)}
 				onDrop={(src, dir) => ctx.drop(src, fs.side, dir)}
 				onSend={ctx.local ? (e) => ctx.sendTo(props.params.which, e) : undefined}
@@ -547,16 +561,19 @@ export function Workbench({
 
 	/** 터미널에서 그 폴더로 — 보이는(없으면 첫) 터미널에 */
 	const cd = useCallback(
-		(dir: string) => {
+		(dir: string, quiet = false) => {
 			const d = dock.current;
 			const s = visibleShell();
 			const termId = s?.id;
 			const send = s?.h?.send;
-			if (!send) return;
+			if (!send) return false;
+			// 명령 실행 중·입력 중(vim 등)이면 보내지 않는다
+			if (s?.h?.idle && !s.h.idle()) return false;
 			// 원격은 POSIX 셸(작은따옴표), 내 PC 는 PowerShell/zsh 모두 받는 큰따옴표
 			const q = local ? `'${dir.replaceAll("'", "'\\''")}'` : `"${dir}"`;
 			send(` cd ${q}\r`);
-			if (termId) d?.getPanel(termId)?.api.setActive();
+			if (termId && !quiet) d?.getPanel(termId)?.api.setActive();
+			return true;
 		},
 		[local],
 	);
@@ -794,6 +811,7 @@ export function Workbench({
 			sendTo,
 			cd,
 			follow,
+			setFollow,
 			uploadPick: local && fs.side === "remote" ? uploadPick : undefined,
 			downloadTo: local && fs.side === "remote" ? downloadTo : undefined,
 			newTerminal: (dir: string) => addTerminalRef.current(dir),
@@ -815,7 +833,7 @@ export function Workbench({
 			profileId,
 			sudoOn: sudoOn && !!sudoFs,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding, setFollow],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -887,18 +905,6 @@ export function Workbench({
 						<SquareTerminal size={14} /> <span className="lbl">터미널 +</span>
 					</button>
 					<span className="sep" />
-					<button
-						type="button"
-						className={`btn ghost${follow ? " on" : ""}`}
-						title="트리가 터미널의 지금 폴더를 따라가기(같이) / 따로"
-						onClick={() => {
-							const next = !follow;
-							setFollow(next);
-							if (next && lastCwd.current) window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: lastCwd.current }));
-						}}
-					>
-						<Link size={14} /> <span className="lbl">{follow ? "따라가기" : "따로"}</span>
-					</button>
 					{sudoFs && (
 						<>
 							<button

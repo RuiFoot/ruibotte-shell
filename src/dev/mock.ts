@@ -17,6 +17,8 @@ const profiles = [
 
 function dir(path: string) {
 	const p = path.replace(/\/$/, "") || "";
+	if (p === "") return ["etc", "home", "opt", "usr", "var"].map((n) => ({ name: n, path: `/${n}`, kind: "dir", size: 4096, mtime: now }));
+	if (p === "/home") return ["app", "deploy"].map((n) => ({ name: n, path: `/home/${n}`, kind: "dir", size: 4096, mtime: now }));
 	const names = ["app", "logs", "conf", ".ssh", "backup-2026-11-01", "README.md", "app.log", "deploy.sh", "config.yaml", "data.csv", "image.png", "very-long-file-name-for-overflow-check-2026-11-05.tar.gz"];
 	return names.map((n, i) => ({ name: n, path: `${p}/${n}`, kind: i < 5 ? "dir" : "file", size: i < 5 ? 4096 : 1200 * (i + 1) * (i + 3), mtime: now - i * 4000 }));
 }

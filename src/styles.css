@@ -2990,3 +2990,32 @@ input[type="radio"] {
 	background: var(--fill);
 	white-space: nowrap;
 }
+/* 트리 머리줄: [같이|따로] · + */
+.tree-bar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 8px 0;
+	flex: none;
+}
+.seg.tiny {
+	margin: 0;
+	padding: 1px;
+	border-radius: 7px;
+}
+.seg.tiny button {
+	padding: 1px 9px;
+	font-size: 11.5px;
+	border-radius: 6px;
+}
+.seg.tiny button[aria-pressed="true"] {
+	background: var(--accent);
+	color: #fff;
+}
+.tree-note {
+	margin: 4px 8px 0;
+	padding: 4px 8px;
+	border-radius: 6px;
+	background: color-mix(in srgb, #ff9f0a 16%, transparent);
+	font-size: 11.5px;
+}

@@ -245,6 +245,8 @@ export const sudoApi = {
 export type ShellHandle = {
 	send: (s: string) => void;
 	expect: (re: RegExp, ms: number) => Promise<boolean>;
+	/** 프롬프트에서 아무것도 치지 않고 기다리는 중인지(셸 통합이 없으면 늘 true) */
+	idle?: () => boolean;
 };
 
 export function sshTerm(conn: number): TermBackend {
