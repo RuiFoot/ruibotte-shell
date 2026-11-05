@@ -96,6 +96,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             pty::pty_open,
+            pty::pty_shells,
+            pty::pty_admin_window,
+            pty::app_is_admin,
+            pty::app_relaunch_admin,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_close,

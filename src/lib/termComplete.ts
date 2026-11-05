@@ -13,6 +13,8 @@ import { api, type FsEntry } from "./ipc";
 export type CompletionSource = {
 	/** 서버별 기록 열쇠(예: ssh:호스트:계정) */
 	key: string;
+	/** 셸 종류 — linux(사전·스펙) · pwsh(cmdlet) · cmd(내장 명령) */
+	shellKind?: "linux" | "pwsh" | "cmd";
 	listDir: (dir: string) => Promise<FsEntry[]>;
 	commands: () => Promise<string[]>;
 	home?: string;
@@ -105,7 +107,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		return null;
 	};
 
-	const ctx = () => ({ commands, history, listDir: listDirCached, cwd, home: src.home ?? null, units, containers });
+	const ctx = () => ({ commands, history, listDir: listDirCached, cwd, home: src.home ?? null, units, containers, shellKind: src.shellKind ?? "linux" });
 
 	const hideGhost = () => {
 		ghostEl.textContent = "";

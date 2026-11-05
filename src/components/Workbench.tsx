@@ -18,11 +18,14 @@ import {
 	type TermBackend,
 	type TransferProgress,
 	transfers,
+	localShells,
+	type ShellInfo,
 } from "../lib/ipc";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
+import { ContextMenu } from "./ContextMenu";
 import { MonitorPanel } from "./MonitorPanel";
 import { Select } from "./Select";
 import { SyncPanel } from "./SyncPanel";
@@ -64,6 +67,9 @@ type Ctx = {
 	newTerminal: (dir: string) => void;
 	/** 서버 로캘로 짐작한 터미널 인코딩 */
 	termEncoding?: string;
+	/** 내 PC 작업대: 쓸 수 있는 셸과 기본 셸 */
+	localShells?: ShellInfo[];
+	defaultShell?: string;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
 	onCwd: (path: string) => void;
 	completion: CompletionSource;
@@ -165,8 +171,18 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 	);
 }
 
-function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string }>) {
+function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; shell?: string }>) {
 	const ctx = useWb();
+	// 내 PC 작업대: 셸 고르기(기본은 설정 › 터미널 › 내 PC 셸)
+	const [shell, setShell] = useState<string | undefined>(props.params.shell ?? (ctx.localShells ? ctx.defaultShell : undefined));
+	useEffect(() => {
+		if (!shell && ctx.localShells && ctx.defaultShell) setShell(ctx.defaultShell);
+	}, [ctx.defaultShell, ctx.localShells, shell]);
+	const info = ctx.localShells?.find((s) => s.id === shell);
+	const kind = info ? (info.kind === "pwsh" ? "pwsh" : info.kind === "cmd" ? "cmd" : "linux") : "linux";
+	const completion = useMemo(() => ({ ...ctx.completion, key: `${ctx.completion.key}:${kind}`, shellKind: kind as "linux" | "pwsh" | "cmd" }), [ctx.completion, kind]);
+	// 터미널이 셸 정보(목록)를 받기 전에는 열지 않는다(기본 셸로 한 번 열렸다 다시 열리지 않게)
+	if (ctx.localShells && !shell) return <div className="panel-fill" />;
 	return (
 		<div className="panel-fill">
 			<TerminalView
@@ -178,7 +194,15 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string }>) 
 				onShell={(h) => ctx.registerShell(props.api.id, h)}
 				onCwd={ctx.onCwd}
 				onInput={(d) => ctx.broadcast(props.api.id, d)}
-				completion={ctx.completion}
+				completion={ctx.localShells ? completion : ctx.completion}
+				shell={shell}
+				shellOptions={ctx.localShells?.map((s) => ({ value: s.id, label: s.label, hint: s.admin ? "관리자" : undefined }))}
+				onShellChange={(id) => {
+					setShell(id);
+					props.api.updateParameters({ ...props.params, shell: id });
+					const label = ctx.localShells?.find((s) => s.id === id)?.label;
+					if (label) props.api.setTitle(label);
+				}}
 				defaultEncoding={ctx.termEncoding}
 				onOpenPath={(p) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 })}
 			/>
@@ -469,6 +493,20 @@ export function Workbench({
 			.catch(() => undefined);
 	}, [fs]);
 	const [help, setHelp] = useState(false);
+	// 내 PC 셸 목록·기본 셸·관리자 여부
+	const [shellList, setShellList] = useState<ShellInfo[] | undefined>(undefined);
+	const [defaultShell, setDefaultShell] = useState<string | undefined>(undefined);
+	const [isAdmin, setIsAdmin] = useState(false);
+	const [adminMenu, setAdminMenu] = useState<{ x: number; y: number } | null>(null);
+	useEffect(() => {
+		if (fs.side !== "local") return;
+		void localShells().then(async (l) => {
+			const saved = await api.settingGet("term.localShell");
+			setShellList(l);
+			setDefaultShell(l.find((s) => s.id === saved)?.id ?? l[0]?.id);
+		});
+		void invoke<boolean>("app_is_admin").then(setIsAdmin).catch(() => undefined);
+	}, [fs]);
 	useEffect(() => () => forgetOwner(owner), [owner]);
 	const sudoFs = useMemo(
 		() => (fs.side === "remote" && fs.conn != null ? sshSudoFs(fs.conn, fs.label, fs.home, profileId) : null),
@@ -745,8 +783,8 @@ export function Workbench({
 		addDoc(d, { id: "monitor", component: "monitor", title: "자원" });
 	};
 
-	const addTerminalRef = useRef<(cwd?: string) => void>(() => {});
-	const addTerminal = (cwd?: string) => {
+	const addTerminalRef = useRef<(cwd?: string, shell?: string) => void>(() => {});
+	const addTerminal = (cwd?: string, shell?: string) => {
 		const d = dock.current;
 		if (!d) return;
 		termSeq.current += 1;
@@ -756,7 +794,7 @@ export function Workbench({
 			id: `term-${n}`,
 			component: "terminal",
 			title: cwd ? `터미널 ${n} · ${cwd.split("/").filter(Boolean).pop() ?? "/"}` : `터미널 ${n}`,
-			params: { n, cwd },
+			params: { n, cwd, shell },
 			renderer: "always",
 			position: ref ? { referencePanel: ref.id, direction: "within" } : undefined,
 		});
@@ -830,6 +868,8 @@ export function Workbench({
 			downloadTo: local && fs.side === "remote" ? downloadTo : undefined,
 			newTerminal: (dir: string) => addTerminalRef.current(dir),
 			termEncoding,
+			localShells: fs.side === "local" ? shellList : undefined,
+			defaultShell,
 			registerShell,
 			onCwd,
 			broadcast,
@@ -847,7 +887,7 @@ export function Workbench({
 			profileId,
 			sudoOn: sudoOn && !!sudoFs,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding, setFollow],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, profileId, sudoOn, sudoFs, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell],
 	);
 
 	useEffect(() => () => window.clearTimeout(saveTimer.current), []);
@@ -918,6 +958,20 @@ export function Workbench({
 					<button type="button" className="btn ghost" onClick={() => addTerminal()} title="터미널 하나 더(같은 연결 위 새 채널)">
 						<SquareTerminal size={14} /> <span className="lbl">터미널 +</span>
 					</button>
+					{fs.side === "local" && (
+						<button
+							type="button"
+							className={`btn ghost${isAdmin ? " on" : ""}`}
+							style={isAdmin ? { color: "var(--danger)" } : undefined}
+							title={isAdmin ? "앱이 관리자 권한으로 돌고 있습니다" : "관리자 권한으로 셸 열기"}
+							onClick={(e) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								setAdminMenu({ x: r.left, y: r.bottom + 4 });
+							}}
+						>
+							<ShieldAlert size={14} /> <span className="lbl keep">{isAdmin ? "관리자" : "관리자로…"}</span>
+						</button>
+					)}
 					<span className="sep" />
 					{sudoFs && (
 						<>
@@ -1002,6 +1056,21 @@ export function Workbench({
 				</div>
 			</div>
 			{help && <ShortcutHelp onClose={() => setHelp(false)} />}
+			{adminMenu && (
+				<ContextMenu
+					x={adminMenu.x}
+					y={adminMenu.y}
+					onClose={() => setAdminMenu(null)}
+					items={[
+						...(shellList ?? [])
+							.filter((x) => x.admin)
+							.map((x) => ({ label: `앱 안에서 열기 — ${x.label}`, run: () => addTerminalRef.current(undefined, x.id) })),
+						{ label: "관리자 권한 새 창 — 지금 셸", run: () => void invoke("pty_admin_window", { shell: defaultShell, cwd: lastCwd.current }).catch((e) => alert(String(e))) },
+						{ label: "앱 전체를 관리자 권한으로 다시 열기…", danger: true, run: () => confirm("앱을 관리자 권한으로 다시 엽니다(지금 창은 닫힙니다). 저장 안 한 것은 초안으로 남습니다. 계속할까요?") && void invoke("app_relaunch_admin").catch((e) => alert(String(e))) },
+						...(shellList?.some((x) => x.admin) ? [] : [{ sep: true as const }, { label: "gsudo 를 깔면 앱 안에서 관리자 셸을 열 수 있습니다", disabled: true, run: () => {} }]),
+					]}
+				/>
+			)}
 		</WbCtx.Provider>
 	);
 }

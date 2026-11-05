@@ -163,7 +163,7 @@ export function joinPath(dir: string, name: string): string {
 
 /** 터미널이 보는 셸 — 원격(SSH 채널)과 내 PC(PTY) 가 같은 모양 */
 export type TermBackend = {
-	open(cols: number, rows: number, onData: Channel<ArrayBuffer | number[]>, cwd?: string): Promise<number>;
+	open(cols: number, rows: number, onData: Channel<ArrayBuffer | number[]>, cwd?: string, shell?: string): Promise<number>;
 	/** encoding: 터미널 인코딩(UTF-8 이 아니면 원격이 그 인코딩으로 바꿔 보낸다) */
 	write(id: number, data: string, encoding?: string): Promise<void>;
 	resize(id: number, cols: number, rows: number): Promise<void>;
@@ -190,8 +190,16 @@ export function localFs(home: string): FsBackend {
 	};
 }
 
+/** 내 PC 셸 — pwsh·cmd·bash·zsh·wsl 에 따라 셸 통합·자동완성이 다르다 */
+export type ShellInfo = { id: string; label: string; program: string; args: string[]; kind: "pwsh" | "cmd" | "bash" | "zsh" | "wsl" | "other"; admin: boolean };
+let shellsCache: Promise<ShellInfo[]> | null = null;
+export const localShells = () => {
+	shellsCache ??= invoke<ShellInfo[]>("pty_shells").catch(() => []);
+	return shellsCache;
+};
+
 export const localTerm: TermBackend = {
-	open: (cols, rows, onData, cwd) => invoke<number>("pty_open", { cols, rows, onData, cwd }),
+	open: (cols, rows, onData, cwd, shell) => invoke<number>("pty_open", { cols, rows, onData, cwd, shell }),
 	write: (id, data) => invoke("pty_write", { id, data }),
 	resize: (id, cols, rows) => invoke("pty_resize", { id, cols, rows }),
 	close: (id) => invoke("pty_close", { id }),

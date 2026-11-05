@@ -25,6 +25,8 @@ export type CompleteCtx = {
 	units?: string[];
 	/** 컨테이너 이름(docker 인자) — 받아 둔 것 */
 	containers?: string[];
+	/** 셸 종류 — PowerShell·cmd 는 리눅스 명령 사전을 쓰지 않는다 */
+	shellKind?: "linux" | "pwsh" | "cmd";
 };
 
 /** 셸 낱말 나누기 — 따옴표·역슬래시 존중, 마지막 낱말은 끝까지(빈 낱말 포함) */
@@ -99,6 +101,7 @@ const esc = (s: string) => s.replace(/([ '"\\$`!*?&;|<>(){}[\]])/g, "\\$1");
 
 /** 후보 계산 — line 은 프롬프트 뒤 입력(커서까지). 바꿀 낱말 길이(replace)와 후보 */
 export function complete(line: string, ctx: CompleteCtx): { replace: number; items: Candidate[]; pending?: string } {
+	if (ctx.shellKind === "pwsh" || ctx.shellKind === "cmd") return completeWin(line, ctx);
 	const ws = words(line);
 	const cur = ws[ws.length - 1] ?? "";
 	const dict = dictNow();
@@ -188,4 +191,68 @@ export function ghost(line: string, history: string[]): string {
 	if (!line.trim()) return "";
 	const h = history.find((x) => x.startsWith(line) && x.length > line.length);
 	return h ? h.slice(line.length) : "";
+}
+
+/** PowerShell 자주 쓰는 cmdlet·별칭(설명은 짧게) */
+const PWSH: [string, string][] = [
+	["Get-ChildItem", "목록(ls·dir)"], ["Set-Location", "폴더 이동(cd)"], ["Get-Content", "내용 보기(cat·type)"], ["Set-Content", "내용 쓰기"], ["Add-Content", "내용 덧붙이기"],
+	["Copy-Item", "복사(cp·copy)"], ["Move-Item", "옮기기(mv·move)"], ["Remove-Item", "지우기(rm·del)"], ["New-Item", "새 파일·폴더"], ["Rename-Item", "이름 바꾸기"],
+	["Get-Process", "프로세스(ps)"], ["Stop-Process", "프로세스 끝내기(kill)"], ["Get-Service", "서비스"], ["Start-Service", "서비스 시작"], ["Stop-Service", "서비스 멈추기"], ["Restart-Service", "서비스 다시 시작"],
+	["Select-String", "글 찾기(grep)"], ["Where-Object", "거르기(where·?)"], ["Select-Object", "열 고르기(select)"], ["Sort-Object", "정렬(sort)"], ["Measure-Object", "세기(measure)"], ["ForEach-Object", "하나씩(%)"],
+	["Get-Command", "명령 찾기(gcm)"], ["Get-Help", "도움말"], ["Get-Member", "속성 보기(gm)"], ["Test-Path", "있는지"], ["Test-NetConnection", "포트·연결 확인"], ["Invoke-WebRequest", "웹 요청(curl·iwr)"], ["Invoke-RestMethod", "REST 요청(irm)"],
+	["Get-Location", "지금 폴더(pwd)"], ["Clear-Host", "화면 지우기(cls·clear)"], ["Out-File", "파일로 쓰기"], ["Export-Csv", "CSV 로"], ["Import-Csv", "CSV 읽기"], ["ConvertTo-Json", "JSON 으로"], ["ConvertFrom-Json", "JSON 읽기"],
+	["Get-NetTCPConnection", "TCP 연결(netstat)"], ["Get-NetIPAddress", "IP 주소"], ["Resolve-DnsName", "DNS 조회(nslookup)"], ["Get-FileHash", "해시(sha256)"], ["Expand-Archive", "zip 풀기"], ["Compress-Archive", "zip 만들기"],
+	["Get-EventLog", "이벤트 로그"], ["Get-WinEvent", "이벤트 로그(새)"], ["Start-Process", "실행(관리자: -Verb RunAs)"], ["Get-Date", "날짜"], ["Write-Output", "출력(echo)"], ["Write-Host", "화면에 쓰기"],
+	["ls", "Get-ChildItem"], ["dir", "Get-ChildItem"], ["cd", "Set-Location"], ["cat", "Get-Content"], ["cp", "Copy-Item"], ["mv", "Move-Item"], ["rm", "Remove-Item"], ["mkdir", "새 폴더"], ["cls", "화면 지우기"], ["pwd", "지금 폴더"], ["ps", "Get-Process"], ["kill", "Stop-Process"], ["echo", "Write-Output"],
+	["git", "Git"], ["code", "VS Code"], ["notepad", "메모장"], ["explorer", "탐색기"], ["ssh", "SSH"], ["scp", "SCP"], ["winget", "패키지 설치"], ["choco", "Chocolatey"], ["docker", "Docker"], ["wsl", "WSL"], ["node", "Node.js"], ["python", "Python"], ["ipconfig", "IP 설정"], ["ping", "ping"], ["tracert", "경로 추적"], ["nslookup", "DNS 조회"], ["netstat", "연결 목록"],
+];
+/** PowerShell 자주 쓰는 매개변수 */
+const PWSH_PARAMS: [string, string][] = [
+	["-Path", "경로"], ["-Recurse", "하위까지"], ["-Force", "숨김·강제"], ["-Filter", "거르기"], ["-Include", "포함"], ["-Exclude", "빼기"], ["-Name", "이름"], ["-Tail", "끝 줄 수"], ["-Wait", "따라가기(tail -f)"],
+	["-Encoding", "인코딩"], ["-Pattern", "찾을 글"], ["-Destination", "대상"], ["-ItemType", "File·Directory"], ["-Property", "속성"], ["-Descending", "내림차순"], ["-First", "앞 n개"], ["-Last", "뒤 n개"],
+	["-ComputerName", "컴퓨터"], ["-Port", "포트"], ["-Verb", "RunAs = 관리자"], ["-WhatIf", "해 보기만"], ["-Confirm", "확인"],
+];
+/** cmd 내장 명령 */
+const CMD: [string, string][] = [
+	["dir", "목록"], ["cd", "폴더 이동"], ["type", "내용 보기"], ["copy", "복사"], ["xcopy", "폴더 복사"], ["robocopy", "폴더 동기화 복사"], ["move", "옮기기"], ["del", "지우기"], ["rmdir", "폴더 지우기"], ["mkdir", "새 폴더"], ["ren", "이름 바꾸기"],
+	["cls", "화면 지우기"], ["echo", "출력"], ["set", "환경 변수"], ["where", "실행 파일 찾기"], ["findstr", "글 찾기"], ["tasklist", "프로세스"], ["taskkill", "프로세스 끝내기"], ["ipconfig", "IP 설정"], ["ping", "ping"], ["netstat", "연결 목록"],
+	["tracert", "경로 추적"], ["nslookup", "DNS 조회"], ["sc", "서비스"], ["chcp", "코드 페이지(65001=UTF-8)"], ["start", "실행"], ["exit", "끝내기"], ["git", "Git"], ["code", "VS Code"], ["powershell", "PowerShell"], ["wsl", "WSL"],
+];
+
+/** PowerShell·cmd 완성 — 명령(cmdlet·내장)·매개변수·경로. 리눅스 명령 사전은 쓰지 않는다 */
+function completeWin(line: string, ctx: CompleteCtx): { replace: number; items: Candidate[]; pending?: string } {
+	const ws = words(line);
+	const cur = ws[ws.length - 1] ?? "";
+	const ps = ctx.shellKind === "pwsh";
+	if (ws.length === 1) {
+		const hist: Candidate[] = [];
+		for (const h of ctx.history) {
+			if (h.startsWith(cur) && h !== cur && hist.length < 5) hist.push({ insert: h, label: h, kind: "hist", desc: "지난 명령" });
+		}
+		const list = (ps ? PWSH : CMD).map(([n, d]) => ({ insert: `${n} `, label: n, desc: d, kind: "cmd" as const }));
+		return { replace: cur.length, items: [...hist, ...rank(list, cur)].slice(0, 60) };
+	}
+	if (ps && cur.startsWith("-")) {
+		return { replace: cur.length, items: rank(PWSH_PARAMS.map(([n, d]) => ({ insert: `${n} `, label: n, desc: d, kind: "opt" as const })), cur) };
+	}
+	// 경로 — 앞에 따옴표가 있으면 떼고 본다. 이름에 빈칸이 있으면 따옴표로 감싼다
+	const raw = cur.replace(/^["']/, "").replace(/\\/g, "/");
+	const slash = raw.lastIndexOf("/");
+	const dirPart = slash >= 0 ? raw.slice(0, slash + 1) : "";
+	const namePart = slash >= 0 ? raw.slice(slash + 1) : raw;
+	let base = dirPart;
+	if (base.startsWith("~")) base = (ctx.home ?? "") + base.slice(1);
+	if (!/^([A-Za-z]:)?\//.test(base)) base = `${ctx.cwd ?? ""}/${base}`;
+	const dir = base.replace(/\/+$/, "") || "/";
+	const list = ctx.listDir(dir);
+	if (!list) return { replace: cur.length, items: [], pending: dir };
+	const onlyDirs = /^(cd|set-location|sl|chdir|pushd|rmdir|rd)$/i.test(ws[0] ?? "");
+	const items: Candidate[] = list
+		.filter((e) => !onlyDirs || e.kind === "dir")
+		.map((e) => {
+			const full = dirPart + e.name + (e.kind === "dir" ? "/" : "");
+			const quoted = /\s/.test(full) ? `"${full}"` : full;
+			return { insert: e.kind === "dir" && !/\s/.test(full) ? quoted : `${quoted} `, label: e.name + (e.kind === "dir" ? "/" : ""), desc: e.kind === "dir" ? fmtDate(e.mtime) : `${fmtSize(e.size)}  ${fmtDate(e.mtime)}`, kind: "path" as const, dir: e.kind === "dir" && !/\s/.test(full) };
+		});
+	return { replace: cur.length, items: rank(items, namePart, 80) };
 }

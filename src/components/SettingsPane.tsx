@@ -2,7 +2,7 @@ import { disable as autostartOff, enable as autostartOn, isEnabled as autostartI
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useState } from "react";
 import iconUrl from "../../assets/icon.svg?url";
-import { type AppInfo, api } from "../lib/ipc";
+import { type AppInfo, api, localShells, type ShellInfo } from "../lib/ipc";
 import { checkNow, installNow, RELEASES, setAuto, useUpdate } from "../lib/updater";
 import { Select } from "./Select";
 
@@ -55,6 +55,11 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 	const [scrollback, setScrollback] = useSetting("term.scrollback", "10000");
 	const [copyOnSelect, setCopyOnSelect] = useSetting("term.copyOnSelect", "0");
 	const [completeMode, setCompleteMode] = useSetting("term.completeMode", "ghost");
+	const [localShell, setLocalShell] = useSetting("term.localShell", "");
+	const [shellList, setShellList] = useState<ShellInfo[]>([]);
+	useEffect(() => {
+		void localShells().then(setShellList);
+	}, []);
 	const [autostart, setAutostart] = useState<boolean | null>(null);
 	const [msg, setMsg] = useState("");
 	const [autoSave, setAutoSave] = useState(false);
@@ -162,6 +167,14 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 
 			<h4>터미널</h4>
 			<div className="set-group">
+				<Row label="내 PC 기본 셸" sub="내 PC 터미널을 열 때 — 터미널 상태 줄에서 그때그때 바꿀 수도 있습니다">
+					<Select
+						size="sm"
+						value={localShell || shellList[0]?.id || ""}
+						onChange={setLocalShell}
+						options={shellList.filter((x) => !x.admin).map((x) => ({ value: x.id, label: x.label }))}
+					/>
+				</Row>
 				<Row label="자동완성 방식" sub="새로 여는 터미널부터 적용됩니다">
 					<Select
 						size="sm"

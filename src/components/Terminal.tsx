@@ -57,6 +57,9 @@ export function TerminalView({
 	completion,
 	onOpenPath,
 	defaultEncoding,
+	shell,
+	shellOptions,
+	onShellChange,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -76,6 +79,11 @@ export function TerminalView({
 	onOpenPath?: (path: string) => void;
 	/** 처음 인코딩(서버 로캘이 EUC-KR 이면) */
 	defaultEncoding?: string;
+	/** 내 PC 셸 id(없으면 기본) */
+	shell?: string;
+	/** 고를 수 있는 셸(내 PC) — 있으면 상태 줄에 고르기 */
+	shellOptions?: { value: string; label: string; hint?: string }[];
+	onShellChange?: (id: string) => void;
 }) {
 	const completionRef = useRef(completion);
 	completionRef.current = completion;
@@ -271,7 +279,8 @@ export function TerminalView({
 				} catch {
 					// 그대로
 				}
-				// Windows: file://localhost/C:/Users → C:/Users
+				// Windows: file://localhost/C:/Users → C:/Users (cmd 는 역슬래시로 준다)
+				p = p.replace(/\\/g, "/");
 				if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
 				completer?.cwd(p);
 				onCwdRef.current?.(p);
@@ -286,7 +295,7 @@ export function TerminalView({
 		});
 
 		backend
-			.open(term.cols, term.rows, ch, reopenAt.current ?? cwd)
+			.open(term.cols, term.rows, ch, reopenAt.current ?? cwd, shell)
 			.then((id) => {
 				if (disposed) {
 					void backend.close(id);
@@ -432,7 +441,7 @@ export function TerminalView({
 			term.dispose();
 			termRef.current = null;
 		};
-	}, [gen, backend]);
+	}, [gen, backend, shell]);
 
 	useEffect(() => {
 		if (active) {
@@ -622,6 +631,9 @@ export function TerminalView({
 					</button>
 				)}
 				<span style={{ marginLeft: "auto" }} />
+				{shellOptions && shellOptions.length > 1 && shell && (
+					<Select size="sm" value={shell} onChange={(v) => onShellChange?.(v)} title="셸 바꾸기(새로 연다)" options={shellOptions} />
+				)}
 				<Select
 					size="sm"
 					value={encoding}
