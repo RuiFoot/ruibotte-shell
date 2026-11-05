@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
@@ -204,19 +204,26 @@ export function App() {
 					)}
 					{!folded.has(key) &&
 						items.map((p) => (
-							<button
+							<div
 								key={p.id}
-								type="button"
-								className={`sb-item${g ? " in-group" : ""}`}
-								title={title(p)}
-								onClick={() => connect(p)}
+								className={`sb-row${g ? " in-group" : ""}`}
 								onContextMenu={(e) => {
 									e.preventDefault();
 									setPmenu({ x: e.clientX, y: e.clientY, p });
 								}}
 							>
-								<span className="dot" style={{ background: p.color ?? "var(--accent)" }} /> {p.name}
-							</button>
+								<button type="button" className="sb-item" title={`${title(p)} — 눌러 접속`} onClick={() => connect(p)}>
+									<span className="dot" style={{ background: p.color ?? "var(--accent)" }} /> <span className="sb-name">{p.name}</span>
+								</button>
+								<span className="sb-acts">
+									<button type="button" className="sb-act" title="접속" aria-label={`${p.name} 접속`} onClick={() => connect(p)}>
+										<Play size={12} />
+									</button>
+									<button type="button" className="sb-act" title="설정(고치기·복제·지우기)" aria-label={`${p.name} 설정`} onClick={() => editProfile(p)}>
+										<Pencil size={12} />
+									</button>
+								</span>
+							</div>
 						))}
 				</div>
 			);
@@ -411,6 +418,17 @@ export function App() {
 																		{p.host}:{p.port}
 																	</small>
 																</div>
+																<button
+																	type="button"
+																	className="btn pc-connect"
+																	title="접속"
+																	onClick={(e) => {
+																		e.stopPropagation();
+																		connect(p);
+																	}}
+																>
+																	<Play size={12} /> 접속
+																</button>
 																<button
 																	type="button"
 																	className="btn ghost icon"

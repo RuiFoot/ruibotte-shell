@@ -52,6 +52,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 
 	const ghostEl = document.createElement("div");
 	ghostEl.className = "term-ghost";
+	/** 목록에 그리는 최대 후보 수(그 안에서 스크롤·Tab 순환) */
+	const MAX_POP = 200;
 	const pop = document.createElement("div");
 	pop.className = "term-pop";
 	pop.hidden = true;
@@ -117,7 +119,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const renderPop = () => {
 		if (!items.length) return closePop();
 		pop.innerHTML = "";
-		items.slice(0, 12).forEach((c, i) => {
+		items.slice(0, MAX_POP).forEach((c, i) => {
 			const row = document.createElement("div");
 			row.className = `term-pop-item${i === sel ? " sel" : ""}`;
 			const l = document.createElement("b");
@@ -132,21 +134,26 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			};
 			pop.append(row);
 		});
-		if (items.length > 12) {
-			const more = document.createElement("div");
-			more.className = "term-pop-more";
-			more.textContent = `… ${items.length - 12}개 더 · Tab 다음 · Enter 넣기`;
-			pop.append(more);
-		}
+		const foot = document.createElement("div");
+		foot.className = "term-pop-more";
+		foot.textContent = `${Math.min(sel + 1, items.length)}/${items.length > MAX_POP ? `${MAX_POP}+` : items.length} · Tab 다음 · Enter 넣기 · Esc 닫기`;
+		pop.append(foot);
 		pop.hidden = false;
-		placeAtCursor(pop, true);
-		// 화면 아래로 넘치면 위로
+		// 커서 위·아래 중 넓은 쪽으로 열고, 그 높이 안에서 스크롤(칸 경계에 잘리지 않게)
+		const m = metrics();
 		const hr = host.getBoundingClientRect();
-		const pr = pop.getBoundingClientRect();
-		if (pr.bottom > hr.bottom) {
-			const m = metrics();
-			if (m) pop.style.top = `${m.oy + term.buffer.active.cursorY * m.ch - pr.height}px`;
+		if (m) {
+			const b = term.buffer.active;
+			const curTop = m.oy + b.cursorY * m.ch;
+			const curBottom = curTop + m.ch;
+			const below = hr.height - curBottom - 6;
+			const above = curTop - 6;
+			const down = below >= Math.min(pop.scrollHeight, 220) || below >= above;
+			pop.style.maxHeight = `${Math.max(80, down ? below : above)}px`;
+			pop.style.left = `${Math.max(0, Math.min(m.ox + b.cursorX * m.cw, hr.width - pop.offsetWidth - 4))}px`;
+			pop.style.top = down ? `${curBottom + 2}px` : `${Math.max(2, curTop - 2 - pop.offsetHeight)}px`;
 		}
+		pop.querySelector<HTMLElement>(".term-pop-item.sel")?.scrollIntoView({ block: "nearest" });
 		hideGhost();
 	};
 
@@ -243,7 +250,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			if (e.type !== "keydown" || !promptOn) return true;
 			if (!pop.hidden) {
 				// 목록이 열려 있으면 Tab 은 셸처럼 다음 후보로(포커스가 다른 칸으로 넘어가지 않게 화면 쪽에서 기본 동작을 막는다)
-				const n = Math.min(items.length, 12);
+				const n = Math.min(items.length, MAX_POP);
 				if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Tab") {
 					const back = e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey);
 					sel = (sel + (back ? -1 : 1) + n) % n;

@@ -2689,3 +2689,91 @@ input[type="radio"] {
 .sb-item.in-group {
 	padding-left: 22px;
 }
+/* 자동완성 목록: 넘치면 안에서 스크롤, 아래 안내 줄은 고정 */
+.term-pop {
+	overflow-y: auto;
+	overscroll-behavior: contain;
+}
+.term-pop-more {
+	position: sticky;
+	bottom: -4px;
+	margin: 2px -4px -4px;
+	padding: 4px 12px;
+	background: var(--elevated);
+	border-top: 0.5px solid var(--hairline);
+	font-family: var(--font-ui);
+	font-size: 11px;
+	color: var(--text-3);
+}
+/* 사이드바 연결 줄 — 누르면 접속, 올리면 접속·설정 단추 */
+.sb-row {
+	position: relative;
+}
+.sb-row.in-group .sb-item {
+	padding-left: 22px;
+}
+.sb-name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.sb-acts {
+	position: absolute;
+	top: 50%;
+	right: 4px;
+	display: none;
+	gap: 2px;
+	transform: translateY(-50%);
+}
+.sb-row:hover .sb-acts,
+.sb-row:focus-within .sb-acts {
+	display: flex;
+}
+.sb-row:hover .sb-item {
+	background: var(--fill);
+	padding-right: 56px;
+}
+.sb-act {
+	display: grid;
+	place-items: center;
+	width: 22px;
+	height: 22px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text-2);
+}
+.sb-act:hover {
+	background: var(--fill-hover);
+	color: var(--text);
+}
+/* 홈 연결 카드 — 접속·설정 단추는 늘 보이게 */
+.pcard > .btn {
+	opacity: 1;
+}
+.pcard > .btn.ghost.icon {
+	opacity: 0.75;
+}
+.btn.pc-connect {
+	height: 26px;
+	padding: 0 10px;
+	gap: 4px;
+	font-size: 12px;
+	flex: none;
+}
+/* 시트는 위에 붙인다 — 내용이 바뀌어 높이가 달라져도 아래로만 늘고 위치가 튀지 않는다 */
+.scrim {
+	place-items: start center;
+	padding-top: max(24px, 7vh);
+}
+.sheet {
+	max-height: calc(100vh - max(24px, 7vh) - 24px);
+}
+/* 세그먼트: 고른 쪽만 굵게 하면 글자 폭이 바뀌어 단추가 흔들린다 — 굵기는 그대로, 바탕으로만 표시 */
+.seg button,
+.seg button[aria-pressed="true"] {
+	font-weight: 500;
+}
+.seg button[aria-pressed="false"] {
+	color: var(--text-2);
+}
