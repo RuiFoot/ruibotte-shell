@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.DS_Store
+# 업데이트 서명 키·비밀은 저장소 밖(E:/data/ruibotte-shell/secret, GitHub Secrets)에만 둔다
+*.key
+*.password
+.env*

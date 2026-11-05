@@ -1,0 +1,79 @@
+# 태그(v0.1.0 등)를 올리면: 버전 검사 → Windows(설치판·포터블)·macOS(universal dmg) 빌드
+# → 업데이트 서명·latest.json 생성 → GitHub Release 에 첨부(릴리스 노트 자동).
+# 릴리스 순서: develop → main 병합 → node scripts/set-version.mjs X.Y.Z → 커밋 → git tag vX.Y.Z → git push --follow-tags
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches version
+        run: node scripts/check-version.mjs "${GITHUB_REF_NAME}"
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: ""
+          - os: macos-14
+            args: "--target universal-apple-darwin"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 업데이트 서명(minisign). 이 키를 잃으면 이미 설치된 앱은 더는 업데이트를 받지 못한다.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "RuiBotte Shell ${{ github.ref_name }}"
+          releaseBody: "설치: Windows는 `RuiBotte.Shell_*_x64-setup.exe`(관리자 권한 불필요), 포터블은 `RuiBotteShell-Portable-*.exe`, macOS는 `.dmg`. 앱 안 업데이트는 자동으로 알려 줍니다."
+          generateReleaseNotes: true
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      - name: Portable exe (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $out = "RuiBotteShell-Portable-$ver.exe"
+          Copy-Item src-tauri/target/release/ruibotte-shell.exe $out
+          gh release upload "${{ github.ref_name }}" $out --clobber

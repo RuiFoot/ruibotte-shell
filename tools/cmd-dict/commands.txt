@@ -1,0 +1,50 @@
+# 명령어 사전·자동완성 대상(D24) — 사내 리눅스 서버에서 쓰는 명령. macOS 전용은 넣지 않는다.
+# 한 줄에 하나, # 뒤는 주석. Fig 스펙이나 tldr 페이지(common·linux) 둘 중 하나는 있어야 들어간다.
+
+# 파일·폴더(coreutils 등)
+ls cd pwd cp mv rm mkdir rmdir touch ln stat file tree realpath readlink basename dirname
+cat tac head tail less more nl wc sort uniq cut paste join split csplit tee tr fold fmt column
+chmod chown chgrp umask install truncate shred dd sync du df find locate updatedb which whereis type
+md5sum sha1sum sha256sum sha512sum cksum b2sum base64 xxd od hexdump strings comm diff cmp patch
+date cal sleep watch timeout yes seq expr bc printf echo env printenv export alias unalias history
+xargs parallel nohup nice renice time tput clear reset script
+
+# 텍스트 처리
+grep egrep fgrep rg ag sed awk gawk perl jq yq iconv dos2unix unix2dos rename mmv envsubst
+
+# 압축·묶음
+tar gzip gunzip zcat bzip2 bunzip2 xz unxz zstd zip unzip 7z rar unrar cpio
+
+# 프로세스·시스템
+ps top htop atop pstree pgrep pkill kill killall pidof lsof fuser strace ltrace jobs bg fg disown
+free vmstat iostat mpstat sar uptime uname hostname hostnamectl lscpu lsmem lspci lsusb dmidecode nproc
+dmesg journalctl systemctl systemd-analyze loginctl timedatectl localectl service chkconfig shutdown reboot
+crontab at batch logger logrotate sysctl ulimit getconf
+mount umount lsblk blkid fdisk parted mkfs mkswap swapon swapoff fsck e2fsck tune2fs resize2fs xfs_growfs lvm lvs vgs pvs lvextend pvcreate vgcreate lvcreate mdadm
+
+# 사용자·권한
+id whoami who w last lastlog users groups useradd usermod userdel groupadd groupmod groupdel passwd chpasswd chage su sudo visudo getent newgrp setfacl getfacl chattr lsattr
+
+# 네트워크
+ip ifconfig route ss netstat ping ping6 traceroute tracepath mtr dig nslookup host whois arp arping ethtool nmcli nmap nc ncat socat telnet curl wget ftp sftp scp ssh ssh-keygen ssh-copy-id ssh-agent ssh-add rsync tcpdump iptables ip6tables nft firewall-cmd ufw iftop nethogs iperf3 hostname resolvectl
+
+# 패키지
+apt apt-get apt-cache dpkg yum dnf rpm snap flatpak pip pip3 npm npx pnpm yarn gem cargo go composer
+
+# 보안·인증서
+openssl gpg certbot keytool
+
+# 개발·빌드
+git make cmake gcc g++ java javac mvn gradle node python python3 ruby php dotnet tmux screen vim vi nano emacs code
+
+# 컨테이너·오케스트레이션
+docker docker-compose podman kubectl helm crictl ctr
+
+# DB·캐시 클라이언트
+mysql mysqldump mariadb psql pg_dump pg_restore pg_dumpall createdb dropdb sqlite3 redis-cli mongosh mongo mongodump mongorestore sqlplus
+
+# 웹·서버
+nginx apachectl httpd ab htpasswd
+
+# 기타 유틸
+man info whatis apropos help base32 numfmt shuf factor uuidgen pv lsb_release neofetch fastfetch
