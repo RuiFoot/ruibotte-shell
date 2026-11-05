@@ -38,3 +38,12 @@ SOFTWARE.
 - 출처: https://github.com/tldr-pages/tldr — © the tldr-pages team and contributors (사용 커밋은 `dict.json` 의 `src.tldr`)
 - 라이선스: https://creativecommons.org/licenses/by/4.0/
 - 쓴 것: 명령별 대표 사용 예시. 한국어 페이지(`pages.ko`)는 그대로, 한국어 페이지가 없는 명령은 영어 페이지의 설명을 LLM 으로 번역했다(변경함). 예시 명령의 자리표시자 표기(`{{…}}`)는 원본 그대로.
+
+## 함께 쓰는 라이브러리(파일 보기·SQL)
+
+| 라이브러리 | 라이선스 | 쓰는 곳 |
+|---|---|---|
+| SheetJS Community Edition `xlsx` 0.18.5 | Apache-2.0 | 엑셀(xlsx·xls·ods) 미리보기 |
+| `mammoth` | BSD-2-Clause | 워드(docx) 미리보기 |
+| `sql-formatter` | MIT | SQL 정렬 |
+| CodeMirror 6(`@codemirror/*`, `@lezer/*`) | MIT | 편집기·자동완성·언어 |
