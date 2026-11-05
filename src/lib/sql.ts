@@ -61,7 +61,3 @@ export function statementAt(src: string, pos: number): Stmt | null {
 	const all = splitSql(src);
 	return all.find((s) => pos >= s.from && pos <= s.to + 1) ?? [...all].reverse().find((s) => s.to < pos) ?? all[0] ?? null;
 }
-
-export function quoteIdent(name: string, mysql: boolean): string {
-	return mysql ? `\`${name.replaceAll("`", "``")}\`` : `"${name.replaceAll('"', '""')}"`;
-}

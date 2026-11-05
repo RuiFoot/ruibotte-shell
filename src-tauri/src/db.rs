@@ -9,10 +9,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::{pin_mut, StreamExt};
+use futures_util::{pin_mut, StreamExt, TryStreamExt};
 use mysql_async::prelude::Queryable;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use serde_json::{json, Value};
+use tauri::{AppHandle, State};
+use tiberius::FromSql;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::secrets;
 use crate::store::Store;
@@ -72,11 +75,51 @@ fn my_err(x: mysql_async::Error) -> DbError {
     }
 }
 
+fn ms_err(x: tiberius::error::Error) -> DbError {
+    match &x {
+        tiberius::error::Error::Server(t) => match t.code() {
+            18456 => e("AUTH_FAILED", t.message().to_string()),
+            3981 | 3906 => e("READ_ONLY", t.message().to_string()),
+            c => e("SQL", format!("{} ({c})", t.message())),
+        },
+        tiberius::error::Error::Io { .. } => e("NETWORK", x.to_string()),
+        _ => e("OTHER", x.to_string()),
+    }
+}
+
+fn jdbc_err(v: &Value) -> DbError {
+    let code = match v["code"].as_str().unwrap_or("") {
+        "AUTH_FAILED" => "AUTH_FAILED",
+        "NETWORK" => "NETWORK",
+        "CANCELLED" => "CANCELLED",
+        "BUSY" => "BUSY",
+        "CLOSED" => "CLOSED",
+        "SQL" => "SQL",
+        _ => "OTHER",
+    };
+    e(code, v["message"].as_str().unwrap_or("JDBC 오류").to_string())
+}
+
+type MsClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
 // 연결마다 하나뿐이라 크기 차이는 상관없다
 #[allow(clippy::large_enum_variant)]
 enum Engine {
     Pg { client: tokio_postgres::Client, cancel: tokio_postgres::CancelToken },
     My { conn: tokio::sync::Mutex<mysql_async::Conn>, opts: mysql_async::Opts, thread: u32 },
+    Ms { client: tokio::sync::Mutex<MsClient> },
+    Jdbc { side: crate::jdbc::Sidecar },
+}
+
+impl Engine {
+    /// 화면이 감출 기능 — readOnlySession(세션 자체를 읽기 전용으로), cancel(실행 중 취소)
+    fn features(&self) -> Vec<&'static str> {
+        match self {
+            Engine::Pg { .. } | Engine::My { .. } => vec!["readOnlySession", "cancel"],
+            Engine::Ms { .. } => vec![],
+            Engine::Jdbc { .. } => vec!["cancel"],
+        }
+    }
 }
 
 pub(crate) struct DbConn {
@@ -134,6 +177,7 @@ pub struct DbConnectReq {
 #[serde(rename_all = "camelCase")]
 pub struct DbConnectOk {
     conn_id: u32,
+    features: Vec<&'static str>,
     version: String,
     database: Option<String>,
     used_saved_secret: bool,
@@ -148,11 +192,11 @@ fn lit(s: &str, mysql: bool) -> String {
 }
 
 #[tauri::command]
-pub async fn db_connect(store: State<'_, Store>, dbs: State<'_, DbConns>, req: DbConnectReq) -> R<DbConnectOk> {
-    connect(&store, &dbs, req).await
+pub async fn db_connect(app: AppHandle, store: State<'_, Store>, dbs: State<'_, DbConns>, req: DbConnectReq) -> R<DbConnectOk> {
+    connect(&store, &dbs, req, Some(&app)).await
 }
 
-pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq) -> R<DbConnectOk> {
+pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq, app: Option<&AppHandle>) -> R<DbConnectOk> {
     let mut used_saved = false;
     let pw = match req.password.clone().filter(|p| !p.is_empty()) {
         Some(p) => Some(p),
@@ -193,6 +237,57 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq) -> 
             .unwrap_or_default();
         let cancel = client.cancel_token();
         (Engine::Pg { client, cancel }, version)
+    } else if req.engine == "mssql" {
+        let Some(p) = pw.clone() else {
+            return Err(e("NEED_SECRET", "암호를 입력하세요"));
+        };
+        let mut cfg = tiberius::Config::new();
+        cfg.host(&req.host);
+        cfg.port(req.port);
+        if let Some(d) = req.database.as_deref().filter(|d| !d.is_empty()) {
+            cfg.database(d);
+        }
+        cfg.authentication(tiberius::AuthMethod::sql_server(&req.username, &p));
+        cfg.application_name("RuiBotte Shell");
+        // 사내 SQL Server 는 자체 서명 인증서가 흔하다 — 암호화는 하되 인증서 체인은 묻지 않는다
+        cfg.trust_cert();
+        let tcp = tokio::time::timeout(timeout, tokio::net::TcpStream::connect((req.host.as_str(), req.port)))
+            .await
+            .map_err(|_| e("NETWORK", format!("{}:{} 에 닿지 못했습니다", req.host, req.port)))?
+            .map_err(|x| e("NETWORK", x.to_string()))?;
+        let _ = tcp.set_nodelay(true);
+        let mut client = tiberius::Client::connect(cfg, tcp.compat_write()).await.map_err(ms_err)?;
+        let version = client
+            .simple_query("SELECT @@VERSION")
+            .await
+            .map_err(ms_err)?
+            .into_row()
+            .await
+            .map_err(ms_err)?
+            .and_then(|r| r.get::<&str, _>(0).map(|v| v.lines().next().unwrap_or("").trim().to_string()))
+            .unwrap_or_default();
+        (Engine::Ms { client: tokio::sync::Mutex::new(client) }, version)
+    } else if let Some(je) = crate::jdbc::engine(&req.engine) {
+        let app = app.ok_or_else(|| e("OTHER", "앱 상태가 없습니다"))?;
+        let Some(p) = pw.clone() else {
+            return Err(e("NEED_SECRET", "암호를 입력하세요"));
+        };
+        let side = match crate::jdbc::Sidecar::spawn(app, je.key).await {
+            Ok(s) => s,
+            Err(m) if m == "NEED_JAVA" => return Err(e("NEED_JAVA", "Java 실행기를 먼저 받아야 합니다")),
+            Err(m) if m == "NEED_DRIVER" => return Err(e("NEED_DRIVER", format!("{} 드라이버가 없습니다", je.label))),
+            Err(m) => return Err(e("OTHER", m)),
+        };
+        let url = crate::jdbc::build_url(je, &req.host, req.port, req.database.as_deref().unwrap_or(""));
+        let v = side
+            .call(json!({"op": "connect", "url": url, "user": req.username, "password": p, "driver": je.driver_class, "readOnly": req.read_only}))
+            .await
+            .map_err(|m| e("CLOSED", m))?;
+        if v["type"] == "error" {
+            let err = jdbc_err(&v);
+            return Err(err);
+        }
+        (Engine::Jdbc { side }, v["version"].as_str().unwrap_or("").to_string())
     } else {
         let opts: mysql_async::Opts = mysql_async::OptsBuilder::default()
             .ip_or_hostname(req.host.clone())
@@ -231,17 +326,24 @@ pub(crate) async fn connect(store: &Store, dbs: &DbConns, req: DbConnectReq) -> 
         }
         store.mark_used(id, saved);
     }
+    let features = engine.features();
     let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
     dbs.map.lock().unwrap().insert(id, Arc::new(DbConn { engine, read_only: req.read_only, busy: Default::default() }));
-    Ok(DbConnectOk { conn_id: id, version, database: req.database, used_saved_secret: used_saved })
+    Ok(DbConnectOk { conn_id: id, features, version, database: req.database, used_saved_secret: used_saved })
 }
 
 #[tauri::command]
 pub async fn db_disconnect(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
     let c = dbs.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
-        if let Engine::My { conn, .. } = &c.engine {
-            let _ = conn.lock().await.query_drop("DO 0").await;
+        match &c.engine {
+            Engine::My { conn, .. } => {
+                let _ = conn.lock().await.query_drop("DO 0").await;
+            }
+            Engine::Jdbc { side } => {
+                let _ = side.call(json!({"op": "close"})).await;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -316,6 +418,62 @@ fn my_value(v: mysql_async::Value) -> Option<String> {
             format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
         }),
         Time(neg, d, h, mi, s, _) => Some(format!("{}{:02}:{mi:02}:{s:02}", if neg { "-" } else { "" }, d * 24 + h as u32)),
+    }
+}
+
+fn ms_kind(t: tiberius::ColumnType) -> &'static str {
+    use tiberius::ColumnType::*;
+    match t {
+        Int1 | Int2 | Int4 | Int8 | Intn => "int",
+        Float4 | Float8 | Floatn | Money | Money4 | Decimaln | Numericn => "numeric",
+        Datetime | Datetime4 | Datetimen | Daten | Timen | Datetime2 | DatetimeOffsetn => "date",
+        Bit | Bitn => "bool",
+        BigVarBin | BigBinary | Image => "binary",
+        _ => "text",
+    }
+}
+
+fn ms_value(d: tiberius::ColumnData<'static>) -> Option<String> {
+    use tiberius::ColumnData as C;
+    match &d {
+        C::U8(v) => v.map(|x| x.to_string()),
+        C::I16(v) => v.map(|x| x.to_string()),
+        C::I32(v) => v.map(|x| x.to_string()),
+        C::I64(v) => v.map(|x| x.to_string()),
+        C::F32(v) => v.map(|x| x.to_string()),
+        C::F64(v) => v.map(|x| x.to_string()),
+        C::Bit(v) => v.map(|b| if b { "1".into() } else { "0".into() }),
+        C::String(v) => v.as_ref().map(|x| x.to_string()),
+        C::Guid(v) => v.map(|g| g.to_string()),
+        C::Binary(v) => v.as_ref().map(|b| format!("0x{}", b.iter().take(64).map(|x| format!("{x:02X}")).collect::<String>())),
+        C::Numeric(v) => v.map(|n| n.to_string()),
+        C::Xml(v) => v.as_ref().map(|x| x.to_string()),
+        C::Date(_) => time::Date::from_sql(&d).ok().flatten().map(|x| x.to_string()),
+        C::Time(_) => time::Time::from_sql(&d).ok().flatten().map(fmt_time),
+        C::DateTimeOffset(_) => time::OffsetDateTime::from_sql(&d).ok().flatten().map(|x| {
+            let o = x.offset();
+            format!("{} {}{}{:02}:{:02}", x.date(), fmt_time(x.time()), if o.is_negative() { "-" } else { "+" }, o.whole_hours().abs(), o.minutes_past_hour().abs())
+        }),
+        C::DateTime(_) | C::SmallDateTime(_) | C::DateTime2(_) => time::PrimitiveDateTime::from_sql(&d).ok().flatten().map(|x| format!("{} {}", x.date(), fmt_time(x.time()))),
+    }
+}
+
+/// 12:03:04.1234567 — 시·분·초는 두 자리, 소수 끝 0 은 뺀다
+fn fmt_time(t: time::Time) -> String {
+    let ns = t.nanosecond();
+    let frac = if ns == 0 { String::new() } else { format!(".{ns:09}").trim_end_matches('0').to_string() };
+    format!("{:02}:{:02}:{:02}{frac}", t.hour(), t.minute(), t.second())
+}
+
+fn kind_of(s: &str) -> &'static str {
+    match s {
+        "int" => "int",
+        "numeric" => "numeric",
+        "date" => "date",
+        "bool" => "bool",
+        "binary" => "binary",
+        "json" => "json",
+        _ => "text",
     }
 }
 
@@ -404,6 +562,75 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
             affected = Some(res.affected_rows());
             res.drop_result().await.map_err(my_err)?;
         }
+        Engine::Ms { client } => {
+            let mut g = client.lock().await;
+            let fw = first_word(&sql);
+            if READ_WORDS.contains(&fw.as_str()) || fw == "exec" || fw == "execute" || fw == "sp_help" {
+                let mut stream = g.simple_query(sql.as_str()).await.map_err(ms_err)?;
+                let mut set: Option<usize> = None;
+                while let Some(item) = stream.try_next().await.map_err(ms_err)? {
+                    match item {
+                        tiberius::QueryItem::Metadata(m) => {
+                            if set.is_none() {
+                                set = Some(m.result_index());
+                                has_set = true;
+                                columns = m.columns().iter().map(|c| Col { name: c.name().to_string(), kind: ms_kind(c.column_type()) }).collect();
+                            }
+                        }
+                        tiberius::QueryItem::Row(r) => {
+                            if Some(r.result_index()) != set {
+                                continue;
+                            }
+                            if first_row_ms.is_none() {
+                                first_row_ms = Some(started.elapsed().as_millis() as u64);
+                            }
+                            if rows.len() >= max {
+                                truncated = true;
+                                continue;
+                            }
+                            rows.push(r.into_iter().map(ms_value).collect());
+                        }
+                    }
+                }
+            } else {
+                let res = g.execute(sql.as_str(), &[]).await.map_err(ms_err)?;
+                affected = Some(res.total());
+            }
+        }
+        Engine::Jdbc { side } => {
+            let (id, mut rx) = side.request(json!({"op": "query", "sql": sql, "maxRows": max})).await.map_err(|m| e("CLOSED", m))?;
+            let outcome = loop {
+                let Some(v) = rx.recv().await else {
+                    break Err(e("CLOSED", "JDBC 브리지가 끝났습니다"));
+                };
+                match v["type"].as_str() {
+                    Some("columns") => {
+                        has_set = true;
+                        columns = v["columns"]
+                            .as_array()
+                            .map(|a| a.iter().map(|c| Col { name: c["name"].as_str().unwrap_or("").to_string(), kind: kind_of(c["kind"].as_str().unwrap_or("")) }).collect())
+                            .unwrap_or_default();
+                    }
+                    Some("rows") => {
+                        if first_row_ms.is_none() {
+                            first_row_ms = Some(started.elapsed().as_millis() as u64);
+                        }
+                        for r in v["rows"].as_array().into_iter().flatten() {
+                            rows.push(r.as_array().map(|x| x.iter().map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default());
+                        }
+                    }
+                    Some("done") => {
+                        affected = v["affected"].as_u64();
+                        truncated = v["truncated"].as_bool().unwrap_or(false);
+                        break Ok(());
+                    }
+                    Some("error") => break Err(jdbc_err(&v)),
+                    _ => {}
+                }
+            };
+            side.done(id);
+            outcome?;
+        }
     }
     let row_count = rows.len();
     let result_id = if has_set {
@@ -425,6 +652,11 @@ pub async fn db_cancel(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
             let mut k = mysql_async::Conn::new(opts.clone()).await.map_err(my_err)?;
             k.query_drop(format!("KILL QUERY {thread}")).await.map_err(my_err)?;
             let _ = k.disconnect().await;
+            Ok(())
+        }
+        Engine::Ms { .. } => Err(e("OTHER", "SQL Server 는 아직 실행 중 취소를 지원하지 않습니다")),
+        Engine::Jdbc { side } => {
+            side.call(json!({"op": "cancel"})).await.map_err(|m| e("CLOSED", m))?;
             Ok(())
         }
     }
@@ -526,6 +758,12 @@ async fn rows_of(c: &DbConn, sql: &str) -> R<Vec<Vec<Option<String>>>> {
             let rows: Vec<mysql_async::Row> = g.query(sql).await.map_err(my_err)?;
             Ok(rows.into_iter().map(|r| r.unwrap().into_iter().map(my_value).collect()).collect())
         }
+        Engine::Ms { client } => {
+            let mut g = client.lock().await;
+            let rows = g.simple_query(sql).await.map_err(ms_err)?.into_first_result().await.map_err(ms_err)?;
+            Ok(rows.into_iter().map(|r| r.into_iter().map(ms_value).collect()).collect())
+        }
+        Engine::Jdbc { .. } => Ok(Vec::new()),
     }
 }
 
@@ -537,12 +775,38 @@ pub async fn db_tree(dbs: State<'_, DbConns>, conn: u32, path: Vec<String>) -> R
 
 pub(crate) async fn tree(dbs: &DbConns, conn: u32, path: Vec<String>) -> R<Vec<DbNode>> {
     let c = dbs.get(conn)?;
+    if let Engine::Jdbc { side } = &c.engine {
+        let v = side.call(json!({"op": "tree", "path": path})).await.map_err(|m| e("CLOSED", m))?;
+        if v["type"] == "error" {
+            return Err(jdbc_err(&v));
+        }
+        return Ok(v["nodes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|n| DbNode {
+                        name: n["name"].as_str().unwrap_or("").to_string(),
+                        kind: match n["kind"].as_str() {
+                            Some("schema") => "schema",
+                            Some("view") => "view",
+                            Some("column") => "column",
+                            _ => "table",
+                        },
+                        detail: n["detail"].as_str().map(String::from),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default());
+    }
     let my = matches!(c.engine, Engine::My { .. });
+    let ms = matches!(c.engine, Engine::Ms { .. });
     let s = |r: &Vec<Option<String>>, i: usize| r.get(i).cloned().flatten().unwrap_or_default();
     match path.as_slice() {
         [] => {
             let sql = if my {
                 "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema','performance_schema','sys','mysql') ORDER BY 1"
+            } else if ms {
+                "SELECT name FROM sys.schemas WHERE schema_id < 16384 AND name NOT IN ('sys','INFORMATION_SCHEMA','guest') ORDER BY CASE WHEN name = 'dbo' THEN 0 ELSE 1 END, name"
             } else {
                 "SELECT nspname FROM pg_namespace WHERE nspname NOT IN ('pg_catalog','information_schema') AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%' ORDER BY nspname = 'public' DESC, 1"
             };
@@ -634,10 +898,10 @@ mod live {
             let port: u16 = it.next().unwrap().parse().unwrap();
             let engine = if kind == "pg" { "postgres" } else { "mariadb" };
             println!("== {engine}");
-            let need = connect(&store, &dbs, req(engine, host, port, None, false)).await.err().unwrap();
+            let need = connect(&store, &dbs, req(engine, host, port, None, false), None).await.err().unwrap();
             println!("암호 없이 → {} ({})", need.code, need.message);
             let t0 = Instant::now();
-            let ok = connect(&store, &dbs, req(engine, host, port, Some(&pw), false)).await.unwrap();
+            let ok = connect(&store, &dbs, req(engine, host, port, Some(&pw), false), None).await.unwrap();
             println!("접속 {} ms · {}", t0.elapsed().as_millis(), ok.version);
             let c = ok.conn_id;
             let gen = if engine == "postgres" {
@@ -673,6 +937,7 @@ mod live {
                         let mut k = mysql_async::Conn::new(opts.clone()).await.unwrap();
                         k.query_drop(format!("KILL QUERY {thread}")).await.unwrap();
                     }
+                    _ => {}
                 }
             };
             let (r, _) = tokio::join!(fut, canceller);
@@ -685,7 +950,7 @@ mod live {
             let cols = tree(&dbs, c, vec![first.clone(), "rb_t".into()]).await.unwrap();
             println!("열: {:?}", cols.iter().map(|x| format!("{} {}", x.name, x.detail.clone().unwrap_or_default())).collect::<Vec<_>>());
             // 읽기 전용
-            let ro = connect(&store, &dbs, req(engine, host, port, Some(&pw), true)).await.unwrap();
+            let ro = connect(&store, &dbs, req(engine, host, port, Some(&pw), true), None).await.unwrap();
             let w = query(&dbs, ro.conn_id, "DELETE FROM rb_t WHERE id = 1".into(), None).await.err().unwrap();
             assert_eq!(w.code, "READ_ONLY");
             let w2 = query(&dbs, ro.conn_id, "WITH x AS (DELETE FROM rb_t WHERE id = 1 RETURNING id) SELECT * FROM x".into(), None).await.err().map(|e| e.code);
@@ -693,6 +958,59 @@ mod live {
             assert!(matches!(w2, Some("READ_ONLY") | Some("SQL")));
             query(&dbs, c, "DROP TABLE rb_t".into(), None).await.unwrap();
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod live_mssql {
+    use super::*;
+
+    /// `RB_MSSQL_TEST=127.0.0.1:21433` 와 `RB_MSSQL_TEST_PW` 를 줄 때만
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_mssql_round_trip() {
+        let spec = std::env::var("RB_MSSQL_TEST").expect("RB_MSSQL_TEST");
+        let pw = std::env::var("RB_MSSQL_TEST_PW").expect("RB_MSSQL_TEST_PW");
+        let (host, port) = spec.split_once(':').unwrap();
+        let dir = std::env::temp_dir().join(format!("rbshell-mstest-{}", std::process::id()));
+        let store = Store::open(dir.clone(), false).unwrap();
+        let dbs = DbConns::default();
+        let req = |ro: bool| DbConnectReq {
+            profile_id: None,
+            engine: "mssql".into(),
+            host: host.into(),
+            port: port.parse().unwrap(),
+            username: "sa".into(),
+            password: Some(pw.clone()),
+            database: Some("master".into()),
+            read_only: ro,
+            save_secret: false,
+            legacy: false,
+        };
+        let t = Instant::now();
+        let ok = connect(&store, &dbs, req(false), None).await.unwrap();
+        println!("접속 {} ms · {} · 기능 {:?}", t.elapsed().as_millis(), ok.version, ok.features);
+        let c = ok.conn_id;
+        let _ = query(&dbs, c, "IF OBJECT_ID('dbo.rb_t') IS NOT NULL DROP TABLE dbo.rb_t".into(), None).await;
+        let made = query(&dbs, c, "SELECT TOP 200000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS id, CONCAT(N'사용자 ', ROW_NUMBER() OVER (ORDER BY (SELECT NULL))) AS name, SYSDATETIME() AS at, CAST(1 AS bit) AS flag, NEWID() AS g, CAST(12.34 AS decimal(8,2)) AS amt, CAST(NULL AS nvarchar(10)) AS memo INTO dbo.rb_t FROM sys.all_objects a CROSS JOIN sys.all_objects b".into(), None).await.unwrap();
+        println!("표 만들기 {} ms affected {:?}", made.ms, made.affected);
+        let q = query(&dbs, c, "SELECT * FROM dbo.rb_t ORDER BY id".into(), Some(100_000)).await.unwrap();
+        println!("10만 상한 → {} 행 truncated {} 첫 행 {:?} ms 전체 {} ms", q.row_count, q.truncated, q.first_row_ms, q.ms);
+        println!("열 {:?}", q.columns.iter().map(|c| format!("{}:{}", c.name, c.kind)).collect::<Vec<_>>());
+        println!("첫 행 {:?}", db_rows_core(&dbs, q.result_id.unwrap(), 0, 1));
+        assert_eq!(q.row_count, 100_000);
+        let n = query(&dbs, c, "SELECT count(*) AS n FROM dbo.rb_t".into(), None).await.unwrap();
+        println!("다음 문장 OK {} ms → {:?}", n.ms, db_rows_core(&dbs, n.result_id.unwrap(), 0, 1));
+        let up = query(&dbs, c, "UPDATE dbo.rb_t SET memo = N'x' WHERE id <= 10".into(), None).await.unwrap();
+        assert_eq!(up.affected, Some(10));
+        let schemas = tree(&dbs, c, vec![]).await.unwrap();
+        assert_eq!(schemas[0].name, "dbo");
+        let cols = tree(&dbs, c, vec!["dbo".into(), "rb_t".into()]).await.unwrap();
+        println!("열 트리 {:?}", cols.iter().map(|x| format!("{} {}", x.name, x.detail.clone().unwrap_or_default())).collect::<Vec<_>>());
+        let ro = connect(&store, &dbs, req(true), None).await.unwrap();
+        assert_eq!(query(&dbs, ro.conn_id, "DELETE FROM dbo.rb_t".into(), None).await.err().unwrap().code, "READ_ONLY");
+        query(&dbs, c, "DROP TABLE dbo.rb_t".into(), None).await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

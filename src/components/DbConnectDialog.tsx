@@ -1,9 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Database } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { Database, Download, FolderOpen } from "lucide-react";
+import { engineOf } from "../lib/engines";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type Profile } from "../lib/ipc";
 
-export type DbConnectOk = { connId: number; version: string; database?: string | null; usedSavedSecret: boolean };
+export type DbConnectOk = { connId: number; version: string; database?: string | null; usedSavedSecret: boolean; features: string[] };
+type Install = { what: string; done: number; total: number; state: "running" | "done" | "error"; message?: string | null };
 type DbError = { code: string; message: string };
 
 /** DB 접속 — 암호(저장 선택)·읽기 전용 고르기 */
@@ -16,7 +20,14 @@ export function DbConnectDialog({
 	onConnected: (ok: DbConnectOk, readOnly: boolean) => void;
 	onCancel: () => void;
 }) {
-	const [step, setStep] = useState<"form" | "connecting">(profile.secretSaved ? "connecting" : "form");
+	const [step, setStep] = useState<"form" | "connecting" | "java" | "driver">(profile.secretSaved ? "connecting" : "form");
+	const [install, setInstall] = useState<Install | null>(null);
+	const [busy, setBusy] = useState(false);
+	const eng = engineOf(profile.engine);
+	useEffect(() => {
+		const un = listen<Install>("jdbc-install", (e) => setInstall(e.payload));
+		return () => void un.then((f) => f());
+	}, []);
 	const [pw, setPw] = useState("");
 	const [save, setSave] = useState(false);
 	const [readOnly, setReadOnly] = useState(false);
@@ -47,6 +58,14 @@ export function DbConnectDialog({
 				onConnected(ok, ro);
 			} catch (e) {
 				const x = e as DbError;
+				if (x.code === "NEED_JAVA") {
+					setStep("java");
+					return;
+				}
+				if (x.code === "NEED_DRIVER") {
+					setStep("driver");
+					return;
+				}
 				setStep("form");
 				if (x.code !== "NEED_SECRET") setErr(x.message ?? String(e));
 			}
@@ -82,9 +101,73 @@ export function DbConnectDialog({
 					{profile.engine} · {profile.username}@{profile.host}:{profile.port}
 					{profile.database ? `/${profile.database}` : ""}
 				</p>
+				{(step === "java" || step === "driver") && (
+					<>
+						<p style={{ color: "var(--text-2)", marginTop: 0 }}>
+							{step === "java"
+								? `${eng.label} 은(는) JDBC 브리지로 붙습니다. 처음 한 번 Java 실행기(Eclipse Temurin JRE 21, 약 45 MB)를 받아 이 PC 의 앱 폴더에 둡니다. 받은 파일은 sha256 으로 확인합니다.`
+								: `${eng.label} 드라이버(jar)가 필요합니다.${eng.key === "oracle" ? " Maven Central 에서 최신판을 받아 sha1 로 확인합니다." : " 공개 저장소에 없어 가지고 계신 jar 파일을 골라 주세요(벤더 사이트·DB 설치 폴더에 있습니다)."}`}
+						</p>
+						{install && (
+							<div className="xfer-row" style={{ border: 0 }}>
+								<span>{install.what}</span>
+								<small>{install.state === "error" ? install.message : install.total ? `${Math.round((100 * install.done) / install.total)}%` : ""}</small>
+								<div className={`bar ${install.state}`}>
+									<i style={{ width: install.total ? `${(100 * install.done) / install.total}%` : install.state === "done" ? "100%" : "8%" }} />
+								</div>
+							</div>
+						)}
+						{err && <p className="err">{err}</p>}
+						<div className="sheet-actions">
+							<button type="button" className="btn" onClick={onCancel}>
+								취소
+							</button>
+							{step === "java" || eng.key === "oracle" ? (
+								<button
+									type="button"
+									className="btn primary"
+									disabled={busy}
+									onClick={async () => {
+										setBusy(true);
+										setErr("");
+										try {
+											if (step === "java") await invoke("jdbc_install_java");
+											else await invoke("jdbc_install_driver", { engine: eng.key });
+											setInstall(null);
+											await run(pw || null, readOnly);
+										} catch (x) {
+											setErr(String(x));
+										} finally {
+											setBusy(false);
+										}
+									}}
+								>
+									<Download size={14} /> {busy ? "받는 중…" : step === "java" ? "Java 실행기 받기" : "드라이버 받기"}
+								</button>
+							) : (
+								<button
+									type="button"
+									className="btn primary"
+									onClick={async () => {
+										const f = await openDialog({ multiple: false, directory: false, title: `${eng.label} JDBC 드라이버(jar)`, filters: [{ name: "JDBC 드라이버", extensions: ["jar"] }] });
+										if (typeof f !== "string") return;
+										try {
+											await invoke("jdbc_add_driver_file", { engine: eng.key, path: f });
+											await run(pw || null, readOnly);
+										} catch (x) {
+											setErr(String(x));
+										}
+									}}
+								>
+									<FolderOpen size={14} /> jar 파일 고르기
+								</button>
+							)}
+						</div>
+					</>
+				)}
 				{step === "connecting" ? (
-					<p style={{ color: "var(--text-2)" }}>접속 중…</p>
-				) : (
+					<p style={{ color: "var(--text-2)" }}>접속 중…{eng.jdbc ? " (JDBC 브리지를 띄우는 데 1~2초 걸립니다)" : ""}</p>
+				) : step !== "form" ? null : (
 					<>
 						<div className="field">
 							<label htmlFor="db-pw">암호</label>

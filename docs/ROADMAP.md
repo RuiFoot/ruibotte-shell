@@ -30,6 +30,12 @@
 - 남음(2단계로): 셸 통합 ✓/✗(OSC 133), 터미널 검색·링크·EUC-KR 터미널 인코딩, 이미지·CSV 표 미리보기, 전송 sha256 확인·이어받기·동시 3개, SQL 파라미터(:이름), zsh 폴더 따라가기
 - 실측 남음: 진짜 CentOS 6(ssh-dss)·구판 MySQL 5.x·MariaDB 5.5 서버, 사람이 화면을 직접 조작해 보는 확인
 
+## 0.3.0 — DB 엔진 넓히기 (2026-11-05)
+- SQL Server(tiberius, 순수 Rust), Oracle·CUBRID·Tibero·Altibase(JDBC 브리지 — Java 실행기·드라이버는 처음 쓸 때 받기)
+- 엔진별 기능 켜고 끄기(취소·세션 읽기 전용), 엔진별 SQL 문법(식별자 인용·TOP/FETCH FIRST/LIMIT·편집기 방언)
+- 사내 Orbit DB 작업대의 일반 엔진 확장(원장 E12 후속)과 같은 범위
+- 남음: SQL Server 실행 중 취소(tiberius 미지원), SQL Server 행 상한 뒤 남은 행 버리는 시간 줄이기, CUBRID·Tibero·Altibase 실제 드라이버로 실측
+
 ## 2단계
 - 결과 표 편집: 셀 인라인 편집, 타입별 입력기, NULL, 변경 막대, 수동 트랜잭션
 - 터미널 입력 도움: 자동완성(경로·명령·옵션 — 명령어 사전), 흐린 제안, 동시 입력

@@ -1,10 +1,11 @@
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FolderOpen } from "lucide-react";
 import { useState } from "react";
+import { ENGINES, engineOf } from "../lib/engines";
 import { api, type LegacyLevel, type Profile } from "../lib/ipc";
 
 const COLORS = ["#0a84ff", "#30d158", "#ff9f0a", "#ff453a", "#bf5af2", "#8e8e93"];
-const DB_PORT: Record<string, number> = { postgres: 5432, mariadb: 3306, mysql: 3306 };
+const DB_PORT: Record<string, number> = Object.fromEntries(ENGINES.map((e) => [e.key, e.port]));
 
 export function blankProfile(kind: "ssh" | "db"): Profile {
 	return {
@@ -93,9 +94,12 @@ export function ProfileSheet({
 					<div className="field">
 						<label htmlFor="pf-engine">엔진</label>
 						<select id="pf-engine" value={p.engine ?? "postgres"} onChange={(e) => set({ engine: e.target.value, port: DB_PORT[e.target.value] })}>
-							<option value="postgres">PostgreSQL</option>
-							<option value="mariadb">MariaDB</option>
-							<option value="mysql">MySQL</option>
+							{ENGINES.map((e) => (
+								<option key={e.key} value={e.key}>
+									{e.label}
+									{e.jdbc ? " (JDBC — 처음 쓸 때 받기)" : ""}
+								</option>
+							))}
 						</select>
 					</div>
 				)}
@@ -145,7 +149,7 @@ export function ProfileSheet({
 				)}
 				{p.kind === "db" && (
 					<div className="field">
-						<label htmlFor="pf-db">데이터베이스</label>
+						<label htmlFor="pf-db">{engineOf(p.engine).dbLabel}</label>
 						<input id="pf-db" value={p.database ?? ""} onChange={(e) => set({ database: e.target.value || null })} spellCheck={false} />
 					</div>
 				)}

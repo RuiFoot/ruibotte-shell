@@ -38,7 +38,7 @@
 | 인코딩 | encoding_rs + chardetng(UTF-8·EUC-KR·UTF-16·BOM·CRLF 보존) |
 | PostgreSQL | tokio-postgres(CancelToken·RowStream), 임의 타입은 텍스트 형식 결과 |
 | MySQL·MariaDB | mysql_async(구판 인증 플러그인 포함 [확인]), 취소는 두 번째 연결 `KILL QUERY` |
-| 후속 DB | MSSQL tiberius, Oracle·CUBRID 는 JDBC 사이드카(선택 설치) |
+| 후속 DB | SQL Server tiberius(0.3.0 반영), Oracle·CUBRID·Tibero·Altibase 는 JDBC 사이드카 — Temurin JRE 21 을 처음 쓸 때 받기(0.3.0 반영, 사용자 지정) |
 | 결과 표 | 행은 Rust 에 두고 화면은 보이는 구간만 받는다(`grid_rows(from,to)`). Canvas 표와 실측 비교 예정 |
 | 앱 저장 | SQLite(rusqlite, WAL, FTS5) 파일 하나. Postgres 내장은 쓰지 않는다(별도 서버·포트·기동 지연) |
 | 비밀 | OS 자격 증명 저장소(keyring — Windows Credential Manager·macOS Keychain). 앱 DB 에는 넣지 않는다 |
@@ -87,6 +87,15 @@
 | MariaDB 11 접속 / 같은 조회 | 4 ms / 89 ms · 0.93초 |
 | 실행 중 취소(pg_sleep·SLEEP 10초) | 0.3초에 멈춤, 같은 연결로 다음 문장 바로 실행 |
 | 읽기 전용 | DELETE 거절, CTE 안 DELETE 도 서버가 거절 |
+
+### 0.3.0 (2026-11-05, 같은 PC, Docker 시험 서버)
+
+| 항목 | 결과 |
+|---|---|
+| SQL Server 2022 접속 / 20만 행 중 10만 행 상한 첫 행·전체 | 350 ms / 100 ms · 4.4초(상한 뒤 남은 행을 읽어 버리는 시간 포함) |
+| JDBC — Temurin JRE 21 받기·sha256 확인·풀기 | 14초(처음 한 번) |
+| JDBC — ojdbc11 23.26.4 받기·sha1 확인 | 1.6초 |
+| JDBC — Oracle 26ai Free 접속(Java 기동 포함) / 5만 행 중 1만 행 상한 | 1.6초 / 0.52초 |
 
 ## 벤치 계획
 

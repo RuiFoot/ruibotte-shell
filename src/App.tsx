@@ -414,6 +414,7 @@ export function App() {
 										version={t.db.ok.version}
 										profileId={t.db.profile.id}
 										active={t.id === active}
+										features={t.db.ok.features}
 									/>
 								)}
 								{t.kind === "grid" && <ResultGridPane />}

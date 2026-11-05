@@ -1,6 +1,6 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
-import { MySQL, PostgreSQL, sql } from "@codemirror/lang-sql";
+import { MSSQL, MySQL, PLSQL, PostgreSQL, StandardSQL, sql } from "@codemirror/lang-sql";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { EditorState } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
@@ -11,7 +11,8 @@ import "dockview-react/dist/styles/dockview.css";
 import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, LayoutTemplate, Lock, Play, PlayCircle, Square, Table } from "lucide-react";
 import { createContext, type ReactElement, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/ipc";
-import { quoteIdent, splitSql, statementAt } from "../lib/sql";
+import { quoteIdentFor, selectTop } from "../lib/engines";
+import { splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { DataGrid, type GridCol } from "./DataGrid";
 
@@ -33,6 +34,7 @@ type Node = { name: string; kind: "schema" | "table" | "view" | "column"; detail
 
 type Ctx = {
 	conn: number;
+	engine: string;
 	mysql: boolean;
 	readOnly: boolean;
 	run: (stmts: string[]) => void;
@@ -94,7 +96,11 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number }>) {
 					highlightSelectionMatches(),
 					search({ top: true }),
 					syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-					sql({ dialect: ctx.mysql ? MySQL : PostgreSQL, upperCaseKeywords: false }),
+					sql({
+						dialect:
+							ctx.engine === "postgres" ? PostgreSQL : ctx.mysql ? MySQL : ctx.engine === "mssql" ? MSSQL : ctx.engine === "oracle" || ctx.engine === "tibero" ? PLSQL : StandardSQL,
+						upperCaseKeywords: false,
+					}),
 					keymap.of([
 						{ key: "Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, false)), true) },
 						{ key: "Shift-Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, true)), true) },
@@ -121,7 +127,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number }>) {
 			ctx.registerEditor(props.api.id, null);
 			v.destroy();
 		};
-	}, [ctx.mysql, ctx.draftKey, ctx.registerEditor, props.api.id, props.params.n]);
+	}, [ctx.mysql, ctx.engine, ctx.draftKey, ctx.registerEditor, props.api.id, props.params.n]);
 	return <div className="cm-host" ref={host} style={{ height: "100%" }} />;
 }
 
@@ -143,9 +149,11 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 		return (
 			<div className="dock-watermark">
 				<p>실행 중…</p>
-				<button type="button" className="btn" onClick={() => void db.cancel(ctx.conn)}>
-					<Square size={12} /> 취소
-				</button>
+				{ctx.engine !== "mssql" && (
+					<button type="button" className="btn" onClick={() => void db.cancel(ctx.conn)}>
+						<Square size={12} /> 취소
+					</button>
+				)}
 			</div>
 		);
 	if (p.state === "error")
@@ -213,7 +221,8 @@ function ObjectsPanel() {
 	);
 	useEffect(() => load([]), [load]);
 
-	const qname = (schema: string, table: string) => `${quoteIdent(schema, ctx.mysql)}.${quoteIdent(table, ctx.mysql)}`;
+	const qname = (schema: string, table: string) =>
+		schema === "(기본)" ? quoteIdentFor(ctx.engine, table) : `${quoteIdentFor(ctx.engine, schema)}.${quoteIdentFor(ctx.engine, table)}`;
 	const toggle = (path: string[]) => {
 		const k = path.join("\u0001");
 		setOpen((s) => {
@@ -269,7 +278,7 @@ function ObjectsPanel() {
 							items.push(
 								{ label: "데이터 보기", run: () => ctx.run([`SELECT * FROM ${q}`]) },
 								{ label: "행 수 세기", run: () => ctx.run([`SELECT count(*) AS row_count FROM ${q}`]) },
-								{ label: "SELECT 문 넣기", run: () => ctx.insertText(`SELECT * FROM ${q} LIMIT 100;\n`) },
+								{ label: "SELECT 문 넣기", run: () => ctx.insertText(`${selectTop(ctx.engine, q, 100)};\n`) },
 								{ sep: true },
 							);
 						}
@@ -314,6 +323,7 @@ export function DbWorkbench({
 	version,
 	profileId,
 	active,
+	features = [],
 }: {
 	conn: number;
 	engine: string;
@@ -321,7 +331,10 @@ export function DbWorkbench({
 	version: string;
 	profileId?: number;
 	active: boolean;
+	/** 엔진이 지원하는 기능 — readOnlySession·cancel */
+	features?: string[];
 }) {
+	const canCancel = features.includes("cancel");
 	const dock = useRef<DockviewApi | null>(null);
 	const editors = useRef(new Map<string, EditorView>());
 	const lastEditor = useRef<string | null>(null);
@@ -456,8 +469,8 @@ export function DbWorkbench({
 	}, [active]);
 
 	const ctx = useMemo<Ctx>(
-		() => ({ conn, mysql, readOnly, run: (s) => void run(s), insertText, registerEditor, draftKey: `sql.draft.${profileId ?? "adhoc"}` }),
-		[conn, mysql, readOnly, run, insertText, registerEditor, profileId],
+		() => ({ conn, engine, mysql, readOnly, run: (s) => void run(s), insertText, registerEditor, draftKey: `sql.draft.${profileId ?? "adhoc"}` }),
+		[conn, engine, mysql, readOnly, run, insertText, registerEditor, profileId],
 	);
 
 	return (
@@ -470,9 +483,11 @@ export function DbWorkbench({
 					<button type="button" className="btn ghost" disabled={running} onClick={() => { const v = currentEditor(); if (v) void run(pickStatements(v, true)); }} title="전체 실행 — Ctrl+Shift+Enter">
 						<PlayCircle size={14} /> 전체
 					</button>
-					<button type="button" className="btn ghost" disabled={!running} onClick={() => void db.cancel(conn)} title="실행 중인 문장 취소">
-						<Square size={12} /> 취소
-					</button>
+					{canCancel && (
+						<button type="button" className="btn ghost" disabled={!running} onClick={() => void db.cancel(conn)} title="실행 중인 문장 취소">
+							<Square size={12} /> 취소
+						</button>
+					)}
 					<span className="sep" />
 					<select className="status-select" value={maxRows} onChange={(e) => setMaxRows(Number(e.target.value))} title="결과 행 상한">
 						{[1000, 10_000, 100_000, 1_000_000].map((n) => (
@@ -489,8 +504,11 @@ export function DbWorkbench({
 					</button>
 					<span style={{ flex: 1 }} />
 					{readOnly && (
-						<span className="badge warn" title="세션 READ ONLY + 조회 문장만">
-							<Lock size={11} /> 읽기 전용
+						<span
+							className="badge warn"
+							title={features.includes("readOnlySession") ? "세션 READ ONLY + 조회 문장만" : "이 엔진은 세션을 읽기 전용으로 못 바꿔 조회 문장 판별로만 막습니다. 확실히 하려면 읽기 전용 계정을 쓰세요."}
+						>
+							<Lock size={11} /> 읽기 전용{features.includes("readOnlySession") ? "" : "(문장 판별)"}
 						</span>
 					)}
 					<span className="badge">{version}</span>

@@ -7,7 +7,7 @@ SSH 터미널·SFTP·편집기와 DataGrip식 DB 접근기를 하나로 합친 *
 - 화면 React 19 + TypeScript — 터미널 xterm.js(WebGL), 결과 표 가상화, Apple macOS·iOS 풍 자체 디자인
 - 앱 자체 저장 SQLite 파일 하나, 암호는 원할 때만 OS 자격 증명 저장소(Windows 자격 증명 관리자·macOS 키체인)
 
-## 할 수 있는 것 (0.2)
+## 할 수 있는 것 (0.3)
 
 **SSH 서버**
 - 접속: 암호·개인키, 처음 보는 호스트 키는 지문을 확인하고 고정, 키가 바뀌면 막는다
@@ -20,11 +20,13 @@ SSH 터미널·SFTP·편집기와 DataGrip식 DB 접근기를 하나로 합친 *
 - 터미널: 여러 개, 트리가 터미널의 지금 폴더를 따라간다(bash), 끊기면 알리고 다시 연결한다
 - 가져오기: `~/.ssh/config`·PuTTY 세션. 내보내기: ssh config
 
-**데이터베이스**(PostgreSQL·MariaDB·MySQL)
+**데이터베이스** — PostgreSQL·MariaDB·MySQL·SQL Server 는 앱에 들어 있고, Oracle·CUBRID·Tibero·Altibase 는 JDBC 브리지로
 - 객체 트리(스키마·표·뷰·열), 더블클릭으로 데이터 보기
 - SQL 편집기: 커서 문장·고른 글·전체 실행(Ctrl+Enter / Ctrl+Shift+Enter), 문장마다 결과 탭, 초안 자동 저장
 - 결과 표: 수십만 행도 보이는 쪽만 그린다, 행 상한, 실행 중 취소, CSV·TSV·JSON 내보내기
-- 읽기 전용 접속: 세션 READ ONLY + 조회 문장만
+- 읽기 전용 접속: 세션 READ ONLY + 조회 문장만(SQL Server·JDBC 엔진은 문장 판별만 — 읽기 전용 계정 권장)
+- JDBC 브리지: 처음 쓸 때만 Java 실행기(Eclipse Temurin JRE 21, 약 45 MB)를 받아 sha256 으로 확인한다. Oracle 드라이버는 Maven Central 에서 받아 sha1 로 확인하고, CUBRID·Tibero·Altibase 는 가지고 있는 jar 를 고른다. 기본 설치 크기는 그대로다
+- 엔진마다 쓸 수 있는 기능(실행 중 취소·세션 읽기 전용)이 달라 화면이 맞춰 감춘다
 
 **공통**: 내 PC 터미널(같은 작업대), 리눅스 명령어 사전 358개(한국어), 암호는 원할 때만 OS 자격 증명 저장소에, 자동 업데이트
 

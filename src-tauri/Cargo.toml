@@ -1,7 +1,7 @@
 [package]
 name = "ruibotte-shell"
 # 버전 정본은 tauri.conf.json — scripts/set-version.mjs 가 여기와 package.json 을 함께 맞춘다
-version = "0.2.0"
+version = "0.3.0"
 description = "RuiBotte Shell"
 authors = ["RuiFoot"]
 license = "MIT"
@@ -30,13 +30,23 @@ russh-sftp = "3"
 keyring = "4"
 encoding_rs = "0.8.35"
 chardetng = "1.0.0"
-tokio = { version = "1", features = ["sync", "time", "macros", "rt", "io-util", "fs"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "io-util", "fs", "net", "process"] }
 tauri-plugin-dialog = "2"
 trash = "5"
 urlencoding = "2"
 tokio-postgres = { version = "0.7", features = ["runtime"] }
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
 futures-util = "0.3"
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hex = "0.4"
+tar = "0.4"
+flate2 = "1"
+time = "0.3"
 
 [profile.release]
 # 설치 크기·기동 우선

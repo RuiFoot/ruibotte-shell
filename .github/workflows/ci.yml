@@ -30,6 +30,17 @@ jobs:
       - name: Version
         run: node scripts/check-version.mjs
 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # JDBC 브리지 소스가 Java 11 대상으로 컴파일되는지(배포 jar 는 저장소의 src-tauri/resources/rb-jdbc.jar)
+      - name: JDBC sidecar
+        shell: bash
+        run: |
+          mkdir -p /tmp/rbj && javac --release 11 -encoding UTF-8 -d /tmp/rbj sidecar/RbJdbc.java
+
       - name: Frontend
         run: |
           pnpm install --frozen-lockfile

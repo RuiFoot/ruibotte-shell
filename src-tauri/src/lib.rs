@@ -4,6 +4,7 @@
 mod db;
 mod grid;
 mod importer;
+mod jdbc;
 mod localfs;
 mod pty;
 mod secrets;
@@ -133,6 +134,10 @@ pub fn run() {
             db::db_result_close,
             db::db_export,
             db::db_tree,
+            jdbc::jdbc_status,
+            jdbc::jdbc_install_java,
+            jdbc::jdbc_install_driver,
+            jdbc::jdbc_add_driver_file,
             importer::export_ssh_config,
             sudo::sudo_list,
             sudo::sudo_read_text,
