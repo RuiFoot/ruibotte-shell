@@ -134,6 +134,7 @@ pub fn run() {
             transfer::sftp_put_chunk,
             transfer::ssh_copy,
             transfer::local_copy,
+            localfs::local_write_bytes,
             db::db_view,
             secrets::secret_set,
             monitor::ssh_stats,

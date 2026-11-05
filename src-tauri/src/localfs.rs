@@ -139,3 +139,18 @@ pub fn local_rename(from: String, to: String) -> Result<(), String> {
 pub fn local_trash(path: String) -> Result<(), String> {
     trash::delete(&path).map_err(|e| e.to_string())
 }
+
+/// 바이너리 파일 쓰기(ERD 그림 저장 등) — 본문은 바이트 그대로, 경로는 머리 x-path(URI 인코딩)
+#[tauri::command]
+pub fn local_write_bytes(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("본문이 없습니다".into());
+    };
+    let path = request
+        .headers()
+        .get("x-path")
+        .and_then(|v| v.to_str().ok())
+        .map(crate::transfer::percent_decode)
+        .ok_or("경로가 없습니다")?;
+    std::fs::write(path, data).map_err(|e| e.to_string())
+}

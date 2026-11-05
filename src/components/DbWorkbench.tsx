@@ -923,7 +923,7 @@ function ErdDock(props: IDockviewPanelProps<{ schema: string }>) {
 	const ctx = useDb();
 	return (
 		<Suspense fallback={<div className="dock-watermark">불러오는 중…</div>}>
-			<ErdPanelLazy conn={ctx.conn} engine={ctx.engine} schema={props.params.schema} />
+			<ErdPanelLazy conn={ctx.conn} engine={ctx.engine} schema={props.params.schema} storeKey={ctx.historyScope} />
 		</Suspense>
 	);
 }
