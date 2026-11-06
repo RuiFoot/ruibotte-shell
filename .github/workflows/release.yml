@@ -27,7 +27,7 @@ jobs:
         include:
           - os: windows-latest
             args: ""
-          - os: macos-14
+          - os: macos-15
             args: "--target universal-apple-darwin"
     runs-on: ${{ matrix.os }}
     steps:
@@ -42,7 +42,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.os == 'macos-15' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@v2
         with:
