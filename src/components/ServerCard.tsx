@@ -300,7 +300,7 @@ export function ServerCard({
 						닫기
 					</button>
 					<button type="button" className="btn primary" disabled={!accounts[sel]} onClick={() => accounts[sel] && onConnect(accounts[sel])}>
-						<Play size={13} /> {accounts[sel] ? `${accounts[sel].username} 로 접속` : "접속"}
+						<Play size={13} /> {accounts[sel] ? `${accounts[sel].username} 계정으로 접속` : "접속"}
 					</button>
 				</div>
 			</div>

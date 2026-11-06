@@ -193,6 +193,66 @@ export function installMock() {
 					return new Promise((r) => setTimeout(() => r({ ms: 142, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false }), 400));
 				case "db_test":
 					return { ms: 38, version: "PostgreSQL 18.6" };
+				case "srv_run": {
+					// 서버 칸(서비스·Docker·웹 화면) 화면 점검용 견본 출력
+					const cmd = String((args as { cmd: string }).cmd);
+					const out = (lines: string[], code = 0) => ({ code, stdout: `${lines.join("\n")}\n`, stderr: "", truncated: false });
+					if (cmd.includes("list-units"))
+						return out([
+							"uid=1000",
+							"sd=yes",
+							"@@UNITS@@",
+							"nginx.service loaded active running A high performance web server",
+							"postgresql.service loaded active running PostgreSQL RDBMS",
+							"app-api.service loaded failed failed Repia API",
+							"cron.service loaded active running Regular background program processing daemon",
+							"sshd.service loaded active running OpenSSH server daemon",
+							"backup.service loaded inactive dead Nightly backup",
+							"@@FILES@@",
+							"nginx.service enabled enabled",
+							"postgresql.service enabled enabled",
+							"app-api.service enabled enabled",
+							"cron.service enabled enabled",
+							"sshd.service enabled enabled",
+							"backup.service disabled enabled",
+						]);
+					if (cmd.includes("systemctl show"))
+						return out([
+							"Id=nginx.service",
+							"ActiveState=active",
+							"SubState=running",
+							"MainPID=812",
+							"MemoryCurrent=48234496",
+							"ActiveEnterTimestamp=Thu 2026-11-05 09:12:44 KST",
+							"FragmentPath=/lib/systemd/system/nginx.service",
+							"@@STATUS@@",
+							"● nginx.service - A high performance web server",
+							"     Loaded: loaded (/lib/systemd/system/nginx.service; enabled)",
+							"     Active: active (running) since Thu 2026-11-05 09:12:44 KST; 1 day ago",
+						]);
+					if (cmd.includes("for b in docker podman")) return out(["bin=docker", "uid=1000"]);
+					if (cmd.includes("ps -q")) return out([]);
+					if (cmd.includes(" stats ")) return out(["a1b2c3\t0.42%\t312MiB / 7.6GiB\t4.01%", "d4e5f6\t3.10%\t1.2GiB / 7.6GiB\t15.8%"]);
+					if (cmd.includes(" ps -a"))
+						return out([
+							"a1b2c3\tapi\trepia/api:1.4.2\trunning\tUp 3 days\t0.0.0.0:8080->8080/tcp\t3 days ago\tcom.docker.compose.project=app",
+							"d4e5f6\tdb\tpostgres:18\trunning\tUp 3 days (healthy)\t5432/tcp\t3 days ago\tcom.docker.compose.project=app",
+							"0f9e8d\tmigrate\trepia/api:1.4.2\texited\tExited (0) 3 days ago\t\t3 days ago\tcom.docker.compose.project=app",
+							"77aa11\tredis\tredis:7\trunning\tUp 9 hours\t6379/tcp\t9 hours ago\t",
+						]);
+					if (cmd.includes(" images ")) return out(["repia/api\t1.4.2\tsha256:aa11\t412MB\t5 days ago", "postgres\t18\tsha256:bb22\t438MB\t2 weeks ago", "redis\t7\tsha256:cc33\t117MB\t3 weeks ago"]);
+					if (cmd.includes("ss -") || cmd.includes("/proc/net"))
+						return out([
+							'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))',
+							'LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:(("java",pid=1201,fd=40))',
+							'LISTEN 0 244 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=640,fd=5))',
+						]);
+					return out([]);
+				}
+				case "srv_stream_open":
+					return 1;
+				case "srv_stream_close":
+					return null;
 				case "ssh_stats":
 					return stats();
 				case "ssh_du":

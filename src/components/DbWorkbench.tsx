@@ -1482,7 +1482,7 @@ export function DbWorkbench({
 	version,
 	profileId,
 	active,
-	features = [],
+	features: featuresIn,
 }: {
 	conn: number;
 	engine: string;
@@ -1491,8 +1491,9 @@ export function DbWorkbench({
 	profileId?: number;
 	active: boolean;
 	/** 엔진이 지원하는 기능 — readOnlySession·cancel */
-	features?: string[];
+	features?: string[] | null;
 }) {
+	const features = featuresIn ?? [];
 	const canCancel = features.includes("cancel");
 	const dock = useRef<DockviewApi | null>(null);
 	const editors = useRef(new Map<string, EditorView>());
@@ -1631,7 +1632,7 @@ export function DbWorkbench({
 			try {
 				const cur = await queryRows(conn, "SELECT current_database()", 1);
 				setCurDb(cur[0]?.[0] ?? "");
-				setDatabases(await db.databases(conn));
+				setDatabases((await db.databases(conn)) ?? []);
 			} catch {
 				// 목록을 못 읽으면 고르기를 감춘다
 			}

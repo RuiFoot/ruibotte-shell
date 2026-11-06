@@ -310,7 +310,7 @@ export function App() {
 	};
 	const profileMenu = (p: Profile): MenuItem[] => [
 		{ label: "서버 카드(계정 고르기)…", run: () => connect(p) },
-		...(p.accounts ?? []).map((a) => ({ label: `${accountName(a)}${a.label?.trim() ? ` (${a.username})` : ""} 로 접속${a.isDefault ? " ★" : ""}`, run: () => connectAs(p, a) })),
+		...(p.accounts ?? []).map((a) => ({ label: `${accountName(a)}${a.label?.trim() ? ` (${a.username})` : ""} 계정으로 접속${a.isDefault ? " ★" : ""}`, run: () => connectAs(p, a) })),
 		{ sep: true as const },
 		{ label: "설정…", run: () => editProfile(p) },
 		{ label: "복제", run: () => editProfile({ ...p, id: undefined, name: `${p.name} 복사본`, secretSaved: false }) },
@@ -434,7 +434,7 @@ export function App() {
 	};
 	const quickTitle = (p: Profile) => {
 		const a = defaultAccount(p);
-		return `기본 계정${a ? ` ${accountName(a)}${a.label?.trim() ? `(${a.username})` : ""}` : ""} 로 바로 접속${(p.accounts?.length ?? 0) > 1 ? ` — 계정 ${p.accounts?.length}개 중` : ""}`;
+		return `${a ? `${accountName(a)}${a.label?.trim() ? `(${a.username})` : ""} 계정` : "기본 계정"}으로 바로 접속${(p.accounts?.length ?? 0) > 1 ? ` — 계정 ${p.accounts?.length}개 중` : ""}`;
 	};
 	const card = cardId != null ? profiles.find((p) => p.id === cardId) : undefined;
 
@@ -612,8 +612,8 @@ export function App() {
 									</span>
 								) : null}
 								{routeWorthShowing(t.ssh?.ok.route) && t.ssh?.ok.route ? (
-									<span className="tab-route" title={routeTitle(t.ssh.ok.route)}>
-										{t.ssh.ok.route.label}
+									<span className="tab-route" title={routeTitle(t.ssh.ok.route)} aria-label={`경로: ${t.ssh.ok.route.label}`}>
+										⇢
 									</span>
 								) : null}
 								{tabs.length > 1 && (
@@ -828,9 +828,9 @@ export function App() {
 																			{p.favorite ? "★" : "☆"}
 																		</button>
 																		<span className="nm">{p.name}</span>
-																		{p.legacy !== "off" && <span className="badge warn">{LEVEL_BADGE[p.legacy]}</span>}
 																	</b>
 																	<small>
+																			{p.legacy !== "off" && <span className="badge warn pc-legacy">{LEVEL_BADGE[p.legacy]}</span>}
 																			{p.secretSaved && <KeyRound size={10} style={{ marginRight: 4, verticalAlign: -1 }} />}
 																			{p.kind === "db" ? `${p.engine} · ` : ""}
 																			{p.username ? `${p.username}@` : ""}

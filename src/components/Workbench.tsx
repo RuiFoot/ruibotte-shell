@@ -563,7 +563,7 @@ function addDoc(d: DockviewApi, opts: { id: string; component: string; title: st
 		d.addPanel({ ...opts, renderer: "always", position: { referenceGroup: empty.id } });
 		return;
 	}
-	const anyDoc = d.panels.find((p) => /^(edit|tail|diff):/.test(p.id) || p.id === "monitor");
+	const anyDoc = d.panels.find((p) => /^(edit|tail|diff):/.test(p.id) || /^(monitor|services|docker|webports|search)$/.test(p.id));
 	if (anyDoc) {
 		d.addPanel({ ...opts, renderer: "always", position: { referencePanel: anyDoc.id, direction: "within" } });
 		return;
