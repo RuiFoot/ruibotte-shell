@@ -57,6 +57,51 @@ function sendChannel(ch: unknown, text: string) {
 	setTimeout(() => internals.runCallback(id, { index: 0, message: bytes }), 120);
 }
 
+/** 셸 흉내(화면 점검용) — 줄 편집 하나: 글자 넣기·백스페이스·←/→·Enter. 명령 입력 보조(빈칸 Tab 이동)를 눈으로 보려고 */
+const shellLine = { buf: [] as string[], at: 0, ch: null as unknown, seq: 1 };
+function quickSend(ch: unknown, text: string) {
+	const id = typeof ch === "object" && ch ? (ch as { id: number }).id : Number(String(ch).replace("__CHANNEL__:", ""));
+	const internals = (window as unknown as { __TAURI_INTERNALS__: { runCallback: (id: number, data: unknown) => void } }).__TAURI_INTERNALS__;
+	const bytes = Array.from(new TextEncoder().encode(text));
+	setTimeout(() => internals.runCallback(id, { index: shellLine.seq++, message: bytes }), 5);
+}
+const cellW = (s: string) => [...s].reduce((n, c) => n + ((c.codePointAt(0) ?? 0) >= 0x1100 ? 2 : 1), 0);
+function shellWrite(data: string) {
+	const L = shellLine;
+	if (!L.ch) return;
+	let out = "";
+	for (let i = 0; i < data.length; ) {
+		if (data.startsWith("\x1b[D", i)) {
+			if (L.at > 0) out += "\b".repeat(cellW(L.buf[--L.at] ?? ""));
+			i += 3;
+		} else if (data.startsWith("\x1b[C", i)) {
+			if (L.at < L.buf.length) out += L.buf[L.at++];
+			i += 3;
+		} else if (data[i] === "\x7f") {
+			if (L.at > 0) {
+				const gone = L.buf.splice(--L.at, 1)[0] ?? "";
+				const rest = L.buf.slice(L.at).join("");
+				out += `${"\b".repeat(cellW(gone))}${rest}${" ".repeat(cellW(gone))}${"\b".repeat(cellW(rest) + cellW(gone))}`;
+			}
+			i++;
+		} else if (data[i] === "\r") {
+			const line = L.buf.join("");
+			L.buf = [];
+			L.at = 0;
+			out += `\r\n${line.trim() ? `(가짜 셸) ${line}\r\n` : ""}\x1b]133;D;0\x07${prompt}`;
+			i++;
+		} else if (data.charCodeAt(i) < 0x20) i++;
+		else {
+			const cp = String.fromCodePoint(data.codePointAt(i) ?? 32);
+			L.buf.splice(L.at++, 0, cp);
+			const rest = L.buf.slice(L.at).join("");
+			out += cp + rest + "\b".repeat(cellW(rest));
+			i += cp.length;
+		}
+	}
+	if (out) quickSend(L.ch, out);
+}
+
 const prompt = "\x1b]133;A\x07\x1b[1;32mdeploy@dev\x1b[0m:\x1b[1;34m~\x1b[0m$ ";
 const banner = `Last login: Thu Nov  5 09:12:44 2026 from 10.0.0.2\r\n\x1b]7;file://dev/home/deploy\x07${prompt}`;
 
@@ -187,8 +232,35 @@ export function installMock() {
 				}
 				case "ssh_shell_open":
 				case "pty_open":
+					shellLine.ch = args.onData;
+					shellLine.buf = [];
+					shellLine.at = 0;
+					shellLine.seq = 1;
 					sendChannel(args.onData, banner);
 					return 1;
+				case "ssh_shell_write":
+				case "pty_write":
+					shellWrite(String(args.data ?? ""));
+					return null;
+				case "pty_shells":
+					return [
+						{ id: "bash", label: "Git Bash", program: "bash.exe", args: [], kind: "bash", admin: false },
+						{ id: "pwsh", label: "PowerShell", program: "pwsh.exe", args: [], kind: "pwsh", admin: false },
+					];
+				case "ssh_exec": {
+					// 명령 입력 보조(D25) 후보·man 견본
+					const cmd = String(args.cmd ?? "");
+					if (cmd.includes("--type=service")) return "nginx.service enabled enabled\npostgresql.service enabled enabled\napp-api.service enabled enabled\n";
+					if (cmd.includes("--type=timer")) return "logrotate.timer enabled enabled\nbackup.timer enabled enabled\n";
+					if (cmd.startsWith("docker ps")) return "api\ndb\nredis\n";
+					if (cmd.startsWith("docker images")) return "repia/api:1.4.2\npostgres:18\n<none>:<none>\n";
+					if (cmd.startsWith("getent passwd")) return "root:x:0:0:root:/root:/bin/bash\ndeploy:x:1000:1000::/home/deploy:/bin/bash\n";
+					if (cmd.startsWith("getent group")) return "root:x:0:\ndeploy:x:1000:\nwww-data:x:33:\n";
+					if (cmd.includes("/sys/class/net")) return "eth0\nlo\n";
+					if (cmd.includes("man -P cat")) return "NAME\n       sed - stream editor\n\nOPTIONS\n       -n, --quiet, --silent\n              suppress automatic printing of pattern space\n";
+					if (cmd.includes("compgen")) return "sed\nfind\ntar\ngrep\nls\n";
+					return "";
+				}
 				case "ssh_test":
 					return new Promise((r) => setTimeout(() => r({ ms: 142, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false }), 400));
 				case "db_test":

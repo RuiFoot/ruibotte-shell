@@ -58,6 +58,7 @@ import { DockerPanel } from "./panels/DockerPanel";
 import { ServicesPanel } from "./panels/ServicesPanel";
 import { WebPortsPanel } from "./panels/WebPortsPanel";
 import { type Command, useCommands } from "../lib/commands";
+import { FORMS } from "../lib/cmdAssist";
 
 /**
  * IDE식 작업대 — 트리·편집기·터미널이 모두 도킹 칸이다.
@@ -240,6 +241,8 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 	const info = ctx.localShells?.find((s) => s.id === shell);
 	const kind = info ? (info.kind === "pwsh" ? "pwsh" : info.kind === "cmd" ? "cmd" : "linux") : "linux";
 	const completion = useMemo(() => ({ ...ctx.completion, key: `${ctx.completion.key}:${kind}`, shellKind: kind as "linux" | "pwsh" | "cmd" }), [ctx.completion, kind]);
+	// 명령 입력 보조(D25) — 원격 SSH 와 내 PC 의 bash·zsh·Git Bash·WSL 만(PowerShell·cmd·그 밖은 끔)
+	const assist = !ctx.localShells || (!!info && (info.kind === "bash" || info.kind === "zsh" || info.kind === "wsl"));
 	// 터미널이 셸 정보(목록)를 받기 전에는 열지 않는다(기본 셸로 한 번 열렸다 다시 열리지 않게)
 	if (ctx.localShells && !shell) return <div className="panel-fill" />;
 	return (
@@ -254,6 +257,7 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 				onCwd={ctx.onCwd}
 				onInput={(d) => ctx.broadcast(props.api.id, d)}
 				completion={ctx.localShells ? completion : ctx.completion}
+				assist={assist}
 				shell={shell}
 				shellOptions={ctx.localShells?.map((s) => ({ value: s.id, label: s.label, hint: s.admin ? "관리자" : undefined }))}
 				onShellChange={(id) => {
@@ -766,6 +770,8 @@ export function Workbench({
 							return out.split("\n").filter(Boolean);
 						}
 					: undefined,
+			// 명령 입력 보조(D25)의 폼 후보·man — 읽기 전용 명령만 부른다(cmdAssist.ts)
+			exec: fs.side === "remote" && fs.conn != null ? (cmd) => invoke<string>("ssh_exec", { conn: fs.conn, cmd }) : undefined,
 		}),
 		[fs, label],
 	);
@@ -1300,6 +1306,18 @@ export function Workbench({
 			w("tree", has("tree") ? "파일 칸 닫기" : "파일 칸 열기", () => toggle("tree"), { disabled: locked, hint: lockHint, keywords: "트리 tree" }),
 			w("help", "단축키 도움말", () => setHelp(true), { keys: "F1", keywords: "도움말 help shortcut" }),
 		];
+		// 명령 입력 보조(D25) — 보이는 터미널이 리눅스 셸일 때만
+		{
+			const ax = visibleShell()?.h?.assist;
+			const off = ax ? {} : { disabled: true, hint: "리눅스 셸 터미널(SSH·bash·zsh·Git Bash·WSL)에서만" };
+			list.push(
+				w("assist.explain", "명령 풀이", () => ax?.({ kind: "explain" }), { keys: "Ctrl+Shift+E", hint: "고른 글자나 지금 입력 줄을 조각마다 풀이", keywords: "explain 설명 풀이 옵션", ...off }),
+				w("assist.form", "명령 만들기…", () => ax?.({ kind: "form" }), { hint: "칸을 채워 명령을 만들고 입력 줄에 넣기", keywords: "form 폼 빈칸 템플릿", ...off }),
+				...FORMS.map(({ cmd, form }) =>
+					w(`assist.form.${form.id}`, `명령 만들기: ${form.label}`, () => ax?.({ kind: "form", id: form.id }), { hint: form.d, keywords: `${cmd} form 폼 만들기`, ...off }),
+				),
+			);
+		}
 		if (local) {
 			list.push(
 				w("localtree", has("localtree") ? "내 PC 칸 닫기" : "내 PC 칸 열기", () => toggle("localtree"), { disabled: locked, hint: lockHint ?? "서버 트리와 끌어 놓아 주고받기" }),
@@ -1623,6 +1641,12 @@ function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => voi
 		["Ctrl+누르기", "출력의 경로를 편집기로 열기"],
 		["Ctrl+= · − · 0", "글자 크기"],
 		["Alt+P", "스니펫·명령어 사전"],
+		["명령 입력 보조(리눅스 셸)", ""],
+		["입력 줄 위 한 줄", "치는 명령의 자리(sed [옵션] 스크립트 [파일…]) — 지금 자리 굵게, 옵션이면 그 뜻"],
+		["Tab · Shift+Tab", "빈칸 템플릿에서 다음 · 이전 빈칸(처음 친 글자가 기본값을 바꿈)"],
+		["Esc · Enter · 마지막 빈칸에서 Tab", "빈칸 끝내고 일반 입력으로(Enter 는 그대로 실행)"],
+		["Ctrl+Shift+E", "명령 풀이 — 고른 글자(없으면 입력 줄)를 조각마다"],
+		["우클릭 › 명령 만들기…", "칸을 채워 명령 만들기(팔레트에서 \"명령 만들기\"로 찾기) — 입력 줄에만 넣음"],
 	];
 	return (
 		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === "Escape" && onClose()}>

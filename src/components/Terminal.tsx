@@ -23,6 +23,9 @@ import { loadTermPrefs, TERM_PREFS_EVENT } from "../lib/termPrefs";
 import { getAppearance, onAppearance, termFontFamily, termTheme } from "../lib/theme";
 import { createZmodem, type ZmodemBridge, type ZmProgress } from "../lib/zmodemTerm";
 import { Select } from "./Select";
+import { AssistFormSheet, ExplainCard } from "./CmdAssist";
+import { candidatesFor, cmdDesc, ensureDict, type ExplainPart, explainLine, fillTemplate, hasTemplateFields, optLookup, subDesc } from "../lib/cmdAssist";
+import { attachAssist, type TermAssist } from "../lib/termAssist";
 
 type Stat = { label: string; ok?: boolean };
 type Pending = { marker: IMarker; start: number; text: string };
@@ -32,6 +35,7 @@ type Pending = { marker: IMarker; start: number; text: string };
  * 셸 통합(OSC 133 A·D, 7, 6974): 명령마다 ✓/✗·걸린 시간, 트리 따라가기, root 표시, 오래 걸린 명령 끝 알림.
  * 검색(Ctrl+Shift+F)·링크·글꼴(Ctrl+=/−/0)·복사/붙여넣기(Ctrl+Shift+C/V, 우클릭)·여러 줄 붙여넣기 확인·
  * 스크롤백 저장·인코딩(UTF-8/EUC-KR)·스니펫(Alt+P).
+ * 명령 입력 보조(D25, 리눅스 셸만): 입력 줄 위 서명 힌트·{{빈칸}} Tab 템플릿·명령 만들기 폼·Ctrl+Shift+E 조각 풀이.
  */
 
 /** 바이트 → x-user-defined 글(0x80~0xFF 는 U+F780~) — 원격이 그 인코딩으로 바이트 그대로 되돌려 보낸다(ZMODEM 바이너리) */
@@ -76,6 +80,7 @@ export function TerminalView({
 	onRecording,
 	logName,
 	profileId,
+	assist = false,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -112,6 +117,8 @@ export function TerminalView({
 	logName?: string;
 	/** 원격: 이 서버 번호 — 서버별 터미널 색 덮어쓰기(설정 › 화면, 서버 설정) */
 	profileId?: number;
+	/** 명령 입력 보조(D25) — 리눅스 셸(원격 SSH·bash·zsh·Git Bash·WSL)에서만 켠다. PowerShell·cmd 는 끔 */
+	assist?: boolean;
 }) {
 	const profileIdRef = useRef(profileId);
 	profileIdRef.current = profileId;
@@ -163,6 +170,48 @@ export function TerminalView({
 	const isRemote = backend.exitEvent === "ssh-shell-exit";
 	const zmRef = useRef<ZmodemBridge | null>(null);
 	const [zm, setZm] = useState<ZmProgress | null>(null);
+	// 명령 입력 보조(D25)
+	const assistRef = useRef(assist);
+	assistRef.current = assist;
+	const axRef = useRef<TermAssist | null>(null);
+	const [formOpen, setFormOpen] = useState<{ id: string | null } | null>(null);
+	const [explain, setExplainView] = useState<{ text: string; parts: ExplainPart[] } | null>(null);
+	const explainOpen = useRef(false);
+	const setExplain = (v: { text: string; parts: ExplainPart[] } | null) => {
+		explainOpen.current = !!v;
+		setExplainView(v);
+	};
+	const completerRef = useRef<Completer | null>(null);
+	/** 폼 후보 — 지금 터미널 폴더 목록·읽기 전용 서버 명령 */
+	const candidates = (src: Parameters<typeof candidatesFor>[0]) => {
+		const c = completionRef.current;
+		return candidatesFor(src, { key: c?.key ?? label, exec: c?.exec, listDir: c?.listDir, cwd: completerRef.current?.cwdNow() ?? null });
+	};
+	const openExplain = async (given?: string) => {
+		let text = (given ?? axRef.current?.explainText() ?? "").trim();
+		if (!text) text = (cmds.current.at(-1)?.text ?? "").replace(/^.*?[$#>]\s/, "").trim();
+		if (!text) {
+			setStat({ label: "풀이할 명령을 고르거나(선택) 입력 줄에 쳐 주세요" });
+			return;
+		}
+		await ensureDict();
+		const line = text.split("\n")[0] ?? "";
+		setExplain({ text: line, parts: explainLine(line, optLookup, cmdDesc, subDesc) });
+	};
+	const openExplainRef = useRef(openExplain);
+	openExplainRef.current = openExplain;
+	/** 넣기 — {{빈칸}} 이 있으면 빈칸 템플릿, 없으면 그대로(실행하지 않음) */
+	const insertTemplate = (text: string) => {
+		const ax = axRef.current;
+		const t = termRef.current;
+		if (ax && hasTemplateFields(text)) ax.template(text);
+		else if (t) t.input(ax ? fillTemplate(text) : text);
+		t?.focus();
+	};
+	const insertRef = useRef(insertTemplate);
+	insertRef.current = insertTemplate;
+	const candRef = useRef(candidates);
+	candRef.current = candidates;
 
 	const startRec = async () => {
 		if (recRef.current || recStarting.current) return;
@@ -346,6 +395,7 @@ export function TerminalView({
 		let zmWatch = 0;
 		let zmTail = "";
 		const ch = bytesChannel((b) => {
+			axRef.current?.output(b.length);
 			if (zmb) zmb.consume(b);
 			else show(b);
 			if (zmWatch) {
@@ -372,7 +422,26 @@ export function TerminalView({
 
 		// ── 자동완성 ──
 		let completer: Completer | null = null;
-		if (completionRef.current) completer = attachCompletion(term, el, completionRef.current, (s) => write(s));
+		if (completionRef.current) completer = attachCompletion(term, el, completionRef.current, (s) => write(s), (open) => axRef.current?.popChanged(open));
+		completerRef.current = completer;
+		// ── 명령 입력 보조(D25) — 리눅스 셸만 ──
+		const ax =
+			completer && assistRef.current
+				? attachAssist({
+						term,
+						host: el,
+						completer,
+						emit: (s) => {
+							write(s);
+							onInputRef.current?.(s);
+						},
+						exec: completionRef.current?.exec,
+						onExplain: () => void openExplainRef.current(),
+						explainOpen: () => explainOpen.current,
+						closeExplain: () => setExplain(null),
+					})
+				: null;
+		axRef.current = ax;
 
 		// ── 셸 통합 ──
 		let atPrompt = false;
@@ -386,6 +455,7 @@ export function TerminalView({
 				promptSeen = true;
 				typedAtPrompt = false;
 				completer?.prompt();
+				ax?.reset();
 			}
 			if (kind === "D" && pending) {
 				const code = Number(arg ?? 0);
@@ -444,6 +514,13 @@ export function TerminalView({
 				idRef.current = id;
 				onShellRef.current?.({
 					idle: () => !promptSeen || (atPrompt && !typedAtPrompt),
+					assist: ax
+						? (a) => {
+								if (a.kind === "form") setFormOpen({ id: a.id ?? null });
+								else if (a.kind === "explain") void openExplainRef.current();
+								else insertRef.current(a.text);
+							}
+						: undefined,
 					send: (s) => write(s),
 					sudoPw: backend.sudoPw ? () => backend.sudoPw?.(id) ?? Promise.resolve(false) : undefined,
 					expect: (re, ms) =>
@@ -477,8 +554,11 @@ export function TerminalView({
 				}
 			}
 			if (atPrompt && d !== "\r") typedAtPrompt = true;
+			// 빈칸 템플릿 입력(D25 ①) — 셸로 보내기까지 끝
+			if (ax?.data(d)) return;
 			if (d === "\r") completer?.submitted();
-			else if (d.length === 1 && d >= " ") completer?.typed();
+			// 첫 입력(붙여넣기·템플릿처럼 여러 글자도) 직전 커서 = 입력 시작
+			else if (d >= " " && d !== "\x7f") completer?.typed();
 			if (atPrompt && d.includes("\r")) {
 				const buf = term.buffer.active;
 				const line = buf.getLine(buf.cursorY + buf.baseY)?.translateToString(true) ?? "";
@@ -488,11 +568,18 @@ export function TerminalView({
 			}
 			write(d);
 			onInputRef.current?.(d);
+			if (d.includes("\r")) ax?.reset();
 		});
 		const onResize = term.onResize(({ cols, rows }) => {
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
 		term.attachCustomKeyEventHandler((e) => {
+			// 입력 보조(D25) — 빈칸 Tab 이 자동완성 Tab 보다 먼저, Ctrl+Shift+E 풀이
+			if (ax && !ax.key(e)) {
+				e.preventDefault();
+				e.stopPropagation();
+				return false;
+			}
 			if (completer && !completer.key(e)) {
 				// xterm 이 처리하지 않은 키는 브라우저 기본 동작(Tab = 다음 칸으로 포커스)이 남는다 — 막는다
 				e.preventDefault();
@@ -547,7 +634,12 @@ export function TerminalView({
 		// 여러 줄 붙여넣기 확인 — xterm 이 받기 전에 가로챈다
 		const ta = term.textarea;
 		// 사전에서 "터미널에 넣기" 할 대상 — 마지막으로 포커스를 받은 터미널
-		const onFocusIn = () => setActiveTerminal({ write: (s) => write(s), label });
+		const onFocusIn = () =>
+			setActiveTerminal({
+				write: (s) => write(s),
+				label,
+				...(ax ? { template: (s: string) => insertRef.current(s), candidates: (src: Parameters<typeof candidatesFor>[0]) => candRef.current(src) } : {}),
+			});
 		ta?.addEventListener("focus", onFocusIn);
 		const onPaste = (ev: ClipboardEvent) => {
 			const text = ev.clipboardData?.getData("text/plain") ?? "";
@@ -594,7 +686,10 @@ export function TerminalView({
 			zmRef.current = null;
 			setZm(null);
 			hi.dispose();
+			ax?.dispose();
+			axRef.current = null;
 			completer?.dispose();
+			completerRef.current = null;
 			ta?.removeEventListener("paste", onPaste, true);
 			ta?.removeEventListener("focus", onFocusIn);
 			osc133.dispose();
@@ -714,6 +809,12 @@ export function TerminalView({
 		{ sep: true },
 		{ label: "찾기  Ctrl+Shift+F", run: () => setFind("") },
 		{ label: "스니펫  Alt+P", run: () => setPalette(true) },
+		...(axRef.current
+			? ([
+					{ label: "명령 풀이  Ctrl+Shift+E", run: () => void openExplain(termRef.current?.getSelection() || undefined) },
+					{ label: "명령 만들기…", run: () => setFormOpen({ id: null }) },
+				] as MenuItem[])
+			: []),
 		{ label: "화면 지우기", run: () => termRef.current?.clear() },
 		{ label: "스크롤백 저장…", run: () => void exportScrollback() },
 		recording ? { label: "이 터미널 기록 멈추기", run: () => void stopRec() } : { label: "이 터미널 기록 시작", run: () => void startRec() },
@@ -868,6 +969,32 @@ export function TerminalView({
 				)}
 			</div>
 			{menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />}
+			{formOpen && (
+				<AssistFormSheet
+					initial={formOpen.id}
+					candidates={candidates}
+					target={label}
+					onClose={() => {
+						setFormOpen(null);
+						termRef.current?.focus();
+					}}
+					onInsert={(text) => {
+						setFormOpen(null);
+						insertTemplate(text);
+					}}
+				/>
+			)}
+			{explain && (
+				<ExplainCard
+					text={explain.text}
+					parts={explain.parts}
+					anchor={host.current?.getBoundingClientRect() ?? null}
+					onClose={() => {
+						setExplain(null);
+						termRef.current?.focus();
+					}}
+				/>
+			)}
 			{palette && (
 				<SnippetPalette
 					onClose={() => {
@@ -876,7 +1003,11 @@ export function TerminalView({
 					}}
 					onPick={(body, run) => {
 						setPalette(false);
-						write(run ? `${body}\r` : body);
+						// {{빈칸}} — 넣기는 빈칸 템플릿으로, 바로 실행은 기본값으로 채워 보낸다(D25)
+						if (axRef.current && hasTemplateFields(body)) {
+							if (run) write(`${fillTemplate(body)}\r`);
+							else return insertTemplate(body);
+						} else write(run ? `${body}\r` : body);
 						termRef.current?.focus();
 					}}
 					currentLine={() => {

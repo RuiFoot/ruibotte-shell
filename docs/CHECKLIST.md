@@ -253,3 +253,18 @@
 - [ ] 실제 앱(Tauri) 화면에서 눌러 보기 — 이번엔 가짜 백엔드로 화면만, 백엔드는 시험으로
 - [ ] macOS·Linux 망 판별 실물 확인(명령 결과 파싱만 작성), Windows 11 24H2 Wi-Fi 위치 권한 켠 상태 확인
 - [ ] 같은 서버를 경로마다 다른 호스트 키 주소로 고정하는 방식 — 서버 단위 고정으로 바꿀지 결정
+
+## 명령 입력 보조 D25 — 빈칸 템플릿·서명 힌트·명령 만들기 폼·조각 풀이(사용자 지정 2026-11-06)
+- [x] 데이터·규칙은 웹 Orbit 판 그대로(src/lib/cmd-assist/assist.json·assist.ts, scripts/sync-orbit-data.mjs 로만 갱신), 앱 쪽 연결은 src/lib/cmdAssist.ts(옵션 설명 손 스펙 > D24 사전 > 서버 man, 후보 출처, 위험 표시)
+- [x] 켜는 곳: 원격 SSH 터미널, 내 PC 의 bash·zsh·Git Bash·WSL. PowerShell·cmd·그 밖 셸은 끔(우클릭 메뉴·팔레트도 흐리게)
+- [x] ② 서명 줄(src/lib/termAssist.ts): 입력 줄 바로 위 한 줄(맨 윗줄이면 아래), 입력이 110ms 멈춘 뒤 줄 하나 계산(4~18µs), 자동완성 목록이 뜨면 숨김, 명령이 도는 중·큰 출력 중·화면을 올려 본 중·전체 화면 프로그램에선 계산 안 함. 옵션 설명을 못 찾으면 원격은 man -P cat 을 한 번 받아 캐시
+- [x] ① 빈칸 템플릿: 기본값으로 채워 넣고 첫 빈칸으로, Tab·Shift+Tab 이동(←/→ 를 셸로), 처음 친 글자가 기본값을 바꿈, 마지막에서 Tab·Esc·Enter·다른 편집 키면 일반 입력. 빈칸 동안 자동완성·흐린 제안은 쉼(빈칸 Tab 이 먼저). 빈칸 안내(용어집)는 서명 줄 자리에
+- [x] ③ 명령 만들기 폼(src/components/CmdAssist.tsx): 팔레트 "명령 만들기: …"(지금 데이터 21개)·우클릭 "명령 만들기…"·사전 상세 단추. text/select(앱 Select)/flag, 추천 값 목록(네이티브 datalist 없음), 완성 명령 실시간·빈칸 강조, 위험(form.danger + 공통 DANGER), 버튼은 [입력 줄에 넣기]만(Ctrl+Enter), 비운 필수 칸은 빈칸으로
+- [x] 폼 후보: 파일·폴더·경로는 지금 터미널 폴더(OSC 7) 목록, 원격은 schema.md 표의 읽기 전용 명령만(systemctl list-unit-files·docker ps -a/images·getent·/sys/class/net, sudo 없음) 30초 캐시
+- [x] ④ 조각 풀이: Ctrl+Shift+E(셸로 가지 않음)·우클릭 "명령 풀이" — 고른 글자, 없으면 입력 줄, 없으면 마지막 명령. 설명 없는 조각은 "설명 없음"
+- [x] 사전 상세: 빈칸 템플릿을 tldr 예시보다 먼저, "터미널에 넣기"는 빈칸 템플릿으로(PowerShell 터미널이면 예전처럼 자리표시자 이름만). 스니펫 Ctrl+Enter 는 빈칸을 기본값으로 채워 실행
+- [x] F1 도움말·명령 팔레트에 추가, 앱 CSS(src/styles/assist.css, 밝게·어둡게 토큰)
+- [x] 가짜 백엔드(src/dev/mock.ts — 줄 편집 흉내·ssh_exec 견본)로 브라우저에서 확인: 서명(sed 자리·-n 설명·파일 자리), 빈칸 이동·덮어쓰기·Shift+Tab·마지막 Tab 끝, 풀이(tar … | grep … > … 2>&1 12조각), 폼 후보·위험·빈칸 남김, pwsh 끔·Git Bash 켬, 팔레트 등록
+- [ ] 실제 앱(Tauri) 화면에서 눈으로 보기 — 이번엔 브라우저 창이 가려진 상태라 빈칸 강조(xterm 꾸밈)·서명 줄 자리는 그림으로 못 봄
+- [ ] 실제 SSH(rbshell-sshd-modern)에서 readline ←/→·한글 빈칸·man 받기 확인 — 시험 컨테이너에 man 페이지가 없음(minimized), man 파싱은 견본으로만 확인
+- [ ] 줄이 터미널 폭을 넘어 접힌 입력에서 빈칸 강조(지금은 강조만 건너뜀)

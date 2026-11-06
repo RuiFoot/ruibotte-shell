@@ -1,9 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, BookOpen, Copy, CornerDownLeft, Search, SquareTerminal, Star } from "lucide-react";
+import { AlertTriangle, BookOpen, Copy, CornerDownLeft, FormInput, Search, SquareTerminal, Star } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { activeTerminal, DANGER } from "../lib/activeTerm";
 import { initials, isCho } from "../lib/hangul";
 import { type Dict, type DictCmd, loadDict } from "../lib/dict";
+import { assistOf, fillTemplate } from "../lib/cmdAssist";
+import { AssistFormSheet, SlotText } from "./CmdAssist";
 
 const SYN: string[][] = [
 	["교체", "바꾸기", "치환", "대체"],
@@ -49,13 +51,19 @@ export function CommandDictionaryPane() {
 		window.setTimeout(() => setNote(""), 2500);
 	};
 	const plain = fillPlaceholders;
-	/** 터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널 */
+	/** 터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널. 리눅스 셸이면 {{빈칸}} 을 기본값으로 채우고 Tab 으로 옮겨 다니는 빈칸 템플릿(D25 ①) */
 	const insert = (text: string) => {
 		const t = activeTerminal();
 		if (!t) return flash("먼저 터미널을 한 번 눌러 두세요");
-		t.write(text);
-		flash(`${t.label} 터미널에 넣었습니다 — 확인한 뒤 Enter`);
+		if (t.template) {
+			t.template(text);
+			flash(`${t.label} 터미널에 넣었습니다 — 빈칸은 Tab 으로 옮겨 채우고 Enter`);
+		} else {
+			t.write(plain(text));
+			flash(`${t.label} 터미널에 넣었습니다 — 확인한 뒤 Enter`);
+		}
 	};
+	const [form, setForm] = useState<{ id: string; cmd: string } | null>(null);
 
 	useEffect(() => {
 		void loadDict().then(setDict);
@@ -75,6 +83,7 @@ export function CommandDictionaryPane() {
 
 	const cur = sel && dict?.c[sel] ? sel : list[0];
 	const cmd = cur && dict ? dict.c[cur] : null;
+	const ax = cur ? assistOf(cur) : null;
 
 	return (
 		<>
@@ -116,6 +125,48 @@ export function CommandDictionaryPane() {
 								))}
 							</div>
 							{note && <div className="tree-note" style={{ margin: "0 0 10px" }}>{note}</div>}
+							{ax?.forms?.length ? (
+								<div className="dict-forms">
+									{ax.forms.map((f) => (
+										<button key={f.id} type="button" className="btn" title={f.d} onClick={() => setForm({ id: f.id, cmd: cur })}>
+											<FormInput size={13} /> 명령 만들기: {f.label}
+										</button>
+									))}
+								</div>
+							) : null}
+							{ax?.templates?.map((t) => (
+								<div key={t.t} className={`ex tpl${DANGER.test(t.t) ? " danger" : ""}`}>
+									<p>
+										<span className="tpl-tag">빈칸 템플릿</span>
+										{t.label}
+									</p>
+									<div className="ex-row">
+										<code>
+											<SlotText text={t.t} />
+										</code>
+										<span className="ex-acts">
+											<button type="button" className="btn ghost icon" title="터미널에 넣기(실행하지 않음) — 빈칸을 기본값으로 채우고 Tab 으로 옮겨 다님" onClick={() => insert(t.t)}>
+												<SquareTerminal size={13} />
+											</button>
+											<button type="button" className="btn ghost icon" title="복사(빈칸은 기본값으로)" onClick={() => void navigator.clipboard.writeText(fillTemplate(t.t)).then(() => flash("복사했습니다"))}>
+												<Copy size={13} />
+											</button>
+											<button
+												type="button"
+												className="btn ghost icon"
+												title="내 스니펫으로 저장(Alt+P — 넣으면 빈칸 템플릿, Ctrl+Enter 는 기본값으로 실행)"
+												onClick={() =>
+													void invoke("snippet_save", { s: { kind: "shell", name: `${cur} — ${t.label}`.slice(0, 80), body: t.t } })
+														.then(() => flash("스니펫으로 저장했습니다(터미널에서 Alt+P)"))
+														.catch((e) => flash(String(e)))
+												}
+											>
+												<Star size={13} />
+											</button>
+										</span>
+									</div>
+								</div>
+							))}
 							{cmd.x?.map(([d, c]) => (
 								<div key={c} className={`ex${DANGER.test(c) ? " danger" : ""}`}>
 									<p>
@@ -132,8 +183,8 @@ export function CommandDictionaryPane() {
 											<button
 												type="button"
 												className="btn ghost icon"
-												title="터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널, 자리표시자는 이름만 남김"
-												onClick={() => insert(plain(c))}
+												title="터미널에 넣기(실행하지 않음) — 마지막으로 쓴 터미널, 자리표시자는 빈칸으로(Tab 이동)"
+												onClick={() => insert(c)}
 											>
 												<SquareTerminal size={13} />
 											</button>
@@ -176,6 +227,19 @@ export function CommandDictionaryPane() {
 					)}
 				</div>
 			</div>
+			{form && (
+				<AssistFormSheet
+					initial={form.id}
+					only={form.cmd}
+					candidates={activeTerminal()?.candidates}
+					target={activeTerminal()?.label}
+					onClose={() => setForm(null)}
+					onInsert={(text) => {
+						setForm(null);
+						insert(text);
+					}}
+				/>
+			)}
 		</>
 	);
 }
@@ -223,11 +287,11 @@ function ExampleEdit({ command, cmdName, onInsert }: { command: string; cmdName:
 					if (e.key === "Tab" && jump(e.shiftKey)) e.preventDefault();
 					else if (e.key === "Enter") {
 						e.preventDefault();
-						onInsert(fillPlaceholders(value));
+						onInsert(value);
 					} else if (e.key === "Escape") setValue(command);
 				}}
 			/>
-			<button type="button" className="btn ghost" title="고친 명령을 터미널 입력 줄에 넣기(실행하지 않음)" onClick={() => onInsert(fillPlaceholders(value))}>
+			<button type="button" className="btn ghost" title="고친 명령을 터미널 입력 줄에 넣기(실행하지 않음) — 남은 자리표시자는 빈칸으로" onClick={() => onInsert(value)}>
 				<CornerDownLeft size={13} /> 터미널에 넣기
 			</button>
 		</div>

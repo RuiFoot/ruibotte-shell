@@ -22,6 +22,8 @@ export type CompletionSource = {
 	units?: () => Promise<string[]>;
 	/** 컨테이너 이름(원격만) */
 	containers?: () => Promise<string[]>;
+	/** 원격만: 읽기 전용 명령 하나 실행(명령 입력 보조의 후보·man) */
+	exec?: (cmd: string) => Promise<string>;
 };
 
 export type Completer = {
@@ -34,10 +36,22 @@ export type Completer = {
 	cwd: (p: string) => void;
 	/** 키 처리 — false 면 xterm 이 처리하지 않는다 */
 	key: (e: KeyboardEvent) => boolean;
+	/** 지금 입력(프롬프트 끝부터 커서까지, 한 줄일 때만) — 프롬프트가 아니면 null */
+	input: () => string | null;
+	/** 입력 시작 칸(프롬프트 끝) — 모르면 null */
+	inputStart: () => { x: number; y: number } | null;
+	/** 지금 폴더(OSC 7) */
+	cwdNow: () => string | null;
+	/** 목록이 떠 있는지 */
+	popOpen: () => boolean;
+	/** 방식 — off 면 입력 보조도 쉰다 */
+	mode: () => string;
+	/** 잠깐 멈추기(빈칸 템플릿 동안 — 목록·흐린 제안·Tab 을 쓰지 않는다) */
+	hold: (on: boolean) => void;
 	dispose: () => void;
 };
 
-export function attachCompletion(term: Terminal, host: HTMLElement, src: CompletionSource, send: (s: string) => void): Completer {
+export function attachCompletion(term: Terminal, host: HTMLElement, src: CompletionSource, send: (s: string) => void, onPop?: (open: boolean) => void): Completer {
 	void loadDict();
 	let history: string[] = [];
 	void api.settingGet(`hist.${src.key}`).then((v) => {
@@ -68,6 +82,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	let sel = 0;
 	let replace = 0;
 	let timer: number | undefined;
+	let held = false;
 
 	const ghostEl = document.createElement("div");
 	ghostEl.className = "term-ghost";
@@ -113,8 +128,10 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		ghostEl.textContent = "";
 	};
 	const closePop = () => {
+		const was = !pop.hidden;
 		pop.hidden = true;
 		items = [];
+		if (was) onPop?.(false);
 	};
 
 	const placeAtCursor = (el: HTMLElement, below: boolean) => {
@@ -129,14 +146,15 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 
 	const renderGhost = () => {
 		const line = currentInput();
-		if (line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
+		if (held || line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
 		const g = ghost(line, history);
 		ghostEl.textContent = g;
 		if (g) placeAtCursor(ghostEl, false);
 	};
 
 	const renderPop = () => {
-		if (!items.length) return closePop();
+		if (!items.length || held) return closePop();
+		const wasHidden = pop.hidden;
 		pop.innerHTML = "";
 		items.slice(0, MAX_POP).forEach((c, i) => {
 			const row = document.createElement("div");
@@ -190,6 +208,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		}
 		pop.querySelector<HTMLElement>(".term-pop-item.sel")?.scrollIntoView({ block: "nearest" });
 		hideGhost();
+		if (wasHidden) onPop?.(true);
 	};
 
 	const accept = () => {
@@ -336,7 +355,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			cwd = p;
 		},
 		key: (e) => {
-			if (e.type !== "keydown" || !promptOn || mode === "off") return true;
+			if (e.type !== "keydown" || !promptOn || mode === "off" || held) return true;
 			if (drilling && e.key === "Tab") return false; // 파고드는 중에 온 Tab 은 삼킨다
 			if (!pop.hidden) {
 				const n = Math.min(items.length, MAX_POP);
@@ -384,8 +403,22 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			}
 			return true;
 		},
+		input: currentInput,
+		inputStart: () => (promptOn ? inputStart : null),
+		cwdNow: () => cwd,
+		popOpen: () => !pop.hidden,
+		mode: () => mode,
+		hold: (on) => {
+			held = on;
+			if (on) {
+				window.clearTimeout(autoTimer);
+				closePop();
+				hideGhost();
+			}
+		},
 		dispose: () => {
 			window.clearTimeout(timer);
+			window.clearTimeout(autoTimer);
 			onRender.dispose();
 			ghostEl.remove();
 			pop.remove();

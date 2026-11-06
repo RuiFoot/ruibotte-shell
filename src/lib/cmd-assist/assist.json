@@ -1,0 +1,2531 @@
+{
+	"schema": "orbit-cmd-assist",
+	"v": 1,
+	"dataVersion": "2026-11-06",
+	"glossary": {
+		"찾을말": "바꿀 대상 글자(정규식) — / 는 \\/ 로",
+		"바꿀말": "새로 넣을 글자 — & 는 찾은 글자 전체",
+		"파일": "대상 파일 경로",
+		"폴더": "대상 폴더(. = 지금 폴더)",
+		"대상": "묶을 파일·폴더(여러 개면 띄어 쓰기)",
+		"원본": "복사·연결할 원래 파일·폴더",
+		"링크": "새로 만들 링크 이름",
+		"묶음파일": "tar 묶음 파일 이름(.tar.gz)",
+		"서비스": "systemd 서비스 이름(nginx, sshd …)",
+		"컨테이너": "docker 컨테이너 이름이나 ID",
+		"이미지": "docker 이미지(이름:태그)",
+		"사용자": "계정 이름",
+		"그룹": "그룹 이름",
+		"권한": "숫자(644·755) 또는 기호(u+x, go-w)",
+		"패턴": "찾을 글자(정규식)",
+		"호스트": "서버 주소나 이름",
+		"원격경로": "상대 서버의 경로",
+		"줄수": "보여 줄 줄 수",
+		"명령": "실행할 명령",
+		"이름": "파일 이름 패턴(* 사용 가능 — 작은따옴표로 감싸기)",
+		"일수": "며칠(+7 = 7일보다 오래된)",
+		"크기": "크기(+100M = 100MB보다 큰, k·M·G)",
+		"열": "몇 번째 칸(1부터, $NF = 마지막)",
+		"구분자": "칸을 나누는 글자(: , 탭은 \\t)",
+		"시작줄": "처음 줄 번호",
+		"끝줄": "마지막 줄 번호",
+		"시각": "시각(1 hour ago, today, 2026-11-06 09:00)",
+		"포트": "포트 번호"
+	},
+	"generic": [
+		{
+			"re": "^\\|$",
+			"d": "앞 명령의 출력을 다음 명령의 입력으로(파이프)"
+		},
+		{
+			"re": "^\\|\\|$",
+			"d": "앞 명령이 실패하면 다음 명령 실행"
+		},
+		{
+			"re": "^&&$",
+			"d": "앞 명령이 성공하면 다음 명령 실행"
+		},
+		{
+			"re": "^;$",
+			"d": "앞 명령이 끝나면 다음 명령 실행"
+		},
+		{
+			"re": "^&$",
+			"d": "뒤에서(백그라운드로) 실행"
+		},
+		{
+			"re": "^>$",
+			"d": "출력을 파일로(덮어쓰기)"
+		},
+		{
+			"re": "^>>$",
+			"d": "출력을 파일 끝에 덧붙이기"
+		},
+		{
+			"re": "^<$",
+			"d": "파일 내용을 입력으로"
+		},
+		{
+			"re": "^2>$",
+			"d": "오류 출력을 파일로"
+		},
+		{
+			"re": "^2>&1$",
+			"d": "오류 출력도 일반 출력과 같은 곳으로"
+		},
+		{
+			"re": "^&>$",
+			"d": "출력·오류를 모두 파일로"
+		},
+		{
+			"re": "^/dev/null$",
+			"d": "버리는 곳(출력을 버림)"
+		},
+		{
+			"re": "^sudo$",
+			"d": "root 권한으로 실행"
+		},
+		{
+			"re": "^\\$\\(.*\\)$",
+			"d": "괄호 안 명령의 결과로 바꿔 넣기"
+		},
+		{
+			"re": "^\\$\\{?([A-Za-z_][A-Za-z0-9_]*)\\}?$",
+			"d": "환경 변수 $1 의 값"
+		},
+		{
+			"re": "^~(/.*)?$",
+			"d": "홈 폴더$1"
+		},
+		{
+			"re": "^\\.$",
+			"d": "지금 폴더"
+		},
+		{
+			"re": "^\\.\\.$",
+			"d": "위 폴더"
+		},
+		{
+			"re": "^.*[*?].*$",
+			"d": "이름 패턴(* 아무 글자, ? 한 글자) — 맞는 파일들로 펼쳐짐"
+		},
+		{
+			"re": "^[0-9]+$",
+			"d": "숫자 $&"
+		}
+	],
+	"commands": {
+		"sed": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "스크립트",
+							"d": "할 일 — s/찾을말/바꿀말/g(바꾸기), /패턴/d(지우기), 1,10p(출력)"
+						},
+						{
+							"name": "파일",
+							"d": "읽을 파일 — 없으면 표준 입력",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-e", "-f"],
+			"opts": {
+				"-i": "파일 직접 수정(원본이 바뀜)",
+				"-n": "자동 출력 끄기 — p 로 고른 줄만",
+				"-E": "확장 정규식(괄호·+·? 그대로)",
+				"-r": "확장 정규식(GNU, -E 와 같음)",
+				"-e": "스크립트 하나 더",
+				"-f": "스크립트를 파일에서",
+				"-s": "파일마다 따로 처리"
+			},
+			"explain": [
+				{
+					"re": "^-i(.+)$",
+					"d": "파일 직접 수정, 원본은 '$1' 붙여 백업"
+				},
+				{
+					"re": "^s(.)(.+?)\\1(.*?)\\1g$",
+					"d": "“$2”를 “$3”(으)로 모두 바꿈"
+				},
+				{
+					"re": "^s(.)(.+?)\\1(.*?)\\1gI$|^s(.)(.+?)\\4(.*?)\\4Ig$",
+					"d": "“$2$5”를 “$3$6”(으)로 대소문자 없이 모두 바꿈"
+				},
+				{
+					"re": "^s(.)(.+?)\\1(.*?)\\1$",
+					"d": "“$2”를 “$3”(으)로 바꿈(줄마다 처음 하나만)"
+				},
+				{
+					"re": "^s(.)(.+?)\\1(.*?)\\1([0-9]+)$",
+					"d": "“$2”를 “$3”(으)로 바꿈(줄마다 $4번째만)"
+				},
+				{
+					"re": "^/(.+)/d$",
+					"d": "“$1”이 들어간 줄 지우기"
+				},
+				{
+					"re": "^([0-9]+),([0-9$]+)p$",
+					"d": "$1~$2번째 줄 출력"
+				},
+				{
+					"re": "^([0-9]+)p$",
+					"d": "$1번째 줄 출력"
+				},
+				{
+					"re": "^([0-9]+),([0-9$]+)d$",
+					"d": "$1~$2번째 줄 지우기"
+				},
+				{
+					"re": "^([0-9]+)d$",
+					"d": "$1번째 줄 지우기"
+				},
+				{
+					"re": "^/(.+)/p$",
+					"d": "“$1”이 들어간 줄 출력"
+				}
+			],
+			"templates": [
+				{
+					"label": "파일 안 글자 모두 바꾸기",
+					"t": "sed -i 's/{{찾을말}}/{{바꿀말}}/g' {{파일}}"
+				},
+				{
+					"label": "몇째 줄부터 몇째 줄까지 보기",
+					"t": "sed -n '{{시작줄=1}},{{끝줄=20}}p' {{파일}}"
+				},
+				{
+					"label": "패턴이 든 줄 지우기",
+					"t": "sed -i '/{{패턴}}/d' {{파일}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "sed-replace",
+					"label": "sed 글자 바꾸기",
+					"d": "파일 안의 글자를 찾아 다른 글자로 바꿉니다.",
+					"fields": [
+						{
+							"name": "from",
+							"label": "찾을 말",
+							"kind": "text",
+							"req": true,
+							"esc": "sed",
+							"d": "정규식 — . * [ 는 특수 문자"
+						},
+						{
+							"name": "to",
+							"label": "바꿀 말",
+							"kind": "text",
+							"esc": "sed"
+						},
+						{
+							"name": "all",
+							"label": "줄마다 모두(g)",
+							"kind": "flag",
+							"on": "g",
+							"def": "g"
+						},
+						{
+							"name": "icase",
+							"label": "대소문자 무시(I)",
+							"kind": "flag",
+							"on": "I"
+						},
+						{
+							"name": "inplace",
+							"label": "결과",
+							"kind": "select",
+							"options": [
+								["", "화면에만 보이기(파일 그대로)"],
+								["-i", "파일 직접 고치기"],
+								["-i.bak", "고치고 .bak 백업 남기기"]
+							],
+							"def": ""
+						},
+						{
+							"name": "file",
+							"label": "파일",
+							"kind": "text",
+							"src": "files",
+							"req": true
+						}
+					],
+					"build": "sed[[ {{inplace}}]] 's/{{from}}/{{to}}/{{all}}{{icase}}' {{file}}",
+					"danger": [
+						{
+							"when": "inplace",
+							"d": "파일을 직접 고칩니다 — 되돌리려면 백업(.bak)을 남기세요"
+						}
+					]
+				}
+			]
+		},
+		"find": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "폴더",
+							"d": "찾기 시작할 폴더(. = 지금 폴더)",
+							"opt": true,
+							"many": true
+						},
+						{
+							"name": "조건",
+							"flag": true,
+							"d": "-name 이름 · -type f/d · -mtime +일수 · -size +크기",
+							"opt": true
+						},
+						{
+							"name": "동작",
+							"d": "-print(기본) · -delete · -exec 명령 {} \\;",
+							"opt": true
+						}
+					]
+				}
+			],
+			"takes": [
+				"-name",
+				"-iname",
+				"-type",
+				"-mtime",
+				"-mmin",
+				"-size",
+				"-maxdepth",
+				"-mindepth",
+				"-user",
+				"-perm",
+				"-newer",
+				"-path",
+				"-exec"
+			],
+			"opts": {
+				"-name": "이름 패턴(대소문자 구분)",
+				"-iname": "이름 패턴(대소문자 무시)",
+				"-type": "종류 — f 파일, d 폴더, l 링크",
+				"-mtime": "수정한 지 며칠(+7 이전, -1 하루 안)",
+				"-mmin": "수정한 지 몇 분",
+				"-size": "크기(+100M 보다 큰, -1k 보다 작은)",
+				"-maxdepth": "몇 단계 아래까지만",
+				"-mindepth": "몇 단계 아래부터",
+				"-user": "소유자가 이 계정",
+				"-perm": "권한이 이 값",
+				"-empty": "빈 파일·폴더",
+				"-newer": "이 파일보다 최근에 바뀐",
+				"-path": "경로 패턴",
+				"-not": "다음 조건의 반대",
+				"-o": "또는",
+				"-delete": "찾은 것을 지움(되돌릴 수 없음)",
+				"-exec": "찾은 것마다 명령 실행({} 자리에 이름)",
+				"-print": "찾은 경로 출력",
+				"-print0": "경로를 NUL 로 구분(xargs -0 와 함께)",
+				"-ls": "ls -l 형식으로 출력"
+			},
+			"explain": [
+				{
+					"re": "^f$",
+					"d": "종류: 일반 파일"
+				},
+				{
+					"re": "^d$",
+					"d": "종류: 폴더"
+				},
+				{
+					"re": "^l$",
+					"d": "종류: 심볼릭 링크"
+				},
+				{
+					"re": "^\\+([0-9]+)$",
+					"d": "$1보다 큼(오래됨)"
+				},
+				{
+					"re": "^-([0-9]+)$",
+					"d": "$1보다 작음(최근)"
+				},
+				{
+					"re": "^\\+([0-9]+)([kMG])$",
+					"d": "$1$2B보다 큼"
+				},
+				{
+					"re": "^\\{\\}$",
+					"d": "찾은 경로가 들어갈 자리"
+				},
+				{
+					"re": "^\\\\;$|^';'$|^;$",
+					"d": "-exec 명령의 끝"
+				},
+				{
+					"re": "^\\+$",
+					"d": "-exec 에 여러 경로를 한 번에"
+				}
+			],
+			"templates": [
+				{
+					"label": "이름으로 찾기",
+					"t": "find {{폴더=.}} -name '{{이름=*.log}}'"
+				},
+				{
+					"label": "오래된 파일 찾기",
+					"t": "find {{폴더=.}} -type f -mtime +{{일수=7}}"
+				},
+				{
+					"label": "큰 파일 찾기",
+					"t": "find {{폴더=.}} -type f -size +{{크기=100M}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "find",
+					"label": "find 파일 찾기",
+					"d": "이름·종류·날짜·크기로 파일을 찾습니다.",
+					"fields": [
+						{
+							"name": "dir",
+							"label": "어디서",
+							"kind": "text",
+							"src": "dirs",
+							"def": "."
+						},
+						{
+							"name": "depth",
+							"label": "몇 단계 아래까지",
+							"kind": "text",
+							"d": "비우면 끝까지"
+						},
+						{
+							"name": "type",
+							"label": "종류",
+							"kind": "select",
+							"options": [["", "모두"], ["f", "파일"], ["d", "폴더"], ["l", "링크"]],
+							"def": "f"
+						},
+						{
+							"name": "name",
+							"label": "이름 패턴",
+							"kind": "text",
+							"d": "*.log, app-*",
+							"esc": "squote"
+						},
+						{
+							"name": "mtime",
+							"label": "수정한 지(일)",
+							"kind": "text",
+							"d": "+7 = 7일 넘게 · -1 = 하루 안",
+							"options": [["+7", "7일 넘은"], ["+30", "30일 넘은"], ["-1", "하루 안"]]
+						},
+						{
+							"name": "size",
+							"label": "크기",
+							"kind": "text",
+							"d": "+100M = 100MB 넘는",
+							"options": [["+100M", "100MB 넘는"], ["+1G", "1GB 넘는"], ["-1k", "1KB 안"]]
+						},
+						{
+							"name": "action",
+							"label": "찾은 뒤",
+							"kind": "select",
+							"options": [
+								["", "경로만 보이기"],
+								["-ls", "자세히(크기·날짜) 보이기"],
+								["-delete", "지우기"]
+							],
+							"def": ""
+						}
+					],
+					"build": "find {{dir}}[[ -maxdepth {{depth}}]][[ -type {{type}}]][[ -name '{{name}}']][[ -mtime {{mtime}}]][[ -size {{size}}]][[ {{action}}]]",
+					"danger": [
+						{
+							"when": "action=-delete",
+							"d": "찾은 파일을 되돌릴 수 없이 지웁니다 — 먼저 경로만 보이기로 확인하세요"
+						}
+					]
+				}
+			]
+		},
+		"tar": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "동작·옵션",
+							"flag": true,
+							"d": "-c 묶기 · -x 풀기 · -t 목록, z(gzip) v(자세히) f(파일)"
+						},
+						{
+							"name": "묶음파일",
+							"d": "-f 뒤 — .tar.gz 파일"
+						},
+						{
+							"name": "대상",
+							"d": "묶을 파일·폴더(풀 때는 꺼낼 것만)",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-f", "-C", "--exclude"],
+			"opts": {
+				"-c": "새로 묶기",
+				"-x": "풀기",
+				"-t": "목록 보기",
+				"-z": "gzip 압축(.tar.gz)",
+				"-j": "bzip2 압축(.tar.bz2)",
+				"-J": "xz 압축(.tar.xz)",
+				"-v": "처리하는 파일 이름 보이기",
+				"-f": "묶음 파일 이름(바로 뒤)",
+				"-C": "이 폴더에서(풀 곳·묶을 곳)",
+				"-p": "권한 그대로",
+				"--exclude": "이 패턴은 빼기"
+			},
+			"templates": [
+				{
+					"label": "묶기(.tar.gz)",
+					"t": "tar -czvf {{묶음파일=backup.tar.gz}} {{대상}}"
+				},
+				{
+					"label": "풀기",
+					"t": "tar -xzvf {{묶음파일}} -C {{폴더=.}}"
+				},
+				{
+					"label": "안에 든 것 보기",
+					"t": "tar -tzvf {{묶음파일}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "tar-create",
+					"label": "tar 묶기",
+					"d": "파일·폴더를 하나의 압축 파일로 묶습니다.",
+					"fields": [
+						{
+							"name": "out",
+							"label": "만들 파일",
+							"kind": "text",
+							"def": "backup.tar.gz",
+							"req": true
+						},
+						{
+							"name": "z",
+							"label": "압축",
+							"kind": "select",
+							"options": [
+								["z", "gzip(.tar.gz)"],
+								["j", "bzip2(.tar.bz2)"],
+								["J", "xz(.tar.xz)"],
+								["", "압축 없음(.tar)"]
+							],
+							"def": "z"
+						},
+						{
+							"name": "src",
+							"label": "묶을 것",
+							"kind": "text",
+							"src": "paths",
+							"req": true,
+							"esc": "raw",
+							"d": "여러 개면 띄어 쓰기"
+						},
+						{
+							"name": "exclude",
+							"label": "뺄 패턴",
+							"kind": "text",
+							"esc": "squote",
+							"d": "*.log"
+						},
+						{
+							"name": "v",
+							"label": "파일 이름 보이기",
+							"kind": "flag",
+							"on": "v",
+							"def": "v"
+						}
+					],
+					"build": "tar -c{{z}}{{v}}f {{out}}[[ --exclude='{{exclude}}']] {{src}}"
+				},
+				{
+					"id": "tar-extract",
+					"label": "tar 풀기",
+					"d": "tar 묶음을 풉니다.",
+					"fields": [
+						{
+							"name": "file",
+							"label": "묶음 파일",
+							"kind": "text",
+							"src": "files",
+							"req": true
+						},
+						{
+							"name": "to",
+							"label": "풀 곳",
+							"kind": "text",
+							"src": "dirs",
+							"d": "비우면 지금 폴더"
+						},
+						{
+							"name": "v",
+							"label": "파일 이름 보이기",
+							"kind": "flag",
+							"on": "v",
+							"def": "v"
+						},
+						{
+							"name": "list",
+							"label": "풀지 말고 목록만",
+							"kind": "flag",
+							"on": "t"
+						}
+					],
+					"build": "tar -{{mode}}{{z}}{{v}}f {{file}}[[ -C {{to}}]]",
+					"derive": {
+						"mode": {
+							"if": "list",
+							"then": "t",
+							"else": "x"
+						},
+						"z": {
+							"if": "file~\\.(tgz|gz)$",
+							"then": "z",
+							"else": ""
+						}
+					}
+				}
+			]
+		},
+		"rsync": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-a 그대로 · -v 자세히 · -z 압축 · --delete 없는 것 지움"
+						},
+						{
+							"name": "원본",
+							"d": "보낼 쪽 — 끝에 / 면 폴더 안의 것만",
+							"many": true
+						},
+						{
+							"name": "대상",
+							"d": "받을 쪽 — 사용자@호스트:경로"
+						}
+					]
+				}
+			],
+			"takes": ["-e", "--exclude"],
+			"opts": {
+				"-a": "권한·시각·링크까지 그대로(하위까지)",
+				"-v": "자세히",
+				"-z": "보내는 동안 압축",
+				"-n": "시험만(아무것도 안 바꿈)",
+				"--dry-run": "시험만(아무것도 안 바꿈)",
+				"--delete": "원본에 없는 것을 대상에서 지움",
+				"--progress": "진행률",
+				"-P": "진행률 + 끊긴 곳부터",
+				"--exclude": "이 패턴은 빼기",
+				"-e": "원격 셸(ssh -p 2222 같은)"
+			},
+			"templates": [
+				{
+					"label": "다른 서버로 보내기",
+					"t": "rsync -avz {{원본}} {{사용자}}@{{호스트}}:{{원격경로}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "rsync",
+					"label": "rsync 동기화",
+					"d": "파일·폴더를 다른 곳(다른 서버)과 맞춥니다.",
+					"fields": [
+						{
+							"name": "src",
+							"label": "원본",
+							"kind": "text",
+							"src": "paths",
+							"req": true,
+							"d": "폴더 끝에 / 면 안의 것만"
+						},
+						{
+							"name": "dst",
+							"label": "대상",
+							"kind": "text",
+							"req": true,
+							"esc": "raw",
+							"d": "user@host:/경로 또는 로컬 경로"
+						},
+						{
+							"name": "dry",
+							"label": "시험만(-n)",
+							"kind": "flag",
+							"on": "n",
+							"def": "n"
+						},
+						{
+							"name": "z",
+							"label": "압축(-z)",
+							"kind": "flag",
+							"on": "z",
+							"def": "z"
+						},
+						{
+							"name": "del",
+							"label": "원본에 없는 것 지우기(--delete)",
+							"kind": "flag",
+							"on": "--delete"
+						},
+						{
+							"name": "progress",
+							"label": "진행률",
+							"kind": "flag",
+							"on": "--progress"
+						},
+						{
+							"name": "exclude",
+							"label": "뺄 패턴",
+							"kind": "text",
+							"esc": "squote"
+						},
+						{
+							"name": "port",
+							"label": "ssh 포트",
+							"kind": "text",
+							"d": "22 가 아니면"
+						}
+					],
+					"build": "rsync -av{{z}}{{dry}}[[ {{del}}]][[ {{progress}}]][[ --exclude='{{exclude}}']][[ -e 'ssh -p {{port}}']] {{src}} {{dst}}",
+					"danger": [
+						{
+							"when": "del",
+							"d": "원본에 없는 파일을 대상에서 지웁니다 — 시험만(-n)으로 먼저 보세요"
+						}
+					]
+				}
+			]
+		},
+		"chmod": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "권한",
+							"d": "644(rw-r--r--) · 755(rwxr-xr-x) · u+x · go-w"
+						},
+						{
+							"name": "파일",
+							"many": true
+						}
+					]
+				}
+			],
+			"opts": {
+				"-R": "하위 폴더까지 모두",
+				"-v": "바꾼 것 보이기",
+				"-c": "바뀐 것만 보이기"
+			},
+			"explain": [
+				{
+					"re": "^([0-7])([0-7])([0-7])$",
+					"d": "권한 숫자 — 주인 $1 · 그룹 $2 · 나머지 $3 (4 읽기 + 2 쓰기 + 1 실행)"
+				},
+				{
+					"re": "^([ugoa]*)([+-=])([rwxXst]+)$",
+					"d": "기호 권한 — $1(u 주인 g 그룹 o 나머지 a 모두)에 $3 을 $2(+ 더함 − 뺌 = 그것만)"
+				}
+			],
+			"templates": [
+				{
+					"label": "권한 바꾸기",
+					"t": "chmod {{권한=644}} {{파일}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "chmod",
+					"label": "chmod 권한",
+					"d": "파일·폴더의 읽기·쓰기·실행 권한을 바꿉니다.",
+					"fields": [
+						{
+							"name": "mode",
+							"label": "권한",
+							"kind": "text",
+							"req": true,
+							"def": "644",
+							"options": [
+								["644", "파일 기본(rw-r--r--)"],
+								["600", "나만(rw-------)"],
+								["755", "실행·폴더(rwxr-xr-x)"],
+								["700", "나만 실행·폴더"],
+								["u+x", "주인에게 실행 더하기"],
+								["go-w", "그룹·나머지 쓰기 빼기"]
+							]
+						},
+						{
+							"name": "file",
+							"label": "대상",
+							"kind": "text",
+							"src": "paths",
+							"req": true
+						},
+						{
+							"name": "r",
+							"label": "하위까지(-R)",
+							"kind": "flag",
+							"on": "-R"
+						}
+					],
+					"build": "chmod[[ {{r}}]] {{mode}} {{file}}",
+					"danger": [
+						{
+							"when": "r",
+							"d": "하위 폴더의 모든 파일 권한을 한꺼번에 바꿉니다"
+						},
+						{
+							"when": "mode=777",
+							"d": "모두에게 쓰기 권한을 엽니다"
+						}
+					]
+				}
+			]
+		},
+		"chown": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "사용자:그룹",
+							"d": "새 주인(그룹만은 :그룹)"
+						},
+						{
+							"name": "파일",
+							"many": true
+						}
+					]
+				}
+			],
+			"opts": {
+				"-R": "하위 폴더까지 모두",
+				"-h": "링크 자체를(가리키는 것 말고)",
+				"-v": "바꾼 것 보이기"
+			},
+			"explain": [
+				{
+					"re": "^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)$",
+					"d": "주인 $1, 그룹 $2"
+				},
+				{
+					"re": "^:([A-Za-z0-9_.-]+)$",
+					"d": "그룹만 $1"
+				}
+			],
+			"templates": [
+				{
+					"label": "주인 바꾸기",
+					"t": "chown {{사용자}}:{{그룹}} {{파일}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "chown",
+					"label": "chown 주인",
+					"d": "파일·폴더의 주인(사용자·그룹)을 바꿉니다.",
+					"fields": [
+						{
+							"name": "user",
+							"label": "사용자",
+							"kind": "text",
+							"src": "users"
+						},
+						{
+							"name": "group",
+							"label": "그룹",
+							"kind": "text",
+							"src": "groups"
+						},
+						{
+							"name": "file",
+							"label": "대상",
+							"kind": "text",
+							"src": "paths",
+							"req": true
+						},
+						{
+							"name": "r",
+							"label": "하위까지(-R)",
+							"kind": "flag",
+							"on": "-R"
+						},
+						{
+							"name": "sudo",
+							"label": "sudo 로",
+							"kind": "flag",
+							"on": "sudo",
+							"def": "sudo"
+						}
+					],
+					"build": "[[{{sudo}} ]]chown[[ {{r}}]] {{user}}[[:{{group}}]] {{file}}",
+					"danger": [
+						{
+							"when": "r",
+							"d": "하위 폴더의 모든 파일 주인을 한꺼번에 바꿉니다"
+						}
+					]
+				}
+			]
+		},
+		"grep": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "패턴",
+							"d": "찾을 글자(정규식) — 공백·특수문자는 작은따옴표로"
+						},
+						{
+							"name": "파일",
+							"d": "찾을 파일·폴더(-r) — 없으면 표준 입력",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-A", "-B", "-C", "-e", "-f", "--include", "--exclude", "-m"],
+			"opts": {
+				"-r": "폴더 안 하위까지",
+				"-R": "하위까지(링크도 따라감)",
+				"-i": "대소문자 무시",
+				"-n": "줄 번호",
+				"-v": "맞지 않는 줄만",
+				"-l": "맞은 파일 이름만",
+				"-c": "맞은 줄 수만",
+				"-w": "낱말 단위로만",
+				"-E": "확장 정규식(| + ? 그대로)",
+				"-F": "정규식 아닌 글자 그대로",
+				"-o": "맞은 부분만",
+				"-A": "맞은 줄 뒤 N줄도",
+				"-B": "맞은 줄 앞 N줄도",
+				"-C": "맞은 줄 앞뒤 N줄도",
+				"--include": "이 이름 패턴 파일만",
+				"--exclude": "이 이름 패턴 파일은 빼기",
+				"--color": "맞은 부분 색칠"
+			},
+			"templates": [
+				{
+					"label": "폴더에서 글자 찾기",
+					"t": "grep -rn '{{패턴}}' {{폴더=.}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "grep",
+					"label": "grep 글자 찾기",
+					"d": "파일 안에서 글자가 들어간 줄을 찾습니다.",
+					"fields": [
+						{
+							"name": "pat",
+							"label": "찾을 글자",
+							"kind": "text",
+							"req": true,
+							"esc": "squote"
+						},
+						{
+							"name": "where",
+							"label": "어디서",
+							"kind": "text",
+							"src": "paths",
+							"def": "."
+						},
+						{
+							"name": "r",
+							"label": "하위 폴더까지(-r)",
+							"kind": "flag",
+							"on": "r",
+							"def": "r"
+						},
+						{
+							"name": "i",
+							"label": "대소문자 무시(-i)",
+							"kind": "flag",
+							"on": "i"
+						},
+						{
+							"name": "n",
+							"label": "줄 번호(-n)",
+							"kind": "flag",
+							"on": "n",
+							"def": "n"
+						},
+						{
+							"name": "fixed",
+							"label": "글자 그대로(-F)",
+							"kind": "flag",
+							"on": "F"
+						},
+						{
+							"name": "v",
+							"label": "반대로 — 없는 줄(-v)",
+							"kind": "flag",
+							"on": "v"
+						},
+						{
+							"name": "l",
+							"label": "파일 이름만(-l)",
+							"kind": "flag",
+							"on": "l"
+						},
+						{
+							"name": "include",
+							"label": "이런 파일만",
+							"kind": "text",
+							"d": "*.java",
+							"esc": "squote"
+						},
+						{
+							"name": "ctx",
+							"label": "앞뒤 줄 수",
+							"kind": "text",
+							"d": "2"
+						}
+					],
+					"build": "grep[[ -{{flags}}]][[ -C {{ctx}}]][[ --include='{{include}}']] '{{pat}}' {{where}}",
+					"derive": {
+						"flags": {
+							"join": ["r", "i", "n", "fixed", "v", "l"]
+						}
+					}
+				}
+			]
+		},
+		"awk": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-F 구분자"
+						},
+						{
+							"name": "프로그램",
+							"d": "'조건 {동작}' — 예: '{print $1}', '$3 > 100'"
+						},
+						{
+							"name": "파일",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-F", "-v", "-f"],
+			"opts": {
+				"-F": "칸 구분자(기본 공백)",
+				"-v": "변수 정하기(이름=값)",
+				"-f": "프로그램을 파일에서"
+			},
+			"explain": [
+				{
+					"re": "^\\{\\s*print \\$([0-9]+)\\s*\\}$",
+					"d": "줄마다 $1번째 칸 출력"
+				},
+				{
+					"re": "^\\{\\s*print \\$NF\\s*\\}$",
+					"d": "줄마다 마지막 칸 출력"
+				},
+				{
+					"re": "^\\{\\s*print (.+)\\}$",
+					"d": "줄마다 $1 출력"
+				},
+				{
+					"re": "^-F(.+)$",
+					"d": "칸 구분자 '$1'"
+				},
+				{
+					"re": "^\\{\\s*s\\s*\\+=\\s*\\$([0-9]+)\\s*\\}\\s*END\\s*\\{\\s*print s\\s*\\}$",
+					"d": "$1번째 칸의 합계"
+				}
+			],
+			"templates": [
+				{
+					"label": "몇째 칸만 보기",
+					"t": "awk '{print ${{열=1}}}' {{파일}}"
+				},
+				{
+					"label": "구분자로 나눠 칸 보기",
+					"t": "awk -F'{{구분자=:}}' '{print ${{열=1}}}' {{파일}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "awk-column",
+					"label": "awk 칸 뽑기",
+					"d": "줄마다 원하는 칸(열)만 뽑습니다.",
+					"fields": [
+						{
+							"name": "cols",
+							"label": "칸 번호",
+							"kind": "text",
+							"req": true,
+							"def": "1",
+							"esc": "raw",
+							"d": "1 · 1,3 · NF(마지막)"
+						},
+						{
+							"name": "sep",
+							"label": "구분자",
+							"kind": "text",
+							"esc": "squote",
+							"d": "비우면 공백, : , \\t",
+							"options": [[":", "콜론"], [",", "쉼표"], ["\\t", "탭"]]
+						},
+						{
+							"name": "cond",
+							"label": "조건",
+							"kind": "text",
+							"esc": "raw",
+							"d": "$3 > 100, /ERROR/"
+						},
+						{
+							"name": "file",
+							"label": "파일",
+							"kind": "text",
+							"src": "files"
+						}
+					],
+					"build": "awk[[ -F'{{sep}}']] '[[{{cond}} ]]{print {{colexpr}}}'[[ {{file}}]]",
+					"derive": {
+						"colexpr": {
+							"cols": "cols"
+						}
+					}
+				}
+			]
+		},
+		"crontab": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"d": "-l 보기 · -e 고치기 · -r 모두 지움"
+						}
+					]
+				}
+			],
+			"takes": ["-u"],
+			"opts": {
+				"-l": "지금 예약 보기",
+				"-e": "편집기로 고치기",
+				"-r": "모든 예약 지우기(되돌릴 수 없음)",
+				"-u": "다른 계정의 것"
+			},
+			"explain": [
+				{
+					"re": "^\\*/([0-9]+)$",
+					"d": "$1 간격마다"
+				}
+			],
+			"templates": [
+				{
+					"label": "예약 보기",
+					"t": "crontab -l"
+				}
+			],
+			"forms": [
+				{
+					"id": "crontab-add",
+					"label": "crontab 예약 더하기",
+					"d": "주기적으로 돌 명령을 내 crontab 끝에 한 줄 더합니다(있던 줄은 그대로).",
+					"fields": [
+						{
+							"name": "when",
+							"label": "언제",
+							"kind": "text",
+							"req": true,
+							"esc": "squote",
+							"def": "0 3 * * *",
+							"d": "분 시 일 월 요일",
+							"options": [
+								["*/5 * * * *", "5분마다"],
+								["0 * * * *", "매시 정각"],
+								["0 3 * * *", "매일 3시"],
+								["0 3 * * 0", "매주 일요일 3시"],
+								["0 3 1 * *", "매달 1일 3시"]
+							]
+						},
+						{
+							"name": "cmd",
+							"label": "명령",
+							"kind": "text",
+							"req": true,
+							"esc": "squote",
+							"d": "전체 경로로(/usr/bin/…)"
+						},
+						{
+							"name": "log",
+							"label": "출력 남길 파일",
+							"kind": "text",
+							"esc": "squote",
+							"d": "/tmp/job.log"
+						}
+					],
+					"build": "(crontab -l 2>/dev/null; echo '{{when}} {{cmd}}[[ >> {{log}} 2>&1]]') | crontab -",
+					"danger": [
+						{
+							"d": "내 crontab 을 바꿉니다 — 있던 줄은 그대로 두고 끝에 더합니다"
+						}
+					]
+				}
+			]
+		},
+		"ln": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "원본",
+							"d": "가리킬 파일·폴더"
+						},
+						{
+							"name": "링크",
+							"d": "새로 만들 링크 이름",
+							"opt": true
+						}
+					]
+				}
+			],
+			"opts": {
+				"-s": "심볼릭 링크(바로가기)",
+				"-f": "이미 있으면 바꿈",
+				"-n": "링크 폴더를 따라가지 않음",
+				"-v": "만든 것 보이기"
+			},
+			"templates": [
+				{
+					"label": "바로가기 만들기",
+					"t": "ln -s {{원본}} {{링크}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "ln",
+					"label": "ln 링크",
+					"d": "파일·폴더를 가리키는 링크(바로가기)를 만듭니다.",
+					"fields": [
+						{
+							"name": "src",
+							"label": "원본",
+							"kind": "text",
+							"src": "paths",
+							"req": true
+						},
+						{
+							"name": "dst",
+							"label": "링크 이름",
+							"kind": "text",
+							"req": true
+						},
+						{
+							"name": "s",
+							"label": "심볼릭(-s)",
+							"kind": "flag",
+							"on": "s",
+							"def": "s"
+						},
+						{
+							"name": "f",
+							"label": "있으면 바꾸기(-f)",
+							"kind": "flag",
+							"on": "fn"
+						}
+					],
+					"build": "ln[[ -{{flags}}]] {{src}} {{dst}}",
+					"derive": {
+						"flags": {
+							"join": ["s", "f"]
+						}
+					}
+				}
+			]
+		},
+		"scp": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "원본",
+							"many": true,
+							"d": "보낼 것 — 사용자@호스트:경로 도 됨"
+						},
+						{
+							"name": "대상",
+							"d": "받을 곳 — 사용자@호스트:경로"
+						}
+					]
+				}
+			],
+			"takes": ["-P", "-i"],
+			"opts": {
+				"-r": "폴더째",
+				"-P": "ssh 포트",
+				"-p": "시각·권한 그대로",
+				"-C": "압축",
+				"-i": "키 파일",
+				"-q": "조용히"
+			},
+			"templates": [
+				{
+					"label": "다른 서버로 복사",
+					"t": "scp {{파일}} {{사용자}}@{{호스트}}:{{원격경로}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "scp",
+					"label": "scp 복사",
+					"d": "ssh 로 다른 서버에 파일을 복사합니다.",
+					"fields": [
+						{
+							"name": "dir",
+							"label": "방향",
+							"kind": "select",
+							"options": [["up", "여기 → 상대 서버"], ["down", "상대 서버 → 여기"]],
+							"def": "up"
+						},
+						{
+							"name": "local",
+							"label": "여기 경로",
+							"kind": "text",
+							"src": "paths",
+							"req": true
+						},
+						{
+							"name": "user",
+							"label": "상대 계정",
+							"kind": "text",
+							"req": true
+						},
+						{
+							"name": "host",
+							"label": "상대 호스트",
+							"kind": "text",
+							"req": true
+						},
+						{
+							"name": "remote",
+							"label": "상대 경로",
+							"kind": "text",
+							"def": "~/"
+						},
+						{
+							"name": "r",
+							"label": "폴더째(-r)",
+							"kind": "flag",
+							"on": "-r"
+						},
+						{
+							"name": "port",
+							"label": "포트",
+							"kind": "text",
+							"d": "22 가 아니면"
+						}
+					],
+					"build": "scp[[ {{r}}]][[ -P {{port}}]] {{from}} {{to}}",
+					"derive": {
+						"from": {
+							"if": "dir=down",
+							"then": "{{user}}@{{host}}:{{remote}}",
+							"else": "{{local}}"
+						},
+						"to": {
+							"if": "dir=down",
+							"then": "{{local}}",
+							"else": "{{user}}@{{host}}:{{remote}}"
+						}
+					}
+				}
+			]
+		},
+		"systemctl": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "동작",
+							"d": "status · start · stop · restart · reload · enable · disable · list-units"
+						},
+						{
+							"name": "서비스",
+							"opt": true,
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "status",
+					"args": [
+						{
+							"name": "서비스",
+							"d": "상태를 볼 서비스",
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "restart",
+					"args": [
+						{
+							"name": "서비스",
+							"d": "다시 켤 서비스",
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "start",
+					"args": [
+						{
+							"name": "서비스",
+							"d": "켤 서비스",
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "stop",
+					"args": [
+						{
+							"name": "서비스",
+							"d": "끌 서비스",
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "enable",
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "--now 지금도 켜기"
+						},
+						{
+							"name": "서비스",
+							"d": "부팅 때 켤 서비스",
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["--type"],
+			"opts": {
+				"--now": "지금도 바로(enable/disable 과 함께)",
+				"--no-pager": "나눠 보지 않고 한 번에",
+				"-l": "줄을 자르지 않음",
+				"--user": "내 계정 서비스",
+				"--failed": "실패한 것만",
+				"--type": "종류(service, timer)",
+				"--all": "꺼진 것도"
+			},
+			"templates": [
+				{
+					"label": "서비스 상태",
+					"t": "systemctl status {{서비스}}"
+				},
+				{
+					"label": "서비스 다시 켜기",
+					"t": "sudo systemctl restart {{서비스}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "systemctl",
+					"label": "systemctl 서비스",
+					"d": "systemd 서비스의 상태를 보거나 켜고 끕니다.",
+					"fields": [
+						{
+							"name": "verb",
+							"label": "동작",
+							"kind": "select",
+							"options": [
+								["status", "상태 보기"],
+								["restart", "다시 켜기"],
+								["reload", "설정 다시 읽기"],
+								["start", "켜기"],
+								["stop", "끄기"],
+								["enable --now", "부팅 때도 켜기(지금도)"],
+								["disable --now", "부팅 때 안 켜기(지금 끄기)"],
+								["is-active", "켜져 있는지만"]
+							],
+							"def": "status"
+						},
+						{
+							"name": "svc",
+							"label": "서비스",
+							"kind": "text",
+							"src": "services",
+							"req": true
+						},
+						{
+							"name": "sudo",
+							"label": "sudo 로",
+							"kind": "flag",
+							"on": "sudo"
+						}
+					],
+					"build": "[[{{sudo}} ]]systemctl {{verb}} {{svc}}",
+					"danger": [
+						{
+							"when": "verb=stop",
+							"d": "서비스를 끕니다"
+						},
+						{
+							"when": "verb=disable --now",
+							"d": "서비스를 끄고 부팅 때도 켜지 않습니다"
+						},
+						{
+							"when": "verb=restart",
+							"d": "서비스가 잠깐 끊깁니다"
+						}
+					]
+				}
+			]
+		},
+		"journalctl": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-u 서비스 · -f 따라가기 · --since 시각 · -n 줄 수"
+						}
+					]
+				}
+			],
+			"takes": ["-u", "-n", "--since", "--until", "-p", "-o"],
+			"opts": {
+				"-u": "이 서비스의 로그",
+				"-f": "새 로그 따라가기",
+				"-n": "마지막 N줄",
+				"--since": "이 시각부터",
+				"--until": "이 시각까지",
+				"-p": "중요도(err, warning)",
+				"-b": "이번 부팅부터",
+				"--no-pager": "나눠 보지 않고 한 번에",
+				"-r": "최근 것부터",
+				"-o": "출력 형식(short-iso, json, cat)",
+				"-k": "커널 로그만"
+			},
+			"templates": [
+				{
+					"label": "서비스 로그 따라가기",
+					"t": "journalctl -u {{서비스}} -f"
+				},
+				{
+					"label": "서비스 로그(언제부터)",
+					"t": "journalctl -u {{서비스}} --since '{{시각=1 hour ago}}'"
+				}
+			],
+			"forms": [
+				{
+					"id": "journalctl",
+					"label": "journalctl 로그",
+					"d": "systemd 로그(서비스·커널)를 봅니다.",
+					"fields": [
+						{
+							"name": "svc",
+							"label": "서비스",
+							"kind": "text",
+							"src": "services",
+							"d": "비우면 전체"
+						},
+						{
+							"name": "since",
+							"label": "언제부터",
+							"kind": "text",
+							"esc": "squote",
+							"options": [
+								["10 min ago", "10분 전"],
+								["1 hour ago", "1시간 전"],
+								["today", "오늘"],
+								["yesterday", "어제"]
+							]
+						},
+						{
+							"name": "n",
+							"label": "마지막 몇 줄",
+							"kind": "text",
+							"def": "200"
+						},
+						{
+							"name": "prio",
+							"label": "중요도",
+							"kind": "select",
+							"options": [["", "모두"], ["err", "오류 이상"], ["warning", "경고 이상"]],
+							"def": ""
+						},
+						{
+							"name": "f",
+							"label": "따라가기(-f)",
+							"kind": "flag",
+							"on": "-f"
+						},
+						{
+							"name": "np",
+							"label": "한 번에(--no-pager)",
+							"kind": "flag",
+							"on": "--no-pager",
+							"def": "--no-pager"
+						}
+					],
+					"build": "journalctl[[ -u {{svc}}]][[ --since '{{since}}']][[ -n {{n}}]][[ -p {{prio}}]][[ {{f}}]][[ {{np}}]]"
+				}
+			]
+		},
+		"docker": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "명령",
+							"d": "ps · logs · exec · run · images · restart · stop · compose"
+						},
+						{
+							"name": "인자",
+							"opt": true,
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "exec",
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-it 대화형"
+						},
+						{
+							"name": "컨테이너"
+						},
+						{
+							"name": "명령",
+							"d": "안에서 실행할 명령(bash, sh)",
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "logs",
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-f 따라가기 · --tail N"
+						},
+						{
+							"name": "컨테이너"
+						}
+					]
+				},
+				{
+					"sub": "run",
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-d 뒤에서 · -p 포트 · -v 폴더 · --name 이름 · --rm"
+						},
+						{
+							"name": "이미지"
+						},
+						{
+							"name": "명령",
+							"opt": true,
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "restart",
+					"args": [
+						{
+							"name": "컨테이너",
+							"many": true
+						}
+					]
+				},
+				{
+					"sub": "stop",
+					"args": [
+						{
+							"name": "컨테이너",
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-p", "-v", "-e", "--name", "-u", "-w", "--tail", "--restart"],
+			"opts": {
+				"-it": "대화형 터미널로",
+				"-i": "입력 열어 두기",
+				"-t": "터미널 붙이기",
+				"-d": "뒤에서 실행",
+				"-p": "포트 연결(호스트:컨테이너)",
+				"-v": "폴더 연결(호스트:컨테이너)",
+				"-e": "환경 변수",
+				"--name": "컨테이너 이름",
+				"--rm": "끝나면 지움",
+				"-f": "따라가기",
+				"--tail": "마지막 N줄",
+				"-u": "이 계정으로",
+				"-w": "이 폴더에서",
+				"-a": "멈춘 것도",
+				"--restart": "재시작 정책(unless-stopped)"
+			},
+			"explain": [
+				{
+					"re": "^([0-9]+):([0-9]+)$",
+					"d": "호스트 $1 → 컨테이너 $2"
+				},
+				{
+					"re": "^(/[^:]*):(/[^:]*)(:ro)?$",
+					"d": "호스트 $1 ↔ 컨테이너 $2 $3"
+				}
+			],
+			"templates": [
+				{
+					"label": "로그 따라가기",
+					"t": "docker logs -f --tail {{줄수=100}} {{컨테이너}}"
+				},
+				{
+					"label": "컨테이너 안으로",
+					"t": "docker exec -it {{컨테이너}} {{명령=bash}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "docker-run",
+					"label": "docker run",
+					"d": "이미지로 새 컨테이너를 띄웁니다.",
+					"fields": [
+						{
+							"name": "image",
+							"label": "이미지",
+							"kind": "text",
+							"src": "images",
+							"req": true
+						},
+						{
+							"name": "name",
+							"label": "이름",
+							"kind": "text"
+						},
+						{
+							"name": "d",
+							"label": "뒤에서(-d)",
+							"kind": "flag",
+							"on": "-d",
+							"def": "-d"
+						},
+						{
+							"name": "rm",
+							"label": "끝나면 지우기(--rm)",
+							"kind": "flag",
+							"on": "--rm"
+						},
+						{
+							"name": "port",
+							"label": "포트",
+							"kind": "text",
+							"d": "8080:80 (호스트:컨테이너)"
+						},
+						{
+							"name": "vol",
+							"label": "폴더",
+							"kind": "text",
+							"d": "/data:/var/lib/app"
+						},
+						{
+							"name": "env",
+							"label": "환경 변수",
+							"kind": "text",
+							"d": "TZ=Asia/Seoul"
+						},
+						{
+							"name": "restart",
+							"label": "재시작",
+							"kind": "select",
+							"options": [["", "안 함"], ["unless-stopped", "멈추기 전까지"], ["always", "늘"]],
+							"def": ""
+						},
+						{
+							"name": "cmd",
+							"label": "명령",
+							"kind": "text",
+							"esc": "raw"
+						}
+					],
+					"build": "docker run[[ {{d}}]][[ {{rm}}]][[ --name {{name}}]][[ -p {{port}}]][[ -v {{vol}}]][[ -e {{env}}]][[ --restart {{restart}}]] {{image}}[[ {{cmd}}]]"
+				},
+				{
+					"id": "docker-exec",
+					"label": "docker exec",
+					"d": "도는 컨테이너 안에서 명령을 실행합니다.",
+					"fields": [
+						{
+							"name": "c",
+							"label": "컨테이너",
+							"kind": "text",
+							"src": "containers",
+							"req": true
+						},
+						{
+							"name": "it",
+							"label": "대화형(-it)",
+							"kind": "flag",
+							"on": "-it",
+							"def": "-it"
+						},
+						{
+							"name": "user",
+							"label": "계정",
+							"kind": "text",
+							"d": "root"
+						},
+						{
+							"name": "cmd",
+							"label": "명령",
+							"kind": "text",
+							"def": "bash",
+							"esc": "raw",
+							"options": [["bash", "bash"], ["sh", "sh"]]
+						}
+					],
+					"build": "docker exec[[ {{it}}]][[ -u {{user}}]] {{c}} {{cmd}}"
+				}
+			]
+		},
+		"du": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "폴더",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-d", "--max-depth"],
+			"opts": {
+				"-s": "합계만",
+				"-h": "읽기 쉬운 단위(K·M·G)",
+				"-a": "파일도",
+				"-d": "몇 단계 아래까지",
+				"--max-depth": "몇 단계 아래까지",
+				"-x": "다른 디스크는 건너뜀",
+				"-c": "끝에 총합"
+			},
+			"templates": [
+				{
+					"label": "폴더별 크기(큰 것 아래)",
+					"t": "du -sh {{폴더=.}}/* | sort -h"
+				}
+			],
+			"forms": [
+				{
+					"id": "du",
+					"label": "du 폴더 크기",
+					"d": "폴더가 차지한 용량을 잽니다.",
+					"fields": [
+						{
+							"name": "dir",
+							"label": "폴더",
+							"kind": "text",
+							"src": "dirs",
+							"def": "."
+						},
+						{
+							"name": "depth",
+							"label": "몇 단계 아래까지",
+							"kind": "text",
+							"def": "1"
+						},
+						{
+							"name": "x",
+							"label": "다른 디스크 건너뛰기(-x)",
+							"kind": "flag",
+							"on": "x"
+						},
+						{
+							"name": "sort",
+							"label": "크기 순(큰 것 아래)",
+							"kind": "flag",
+							"on": " | sort -h",
+							"def": " | sort -h"
+						},
+						{
+							"name": "top",
+							"label": "큰 것 몇 개만",
+							"kind": "text",
+							"d": "20"
+						}
+					],
+					"build": "du -h{{x}}[[ -d {{depth}}]] {{dir}}{{sort}}[[ | tail -n {{top}}]]"
+				}
+			]
+		},
+		"df": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "경로",
+							"opt": true,
+							"many": true,
+							"d": "이 경로가 있는 디스크만"
+						}
+					]
+				}
+			],
+			"takes": ["-x", "-t"],
+			"opts": {
+				"-h": "읽기 쉬운 단위",
+				"-T": "파일 시스템 종류",
+				"-i": "inode 사용량",
+				"-x": "이 종류는 빼기(tmpfs)",
+				"-t": "이 종류만"
+			},
+			"forms": [
+				{
+					"id": "df",
+					"label": "df 디스크 여유",
+					"d": "디스크마다 남은 공간을 봅니다.",
+					"fields": [
+						{
+							"name": "path",
+							"label": "경로(그 디스크만)",
+							"kind": "text",
+							"src": "dirs"
+						},
+						{
+							"name": "T",
+							"label": "종류도(-T)",
+							"kind": "flag",
+							"on": "T",
+							"def": "T"
+						},
+						{
+							"name": "i",
+							"label": "inode(-i)",
+							"kind": "flag",
+							"on": "i"
+						},
+						{
+							"name": "notmp",
+							"label": "tmpfs 빼기",
+							"kind": "flag",
+							"on": " -x tmpfs -x devtmpfs",
+							"def": " -x tmpfs -x devtmpfs"
+						}
+					],
+					"build": "df -h{{T}}{{i}}{{notmp}}[[ {{path}}]]"
+				}
+			]
+		},
+		"tail": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-n 줄 수 · -f 따라가기"
+						},
+						{
+							"name": "파일",
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-n", "-c"],
+			"opts": {
+				"-n": "마지막 N줄",
+				"-f": "새 줄 따라가기",
+				"-F": "따라가기(파일이 바뀌어도)",
+				"-q": "파일 이름 머리말 없이",
+				"-c": "마지막 N바이트"
+			},
+			"templates": [
+				{
+					"label": "로그 따라가기",
+					"t": "tail -n {{줄수=100}} -f {{파일}}"
+				}
+			],
+			"forms": [
+				{
+					"id": "tail-follow",
+					"label": "tail 로그 따라가기",
+					"d": "파일 끝을 보며 새 줄을 따라갑니다(멈출 때 Ctrl+C).",
+					"fields": [
+						{
+							"name": "file",
+							"label": "파일",
+							"kind": "text",
+							"src": "files",
+							"req": true
+						},
+						{
+							"name": "n",
+							"label": "처음 보일 줄 수",
+							"kind": "text",
+							"def": "100"
+						},
+						{
+							"name": "F",
+							"label": "파일이 바뀌어도 따라가기(-F)",
+							"kind": "flag",
+							"on": "-F",
+							"def": "-F"
+						},
+						{
+							"name": "grep",
+							"label": "이 글자 든 줄만",
+							"kind": "text",
+							"esc": "squote"
+						}
+					],
+					"build": "tail -n {{n}} {{follow}} {{file}}[[ | grep --line-buffered '{{grep}}']]",
+					"derive": {
+						"follow": {
+							"if": "F",
+							"then": "-F",
+							"else": "-f"
+						}
+					}
+				}
+			]
+		},
+		"ps": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "aux 모두 · -ef 전체 형식 · --sort"
+						}
+					]
+				}
+			],
+			"takes": ["-u", "-o", "-p"],
+			"opts": {
+				"aux": "모든 프로세스(BSD 형식)",
+				"-e": "모든 프로세스",
+				"-f": "자세히",
+				"-u": "이 계정의",
+				"--sort": "정렬(-%mem, -%cpu)",
+				"-o": "보일 칸",
+				"-p": "이 PID"
+			},
+			"forms": [
+				{
+					"id": "ps-find",
+					"label": "ps 프로세스 찾기",
+					"d": "이름으로 도는 프로세스를 찾습니다.",
+					"fields": [
+						{
+							"name": "name",
+							"label": "이름에 든 글자",
+							"kind": "text",
+							"req": true,
+							"esc": "squote"
+						},
+						{
+							"name": "sort",
+							"label": "정렬",
+							"kind": "select",
+							"options": [["", "그대로"], ["-%mem", "메모리 많은 순"], ["-%cpu", "CPU 많은 순"]],
+							"def": ""
+						}
+					],
+					"build": "ps aux[[ --sort={{sort}}]] | grep -i '[{{first}}]{{rest}}'",
+					"derive": {
+						"first": {
+							"head": "name"
+						},
+						"rest": {
+							"tail": "name"
+						}
+					}
+				}
+			]
+		},
+		"ss": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-t TCP · -u UDP · -l 리슨 · -n 숫자 · -p 프로세스"
+						},
+						{
+							"name": "필터",
+							"opt": true,
+							"d": "sport = :80"
+						}
+					]
+				}
+			],
+			"opts": {
+				"-t": "TCP",
+				"-u": "UDP",
+				"-l": "리슨(열린 포트)만",
+				"-n": "이름 말고 숫자로",
+				"-p": "프로세스까지",
+				"-a": "모두",
+				"-s": "요약"
+			},
+			"forms": [
+				{
+					"id": "ss-ports",
+					"label": "ss 열린 포트",
+					"d": "어떤 포트를 어떤 프로세스가 열었는지 봅니다.",
+					"fields": [
+						{
+							"name": "proto",
+							"label": "종류",
+							"kind": "select",
+							"options": [["tu", "TCP·UDP"], ["t", "TCP"], ["u", "UDP"]],
+							"def": "t"
+						},
+						{
+							"name": "p",
+							"label": "프로세스까지(-p)",
+							"kind": "flag",
+							"on": "p",
+							"def": "p"
+						},
+						{
+							"name": "port",
+							"label": "이 포트만",
+							"kind": "text"
+						},
+						{
+							"name": "sudo",
+							"label": "sudo 로(남의 프로세스 보기)",
+							"kind": "flag",
+							"on": "sudo"
+						}
+					],
+					"build": "[[{{sudo}} ]]ss -ln{{proto}}{{p}}[[ 'sport = :{{port}}']]"
+				}
+			]
+		},
+		"cp": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "원본",
+							"many": true
+						},
+						{
+							"name": "대상",
+							"d": "새 이름이나 넣을 폴더"
+						}
+					]
+				}
+			],
+			"opts": {
+				"-r": "폴더째",
+				"-a": "권한·시각까지 그대로(폴더째)",
+				"-i": "덮어쓰기 전에 묻기",
+				"-n": "있으면 덮어쓰지 않음",
+				"-v": "복사한 것 보이기",
+				"-p": "권한·시각 그대로",
+				"-u": "더 새것만"
+			}
+		},
+		"mv": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "원본",
+							"many": true
+						},
+						{
+							"name": "대상",
+							"d": "새 이름이나 옮길 폴더"
+						}
+					]
+				}
+			],
+			"opts": {
+				"-i": "덮어쓰기 전에 묻기",
+				"-n": "있으면 덮어쓰지 않음",
+				"-v": "옮긴 것 보이기",
+				"-f": "묻지 않고 덮어쓰기"
+			}
+		},
+		"rm": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "파일",
+							"many": true,
+							"d": "지울 것 — 되돌릴 수 없음"
+						}
+					]
+				}
+			],
+			"opts": {
+				"-r": "폴더째(하위까지)",
+				"-f": "묻지 않고·없어도 오류 없이",
+				"-i": "하나씩 묻기",
+				"-v": "지운 것 보이기",
+				"-d": "빈 폴더"
+			}
+		},
+		"mkdir": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "폴더",
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-m"],
+			"opts": {
+				"-p": "중간 폴더까지 만들고, 있어도 오류 없이",
+				"-m": "권한 지정",
+				"-v": "만든 것 보이기"
+			}
+		},
+		"ls": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "경로",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"opts": {
+				"-l": "자세히",
+				"-a": "숨김 파일도",
+				"-h": "크기 읽기 쉽게",
+				"-t": "수정 시각 순",
+				"-r": "거꾸로",
+				"-S": "크기 순",
+				"-R": "하위까지",
+				"-d": "폴더 자체(안 말고)",
+				"-1": "한 줄에 하나"
+			}
+		},
+		"head": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true,
+							"d": "-n 줄 수"
+						},
+						{
+							"name": "파일",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-n", "-c"],
+			"opts": {
+				"-n": "처음 N줄",
+				"-c": "처음 N바이트"
+			}
+		},
+		"kill": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "신호",
+							"flag": true,
+							"opt": true,
+							"d": "-15 정상 종료(기본) · -9 강제"
+						},
+						{
+							"name": "PID",
+							"many": true
+						}
+					]
+				}
+			],
+			"opts": {
+				"-9": "강제 종료(SIGKILL — 정리 없이)",
+				"-15": "정상 종료 요청(SIGTERM)",
+				"-HUP": "설정 다시 읽기(SIGHUP)",
+				"-l": "신호 목록"
+			}
+		},
+		"curl": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "URL",
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-o", "-X", "-H", "-d", "-u", "-w", "--max-time"],
+			"opts": {
+				"-I": "머리말만",
+				"-i": "머리말도",
+				"-s": "조용히",
+				"-S": "조용해도 오류는",
+				"-L": "넘겨주기 따라가기",
+				"-o": "파일로 받기",
+				"-O": "원래 이름으로 받기",
+				"-X": "방식(GET, POST)",
+				"-H": "머리말 더하기",
+				"-d": "보낼 본문",
+				"-k": "인증서 검사 끄기",
+				"-v": "자세히",
+				"-u": "사용자:암호",
+				"-w": "끝나고 보일 형식(%{http_code})",
+				"--max-time": "최대 시간(초)"
+			}
+		},
+		"ssh": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "사용자@호스트"
+						},
+						{
+							"name": "명령",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-p", "-i", "-L", "-R", "-J", "-o"],
+			"opts": {
+				"-p": "포트",
+				"-i": "키 파일",
+				"-L": "로컬 포트 넘기기",
+				"-R": "원격 포트 넘기기",
+				"-J": "거쳐 갈 서버",
+				"-v": "자세히",
+				"-t": "터미널 붙이기",
+				"-N": "명령 없이(포트 넘기기만)",
+				"-o": "설정 하나"
+			}
+		},
+		"xargs": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "명령",
+							"d": "입력 줄들을 인자로 받아 실행할 명령",
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-n", "-I", "-P"],
+			"opts": {
+				"-0": "NUL 로 구분(find -print0 와 함께)",
+				"-n": "한 번에 N개씩",
+				"-I": "자리 글자({})에 넣기",
+				"-P": "동시에 N개",
+				"-r": "입력이 없으면 실행 안 함",
+				"-t": "실행 전 명령 보이기"
+			}
+		},
+		"sort": {
+			"sig": [
+				{
+					"args": [
+						{
+							"name": "옵션",
+							"flag": true,
+							"opt": true
+						},
+						{
+							"name": "파일",
+							"opt": true,
+							"many": true
+						}
+					]
+				}
+			],
+			"takes": ["-k", "-t"],
+			"opts": {
+				"-n": "숫자로",
+				"-h": "사람 단위(1K 2M)로",
+				"-r": "거꾸로",
+				"-u": "같은 줄 하나만",
+				"-k": "N번째 칸 기준",
+				"-t": "칸 구분자",
+				"-f": "대소문자 무시"
+			}
+		},
+		"uniq": {
+			"opts": {
+				"-c": "몇 번 나왔는지",
+				"-d": "겹친 줄만",
+				"-u": "한 번만 나온 줄만",
+				"-i": "대소문자 무시"
+			}
+		},
+		"wc": {
+			"opts": {
+				"-l": "줄 수",
+				"-w": "낱말 수",
+				"-c": "바이트 수",
+				"-m": "글자 수"
+			}
+		},
+		"cut": {
+			"takes": ["-d", "-f", "-c"],
+			"opts": {
+				"-d": "구분자",
+				"-f": "칸 번호(1,3 · 2-4)",
+				"-c": "글자 위치"
+			}
+		},
+		"cat": {
+			"opts": {
+				"-n": "줄 번호",
+				"-A": "보이지 않는 글자도",
+				"-s": "빈 줄 겹치면 하나로"
+			}
+		},
+		"less": {
+			"opts": {
+				"-N": "줄 번호",
+				"-S": "긴 줄 자르기",
+				"+F": "따라가기(tail -f 처럼)",
+				"-R": "색 그대로"
+			}
+		}
+	}
+}

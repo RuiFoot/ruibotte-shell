@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 import "./styles/ssh-extra.css";
 import "./styles/route.css";
+import "./styles/assist.css";
 import { App } from "./App";
 
 // 마우스 뒤로·앞으로 단추가 웹뷰 페이지 기록을 넘기지 않게(앱 안에서는 트리 뒤로·앞으로로 쓴다)

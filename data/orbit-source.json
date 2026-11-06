@@ -1,0 +1,10 @@
+{
+	"repo": "repia-works/ui (사내)",
+	"commit": "635028a8",
+	"schemaV": 1,
+	"files": {
+		"data/cmd-dict/dict.json": "67ac8e6fc1bd",
+		"src/lib/cmd-assist/assist.json": "8dd08b8e661e",
+		"src/lib/cmd-assist/assist.ts": "099d78ec1640"
+	}
+}

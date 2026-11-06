@@ -483,6 +483,8 @@ export type ShellHandle = {
 	idle?: () => boolean;
 	/** 원격: sudo 암호를 이 셸에 넣기(값은 화면을 거치지 않는다) — 넣을 암호가 없으면 false */
 	sudoPw?: () => Promise<boolean>;
+	/** 명령 입력 보조(D25) — 리눅스 셸 터미널만. 폼 열기·풀이·빈칸 템플릿 넣기 */
+	assist?: (a: { kind: "form"; id?: string } | { kind: "explain" } | { kind: "template"; text: string }) => void;
 };
 
 export function sshTerm(conn: number): TermBackend {
