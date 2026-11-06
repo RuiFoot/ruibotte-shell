@@ -165,7 +165,7 @@
 - [x] 실행 계획 트리 보기
 - [x] prompt() 를 쓰는 곳(이름 확인·객체 찾기) — macOS 에서 안 될 수 있음
 - [x] 객체 트리 PG 구체화 뷰·열 PK 표시·DDL 복사·SQL INSERT 파일 저장
-- [ ] 진짜 스트리밍(첫 묶음 먼저 그리기)
+- [x] 진짜 스트리밍(첫 묶음 먼저 그리기) — 아래 "DB 진짜 스트리밍" 항목
 - [x] 작업대 배치 잠금·풀기(끌기·나누기·크기 조절·구조 칸 닫기 막기, 배치 종류별 기억, Ctrl+Alt+L) — 사용자 요청 2026-11-05
 - [x] 접속 화면에서 사이드바 자동 접기(아이콘 막대, 올리면 펼침, Ctrl+B·단추로 펴고 접기) — 사용자 요청 2026-11-05
 - [x] 상태 줄 작은 자원 표시(CPU·메모리·디스크, 켜기·끄기, 간격 자동(망 느리면 최대 1분까지 늘림)·5초·15초·1분, 누르면 자세히) — 부품 MiniMonitor 완료, 작업대 연결 대기
@@ -174,7 +174,9 @@
 - [x] 탭 번호 겹침(개발 중 새로 고침 뒤 같은 번호 탭 두 개 → 닫기 안 됨) 고침
 - [x] 사이드바: 홈에서만 펼치고 나머지는 계속 접힘(손수 편 건 홈까지 유지), 올림 펼침 없앰
 - [x] 프로필 단위 읽기 전용(연결 설정의 체크, 접속 창과 같은 값)
-- [ ] DB 진짜 스트리밍(500행마다 먼저 그리기) — 설계만
+- [x] DB 진짜 스트리밍 — db_query(stream 번호) 가 결과를 처음부터 등록하고 행을 넣으며 `db-rows-progress`(첫 묶음 50행 또는 15ms, 그다음 0.1초마다 500행 넘게 늘었거나 0.25초), 화면은 "받는 중 n행 · n초 · 취소" 로 표를 늘림(덜 찬 묶음은 다시 받음), 정렬·거르기·내보내기·고치기는 다 받은 뒤(받는 중이면 문구·Rust 도 BUSY 로 거절), 취소·시간 상한이면 받은 행을 남기고 "취소됨 · 받은 n행"·"시간 상한 · 받은 n행"(여러 문장이면 거기서 멈춤), 행 상한·자동 LIMIT 그대로, 결과 하나 메모리 어림 512MB 넘으면 멈추고 알림, "보냄→첫 행 n ms" 표시. PG(simple_query_raw 흐름)·MySQL/MariaDB(query_iter, 상한이면 KILL QUERY 로 바로 멈춤 — 100만 중 1만 5.7초→0.4초)·SQL Server(QueryStream, 이제 취소·시간 상한도 됨)·JDBC(사이드카 firstBatch/firstBatchMs/batch·cancel 멈춤 표시·done.cancelled) — 임시 PG18·MariaDB11·SQL Server 2022·PG JDBC 로 100만 행·상한·취소·시간 상한 확인(디버그 빌드: PG 첫 알림 61ms·전체 3.1초, MariaDB 2ms·4.2초, SQL Server 3ms·13.8초, PG JDBC 는 드라이버가 자동 커밋에서 다 받아 1.5초). 같이 고친 것: SQL Server 의 SELECT 가 대소문자 비교 오류로 행 없이 execute 로 가던 버그
+- [ ] SQL Server 실행 중 취소 뒤 연결 다시 쓰기 — tiberius 0.13 cancel_query 가 Attention 확인을 못 읽어(계산 중에도) 응답이 하나씩 밀림 → 그 연결을 막고(db-closed) 다시 연결하게 함. 행 상한은 남은 행을 읽어 버려 느림(100만 중 1만 9초)
+- [ ] DB 스트리밍 실제 앱 화면에서 눌러 보기(받는 중 상태 줄·Esc 취소·정렬 막힘 문구) — 지금은 Rust 실측과 tsc 만
 
 ## 3차 — 다른 도구 대비 추가(사용자 지정 2026-11-05)
 - [x] SSH 터널로 DB 접속(연결 설정에서 거칠 SSH 서버·계정 고르기) — PG·MySQL·MariaDB·SQL Server·JDBC 모두 127.0.0.1 임의 포트 → direct-tcpip, 같은 계정의 DB 연결끼리 SSH 연결 하나 공유·마지막이 닫히면 닫음, 지문·SSH 암호는 접속 창에서, 연결 테스트도 터널 경유, 끊기면 db-closed, TLS verify 는 원래 호스트 이름(PG hostaddr·MySQL hostname override), 서버 카드·탭에 SSH 경유 — 로컬 sshd + 임시 PG·MariaDB 로 확인(SSH 끊김 알림은 실제로 끊어 보지 않음)
@@ -211,3 +213,43 @@
 - [ ] 키 관리: 암호 걸린 PPK 만들기(Argon2) — 미지원
 - [ ] 키 관리: App 탭에 붙이기(앱 쪽 작업)
 - [x] 터미널 단어 색칠: ERROR·FATAL·…Exception(빨강)·WARN(주황)·INFO(파랑), 내 단어·색 추가, 켜기/끄기 — 꾸밈(decoration) 방식, 이미 색 있는 글자·전체 화면 앱 제외, 새 줄만 묶어 살핌
+
+## 명령 팔레트·테마(사용자 지정 2026-11-06)
+- [x] 명령 팔레트 Ctrl+Shift+P(맥 ⌘⇧P, 제목 줄 ⌘ 단추) — 한 칸에서 찾아 실행, 묶음: 지금 작업대·DB 작업대·서버·DB 연결(서버 카드/기본 계정으로 접속/"서버명 › 계정"/서버 설정)·열린 탭·최근 파일·앱(화면 이동·설정 각 묶음·새 연결·가져오기·테마·터미널 색·업데이트 확인), 띄어 쓴 낱말 모두 맞기·초성(사전과 같은 코드, src/lib/hangul.ts), 단축키 표시, ↑↓ PgUp/PgDn Enter Esc, 최근 실행 위로(palette.recent). 터미널·편집기보다 먼저 잡아 셸에 ^P 가 가지 않음. Ctrl+K(홈에서 연결 찾기)는 그대로 — 겹치지 않음
+- [x] 등록 구조 src/lib/commands.ts — registerCommands(scope, 목록|함수)·useCommands(scope, 켜짐, 함수)·openPalette, 작업대는 앞에 보일 때만 자기 명령(파일 빠른 열기·새 터미널·나누기·동시 입력·칸 옮기기·잠금·기본 배치·칸 열기·자원·전송·동기화·포워딩·tmux·sudo·root 셸·관리자 셸·도움말)과 최근 파일(서버별 15개, recent.files.*)
+- [ ] DB 작업대 명령 등록(DbWorkbench 에서 useCommands("db", active, …) — 다른 작업과 겹쳐 이번엔 API 만)
+- [x] F1 단축키 도움말에 앱 단축키(팔레트·Ctrl+T·W·K·B)
+- [x] 설정 › 화면: 앱 테마(시스템 따라·밝게·어둡게, html[data-theme] — CSS 는 :root + 다크 미디어(:not([data-theme=light])) + [data-theme=dark] 짝, OS 창 바탕도 setTheme), 첫 화면 번쩍임 막기(웹 저장소에 마지막 값)
+- [x] 터미널 색 구성 8개(기본=앱 테마 따라, Solarized Dark·Light, One Dark, Dracula, Nord, Gruvbox Dark, GitHub Light) 미리보기 카드, 열린 터미널·tail 에 바로(options.theme·바탕)
+- [x] 서버별 터미널 색 덮어쓰기(서버 설정 › 터미널 색 구성, term.scheme.byProfile), 설정에서 모두 지우기
+- [x] 편집기 강조 색 미리보기(--syn-* 는 앱 테마의 밝은·어두운 짝), 글꼴: 터미널·편집기 글꼴 이름(목록·직접 넣기)·크기·줄 간격 — 편집기는 CSS 변수(--editor-*)라 SQL·비교 편집기까지, 바꾸면 열린 편집기 다시 재기
+- [ ] 실제 앱(Tauri)에서 확인: Mica 바탕이 강제 테마를 따르는지(core:window:allow-set-theme 권한 추가), 맥 vibrancy, 터미널 WebGL 렌더러 색 바뀜 — 이번엔 가짜 백엔드 브라우저로만 봄
+
+## 서버 도구 칸 5종(사용자 지정 2026-11-06)
+- [x] 바탕 명령(src-tauri/src/srvtools.rs): srv_run(종료 코드·출력·오류, sudo·시간 제한, 늘 sh -c), srv_stream_open/close(감시 셸 — 닫으면 채널 입력 EOF → 프로세스 묶음째 끝냄, 출력 없는 명령도 바로 멈춤, sudo 포함), local_grep(내 PC 찾기·묶음 전송·취소, EUC-KR 등 판별), web_forward_open/list/close(저장 안 하는 잠깐 포워딩, 같은 포트 번호 우선) — 시험 sshd·systemd 컨테이너로 실행·sudo·닫힘(남은 프로세스 0)·HTTP 왕복 확인
+- [x] 서비스 칸(panels/ServicesPanel): 목록(실패 먼저·상태별 묶기·거르기·부팅 켜짐), 상세(메모리·CPU·PID·의존 칩·systemctl status), 시작·중지·재시작·reload·켜기·끄기·daemon-reload(위험은 확인, ssh 서비스 경고), journal 실시간(줄 수·우선순위·찾기·맞는 줄만·멈춤·권한 없으면 sudo 로 보기), systemd 없으면 안내 — systemd 컨테이너에서 명령·파싱 확인
+- [x] Docker 칸(panels/DockerPanel): 컨테이너(이름·이미지·상태·포트·만든 지·CPU/메모리)·실행 중/전체·compose 묶음·로그 실시간·셸(onOpenTerminal)·시작/중지/재시작/삭제(확인)·이미지·system df, 권한 없으면 sudo(계정 설정)·안내, podman — docker:dind 에서 명령 출력·권한 거절 문구 확인(podman 은 못 봄)
+- [x] 파일 내용 찾기(panels/ContentSearch): 낱말·정규식·대소문자·이름 거르기·건너뛸 폴더·깊이·크기·sudo, 서버 rg(없으면 find+grep -Z) 흘려 받기, 파일별 묶음·일치 강조·onOpenFile(path, line) — rg·grep 둘 다 컨테이너에서 확인
+- [x] 웹 포트(panels/WebPortsPanel + openServerPort 함수): ss→netstat→/proc/net/tcp, 프로세스 이름(sudo 로 모두), curl·wget 로 HTTP/HTTPS 확인, 브라우저로 열기·열린 터널 목록·닫기 — 세 경로 파싱·확인 스크립트 확인
+- [x] DB 활동(panels/DbActivityPanel): 세션(오래 걸린 순·쉬는 세션 숨김)·막는 관계 나무·자동 새로 고침·쿼리 멈추기·연결 끊기(확인)·고른 세션 잠금 — PG 18·MariaDB 11 로 실제 막힘 만들어 확인(MariaDB 는 INNODB_LOCK_WAITS 로 물러남)
+- [ ] 작업대·DB 작업대에 붙이기(칸 등록·메뉴) — 붙이는 쪽 작업
+- [ ] 실제 앱 화면에서 눌러 보기(이번엔 명령·파싱만), SQL Server·Oracle·MySQL 8·podman 실물 확인
+
+## 서버 경로 여럿·망 따라 고르기·점프 여러 단계·프록시·접속 진단(사용자 지정 2026-11-06)
+- [x] 저장: route 표(마이그레이션 11) — 서버마다 경로 여럿(이름·주소·포트·점프 단계 JSON·프록시 http/socks5/command·프록시 계정·망 조건·뒤집기·마지막 접속), 지금까지의 host·port·jump_id 를 첫 경로로 옮김. profile 의 host·port·jump_id 는 첫 경로와 같게 둠(예전 판 호환)
+- [x] 명령: route_list·route_save(프록시 암호는 OS 저장소 "route:{id}:proxy")·route_delete(마지막 하나는 못 지움)·route_reorder·net_info_get·ssh_conn_route·ssh_diagnose·import_routes
+- [x] 망 판별(route.rs): Windows GetAdaptersAddresses(기본 게이트웨이·DNS 접미사)·WLAN API(Wi-Fi 이름, 위치 권한 없으면 안내), macOS route·scutil·ipconfig getsummary, 그 밖 ip route·resolv.conf·nmcli. 호스트:포트 닿음은 TCP 300ms. 못 읽는 값은 화면에서 숨기거나 "알 수 없음"
+- [x] 접속 순서: 조건 맞는 경로 → 조건 없는 경로 → 알 수 없는 경로, 안 맞는 경로는 건너뜀(모두 안 맞으면 차례로 다). 경로가 여럿이면 경로마다 기다리기(기본 4초, 서버 설정에서 3·4·5·8·10초), 하나면 12초
+- [x] 길을 못 찾은 오류(이름 풀이·TCP·프록시·점프·인사 시간 초과)만 다음 경로로, 호스트 키·인증·구형 알고리즘 오류는 멈춤. 모두 실패하면 경로별 오류 목록
+- [x] 호스트 키는 경로 주소마다 고정, 그 주소에 고정한 키가 없어도 같은 서버 다른 경로에서 고정한 키와 같으면 믿음. 지문 확인 뒤에는 그 경로로만 다시(routeId)
+- [x] 점프 여러 단계: 단계마다 다른 서버·계정(비우면 기본), 고정 키·저장 비밀만(묻지 않음), direct-tcpip 를 이어 붙임, 다섯 단계까지, 자기 자신·같은 서버 두 번(순환)은 저장·접속 둘 다에서 막음
+- [x] 프록시: HTTP CONNECT(Basic 계정)·SOCKS5(계정 RFC1929, 이름은 프록시가 풀이)·ProxyCommand(%h %p %r %%, cmd /C·sh -c, 창 숨김, 연결이 끝나면 프로세스 끝냄). 점프가 있으면 첫 점프 서버까지의 구간에
+- [x] 작업대 연결·DB SSH 터널·포트 포워딩·tmux 다시 연결이 모두 같은 경로 규칙(open_authed 하나)
+- [x] 붙은 경로 표시: 탭(경로 이름 알약, 툴팁에 앞서 실패한 경로)·터미널 상태 줄(앞 경로에서 넘어오면 주황)·서버 카드(경로 목록·지금 연결·지난번·망 조건)
+- [x] 서버 설정의 "경로" 칸: 위아래 옮기기·고치기·지우기·추가, 경로 시트(점프 단계 고르기와 길 그림·프록시·명령·망 조건과 "지금 PC" 값 넣기·거꾸로)
+- [x] 가져오기(~/.ssh/config): ProxyJump(쉼표 여러 단계·user@host:port·ssh://) → 첫 경로의 점프 단계(같은 이름·주소 서버, 없으면 새로 만듦·순환 뺌), ProxyCommand → 프록시 명령
+- [x] 접속 진단(서버 카드·접속 실패 화면 [진단]): 경로마다 망 조건 → 이름 풀이(시간·IP) → TCP 3회 평균(핑 대신) → 프록시 통과 → 점프 단계 → 점프 서버→대상 → SSH 인사(버전) → 키 교환·호스트 키 → 인증, ✓/✗·쉬운 원인(포트 닫힘·방화벽·사내망 전용·사설 IP·구형 호환 단계·AllowTcpForwarding 등)·결과 복사. 처음 보는 키면 인증은 시험 안 함, 저장한 비밀만·지우지 않음
+- [x] 로컬 Docker 로 확인(임시 컨테이너 rbshell-route-*): 막힌 주소·닫힌 포트 실패 → 점프 2단(A 공개 → B·대상 내부망) 성공, SOCKS5(계정)·HTTP·ProxyCommand(docker exec 브리지) 경로, 망 조건 건너뜀, 작업대 SFTP 연결·DB 터널이 같은 경로로, 진단 6경로 결과
+- [ ] 실제 앱(Tauri) 화면에서 눌러 보기 — 이번엔 가짜 백엔드로 화면만, 백엔드는 시험으로
+- [ ] macOS·Linux 망 판별 실물 확인(명령 결과 파싱만 작성), Windows 11 24H2 Wi-Fi 위치 권한 켠 상태 확인
+- [ ] 같은 서버를 경로마다 다른 호스트 키 주소로 고정하는 방식 — 서버 단위 고정으로 바꿀지 결정

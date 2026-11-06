@@ -1,8 +1,10 @@
-import { ArrowRightLeft, Database, Fingerprint, KeyRound, Layers, Pencil, Play, Plus, Server, Settings2, ShieldAlert, Star, Trash2 } from "lucide-react";
+import { ArrowRightLeft, Database, Fingerprint, KeyRound, Layers, Pencil, Play, Plus, Server, Settings2, ShieldAlert, Star, Stethoscope, Trash2, Wifi } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { type Account, accountName, api, type Profile } from "../lib/ipc";
+import { type Account, accountName, api, type Profile, type Route, routes as routeApi } from "../lib/ipc";
 import { AccountEditor, type AccountDraft, AUTH_LABEL, blankAccount, draftOf, SUDO_LABEL } from "./AccountEditor";
+import { DiagSheet } from "./DiagSheet";
 import { ForwardRules } from "./ForwardPanel";
+import { condText, routeName, routeSummary } from "./RouteEditor";
 
 /** 마지막 접속(밀리초) → "3시간 전" */
 export function agoMs(t?: number | null): string {
@@ -34,8 +36,11 @@ export function ServerCard({
 	onChanged,
 	via,
 	openConn,
+	servers = [],
 }: {
 	profile: Profile;
+	/** 경로 줄임에 쓸 서버 목록(점프 단계 이름) */
+	servers?: Profile[];
 	/** DB: 거쳐 가는 SSH 서버 이름(SSH 터널) */
 	via?: string;
 	/** SSH: 지금 이 서버에 열린 연결(포워딩을 바로 켜고 끄기) */
@@ -52,7 +57,25 @@ export function ServerCard({
 	const [hostKey, setHostKey] = useState<{ algorithm: string; fingerprint: string } | null>(null);
 	const [err, setErr] = useState("");
 	const [showFwd, setShowFwd] = useState(false);
+	const [routeList, setRouteList] = useState<Route[]>([]);
+	const [nowRoute, setNowRoute] = useState<number | null>(null);
+	const [diag, setDiag] = useState(false);
 	const listRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (p.kind !== "ssh" || p.id == null) return;
+		void routeApi
+			.list(p.id)
+			.then(setRouteList)
+			.catch(() => setRouteList([]));
+	}, [p.kind, p.id, p.host, p.port]);
+	useEffect(() => {
+		if (openConn == null) return setNowRoute(null);
+		void routeApi
+			.ofConn(openConn)
+			.then((r) => setNowRoute(r?.id ?? null))
+			.catch(() => setNowRoute(null));
+	}, [openConn]);
+	const lastRoute = routeList.reduce<Route | null>((b, r) => ((r.lastOkAt ?? 0) > (b?.lastOkAt ?? 0) ? r : b), null);
 	useEffect(() => {
 		if (p.kind !== "ssh") return;
 		void api
@@ -121,7 +144,12 @@ export function ServerCard({
 							)}
 						</div>
 					</div>
-					<button type="button" className="btn ghost" title="서버 설정(주소·묶음·메모·점프·계정)" onClick={onEditServer}>
+					{p.kind === "ssh" && p.id != null && (
+						<button type="button" className="btn ghost" title="경로마다 이름 풀이·TCP·SSH 인사·호스트 키·인증까지 어디서 막히는지 봅니다(고른 계정으로)" onClick={() => setDiag(true)}>
+							<Stethoscope size={14} /> 진단
+						</button>
+					)}
+					<button type="button" className="btn ghost" title="서버 설정(주소·경로·묶음·메모·점프·계정)" onClick={onEditServer}>
 						<Settings2 size={14} /> 서버 설정
 					</button>
 				</div>
@@ -135,6 +163,23 @@ export function ServerCard({
 					)}
 				</div>
 
+				{p.kind === "ssh" && routeList.length > 1 && (
+					<div className="sc-routes" aria-label="경로">
+						{routeList.map((r, i) => (
+							<div key={r.id} className={`sc-route${nowRoute === r.id ? " now" : ""}`} title={r.lastOkAt ? `이 경로로 마지막 접속 ${agoMs(r.lastOkAt)}` : "아직 이 경로로 붙은 적이 없습니다"}>
+								<span className="rt-n">{i + 1}</span>
+								<b>{routeName(r, i)}</b>
+								<span className="rt-sum">{routeSummary(r, servers)}</span>
+								{r.condKind && (
+									<span className="badge" title={condText(r)}>
+										<Wifi size={10} /> {condText(r)}
+									</span>
+								)}
+								{nowRoute === r.id ? <span className="badge">지금 연결</span> : lastRoute?.id === r.id ? <span className="badge">지난번</span> : null}
+							</div>
+						))}
+					</div>
+				)}
 				<div className="sc-acc-head">
 					<b>계정</b> <small>{accounts.length}</small>
 					<span style={{ flex: 1 }} />
@@ -259,6 +304,7 @@ export function ServerCard({
 					</button>
 				</div>
 			</div>
+			{diag && p.id != null && <DiagSheet profileId={p.id} accountId={accounts[sel]?.id} title={`${p.name}${accounts[sel] ? ` · ${accounts[sel].username}` : ""}`} onClose={() => setDiag(false)} />}
 			{editing && (
 				<AccountEditor
 					asSheet

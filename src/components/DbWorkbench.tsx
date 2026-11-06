@@ -19,12 +19,14 @@ import {
 import "dockview-react/dist/styles/dockview.css";
 import "../styles/db-extra.css";
 import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, KeyRound, LayoutTemplate, Lock, Play, PlayCircle, Search, Square, Table, WrapText } from "lucide-react";
+import { DbActivityPanel } from "./panels/DbActivityPanel";
 import { createContext, lazy, type ReactElement, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ComparePanel, HistoryPanel } from "./DbPanels";
 import { type ExplainOk, ExplainView } from "./DbExplain";
 import { ImportCsvSheet } from "./DbImport";
 import { type AskReq, AskSheet, BigEditSheet } from "./DbSheets";
 import { setOpenTx } from "../lib/dbTx";
+import { useCommands } from "../lib/commands";
 import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
 
 const ErdPanelLazy = lazy(() => import("./DbErd").then((m) => ({ default: m.ErdPanel })));
@@ -68,15 +70,19 @@ type QueryOk = {
 	rowCount: number;
 	affected?: number | null;
 	truncated: boolean;
+	/** 받는 중에 멈춤 — 받은 행은 결과에 남는다 */
+	stopped?: "cancelled" | "timeout" | "memory" | null;
 	ms: number;
 	firstRowMs?: number | null;
 	tx?: TxState;
 };
+/** 받는 중 알림(Rust db-rows-progress) — stream 은 실행마다 화면이 고른 번호 */
+type RowsProgress = { stream: number; resultId: number; columns: GridCol[]; rowCount: number; ms: number; firstRowMs?: number | null };
 type TxState = { inTx: boolean; stmts: number; manual: boolean };
 type DbError = { code: string; message: string };
 /** 표 보기 — 서버 쪽 WHERE·정렬·쪽 나누기 */
 type Source = { schema: string | null; table: string; where?: string; order?: { col: string; desc: boolean } | null; offset?: number; limit?: number };
-type ResultParams = { sql: string; state: "running" | "ok" | "error"; ok?: QueryOk; error?: DbError; at: number; source?: Source; tool?: string };
+type ResultParams = { sql: string; state: "running" | "streaming" | "ok" | "error"; ok?: QueryOk; error?: DbError; at: number; source?: Source; tool?: string };
 
 type Node = { name: string; kind: "schema" | "table" | "view" | "column"; detail?: string | null };
 
@@ -130,6 +136,8 @@ const ranField = StateField.define<DecorationSet>({
 	provide: (f) => EditorView.decorations.from(f),
 });
 const DbCtx = createContext<Ctx | null>(null);
+/** db_query 받는 중 알림 번호(앱 전체에서 하나씩 늘림) */
+let streamSeq = 0;
 const useDb = () => useContext(DbCtx) as Ctx;
 
 /** 연결마다 하나 — 열어 둔 SQL 편집기들이 같은 이름 목록을 함께 쓴다 */
@@ -166,7 +174,8 @@ function sqlLit(val: string | null, kind?: string) {
 }
 
 const db = {
-	query: (conn: number, sql: string, maxRows: number, timeoutMs?: number) => invoke<QueryOk>("db_query", { conn, sql, maxRows, timeoutMs: timeoutMs || null }),
+	query: (conn: number, sql: string, maxRows: number, timeoutMs?: number, stream?: number) =>
+		invoke<QueryOk>("db_query", { conn, sql, maxRows, timeoutMs: timeoutMs || null, stream: stream ?? null }),
 	cancel: (conn: number) => invoke<void>("db_cancel", { conn }),
 	rows: (result: number, from: number, to: number) => invoke<(string | null)[][]>("db_rows", { result, from, to }),
 	export: (result: number, format: string, path: string, insertPrefix?: string, mysql?: boolean) => invoke<number>("db_export", { result, format, path, insertPrefix: insertPrefix ?? null, mysql: mysql ?? null }),
@@ -316,6 +325,14 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const [busy, setBusy] = useState(false);
 	const ok = p.ok;
 	const rid = ok?.resultId ?? null;
+	// 받는 중 — 표는 받은 만큼 늘어나고, 정렬·거르기·내보내기·고치기는 다 받은 뒤에
+	const streaming = p.state === "streaming";
+	const [, setClock] = useState(0);
+	useEffect(() => {
+		if (!streaming) return;
+		const t = window.setInterval(() => setClock((n) => n + 1), 200);
+		return () => window.clearInterval(t);
+	}, [streaming]);
 	// 받은 행 정렬·거르기(서버에 다시 묻지 않음) — 보이는 행 수와 다시 그리기 번호
 	const [sort, setSort] = useState<{ col: number; desc: boolean } | null>(null);
 	const [filter, setFilter] = useState("");
@@ -367,12 +384,10 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	if (p.state === "running")
 		return (
 			<div className="dock-watermark">
-				<p>실행 중…</p>
-				{ctx.engine !== "mssql" && (
-					<button type="button" className="btn" onClick={() => void db.cancel(ctx.conn)}>
-						<Square size={12} /> 취소
-					</button>
-				)}
+				<p>실행 중… 첫 행을 기다리는 중</p>
+				<button type="button" className="btn" onClick={() => void db.cancel(ctx.conn)} title="실행 중인 문장 취소 — Esc">
+					<Square size={12} /> 취소
+				</button>
 			</div>
 		);
 	if (p.state === "error")
@@ -402,8 +417,10 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const src = p.source;
 	const metaOf = (ci: number) => metas?.find((m) => m.name.toLowerCase() === cols[ci]?.name.toLowerCase());
 	const pkIdx = metas ? metas.filter((m) => m.pk).map((m) => cols.findIndex((c) => c.name.toLowerCase() === m.name.toLowerCase())) : [];
-	const canEdit = !!metas && pkIdx.length > 0 && pkIdx.every((i) => i >= 0);
-	const why = ctx.readOnly
+	const canEdit = !streaming && !!metas && pkIdx.length > 0 && pkIdx.every((i) => i >= 0);
+	const why = streaming
+		? "받는 중 — 다 받은 뒤에 고칠 수 있습니다"
+		: ctx.readOnly
 		? "읽기 전용 연결이라 고칠 수 없습니다"
 		: !src
 			? "표 보기(객체 트리 › 데이터 보기)에서만 고칠 수 있습니다"
@@ -646,8 +663,10 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 		setAdded((prev) => prev.filter((_, i) => !picked.includes(total + i)));
 	}
 
+	const STREAM_WAIT = "받는 중 — 정렬·거르기·내보내기는 다 받은 뒤에 됩니다(취소하면 받은 행으로)";
 	async function applyView(next: { sort: { col: number; desc: boolean } | null; filter: string }) {
 		if (!rid || !ok) return;
+		if (streaming) return void setMsg(STREAM_WAIT);
 		if (changeCount > 0) {
 			setMsg("고친 것을 반영하거나 되돌린 뒤에 정렬·거를 수 있습니다");
 			return;
@@ -657,6 +676,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 		setViewSeq((x) => x + 1);
 	}
 	const onSort = (c: number) => {
+		if (streaming) return void setMsg(STREAM_WAIT);
 		// 표 보기(쪽 나누기)면 서버 ORDER BY 로 — 받은 쪽만 정렬하면 순서가 틀린다
 		if (paged && src) {
 			if (changeCount > 0) return void setMsg("고친 것을 반영하거나 되돌린 뒤에 정렬할 수 있습니다");
@@ -689,6 +709,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 
 	async function doExport(format: "csv" | "tsv" | "json" | "xlsx") {
 		if (!rid) return;
+		if (streaming) return void setMsg(STREAM_WAIT);
 		const path = await saveDialog({ defaultPath: `result.${format}`, filters: [{ name: format === "xlsx" ? "엑셀" : format.toUpperCase(), extensions: [format] }] });
 		if (!path) return;
 		if (format === "xlsx") {
@@ -828,12 +849,34 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 				</div>
 			)}
 			<div className="statusbar">
-				<span className="ok">
-					{rid ? (viewCount != null ? `${viewCount.toLocaleString()} / ${ok.rowCount.toLocaleString()}행` : `${ok.rowCount.toLocaleString()}행`) : "완료"}
-					{ok.truncated ? " (상한에서 멈춤)" : ""}
-				</span>
-				<span>{ok.ms.toLocaleString()} ms</span>
-				{ok.firstRowMs != null && <span>첫 행 {ok.firstRowMs} ms</span>}
+				{streaming ? (
+					<span className="db-streaming" title="받은 만큼 표가 늘어납니다 — 스크롤해서 보세요">
+						<span className="db-streaming-dot" />
+						받는 중 {ok.rowCount.toLocaleString()}행 · {((Date.now() - p.at) / 1000).toFixed(1)}초
+						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void db.cancel(ctx.conn)} title="그만 받기 — 받은 행은 남습니다(Esc)">
+							<Square size={10} /> 취소
+						</button>
+					</span>
+				) : (
+					<>
+						<span className={ok.stopped ? "db-stopped" : "ok"} title={ok.stopped === "memory" ? "결과 하나가 쓸 메모리 어림(512MB)을 넘어 멈췄습니다 — 조건·LIMIT 으로 줄여 보세요" : undefined}>
+							{ok.stopped === "cancelled"
+								? `취소됨 · 받은 ${ok.rowCount.toLocaleString()}행`
+								: ok.stopped === "timeout"
+									? `시간 상한 · 받은 ${ok.rowCount.toLocaleString()}행`
+									: ok.stopped === "memory"
+										? `메모리 상한에서 멈춤 · 받은 ${ok.rowCount.toLocaleString()}행`
+										: rid
+											? viewCount != null
+												? `${viewCount.toLocaleString()} / ${ok.rowCount.toLocaleString()}행`
+												: `${ok.rowCount.toLocaleString()}행`
+											: "완료"}
+							{ok.truncated && ok.stopped !== "memory" ? " (상한에서 멈춤)" : ""}
+						</span>
+						<span>{ok.ms.toLocaleString()} ms</span>
+					</>
+				)}
+				{ok.firstRowMs != null && <span title="문장을 보낸 뒤 첫 행이 올 때까지">보냄→첫 행 {ok.firstRowMs.toLocaleString()} ms</span>}
 				{rid && src && <span title={why ?? "두 번 누르기·F2 로 고치기, Shift+Enter 크게 고치기, Delete 로 행 지우기, 우클릭으로 행 추가"}>{why ? `🔒 ${why}` : canEdit ? "✎ 고칠 수 있음" : ""}</span>}
 				{paged && (
 					<span className="page-bar">
@@ -884,7 +927,8 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 							<Search size={11} />
 							<input
 								value={filter}
-								placeholder={paged ? "이 쪽에서 거르기" : "결과에서 거르기"}
+								disabled={streaming}
+								placeholder={streaming ? "다 받은 뒤 거르기" : paged ? "이 쪽에서 거르기" : "결과에서 거르기"}
 								spellCheck={false}
 								onChange={(e) => {
 									const v = e.target.value;
@@ -900,16 +944,23 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 								}}
 							/>
 						</label>
-						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void doExport("csv")}>
+						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={streaming} title={streaming ? STREAM_WAIT : undefined} onClick={() => void doExport("csv")}>
 							<Download size={12} /> CSV
 						</button>
-						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void doExport("tsv")}>
+						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={streaming} title={streaming ? STREAM_WAIT : undefined} onClick={() => void doExport("tsv")}>
 							TSV
 						</button>
-						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void doExport("json")}>
+						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={streaming} title={streaming ? STREAM_WAIT : undefined} onClick={() => void doExport("json")}>
 							JSON
 						</button>
-						<button type="button" className="btn ghost" style={{ height: 20 }} title="엑셀(xlsx) — 보이는 행(정렬·거르기 적용)" onClick={() => void doExport("xlsx")}>
+						<button
+							type="button"
+							className="btn ghost"
+							style={{ height: 20 }}
+							disabled={streaming}
+							title={streaming ? STREAM_WAIT : "엑셀(xlsx) — 보이는 행(정렬·거르기 적용)"}
+							onClick={() => void doExport("xlsx")}
+						>
 							엑셀
 						</button>
 					</>
@@ -1369,11 +1420,31 @@ function withLimit(engine: string, sql: string, n: number): string {
 	return sql;
 }
 
+/** 지금 도는 쿼리·잠금·막는 관계 — 같은 연결을 쓰므로 쿼리 실행 중·트랜잭션 안에서는 기다렸다 읽는다 */
+function ActivityDock(props: IDockviewPanelProps) {
+	const ctx = useDb();
+	const [visible, setVisible] = useState(props.api.isVisible);
+	useEffect(() => {
+		const d = props.api.onDidVisibilityChange((e) => setVisible(e.isVisible));
+		return () => d.dispose();
+	}, [props.api]);
+	const busy = useRef(false);
+	busy.current = ctx.running || ctx.inTx;
+	const runSql = useCallback(
+		async (sql: string) => {
+			if (busy.current) throw new Error(ctx.inTx ? "이 연결에 열린 트랜잭션이 있어 잠깐 멈췄습니다 — 커밋·되돌리기 뒤에 다시 읽습니다" : "쿼리가 실행 중이라 끝난 뒤 다시 읽습니다");
+			return queryRows(ctx.conn, sql, 2000);
+		},
+		[ctx.conn, ctx.inTx],
+	);
+	return <DbActivityPanel engine={ctx.engine} runSql={runSql} visible={visible} />;
+}
+
 function ExplainDock(props: IDockviewPanelProps<{ ok: ExplainOk; sql: string; analyze: boolean }>) {
 	return <ExplainView ok={props.params.ok} sql={props.params.sql} analyze={props.params.analyze} />;
 }
 
-const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock, messages: MessagesPanel, explain: ExplainDock };
+const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock, messages: MessagesPanel, explain: ExplainDock, activity: ActivityDock };
 const FIXED = /^(objects|sql-\d+)$/;
 /** 배치를 잠그면 닫기를 숨기는 구조 칸 */
 const STRUCT = /^(objects|sql-1|res-\d+|messages)$/;
@@ -1538,6 +1609,12 @@ export function DbWorkbench({
 		}, 30_000);
 		return () => window.clearInterval(t);
 	}, [txState.inTx, conn, showNotice]);
+	// 받는 중 알림 — 실행마다 stream 번호로 그 결과 탭을 늘린다(끝난 뒤 늦게 온 알림은 버린다)
+	const streams = useRef(new Map<number, (p: RowsProgress) => void>());
+	useEffect(() => {
+		const un = listen<RowsProgress>("db-rows-progress", (e) => streams.current.get(e.payload.stream)?.(e.payload));
+		return () => void un.then((f) => f());
+	}, []);
 	// 연결 끊김
 	useEffect(() => {
 		const un = listen<{ conn: number }>("db-closed", (e) => {
@@ -1658,12 +1735,39 @@ export function DbWorkbench({
 				}
 				panel.api.setTitle(stmts.length > 1 ? `결과 ${i + 1}` : "결과");
 				if (i === 0) panel.api.setActive();
+				const token = ++streamSeq;
+				const tab = panel;
+				streams.current.set(token, (pr) =>
+					tab.api.updateParameters({
+						...params,
+						state: "streaming",
+						ok: { resultId: pr.resultId, columns: pr.columns, rowCount: pr.rowCount, truncated: false, ms: pr.ms, firstRowMs: pr.firstRowMs },
+					}),
+				);
 				try {
-					const ok = await db.query(conn, stmts[i], maxRef.current, timeoutRef.current);
+					const ok = await db.query(conn, stmts[i], maxRef.current, timeoutRef.current, token).finally(() => streams.current.delete(token));
 					if (ok.tx) setTxState(ok.tx);
 					panel.api.updateParameters({ ...params, state: "ok", ok });
-					addMsg({ at: Date.now(), sql: stmts[i], ok: true, ms: ok.ms, text: ok.resultId ? `${ok.rowCount.toLocaleString()}행${ok.truncated ? "(상한에서 멈춤)" : ""}` : ok.affected != null ? `${ok.affected.toLocaleString()}행 반영` : "완료" });
+					const rows = `${ok.rowCount.toLocaleString()}행`;
+					const text = ok.stopped
+						? `${ok.stopped === "cancelled" ? "취소됨" : ok.stopped === "timeout" ? "시간 상한" : "메모리 상한에서 멈춤"} · 받은 ${rows}`
+						: ok.resultId
+							? `${rows}${ok.truncated ? "(상한에서 멈춤)" : ""}`
+							: ok.affected != null
+								? `${ok.affected.toLocaleString()}행 반영`
+								: "완료";
+					addMsg({ at: Date.now(), sql: stmts[i], ok: !ok.stopped || ok.stopped === "memory", ms: ok.ms, text });
 					if (!tool) void invoke("history_add", { scope: historyScope, item: { sql: stmts[i], ms: ok.ms, rows: ok.rowCount, ok: true } }).then(() => window.dispatchEvent(new Event("rb-history")));
+					if (ok.stopped === "memory") showNotice(`결과가 너무 커서(메모리 어림 512MB) ${rows}에서 멈췄습니다 — 조건이나 LIMIT 으로 줄여 보세요`, true);
+					// 취소·시간 상한이면 남은 문장은 실행하지 않는다(받은 행은 이 탭에 남는다)
+					if (ok.stopped === "cancelled" || ok.stopped === "timeout") {
+						for (const rest of d.panels.filter((p) => p.id.startsWith("res-") && Number(p.id.slice(4)) > i + 1)) {
+							const old = (rest.params as ResultParams | undefined)?.ok?.resultId;
+							if (old) void db.closeResult(old);
+							d.removePanel(rest);
+						}
+						break;
+					}
 				} catch (e) {
 					const err = e as DbError;
 					panel.api.updateParameters({ ...params, state: "error", error: err });
@@ -1683,7 +1787,7 @@ export function DbWorkbench({
 			lastInput.current = Date.now();
 			currentEditor()?.focus();
 		},
-		[conn, historyScope, engine, addMsg],
+		[conn, historyScope, engine, addMsg, showNotice],
 	);
 
 	const openTable = useCallback(
@@ -1809,6 +1913,27 @@ export function DbWorkbench({
 		const p = d.panels.find((x) => (x.id.startsWith("res-") || x.id === "explain") && x.api.isVisible) ?? d.activePanel;
 		if (p) d.maximizeGroup(p);
 	};
+
+	// 명령 팔레트(Ctrl+Shift+P) — 이 DB 작업대가 앞에 있을 때만
+	useCommands(`db:${conn}`, active, () => [
+		{ id: "db.runCur", group: "db", title: "SQL 실행(커서 문장)", keys: "Mod+Enter", run: () => {
+			const v = lastEditor.current ? editors.current.get(lastEditor.current) : undefined;
+			if (v) run(pickStatements(v, false));
+		} },
+		{ id: "db.runAll", group: "db", title: "SQL 전체 실행", keys: "Shift+Mod+Enter", run: () => {
+			const v = lastEditor.current ? editors.current.get(lastEditor.current) : undefined;
+			if (v) run(pickStatements(v, true));
+		} },
+		{ id: "db.cancel", group: "db", title: "실행 멈추기", keys: "Esc", run: () => void db.cancel(conn), disabled: !running },
+		{ id: "db.newSql", group: "db", title: "새 SQL 탭", run: () => openSql("", undefined) },
+		{ id: "db.explain", group: "db", title: "실행 계획(커서 문장)", keys: "Mod+E", run: () => void explain(false) },
+		{ id: "db.find", group: "db", title: "객체 찾기", keys: "Alt+O", run: () => void findObjects() },
+		{ id: "db.history", group: "db", title: "쿼리 기록", keys: "Alt+H", run: () => openPanel("history", "history", "기록", {}) },
+		{ id: "db.activity", group: "db", title: "실행 중 쿼리·잠금 감시", hint: "막는 관계·쿼리 끊기", run: () => openPanel("activity", "activity", "활동", {}) },
+		{ id: "db.sizes", group: "db", title: "표 크기", run: () => runTool("sizes"), disabled: !toolSql(engine, "sizes") },
+		{ id: "db.max", group: "db", title: "결과 최대화·되돌리기", keys: "Alt+M", run: toggleMax },
+		{ id: "db.lock", group: "db", title: locked ? "배치 잠금 풀기" : "배치 잠그기", keys: "Mod+Alt+L", run: () => setLocked(!locked) },
+	]);
 
 	const layoutKey = "layout.db";
 	const onReady = (e: DockviewReadyEvent) => {
@@ -2095,6 +2220,7 @@ export function DbWorkbench({
 								{ label: "표 크기", run: () => runTool("sizes"), disabled: !toolSql(engine, "sizes") },
 								{ label: "세션(우클릭으로 멈추기·끊기)", run: () => runTool("sessions"), disabled: !toolSql(engine, "sessions") },
 								{ label: "잠금 기다림", run: () => runTool("locks"), disabled: !toolSql(engine, "locks") },
+								{ label: "실행 중 쿼리·잠금 감시(자동 새로 고침)", run: () => openPanel("activity", "activity", "활동", {}) },
 								{ label: "읽기 전용 계정 만들기 SQL", run: () => readOnlyUserSql(engine, null) && openSql(readOnlyUserSql(engine, null) as string, "읽기 전용 계정"), disabled: !readOnlyUserSql(engine, null) },
 								{ sep: true },
 								{ label: "쿼리 기록  Alt+H", run: () => openPanel("history", "history", "기록", {}) },

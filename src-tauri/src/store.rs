@@ -120,6 +120,35 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
      );
      CREATE INDEX forward_profile ON forward(profile_id);",
+    // 11: SSH 서버의 경로 여럿(주소·점프 단계·프록시·망 조건) — 접속 때 순서대로 시도한다.
+    //     지금까지의 주소·점프 호스트를 첫 경로로 옮긴다. profile 의 host·port·jump_id 는 첫 경로와 같게 둔다(예전 판 호환).
+    "CREATE TABLE route (
+        id INTEGER PRIMARY KEY,
+        profile_id INTEGER NOT NULL REFERENCES profile(id) ON DELETE CASCADE,
+        ord INTEGER NOT NULL DEFAULT 0,
+        label TEXT,
+        host TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        jumps TEXT NOT NULL DEFAULT '[]',
+        proxy_kind TEXT CHECK (proxy_kind IS NULL OR proxy_kind IN ('http','socks5','command')),
+        proxy_host TEXT,
+        proxy_port INTEGER,
+        proxy_user TEXT,
+        proxy_command TEXT,
+        proxy_secret_saved_at INTEGER,
+        cond_kind TEXT CHECK (cond_kind IS NULL OR cond_kind IN ('gateway','dns','wifi','reach')),
+        cond_value TEXT,
+        cond_not INTEGER NOT NULL DEFAULT 0,
+        last_ok_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+     );
+     CREATE INDEX route_profile ON route(profile_id, ord);
+     INSERT INTO route (profile_id, ord, host, port, jumps, created_at, updated_at)
+        SELECT id, 0, host, port,
+               CASE WHEN jump_id IS NULL THEN '[]' ELSE '[{\"profileId\":' || jump_id || '}]' END,
+               created_at, updated_at
+        FROM profile WHERE kind = 'ssh';",
 ];
 
 pub struct Store {
@@ -725,6 +754,9 @@ impl Store {
                 if n == 0 {
                     insert_default_account(&conn, id, p, auth, key_path.as_deref(), t)?;
                 }
+                if p.kind == "ssh" {
+                    sync_first_route(&conn, id, &host, p.port, p.jump_id.filter(|j| *j != id), t)?;
+                }
                 Ok(id)
             }
             None => {
@@ -739,6 +771,9 @@ impl Store {
                 .map_err(|e| e.to_string())?;
                 let id = tx.last_insert_rowid();
                 insert_default_account(&tx, id, p, auth, key_path.as_deref(), t)?;
+                if p.kind == "ssh" {
+                    sync_first_route(&tx, id, &host, p.port, p.jump_id, t)?;
+                }
                 tx.commit().map_err(|e| e.to_string())?;
                 Ok(id)
             }
@@ -751,6 +786,11 @@ impl Store {
         for aid in &ids {
             crate::secrets::forget(&crate::secrets::account_key(*aid));
             crate::secrets::forget(&crate::secrets::sudo_key(*aid));
+        }
+        for r in self.routes(id).unwrap_or_default() {
+            if let Some(rid) = r.id.filter(|_| r.proxy_secret_saved) {
+                crate::secrets::forget(&route_proxy_key(rid));
+            }
         }
         // 아직 옮기지 못한 예전 키도
         crate::secrets::forget(&format!("profile:{id}"));
@@ -1100,6 +1140,436 @@ pub fn forward_list(store: State<'_, Store>, profile_id: i64) -> Result<Vec<Forw
 #[tauri::command]
 pub fn forward_save(store: State<'_, Store>, f: Forward) -> Result<i64, String> {
     store.forward_save(&f)
+}
+
+// ── 경로(서버 주소 여럿) ─────────────
+
+/// 점프 단계 하나 — 거칠 SSH 서버와 그 서버의 계정(비우면 기본 계정)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Hop {
+    pub profile_id: i64,
+    #[serde(default)]
+    pub account_id: Option<i64>,
+}
+
+/// 서버에 닿는 길 하나 — 주소·포트(점프를 거치면 마지막 점프 서버에서 본 주소), 점프 단계, 첫 구간의 프록시, "이 망일 때만" 조건
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Route {
+    pub id: Option<i64>,
+    pub profile_id: i64,
+    #[serde(default)]
+    pub ord: i64,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub host: String,
+    pub port: u16,
+    /// 순서대로 거칠 SSH 서버(서버 A → 서버 B → 대상)
+    #[serde(default)]
+    pub jumps: Vec<Hop>,
+    /// 첫 구간을 거칠 프록시: http(CONNECT) · socks5 · command(ProxyCommand). 없으면 바로
+    #[serde(default)]
+    pub proxy_kind: Option<String>,
+    #[serde(default)]
+    pub proxy_host: Option<String>,
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
+    #[serde(default)]
+    pub proxy_user: Option<String>,
+    /// %h %p %r(사용자) %% 를 바꿔 실행 — 표준 입출력이 SSH 전송로
+    #[serde(default)]
+    pub proxy_command: Option<String>,
+    /// 읽기 전용 — 프록시 암호가 OS 저장소에 있는지
+    #[serde(default)]
+    pub proxy_secret_saved: bool,
+    /// 이 망일 때만: gateway(기본 게이트웨이 IP) · dns(DNS 접미사) · wifi(Wi-Fi 이름) · reach(호스트:포트가 닿음)
+    #[serde(default)]
+    pub cond_kind: Option<String>,
+    #[serde(default)]
+    pub cond_value: Option<String>,
+    /// 조건을 뒤집기(그 망이 아닐 때만)
+    #[serde(default)]
+    pub cond_not: bool,
+    /// 읽기 전용 — 이 경로로 마지막에 붙은 때
+    #[serde(default)]
+    pub last_ok_at: Option<i64>,
+}
+
+/// 경로의 프록시 암호 키(OS 저장소)
+pub fn route_proxy_key(route_id: i64) -> String {
+    format!("route:{route_id}:proxy")
+}
+
+const ROUTE_COLS: &str = "id, profile_id, ord, label, host, port, jumps, proxy_kind, proxy_host, proxy_port, proxy_user, proxy_command,
+    proxy_secret_saved_at, cond_kind, cond_value, cond_not, last_ok_at";
+
+fn route_row(r: &Row) -> rusqlite::Result<Route> {
+    let jumps: String = r.get(6)?;
+    Ok(Route {
+        id: r.get(0)?,
+        profile_id: r.get(1)?,
+        ord: r.get(2)?,
+        label: r.get(3)?,
+        host: r.get(4)?,
+        port: r.get(5)?,
+        jumps: serde_json::from_str(&jumps).unwrap_or_default(),
+        proxy_kind: r.get(7)?,
+        proxy_host: r.get(8)?,
+        proxy_port: r.get(9)?,
+        proxy_user: r.get(10)?,
+        proxy_command: r.get(11)?,
+        proxy_secret_saved: r.get::<_, Option<i64>>(12)?.is_some(),
+        cond_kind: r.get(13)?,
+        cond_value: r.get(14)?,
+        cond_not: r.get::<_, i64>(15)? != 0,
+        last_ok_at: r.get(16)?,
+    })
+}
+
+fn routes_of(conn: &Connection, profile_id: i64) -> rusqlite::Result<Vec<Route>> {
+    let mut st = conn.prepare(&format!("SELECT {ROUTE_COLS} FROM route WHERE profile_id=?1 ORDER BY ord, id"))?;
+    let rows = st.query_map([profile_id], route_row)?;
+    rows.collect()
+}
+
+fn hops_json(h: &[Hop]) -> String {
+    serde_json::to_string(h).unwrap_or_else(|_| "[]".into())
+}
+
+fn trimmed(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|x| !x.is_empty()).map(str::to_string)
+}
+
+/// "호스트:포트" 나누기(IPv6 는 [::1]:22)
+pub(crate) fn split_host_port(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    let (h, p) = s.rsplit_once(':')?;
+    let h = h.trim_start_matches('[').trim_end_matches(']').trim();
+    let p: u16 = p.trim().parse().ok().filter(|p| *p > 0)?;
+    (!h.is_empty()).then(|| (h.to_string(), p))
+}
+
+/// 경로 값 고르기 — 점프는 다섯 단계까지, 자기 자신·같은 서버 두 번(순환)은 안 된다
+fn route_check(conn: &Connection, r: &Route) -> Result<Route, String> {
+    let mut x = r.clone();
+    x.host = r.host.trim().to_string();
+    if x.host.is_empty() {
+        return Err("경로의 주소를 입력하세요".into());
+    }
+    if x.port == 0 {
+        return Err("경로의 포트를 입력하세요".into());
+    }
+    x.label = trimmed(&r.label);
+    let kind: Option<String> = conn.query_row("SELECT kind FROM profile WHERE id=?1", [r.profile_id], |q| q.get(0)).optional().map_err(|e| e.to_string())?;
+    if kind.as_deref() != Some("ssh") {
+        return Err("경로는 SSH 서버에만 둘 수 있습니다".into());
+    }
+    if x.jumps.len() > 5 {
+        return Err("점프는 다섯 단계까지입니다".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for h in &x.jumps {
+        if h.profile_id == r.profile_id {
+            return Err("자기 자신을 거쳐 갈 수 없습니다".into());
+        }
+        if !seen.insert(h.profile_id) {
+            return Err("같은 서버를 두 번 거칠 수 없습니다(돌고 도는 길)".into());
+        }
+        let k: Option<String> = conn.query_row("SELECT kind FROM profile WHERE id=?1", [h.profile_id], |q| q.get(0)).optional().map_err(|e| e.to_string())?;
+        if k.as_deref() != Some("ssh") {
+            return Err("점프 단계에 없는 서버가 있습니다".into());
+        }
+        if let Some(aid) = h.account_id {
+            let ok: Option<i64> = conn
+                .query_row("SELECT id FROM account WHERE id=?1 AND profile_id=?2", [aid, h.profile_id], |q| q.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if ok.is_none() {
+                return Err("점프 단계의 계정이 그 서버의 계정이 아닙니다".into());
+            }
+        }
+    }
+    match r.proxy_kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => {
+            x.proxy_kind = None;
+            x.proxy_host = None;
+            x.proxy_port = None;
+            x.proxy_user = None;
+            x.proxy_command = None;
+        }
+        Some(k @ ("http" | "socks5")) => {
+            x.proxy_kind = Some(k.into());
+            x.proxy_host = trimmed(&r.proxy_host);
+            x.proxy_user = trimmed(&r.proxy_user);
+            x.proxy_command = None;
+            if x.proxy_host.is_none() || x.proxy_port.unwrap_or(0) == 0 {
+                return Err("프록시 주소와 포트를 입력하세요".into());
+            }
+        }
+        Some("command") => {
+            x.proxy_kind = Some("command".into());
+            x.proxy_command = trimmed(&r.proxy_command);
+            x.proxy_host = None;
+            x.proxy_port = None;
+            x.proxy_user = None;
+            if x.proxy_command.is_none() {
+                return Err("프록시 명령을 입력하세요".into());
+            }
+        }
+        Some(_) => return Err("알 수 없는 프록시 방식".into()),
+    }
+    match r.cond_kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => {
+            x.cond_kind = None;
+            x.cond_value = None;
+            x.cond_not = false;
+        }
+        Some(k @ ("gateway" | "dns" | "wifi" | "reach")) => {
+            x.cond_kind = Some(k.into());
+            x.cond_value = trimmed(&r.cond_value);
+            let Some(v) = x.cond_value.as_deref() else {
+                return Err("망 조건의 값을 입력하세요".into());
+            };
+            if k == "reach" && split_host_port(v).is_none() {
+                return Err("닿는지 볼 곳은 호스트:포트 로 적으세요(예: intranet.example:443)".into());
+            }
+        }
+        Some(_) => return Err("알 수 없는 망 조건".into()),
+    }
+    Ok(x)
+}
+
+/// 서버 저장 때 — 첫 경로의 주소·포트를 서버 값으로, 점프가 한 단계 이하면 점프도 서버 값으로. 경로가 없으면 만든다
+fn sync_first_route(conn: &Connection, profile_id: i64, host: &str, port: u16, jump_id: Option<i64>, t: i64) -> Result<(), String> {
+    let first: Option<(i64, String)> = conn
+        .query_row("SELECT id, jumps FROM route WHERE profile_id=?1 ORDER BY ord, id LIMIT 1", [profile_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let one = |old: &[Hop]| -> Vec<Hop> {
+        jump_id
+            .map(|j| vec![Hop { profile_id: j, account_id: old.first().filter(|h| h.profile_id == j).and_then(|h| h.account_id) }])
+            .unwrap_or_default()
+    };
+    match first {
+        None => {
+            conn.execute(
+                "INSERT INTO route (profile_id, ord, host, port, jumps, created_at, updated_at) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?5)",
+                params![profile_id, host, port, hops_json(&one(&[])), t],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Some((rid, jumps)) => {
+            let old: Vec<Hop> = serde_json::from_str(&jumps).unwrap_or_default();
+            if old.len() <= 1 {
+                conn.execute("UPDATE route SET host=?1, port=?2, jumps=?3, updated_at=?4 WHERE id=?5", params![host, port, hops_json(&one(&old)), t, rid])
+                    .map_err(|e| e.to_string())?;
+            } else {
+                conn.execute("UPDATE route SET host=?1, port=?2, updated_at=?3 WHERE id=?4", params![host, port, t, rid]).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 경로를 바꾼 뒤 — 서버의 host·port·jump_id 를 첫 경로와 같게(목록·예전 판이 보는 값)
+fn sync_profile_from_routes(conn: &Connection, profile_id: i64) -> Result<(), String> {
+    let list = routes_of(conn, profile_id).map_err(|e| e.to_string())?;
+    if let Some(r) = list.first() {
+        conn.execute(
+            "UPDATE profile SET host=?1, port=?2, jump_id=?3, updated_at=?4 WHERE id=?5",
+            params![r.host, r.port, r.jumps.first().map(|h| h.profile_id), now(), profile_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+impl Store {
+    /// 설정 값 하나
+    pub fn setting(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM setting WHERE key=?1", [key], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// 설정 값 넣기
+    #[cfg(test)]
+    pub fn setting_put(&self, key: &str, value: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("INSERT INTO setting (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]);
+    }
+
+    /// 서버의 경로(순서대로)
+    pub fn routes(&self, profile_id: i64) -> Result<Vec<Route>, String> {
+        let conn = self.conn.lock().unwrap();
+        routes_of(&conn, profile_id).map_err(|e| e.to_string())
+    }
+
+    /// 경로 만들기·고치기 → id. 새 경로는 맨 뒤에
+    pub fn route_save(&self, r: &Route) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        let x = route_check(&conn, r)?;
+        let t = now();
+        let id = match x.id {
+            Some(id) => {
+                let n = conn
+                    .execute(
+                        "UPDATE route SET label=?1, host=?2, port=?3, jumps=?4, proxy_kind=?5, proxy_host=?6, proxy_port=?7, proxy_user=?8, proxy_command=?9,
+                         cond_kind=?10, cond_value=?11, cond_not=?12, updated_at=?13 WHERE id=?14 AND profile_id=?15",
+                        params![
+                            x.label,
+                            x.host,
+                            x.port,
+                            hops_json(&x.jumps),
+                            x.proxy_kind,
+                            x.proxy_host,
+                            x.proxy_port,
+                            x.proxy_user,
+                            x.proxy_command,
+                            x.cond_kind,
+                            x.cond_value,
+                            x.cond_not as i64,
+                            t,
+                            id,
+                            x.profile_id
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("경로가 없습니다".into());
+                }
+                id
+            }
+            None => {
+                let ord: i64 = conn
+                    .query_row("SELECT COALESCE(MAX(ord), -1) + 1 FROM route WHERE profile_id=?1", [x.profile_id], |q| q.get(0))
+                    .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO route (profile_id, ord, label, host, port, jumps, proxy_kind, proxy_host, proxy_port, proxy_user, proxy_command,
+                       cond_kind, cond_value, cond_not, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+                    params![
+                        x.profile_id,
+                        ord,
+                        x.label,
+                        x.host,
+                        x.port,
+                        hops_json(&x.jumps),
+                        x.proxy_kind,
+                        x.proxy_host,
+                        x.proxy_port,
+                        x.proxy_user,
+                        x.proxy_command,
+                        x.cond_kind,
+                        x.cond_value,
+                        x.cond_not as i64,
+                        t
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.last_insert_rowid()
+            }
+        };
+        sync_profile_from_routes(&conn, x.profile_id)?;
+        Ok(id)
+    }
+
+    /// 경로 지우기 — 마지막 하나는 못 지운다(서버째 지우기는 서버 설정에서)
+    pub fn route_delete(&self, id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let pid: i64 = conn
+            .query_row("SELECT profile_id FROM route WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or("경로가 없습니다")?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM route WHERE profile_id=?1", [pid], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if n <= 1 {
+            return Err("서버에 남은 마지막 경로라 지울 수 없습니다".into());
+        }
+        conn.execute("DELETE FROM route WHERE id=?1", [id]).map_err(|e| e.to_string())?;
+        crate::secrets::forget(&route_proxy_key(id));
+        sync_profile_from_routes(&conn, pid)
+    }
+
+    /// 경로 순서 바꾸기 — ids 순서대로(빠진 것은 뒤에 그대로)
+    pub fn route_reorder(&self, profile_id: i64, ids: &[i64]) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let list = routes_of(&conn, profile_id).map_err(|e| e.to_string())?;
+        let mut order: Vec<i64> = ids.iter().copied().filter(|i| list.iter().any(|r| r.id == Some(*i))).collect();
+        for r in &list {
+            if let Some(i) = r.id.filter(|i| !order.contains(i)) {
+                order.push(i);
+            }
+        }
+        for (n, rid) in order.iter().enumerate() {
+            conn.execute("UPDATE route SET ord=?1 WHERE id=?2", params![n as i64, rid]).map_err(|e| e.to_string())?;
+        }
+        sync_profile_from_routes(&conn, profile_id)
+    }
+
+    /// 이 경로로 붙었다
+    pub fn route_mark_ok(&self, id: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("UPDATE route SET last_ok_at=?1 WHERE id=?2", params![now(), id]);
+    }
+
+    /// 프록시 암호 저장(빈 값이면 지운다)
+    pub fn route_proxy_secret_set(&self, id: i64, secret: &str) -> Result<(), String> {
+        if secret.is_empty() {
+            crate::secrets::forget(&route_proxy_key(id));
+        } else {
+            crate::secrets::set(&route_proxy_key(id), secret)?;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE route SET proxy_secret_saved_at=?1 WHERE id=?2", params![(!secret.is_empty()).then(now), id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 이름(별칭) 또는 주소[:포트] 로 SSH 서버 찾기 — 가져오기의 ProxyJump 풀이
+    pub fn find_ssh_profile(&self, name_or_host: &str, port: Option<u16>) -> Option<i64> {
+        let conn = self.conn.lock().unwrap();
+        let by_name: Option<i64> = conn
+            .query_row("SELECT id FROM profile WHERE kind='ssh' AND name=?1 ORDER BY id LIMIT 1", [name_or_host], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        by_name.or_else(|| {
+            conn.query_row(
+                "SELECT id FROM profile WHERE kind='ssh' AND lower(host)=lower(?1) AND port=?2 ORDER BY id LIMIT 1",
+                params![name_or_host, port.unwrap_or(22)],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+    }
+}
+
+#[tauri::command]
+pub fn route_list(store: State<'_, Store>, profile_id: i64) -> Result<Vec<Route>, String> {
+    store.routes(profile_id)
+}
+
+/// 경로 저장 — proxy_secret: Some("") 이면 지우고, 값이면 OS 저장소에 넣는다(None 이면 그대로)
+#[tauri::command]
+pub fn route_save(store: State<'_, Store>, r: Route, proxy_secret: Option<String>) -> Result<i64, String> {
+    let id = store.route_save(&r)?;
+    if let Some(s) = proxy_secret {
+        store.route_proxy_secret_set(id, &s)?;
+    }
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn route_delete(store: State<'_, Store>, id: i64) -> Result<(), String> {
+    store.route_delete(id)
+}
+
+#[tauri::command]
+pub fn route_reorder(store: State<'_, Store>, profile_id: i64, ids: Vec<i64>) -> Result<(), String> {
+    store.route_reorder(profile_id, &ids)
 }
 
 /// 시험용 — SSH 서버 하나(기본 계정 포함) 만들기 → 서버 id

@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { ENGINES, engineOf } from "../lib/engines";
 import { type Account, accountName, api, asSshError, defaultAccount, type LegacyLevel, type Profile, tunnelReq } from "../lib/ipc";
 import { AccountEditor, type AccountDraft, AccountFields, AUTH_LABEL, blankAccount, draftOf, saveAccountDraft } from "./AccountEditor";
+import { getAppearance, onAppearance, setProfileScheme, TERM_SCHEMES } from "../lib/theme";
+import { RoutesBox } from "./RouteEditor";
 import { Select } from "./Select";
 import { agoMs, sudoBadge } from "./ServerCard";
 
@@ -290,6 +292,8 @@ export function ProfileSheet({
 					)}
 				</fieldset>
 
+				{p.kind === "ssh" && <RoutesBox profileId={initial.id} others={others} onFirst={(r) => set({ host: r.host, port: r.port, jumpId: r.jumps[0]?.profileId ?? null })} />}
+
 				<fieldset className="sheet-sec">
 					<legend>계정</legend>
 					{editing && initial.id != null ? (
@@ -340,6 +344,7 @@ export function ProfileSheet({
 							)}
 						</div>
 					)}
+					{p.kind === "ssh" && <TermSchemeField profileId={p.id} />}
 					<div className="field">
 						<label>색</label>
 						<div style={{ display: "flex", gap: 8 }}>
@@ -613,6 +618,31 @@ function AccountsBox({ server, profileId, initialList, onChanged }: { server: Pr
 					<Plus size={13} /> 계정 추가
 				</button>
 			)}
+		</div>
+	);
+}
+
+/** 서버별 터미널 색 구성 — 앱 설정(설정 › 화면)을 덮어쓴다. 고르면 열린 터미널에 바로 */
+function TermSchemeField({ profileId }: { profileId?: number }) {
+	const [, setTick] = useState(0);
+	useEffect(() => onAppearance(() => setTick((t) => t + 1)), []);
+	const cur = profileId != null ? (getAppearance().byProfile[String(profileId)] ?? "inherit") : "inherit";
+	return (
+		<div className="field">
+			<label htmlFor="pf-scheme">터미널 색 구성</label>
+			<Select
+				id="pf-scheme"
+				size="sm"
+				value={cur}
+				disabled={profileId == null}
+				title={profileId == null ? "저장한 뒤 고를 수 있습니다" : "이 서버의 터미널만 — 고르면 바로 적용"}
+				onChange={(v) => profileId != null && setProfileScheme(profileId, v)}
+				options={[
+					{ value: "inherit", label: "앱 설정 따르기", hint: TERM_SCHEMES.find((x) => x.id === getAppearance().termScheme)?.label },
+					...TERM_SCHEMES.map((x) => ({ value: x.id, label: x.label })),
+				]}
+			/>
+			<small className="hint">운영 서버만 다른 색으로 두면 헷갈리지 않습니다. {profileId == null ? "서버를 저장한 뒤 고를 수 있습니다." : "고르면 바로 적용됩니다(저장 단추와 상관없음)."}</small>
 		</div>
 	);
 }

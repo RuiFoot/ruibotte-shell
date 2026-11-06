@@ -7,6 +7,7 @@ import "@xterm/xterm/css/xterm.css";
 import { ArrowDownToLine, ChevronDown, ChevronUp, Palette, Pause, Play, Trash2, WrapText } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { bytesChannel, type FsBackend } from "../lib/ipc";
+import { onAppearance, termFontFamily, termTheme } from "../lib/theme";
 import { Select } from "./Select";
 
 /**
@@ -69,14 +70,20 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 	useEffect(() => {
 		const el = host.current;
 		if (!el) return;
-		const s = getComputedStyle(document.documentElement);
 		const term = new XTerm({
 			disableStdin: true,
 			convertEol: true,
 			scrollback: keep,
-			fontFamily: s.getPropertyValue("--font-mono"),
+			fontFamily: termFontFamily(),
 			fontSize: 12.5,
-			theme: { background: s.getPropertyValue("--term-bg").trim(), foreground: s.getPropertyValue("--term-fg").trim() },
+			theme: termTheme(),
+		});
+		el.style.background = term.options.theme?.background ?? "";
+		// 화면 설정(앱 테마·색 구성·글꼴)이 바뀌면 바로
+		const unLook = onAppearance(() => {
+			term.options.theme = termTheme();
+			el.style.background = term.options.theme.background ?? "";
+			term.options.fontFamily = termFontFamily();
 		});
 		const fit = new FitAddon();
 		const search = new SearchAddon();
@@ -124,6 +131,7 @@ export function TailView({ fs, path }: { fs: FsBackend; path: string }) {
 			if (id != null) void invoke("tail_close", { id });
 			void un.then((f) => f());
 			ro.disconnect();
+			unLook();
 			res.dispose();
 			term.dispose();
 			termRef.current = null;

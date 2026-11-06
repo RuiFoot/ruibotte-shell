@@ -5,8 +5,8 @@
 //! - 취소: PG CancelRequest, MySQL 은 다른 연결로 KILL QUERY.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use futures_util::{pin_mut, StreamExt, TryStreamExt};
@@ -146,8 +146,7 @@ impl Engine {
     fn features(&self) -> Vec<&'static str> {
         match self {
             Engine::Pg { .. } | Engine::My { .. } => vec!["readOnlySession", "cancel"],
-            Engine::Ms { .. } => vec![],
-            Engine::Jdbc { .. } => vec!["cancel"],
+            Engine::Ms { .. } | Engine::Jdbc { .. } => vec!["cancel"],
         }
     }
 }
@@ -172,6 +171,12 @@ pub(crate) struct DbConn {
     closed: AtomicBool,
     /// SSH 터널을 거치면 — 이 연결을 닫으면(놓으면) 터널도 닫힌다
     tunnel: Option<Arc<crate::tunnel::DbTunnel>>,
+    /// 취소를 눌렀는지 — 받는 중인 행 묶음 사이에서 앱이 직접 멈춘다(문장마다 처음에 지운다)
+    stop_req: AtomicBool,
+    /// 취소를 기다리는 쪽 깨우기(SQL Server 처럼 서버 취소가 엔진 루프 안에서만 되는 경우)
+    stop_notify: tokio::sync::Notify,
+    /// 취소 뒤 응답 순서가 어긋남(SQL Server) — 다시 연결할 때까지 이 연결로 아무것도 하지 않는다
+    broken: AtomicBool,
 }
 
 static GEN: AtomicU64 = AtomicU64::new(1);
@@ -190,6 +195,9 @@ impl DbConn {
             gen,
             closed: Default::default(),
             tunnel,
+            stop_req: Default::default(),
+            stop_notify: Default::default(),
+            broken: Default::default(),
         }
     }
     fn is_mysql(&self) -> bool {
@@ -269,22 +277,49 @@ pub struct DbConns {
 
 impl DbConns {
     fn get(&self, id: u32) -> R<Arc<DbConn>> {
+        let c = self.any(id)?;
+        if c.broken.load(Ordering::Relaxed) {
+            return Err(e("CLOSED", "실행 중에 멈춘 SQL Server 연결이라 응답 순서를 믿을 수 없습니다 — 다시 연결하세요"));
+        }
+        Ok(c)
+    }
+    /// 망가진 연결도 — 다시 연결·닫기용
+    fn any(&self, id: u32) -> R<Arc<DbConn>> {
         self.map.lock().unwrap().get(&id).cloned().ok_or_else(|| e("CLOSED", "연결이 닫혔습니다"))
     }
 }
 
+type Row = Vec<Option<String>>;
+
 pub(crate) struct ResultSet {
     columns: Vec<Col>,
-    rows: Vec<Vec<Option<String>>>,
+    /// 받는 중에도 화면이 db_rows 로 앞쪽을 읽는다 — 엔진 루프가 한 행씩 넣는다
+    rows: RwLock<Vec<Row>>,
     /// 정렬·거르기 보기 — 화면 행 번호 → 원래 행 번호. None 이면 받은 순서 그대로
     view: Mutex<Option<Vec<usize>>>,
+    /// 다 받았는지(취소·상한으로 멈춘 것도 끝) — 받는 중에는 정렬·거르기·내보내기를 하지 않는다
+    done: AtomicBool,
 }
 
 impl ResultSet {
-    fn visible(&self) -> Vec<&Vec<Option<String>>> {
+    fn new(columns: Vec<Col>, rows: Vec<Row>, done: bool) -> Self {
+        ResultSet { columns, rows: RwLock::new(rows), view: Mutex::new(None), done: AtomicBool::new(done) }
+    }
+    fn len(&self) -> usize {
+        self.rows.read().unwrap().len()
+    }
+    /// 정렬·거르기를 반영한 행 — 부르는 쪽이 rows 읽기 잠금을 쥐고 넘긴다
+    fn visible<'a>(&self, rows: &'a [Row]) -> Vec<&'a Row> {
         match &*self.view.lock().unwrap() {
-            Some(v) => v.iter().filter_map(|&i| self.rows.get(i)).collect(),
-            None => self.rows.iter().collect(),
+            Some(v) => v.iter().filter_map(|&i| rows.get(i)).collect(),
+            None => rows.iter().collect(),
+        }
+    }
+    fn need_done(&self) -> R<()> {
+        if self.done.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            Err(e("BUSY", "아직 받는 중입니다 — 다 받은 뒤(또는 취소한 뒤 받은 행으로) 정렬·거르기·내보내기를 할 수 있습니다"))
         }
     }
 }
@@ -656,7 +691,7 @@ async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHan
 /// 열린 트랜잭션은 사라진다(화면이 먼저 묻는다).
 #[tauri::command]
 pub async fn db_reconnect(app: AppHandle, store: State<'_, Store>, dbs: State<'_, DbConns>, conn: u32, database: Option<String>) -> R<DbConnectOk> {
-    let old = dbs.get(conn)?;
+    let old = dbs.any(conn)?;
     let mut req = old.req.clone();
     if let Some(d) = database.filter(|d| !d.is_empty()) {
         req.database = Some(d);
@@ -1021,6 +1056,8 @@ pub struct QueryOk {
     row_count: usize,
     affected: Option<u64>,
     truncated: bool,
+    /// 받는 중에 멈춤 — cancelled(취소) · timeout(시간 상한) · memory(메모리 상한). 받은 행은 결과에 남는다
+    stopped: Option<&'static str>,
     ms: u64,
     first_row_ms: Option<u64>,
     tx: TxState,
@@ -1120,14 +1157,19 @@ fn kind_of(s: &str) -> &'static str {
 
 /// 문장 하나 실행. 행은 max_rows 까지만 받고 넘으면 서버 쪽 취소.
 /// timeout_ms — 문장 시간 상한(PostgreSQL statement_timeout · MySQL max_execution_time · MariaDB max_statement_time, 그 밖은 앱이 재다가 취소)
+/// stream — 화면이 고른 번호. 주면 받는 동안 `db-rows-progress` 로 결과 번호·받은 행 수를 알리고(첫 묶음 50행 또는 15ms, 그다음 0.1초마다 500행 넘게 늘었거나 0.25초가 지나면),
+/// 취소·시간 상한으로 멈춰도 받은 행이 있으면 결과로 돌려준다(stopped)
 #[tauri::command]
-pub async fn db_query(app: AppHandle, dbs: State<'_, DbConns>, conn: u32, sql: String, max_rows: Option<usize>, timeout_ms: Option<u64>) -> R<QueryOk> {
-    let r = query_opts(&dbs, conn, sql, max_rows, timeout_ms, Some(&app)).await;
-    if let Err(x) = &r {
-        if matches!(x.code, "CLOSED" | "NETWORK") {
-            if let Ok(c) = dbs.get(conn) {
-                notify_closed(&app, conn, c.gen);
-            }
+pub async fn db_query(app: AppHandle, dbs: State<'_, DbConns>, conn: u32, sql: String, max_rows: Option<usize>, timeout_ms: Option<u64>, stream: Option<u32>) -> R<QueryOk> {
+    let emit = |p: Progress| {
+        let _ = app.emit("db-rows-progress", p);
+    };
+    let progress: Option<&ProgressFn<'_>> = if stream.is_some() { Some(&emit) } else { None };
+    let r = query_opts(&dbs, conn, sql, max_rows, timeout_ms, stream.zip(progress)).await;
+    if let Ok(c) = dbs.any(conn) {
+        // 끊김 — 또는 SQL Server 를 응답 중에 멈춰 연결이 어긋남(받은 행은 결과로 남기고 다시 연결하게)
+        if c.broken.load(Ordering::Relaxed) || matches!(&r, Err(x) if matches!(x.code, "CLOSED" | "NETWORK")) {
+            notify_closed(&app, conn, c.gen);
         }
     }
     r
@@ -1138,13 +1180,153 @@ pub(crate) async fn query(dbs: &DbConns, conn: u32, sql: String, max_rows: Optio
     query_opts(dbs, conn, sql, max_rows, None, None).await
 }
 
-struct Got {
+/// 받는 중 알림 — 화면은 stream 번호로 자기 결과 탭을 찾는다
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Progress {
+    stream: u32,
+    result_id: u32,
     columns: Vec<Col>,
-    rows: Vec<Vec<Option<String>>>,
-    affected: Option<u64>,
-    truncated: bool,
-    has_set: bool,
+    row_count: usize,
+    ms: u64,
     first_row_ms: Option<u64>,
+}
+
+pub(crate) type ProgressFn<'a> = dyn Fn(Progress) + Send + Sync + 'a;
+
+/// 첫 묶음 — 이만큼 모이거나 FIRST_MS 가 지나면 바로 알린다
+const FIRST_BATCH: usize = 50;
+const FIRST_MS: u64 = 15;
+/// 그다음 알림 — TICK_MS 마다 보고 EVERY_ROWS 넘게 늘었거나 IDLE_MS 가 지났으면
+const TICK_MS: u64 = 100;
+const EVERY_ROWS: usize = 500;
+const IDLE_MS: u64 = 250;
+/// 결과 하나가 쓸 메모리 상한(어림 — 칸마다 24바이트 + 글자). 넘으면 거기서 멈추고 알린다
+const MEMORY_CAP: usize = 512 * 1024 * 1024;
+
+/// 받는 중인 결과 — 엔진 루프가 행을 넣고, 진행 알림이 읽는다
+struct Live<'a> {
+    dbs: &'a DbConns,
+    c: &'a DbConn,
+    max: usize,
+    started: Instant,
+    cur: Mutex<Option<(u32, Arc<ResultSet>)>>,
+    first_row_ms: AtomicU64,
+    bytes: AtomicUsize,
+    /// rows(행 상한) · memory(메모리 상한) · cancelled(취소)
+    stop: Mutex<Option<&'static str>>,
+    first_batch: tokio::sync::Notify,
+    /// 넣은 행 수(모든 집합) — 엔진 루프가 가끔 양보해 알림 타이머가 돌게 한다
+    pushed: AtomicUsize,
+}
+
+impl<'a> Live<'a> {
+    fn new(dbs: &'a DbConns, c: &'a DbConn, max: usize, started: Instant) -> Self {
+        Live { dbs, c, max, started, cur: Mutex::new(None), first_row_ms: AtomicU64::new(u64::MAX), bytes: AtomicUsize::new(0), stop: Mutex::new(None), first_batch: Default::default(), pushed: AtomicUsize::new(0) }
+    }
+    /// 새 결과 집합 — 바로 등록해 받는 동안에도 db_rows 로 읽게 한다(앞 집합은 버린다: 여러 집합이면 마지막 것)
+    fn begin(&self, columns: Vec<Col>) -> Arc<ResultSet> {
+        let rs = Arc::new(ResultSet::new(columns, Vec::new(), false));
+        let id = self.dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let old = self.cur.lock().unwrap().replace((id, rs.clone()));
+        let mut m = self.dbs.results.lock().unwrap();
+        if let Some((o, _)) = old {
+            m.remove(&o);
+        }
+        m.insert(id, rs.clone());
+        self.bytes.store(0, Ordering::Relaxed);
+        rs
+    }
+    /// 한 행 넣기 — false 면 그만 받는다(까닭은 stopped)
+    fn push(&self, rs: &ResultSet, row: Row) -> bool {
+        if self.first_row_ms.load(Ordering::Relaxed) == u64::MAX {
+            self.first_row_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+        if self.c.stop_req.load(Ordering::Relaxed) {
+            self.halt("cancelled");
+            return false;
+        }
+        let size = 24 + row.iter().map(|v| 24 + v.as_ref().map_or(0, |s| s.len())).sum::<usize>();
+        let mut g = rs.rows.write().unwrap();
+        if g.len() >= self.max {
+            drop(g);
+            self.halt("rows");
+            return false;
+        }
+        if self.bytes.fetch_add(size, Ordering::Relaxed) + size > MEMORY_CAP {
+            drop(g);
+            self.halt("memory");
+            return false;
+        }
+        g.push(row);
+        if g.len() == FIRST_BATCH {
+            self.first_batch.notify_one();
+        }
+        true
+    }
+    /// 행이 계속 버퍼에 쌓여 있으면 엔진 루프가 쉬지 않아 같은 작업의 알림이 굶는다 — 256행마다 한 번 양보
+    async fn pace(&self) {
+        let n = self.pushed.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == FIRST_BATCH || n & 255 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    fn halt(&self, why: &'static str) {
+        let mut s = self.stop.lock().unwrap();
+        if s.is_none() {
+            *s = Some(why);
+        }
+    }
+    fn stopped(&self) -> Option<&'static str> {
+        *self.stop.lock().unwrap()
+    }
+    fn current(&self) -> Option<(u32, Arc<ResultSet>)> {
+        self.cur.lock().unwrap().clone()
+    }
+    fn rows(&self) -> usize {
+        self.current().map_or(0, |(_, r)| r.len())
+    }
+    fn first_row_ms(&self) -> Option<u64> {
+        Some(self.first_row_ms.load(Ordering::Relaxed)).filter(|v| *v != u64::MAX)
+    }
+    /// 실패 — 받던 결과를 버린다
+    fn discard(&self) {
+        if let Some((id, _)) = self.cur.lock().unwrap().take() {
+            self.dbs.results.lock().unwrap().remove(&id);
+        }
+    }
+}
+
+/// 받는 동안 알림 — 실행이 끝나면 select 가 이 future 를 버린다
+async fn ticker(live: &Live<'_>, progress: Option<(u32, &ProgressFn<'_>)>) {
+    let Some((stream, emit)) = progress else {
+        return std::future::pending().await;
+    };
+    let mut sent: (u32, usize) = (0, 0);
+    let mut last = Instant::now();
+    let mut first = true;
+    loop {
+        if first {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(FIRST_MS)) => {}
+                _ = live.first_batch.notified() => {}
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
+        }
+        let Some((id, rs)) = live.current() else { continue };
+        let n = rs.len();
+        let due = id != sent.0 || (n > sent.1 && (first || n - sent.1 >= EVERY_ROWS || last.elapsed() >= Duration::from_millis(IDLE_MS)));
+        if !due {
+            continue;
+        }
+        emit(Progress { stream, result_id: id, columns: rs.columns.clone(), row_count: n, ms: live.started.elapsed().as_millis() as u64, first_row_ms: live.first_row_ms() });
+        sent = (id, n);
+        last = Instant::now();
+        if n > 0 {
+            first = false;
+        }
+    }
 }
 
 /// 서버 세션에 문장 시간 상한을 건다 — 서버가 맡으면 true(아니면 앱이 잰다)
@@ -1168,8 +1350,15 @@ async fn set_server_timeout(c: &DbConn, ms: u64) -> bool {
     ok
 }
 
-/// 실행 중인 문장 취소(엔진별)
+/// 실행 중인 문장 취소 — 앱 쪽 멈춤 표시(받는 루프가 본다) + 엔진별 서버 취소
 async fn cancel_conn(c: &DbConn) -> R<()> {
+    c.stop_req.store(true, Ordering::Relaxed);
+    c.stop_notify.notify_waiters();
+    server_cancel(c).await
+}
+
+/// 서버 쪽 취소만(엔진별). SQL Server 는 엔진 루프가 흐름을 놓고 Attention 을 보낸다
+async fn server_cancel(c: &DbConn) -> R<()> {
     match &c.engine {
         Engine::Pg { cancel, tls, .. } => match tls {
             Some(t) => cancel.cancel_query(t.clone()).await.map_err(pg_err),
@@ -1181,7 +1370,7 @@ async fn cancel_conn(c: &DbConn) -> R<()> {
             let _ = k.disconnect().await;
             Ok(())
         }
-        Engine::Ms { .. } => Err(e("OTHER", "SQL Server 는 아직 실행 중 취소를 지원하지 않습니다")),
+        Engine::Ms { .. } => Ok(()),
         Engine::Jdbc { side } => {
             side.call(json!({"op": "cancel"})).await.map_err(|m| e("CLOSED", m))?;
             Ok(())
@@ -1250,7 +1439,7 @@ fn track_tx(c: &DbConn, cl: &Classified, sql: &str) {
     }
 }
 
-pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: Option<usize>, timeout_ms: Option<u64>, app: Option<&AppHandle>) -> R<QueryOk> {
+pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: Option<usize>, timeout_ms: Option<u64>, progress: Option<(u32, &ProgressFn<'_>)>) -> R<QueryOk> {
     let c = dbs.get(conn)?;
     let max = max_rows.unwrap_or(100_000).clamp(1, 1_000_000);
     let cl = classify(&sql, c.is_mysql());
@@ -1262,6 +1451,7 @@ pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: 
     let Ok(_busy) = c.busy.try_lock() else {
         return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
     };
+    c.stop_req.store(false, Ordering::Relaxed);
     // 수동 커밋 — 쓰기 문장 앞에서 트랜잭션을 연다
     if c.manual.load(Ordering::Relaxed) && !c.in_tx.load(Ordering::Relaxed) && cl.writes && cl.kind != "tx" {
         tx_raw(&c, "begin").await?;
@@ -1276,93 +1466,115 @@ pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: 
             true
         }
     };
+    let stream = progress.is_some();
     let started = Instant::now();
-    let fut = exec(&c, &sql, max, started);
+    let live = Live::new(dbs, &c, max, started);
+    let fut = async {
+        let run = exec(&c, &sql, &live);
+        let tick = ticker(&live, progress);
+        pin_mut!(run, tick);
+        tokio::select! {
+            r = &mut run => r,
+            _ = &mut tick => unreachable!("알림은 끝나지 않는다"),
+        }
+    };
     pin_mut!(fut);
+    let mut timed_out = false;
     let got = match limit {
         Some(ms) if !server_side => {
             tokio::select! {
                 r = &mut fut => r,
                 _ = tokio::time::sleep(Duration::from_millis(ms)) => {
-                    if matches!(c.engine, Engine::Ms { .. }) {
-                        // SQL Server 는 실행 중 취소가 없어 연결을 버린다(다시 연결 단추로 잇는다)
-                        if let Some(a) = app {
-                            notify_closed(a, conn, c.gen);
-                        }
-                        Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다. SQL Server 는 연결을 끊어 멈추므로 다시 연결하세요", ms / 1000)))
-                    } else {
-                        let _ = cancel_conn(&c).await;
-                        match fut.await {
-                            Err(x) if x.code == "CANCELLED" => Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다", ms / 1000))),
-                            other => other,
-                        }
-                    }
+                    timed_out = true;
+                    // SQL Server 도 이제 엔진 루프가 Attention 으로 멈춘다(연결을 버리지 않는다)
+                    let _ = cancel_conn(&c).await;
+                    fut.await
                 }
             }
         }
         _ => fut.await,
     };
+    let timed_out = timed_out || limit.is_some_and(|ms| started.elapsed().as_millis() as u64 + 100 >= ms);
+    let mut stopped = live.stopped();
     let got = match got {
-        Err(x) if x.code == "CANCELLED" && limit.is_some_and(|ms| started.elapsed().as_millis() as u64 + 100 >= ms) => Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다", limit.unwrap_or(0) / 1000))),
+        // 받는 중에 취소·시간 상한 — 받은 행이 있으면 그것을 결과로
+        Err(x) if matches!(x.code, "CANCELLED" | "TIMEOUT") && stream && live.rows() > 0 => {
+            stopped = Some("cancelled");
+            Ok(None)
+        }
+        Ok(_) if stopped == Some("cancelled") && (!stream || live.rows() == 0) => Err(e("CANCELLED", "취소했습니다")),
+        other => other,
+    };
+    if stopped == Some("cancelled") && timed_out {
+        stopped = Some("timeout");
+    }
+    let got = match got {
+        Err(x) if x.code == "CANCELLED" && timed_out => Err(e("TIMEOUT", format!("{} 초 시간 상한을 넘겨 멈췄습니다", limit.unwrap_or(0) / 1000))),
         other => other,
     };
     track_tx(&c, &cl, &sql);
-    let Got { columns, rows, affected, truncated, has_set, first_row_ms } = got?;
-    let row_count = rows.len();
-    let result_id = if has_set {
-        let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
-        dbs.results.lock().unwrap().insert(id, Arc::new(ResultSet { columns: columns.clone(), rows, view: Mutex::new(None) }));
-        Some(id)
-    } else {
-        None
+    let affected = match got {
+        Ok(a) => a,
+        Err(x) => {
+            live.discard();
+            return Err(x);
+        }
     };
-    Ok(QueryOk { result_id, columns, row_count, affected, truncated, ms: started.elapsed().as_millis() as u64, first_row_ms, tx: c.tx_state() })
+    let cur = live.current();
+    if let Some((_, rs)) = &cur {
+        rs.done.store(true, Ordering::Relaxed);
+    }
+    Ok(QueryOk {
+        result_id: cur.as_ref().map(|(id, _)| *id),
+        columns: cur.as_ref().map(|(_, r)| r.columns.clone()).unwrap_or_default(),
+        row_count: cur.as_ref().map_or(0, |(_, r)| r.len()),
+        affected,
+        truncated: matches!(stopped, Some("rows" | "memory")),
+        stopped: stopped.filter(|s| *s != "rows"),
+        ms: started.elapsed().as_millis() as u64,
+        first_row_ms: live.first_row_ms(),
+        tx: c.tx_state(),
+    })
 }
 
-async fn exec(c: &DbConn, sql: &str, max: usize, started: Instant) -> R<Got> {
-    let mut first_row_ms = None;
-    let mut columns: Vec<Col> = Vec::new();
-    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+/// SQL Server — 흐름을 놓은 뒤 Attention 으로 서버 문장을 멈춘다. 계산 중(보낸 응답이 없을 때)이면 확인이 바로 와 연결을 그대로 쓴다.
+/// 응답을 보내던 중이면 확인(DONE_ATTN)이 그 응답 뒤에 따로 와 tiberius 가 못 읽고, 다음 문장부터 응답이 하나씩 밀린다
+/// (실측: 한 번 더 보내도 서버가 빈 Attention 에도 확인을 보내 다시 밀림) — 그 연결은 쓰지 않게 막고 다시 연결하게 한다
+async fn ms_cancel(g: &mut MsClient, c: &DbConn) {
+    if g.cancel_query().await.is_err() {
+        c.broken.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 문장 실행 — 행은 live 에 넣고, 반영 행 수를 돌려준다
+async fn exec(c: &DbConn, sql: &str, live: &Live<'_>) -> R<Option<u64>> {
     let mut affected = None;
-    let mut truncated = false;
-    let mut has_set = false;
     match &c.engine {
-        Engine::Pg { client, cancel, tls } => {
+        Engine::Pg { client, .. } => {
             let stream = client.simple_query_raw(sql).await.map_err(pg_err)?;
             pin_mut!(stream);
+            let mut set: Option<Arc<ResultSet>> = None;
+            let mut halted = false;
             while let Some(m) = stream.next().await {
                 match m {
                     Ok(tokio_postgres::SimpleQueryMessage::RowDescription(cols)) => {
-                        has_set = true;
-                        columns = cols.iter().map(|c| Col { name: c.name().to_string(), kind: "text" }).collect();
-                        rows.clear();
+                        set = Some(live.begin(cols.iter().map(|c| Col { name: c.name().to_string(), kind: "text" }).collect()));
                     }
                     Ok(tokio_postgres::SimpleQueryMessage::Row(r)) => {
-                        if first_row_ms.is_none() {
-                            first_row_ms = Some(started.elapsed().as_millis() as u64);
-                        }
-                        if rows.len() >= max {
-                            truncated = true;
-                            let _ = match tls {
-                                Some(t) => cancel.cancel_query(t.clone()).await,
-                                None => cancel.cancel_query(tokio_postgres::NoTls).await,
-                            };
+                        let Some(rs) = &set else { continue };
+                        if !live.push(rs, (0..r.len()).map(|i| r.get(i).map(String::from)).collect()) {
+                            halted = true;
+                            let _ = server_cancel(c).await;
                             break;
                         }
-                        rows.push((0..r.len()).map(|i| r.get(i).map(String::from)).collect());
+                        live.pace().await;
                     }
                     Ok(tokio_postgres::SimpleQueryMessage::CommandComplete(n)) => affected = Some(n),
                     Ok(_) => {}
-                    Err(x) => {
-                        let err = pg_err(x);
-                        if truncated && err.code == "CANCELLED" {
-                            break;
-                        }
-                        return Err(err);
-                    }
+                    Err(x) => return Err(pg_err(x)),
                 }
             }
-            if truncated {
+            if halted {
                 // 취소 뒤 남은 메시지를 비워 연결을 다음 문장에 쓸 수 있게
                 while let Some(m) = stream.next().await {
                     if m.is_err() {
@@ -1375,19 +1587,36 @@ async fn exec(c: &DbConn, sql: &str, max: usize, started: Instant) -> R<Got> {
             let mut g = conn.lock().await;
             let mut res = g.query_iter(sql).await.map_err(my_err)?;
             let cols = res.columns_ref().to_vec();
-            if !cols.is_empty() {
-                has_set = true;
-                columns = cols.iter().map(|c| Col { name: c.name_str().to_string(), kind: my_kind(c.column_type()) }).collect();
-            }
-            while let Some(row) = res.next().await.map_err(my_err)? {
-                if first_row_ms.is_none() {
-                    first_row_ms = Some(started.elapsed().as_millis() as u64);
+            let set = (!cols.is_empty()).then(|| live.begin(cols.iter().map(|c| Col { name: c.name_str().to_string(), kind: my_kind(c.column_type()) }).collect()));
+            let mut halted = false;
+            loop {
+                let row = match res.next().await {
+                    Ok(Some(r)) => r,
+                    Ok(None) => break,
+                    // 취소를 눌러 멈춘 뒤 서버가 KILL QUERY 로 끊은 것
+                    Err(x) => {
+                        let err = my_err(x);
+                        if halted && err.code == "CANCELLED" {
+                            return Ok(None);
+                        }
+                        return Err(err);
+                    }
+                };
+                // MySQL 은 남은 행을 읽어 버려야 연결을 다시 쓸 수 있다
+                if halted {
+                    continue;
                 }
-                if rows.len() >= max {
-                    truncated = true;
-                    continue; // MySQL 은 남은 행을 읽어 버려야 연결을 다시 쓸 수 있다
+                if let Some(rs) = &set {
+                    if !live.push(rs, row.unwrap().into_iter().map(my_value).collect()) {
+                        halted = true;
+                        // 행·메모리 상한 — 아직 이 결과를 읽는 중이라(문장이 끝나지 않음) KILL QUERY 는 이 문장만 멈춘다.
+                        // 남은 행을 다 읽어 버리는 것보다 빠르다(100만 행 중 1만 상한: 5.7초 → 바로)
+                        if live.stopped() != Some("cancelled") {
+                            let _ = server_cancel(c).await;
+                        }
+                    }
+                    live.pace().await;
                 }
-                rows.push(row.unwrap().into_iter().map(my_value).collect());
             }
             affected = Some(res.affected_rows());
             res.drop_result().await.map_err(my_err)?;
@@ -1395,66 +1624,137 @@ async fn exec(c: &DbConn, sql: &str, max: usize, started: Instant) -> R<Got> {
         Engine::Ms { client } => {
             let mut g = client.lock().await;
             let fw = first_word(sql);
-            if READ_WORDS.contains(&fw.as_str()) || fw == "exec" || fw == "execute" || fw == "sp_help" {
-                let mut stream = g.simple_query(sql).await.map_err(ms_err)?;
-                let mut set: Option<usize> = None;
-                while let Some(item) = stream.try_next().await.map_err(ms_err)? {
-                    match item {
-                        tiberius::QueryItem::Metadata(m) => {
-                            if set.is_none() {
-                                set = Some(m.result_index());
-                                has_set = true;
-                                columns = m.columns().iter().map(|c| Col { name: c.name().to_string(), kind: ms_kind(c.column_type()) }).collect();
+            // 취소는 이 루프가 받는다 — 흐름을 놓고 Attention 으로 서버 문장을 멈춘다
+            let stop = c.stop_notify.notified();
+            pin_mut!(stop);
+            stop.as_mut().enable();
+            let mut halted = c.stop_req.load(Ordering::Relaxed);
+            // first_word 는 소문자, READ_WORDS 는 대문자 — 예전엔 SELECT 도 execute 로 가서 행을 못 받았다
+            if READ_WORDS.iter().any(|w| w.eq_ignore_ascii_case(&fw)) || fw == "with" || fw == "exec" || fw == "execute" || fw == "sp_help" {
+                let mut set: Option<(usize, Arc<ResultSet>)> = None;
+                if !halted {
+                    let opened = tokio::select! {
+                        biased;
+                        _ = &mut stop => None,
+                        r = g.simple_query(sql) => Some(r.map_err(ms_err)?),
+                    };
+                    // 행·메모리 상한이면 남은 행을 읽어 버린다(응답 중 Attention 은 tiberius 가 확인을 못 읽어 연결이 어긋난다)
+                    let mut draining = false;
+                    match opened {
+                        None => halted = true,
+                        Some(mut stream) => loop {
+                            let item = tokio::select! {
+                                biased;
+                                _ = &mut stop => {
+                                    halted = true;
+                                    break;
+                                }
+                                r = stream.try_next() => r.map_err(ms_err)?,
+                            };
+                            let Some(item) = item else { break };
+                            match item {
+                                tiberius::QueryItem::Metadata(m) => {
+                                    if set.is_none() {
+                                        set = Some((m.result_index(), live.begin(m.columns().iter().map(|c| Col { name: c.name().to_string(), kind: ms_kind(c.column_type()) }).collect())));
+                                    }
+                                }
+                                tiberius::QueryItem::Row(r) => {
+                                    let Some((idx, rs)) = &set else { continue };
+                                    if draining || r.result_index() != *idx {
+                                        continue;
+                                    }
+                                    if !live.push(rs, r.into_iter().map(ms_value).collect()) {
+                                        if live.stopped() == Some("cancelled") {
+                                            halted = true;
+                                            break;
+                                        }
+                                        draining = true;
+                                        continue;
+                                    }
+                                    live.pace().await;
+                                }
                             }
-                        }
-                        tiberius::QueryItem::Row(r) => {
-                            if Some(r.result_index()) != set {
-                                continue;
-                            }
-                            if first_row_ms.is_none() {
-                                first_row_ms = Some(started.elapsed().as_millis() as u64);
-                            }
-                            if rows.len() >= max {
-                                truncated = true;
-                                continue;
-                            }
-                            rows.push(r.into_iter().map(ms_value).collect());
-                        }
+                        },
                     }
                 }
+                if halted {
+                    ms_cancel(&mut g, c).await;
+                    live.halt("cancelled");
+                    return Err(e("CANCELLED", "취소했습니다"));
+                }
             } else {
-                let res = g.execute(sql, &[]).await.map_err(ms_err)?;
-                affected = Some(res.total());
+                let done = if halted {
+                    None
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stop => None,
+                        r = g.execute(sql, &[]) => Some(r.map_err(ms_err)?),
+                    }
+                };
+                match done {
+                    Some(res) => affected = Some(res.total()),
+                    None => {
+                        ms_cancel(&mut g, c).await;
+                        return Err(e("CANCELLED", "취소했습니다"));
+                    }
+                }
             }
         }
         Engine::Jdbc { side } => {
-            let (id, mut rx) = side.request(json!({"op": "query", "sql": sql, "maxRows": max})).await.map_err(|m| e("CLOSED", m))?;
+            let max = live.max;
+            let (id, mut rx) = side
+                .request(json!({"op": "query", "sql": sql, "maxRows": max, "firstBatch": FIRST_BATCH, "firstBatchMs": FIRST_MS, "batch": EVERY_ROWS}))
+                .await
+                .map_err(|m| e("CLOSED", m))?;
+            let mut set: Option<Arc<ResultSet>> = None;
+            let mut halted = false;
             let outcome = loop {
                 let Some(v) = rx.recv().await else {
                     break Err(e("CLOSED", "JDBC 브리지가 끝났습니다"));
                 };
                 match v["type"].as_str() {
                     Some("columns") => {
-                        has_set = true;
-                        columns = v["columns"]
-                            .as_array()
-                            .map(|a| a.iter().map(|c| Col { name: c["name"].as_str().unwrap_or("").to_string(), kind: kind_of(c["kind"].as_str().unwrap_or("")) }).collect())
-                            .unwrap_or_default();
+                        set = Some(
+                            live.begin(
+                                v["columns"]
+                                    .as_array()
+                                    .map(|a| a.iter().map(|c| Col { name: c["name"].as_str().unwrap_or("").to_string(), kind: kind_of(c["kind"].as_str().unwrap_or("")) }).collect())
+                                    .unwrap_or_default(),
+                            ),
+                        );
                     }
-                    Some("rows") => {
-                        if first_row_ms.is_none() {
-                            first_row_ms = Some(started.elapsed().as_millis() as u64);
-                        }
+                    Some("rows") if !halted => {
+                        let Some(rs) = &set else { continue };
                         for r in v["rows"].as_array().into_iter().flatten() {
-                            rows.push(r.as_array().map(|x| x.iter().map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default());
+                            if !live.push(rs, r.as_array().map(|x| x.iter().map(|c| c.as_str().map(String::from)).collect()).unwrap_or_default()) {
+                                halted = true;
+                                // 메모리 상한 — 브리지에도 멈추라고(사용자 취소는 이미 보냈다)
+                                if live.stopped() == Some("memory") {
+                                    let _ = side.call(json!({"op": "cancel"})).await;
+                                }
+                                break;
+                            }
                         }
+                        tokio::task::yield_now().await;
                     }
                     Some("done") => {
                         affected = v["affected"].as_u64();
-                        truncated = v["truncated"].as_bool().unwrap_or(false);
+                        if v["truncated"].as_bool().unwrap_or(false) {
+                            live.halt("rows");
+                        }
+                        if v["cancelled"].as_bool().unwrap_or(false) {
+                            live.halt("cancelled");
+                        }
                         break Ok(());
                     }
-                    Some("error") => break Err(jdbc_err(&v)),
+                    Some("error") => {
+                        let err = jdbc_err(&v);
+                        if halted && err.code == "CANCELLED" {
+                            break Ok(());
+                        }
+                        break Err(err);
+                    }
                     _ => {}
                 }
             };
@@ -1462,7 +1762,7 @@ async fn exec(c: &DbConn, sql: &str, max: usize, started: Instant) -> R<Got> {
             outcome?;
         }
     }
-    Ok(Got { columns, rows, affected, truncated, has_set, first_row_ms })
+    Ok(affected)
 }
 
 #[tauri::command]
@@ -1480,15 +1780,16 @@ pub(crate) fn db_rows_core(dbs: &DbConns, result: u32, from: usize, to: usize) -
     let Some(r) = dbs.results.lock().unwrap().get(&result).cloned() else {
         return Vec::new();
     };
+    let rows = r.rows.read().unwrap();
     let view = r.view.lock().unwrap();
     match &*view {
         Some(v) => {
             let to = to.min(v.len());
-            v[from.min(to)..to].iter().filter_map(|&i| r.rows.get(i).cloned()).collect()
+            v[from.min(to)..to].iter().filter_map(|&i| rows.get(i).cloned()).collect()
         }
         None => {
-            let to = to.min(r.rows.len());
-            r.rows[from.min(to)..to].to_vec()
+            let to = to.min(rows.len());
+            rows[from.min(to)..to].to_vec()
         }
     }
 }
@@ -1497,21 +1798,22 @@ pub(crate) fn db_rows_core(dbs: &DbConns, result: u32, from: usize, to: usize) -
 /// 거르기: 낱말을 띄어 쓰면 모두 들어간 행(대소문자 무시, 아무 열). 돌려주는 값은 보이는 행 수
 pub(crate) fn view_core(r: &ResultSet, sort: Option<usize>, desc: bool, filter: Option<&str>) -> usize {
     let words: Vec<String> = filter.unwrap_or("").split_whitespace().map(|w| w.to_lowercase()).collect();
+    let rows = r.rows.read().unwrap();
     if sort.is_none() && words.is_empty() {
         *r.view.lock().unwrap() = None;
-        return r.rows.len();
+        return rows.len();
     }
-    let mut idx: Vec<usize> = (0..r.rows.len())
+    let mut idx: Vec<usize> = (0..rows.len())
         .filter(|&i| {
             words.is_empty() || {
-                let hay: String = r.rows[i].iter().map(|v| v.as_deref().unwrap_or("null").to_lowercase()).collect::<Vec<_>>().join("");
+                let hay: String = rows[i].iter().map(|v| v.as_deref().unwrap_or("null").to_lowercase()).collect::<Vec<_>>().join("");
                 words.iter().all(|w| hay.contains(w.as_str()))
             }
         })
         .collect();
     if let Some(c) = sort.filter(|c| *c < r.columns.len()) {
         let numeric = matches!(r.columns[c].kind, "int" | "numeric");
-        let key = |i: usize| r.rows[i].get(c).cloned().flatten();
+        let key = |i: usize| rows[i].get(c).cloned().flatten();
         idx.sort_by(|&a, &b| {
             use std::cmp::Ordering;
             match (key(a), key(b)) {
@@ -1540,14 +1842,8 @@ pub(crate) fn view_core(r: &ResultSet, sort: Option<usize>, desc: bool, filter: 
 #[tauri::command]
 pub fn db_view(dbs: State<'_, DbConns>, result: u32, sort: Option<usize>, desc: bool, filter: Option<String>) -> R<usize> {
     let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
+    r.need_done()?;
     Ok(view_core(&r, sort, desc, filter.as_deref()))
-}
-
-#[allow(dead_code)]
-fn _unused_rows(dbs: &DbConns, result: u32, from: usize, to: usize) -> R<Vec<Vec<Option<String>>>> {
-    let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
-    let to = to.min(r.rows.len());
-    Ok(r.rows[from.min(to)..to].to_vec())
 }
 
 #[tauri::command]
@@ -1559,12 +1855,15 @@ pub fn db_result_close(dbs: State<'_, DbConns>, result: u32) {
 #[tauri::command]
 pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: String, insert_prefix: Option<String>, mysql: Option<bool>) -> R<usize> {
     let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
+    r.need_done()?;
+    let all = r.rows.read().unwrap();
+    let vis = r.visible(&all);
     let mut out = String::new();
     match format.as_str() {
         "sql" => {
             let prefix = insert_prefix.unwrap_or_default();
             let my = mysql.unwrap_or(false);
-            for row in r.visible() {
+            for row in &vis {
                 let vals: Vec<String> = row
                     .iter()
                     .zip(&r.columns)
@@ -1578,13 +1877,12 @@ pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: Str
             }
         }
         "json" => {
-            let arr: Vec<serde_json::Map<String, serde_json::Value>> = r
-                .visible()
-                .into_iter()
+            let arr: Vec<serde_json::Map<String, serde_json::Value>> = vis
+                .iter()
                 .map(|row| {
                     r.columns
                         .iter()
-                        .zip(row)
+                        .zip(row.iter())
                         .map(|(c, v)| (c.name.clone(), v.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)))
                         .collect()
                 })
@@ -1607,14 +1905,14 @@ pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: Str
             }
             out.push_str(&r.columns.iter().map(|c| cell(&c.name)).collect::<Vec<_>>().join(&sep.to_string()));
             out.push_str("\r\n");
-            for row in r.visible() {
+            for row in &vis {
                 out.push_str(&row.iter().map(|v| v.as_deref().map(cell).unwrap_or_default()).collect::<Vec<_>>().join(&sep.to_string()));
                 out.push_str("\r\n");
             }
         }
     }
     std::fs::write(&path, out).map_err(|x| e("OTHER", x.to_string()))?;
-    Ok(r.visible().len())
+    Ok(vis.len())
 }
 
 // ── 실행 계획 ───────────────────────
@@ -2500,17 +2798,14 @@ mod view_tests {
     fn sort_and_filter() {
         let col = |n: &str, k: &'static str| Col { name: n.into(), kind: k };
         let row = |a: Option<&str>, b: &str| vec![a.map(str::to_string), Some(b.to_string())];
-        let r = ResultSet {
-            columns: vec![col("n", "int"), col("s", "text")],
-            rows: vec![row(Some("10"), "Kim"), row(None, "lee"), row(Some("9"), "Park"), row(Some("100"), "kimchi")],
-            view: Mutex::new(None),
-        };
+        let r = ResultSet::new(vec![col("n", "int"), col("s", "text")], vec![row(Some("10"), "Kim"), row(None, "lee"), row(Some("9"), "Park"), row(Some("100"), "kimchi")], true);
+        let vis = || r.visible(&r.rows.read().unwrap()).into_iter().cloned().collect::<Vec<_>>();
         assert_eq!(view_core(&r, Some(0), false, None), 4);
-        let got: Vec<_> = r.visible().iter().map(|x| x[0].clone()).collect();
+        let got: Vec<_> = vis().iter().map(|x| x[0].clone()).collect();
         assert_eq!(got, vec![Some("9".into()), Some("10".into()), Some("100".into()), None]);
         assert_eq!(view_core(&r, Some(0), true, None), 4);
-        assert_eq!(r.visible()[0][0].as_deref(), Some("100"));
-        assert_eq!(r.visible()[3][0], None);
+        assert_eq!(vis()[0][0].as_deref(), Some("100"));
+        assert_eq!(vis()[3][0], None);
         assert_eq!(view_core(&r, None, false, Some("KIM")), 2);
         assert_eq!(view_core(&r, Some(1), false, Some("kim 10")), 2);
         assert_eq!(view_core(&r, None, false, Some("null")), 1);
@@ -2670,6 +2965,192 @@ mod live_tunnel {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(crate::tunnel::tests::link_count(), 0, "마지막 DB 연결을 닫으면 SSH 연결도");
         drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// 받는 중 알림·취소·시간 상한 — `RB_STREAM_TEST=pg:127.0.0.1:25442,maria:127.0.0.1:23316,ms:127.0.0.1:21443,jdbc:127.0.0.1:25442`
+/// 와 `RB_DB_TEST_PW`(jdbc 는 `RB_JDBC_JAVA`·`RB_JDBC_JAR` — PostgreSQL JDBC 드라이버로 사이드카 프로토콜 확인)
+#[cfg(test)]
+mod live_stream {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn req(engine: &str, host: &str, port: u16, pw: &str) -> DbConnectReq {
+        let (user, db) = match engine {
+            "postgres" => ("postgres", "postgres"),
+            "mssql" => ("sa", "master"),
+            _ => ("root", "shop"),
+        };
+        DbConnectReq {
+            profile_id: None,
+            account_id: None,
+            engine: engine.into(),
+            host: host.into(),
+            port,
+            username: user.into(),
+            password: Some(pw.into()),
+            database: Some(db.into()),
+            read_only: false,
+            save_secret: false,
+            legacy: false,
+            ssl: None,
+            tunnel: Default::default(),
+        }
+    }
+
+    type Log = Mutex<Vec<(u64, usize, Instant)>>;
+
+    async fn run(dbs: &DbConns, c: u32, sql: &str, max: usize, timeout: Option<u64>, log: &Log) -> R<QueryOk> {
+        log.lock().unwrap().clear();
+        let f = |p: Progress| log.lock().unwrap().push((p.ms, p.row_count, Instant::now()));
+        query_opts(dbs, c, sql.into(), Some(max), timeout, Some((1, &f))).await
+    }
+
+    fn report(name: &str, q: &R<QueryOk>, log: &Log, t: Instant) {
+        let l = log.lock().unwrap();
+        let first = l.first().map(|x| format!("{} ms 에 {}행", x.2.duration_since(t).as_millis(), x.1));
+        match q {
+            Ok(q) => println!(
+                "{name}: {}행 truncated {} stopped {:?} 전체 {} ms · 보냄→첫 행 {:?} ms · 알림 {}번(첫 알림 {:?}) · 마지막 알림 {:?}",
+                q.row_count,
+                q.truncated,
+                q.stopped,
+                q.ms,
+                q.first_row_ms,
+                l.len(),
+                first,
+                l.last().map(|x| (x.0, x.1))
+            ),
+            Err(x) => println!("{name}: 오류 {} {} · 알림 {}번", x.code, x.message, l.len()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_stream_all_engines() {
+        let spec = std::env::var("RB_STREAM_TEST").expect("RB_STREAM_TEST");
+        let pw = std::env::var("RB_DB_TEST_PW").expect("RB_DB_TEST_PW");
+        let dir = std::env::temp_dir().join(format!("rbshell-stream-{}", std::process::id()));
+        let store = Store::open(dir.clone(), false).unwrap();
+        let dbs = DbConns::default();
+        let log: Log = Mutex::new(Vec::new());
+        for item in spec.split(',') {
+            let mut it = item.split(':');
+            let kind = it.next().unwrap();
+            let host = it.next().unwrap();
+            let port: u16 = it.next().unwrap().parse().unwrap();
+            println!("== {kind}");
+            let mut c = if kind == "jdbc" {
+                let java = std::env::var("RB_JDBC_JAVA").expect("RB_JDBC_JAVA");
+                let jar = PathBuf::from(std::env::var("RB_JDBC_JAR").expect("RB_JDBC_JAR"));
+                let side = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("rb-jdbc.jar");
+                let s = crate::jdbc::Sidecar::spawn_with(std::path::Path::new(&java), &side, &[jar]).await.unwrap();
+                let url = format!("jdbc:postgresql://{host}:{port}/postgres");
+                let v = s.call(json!({"op": "connect", "url": url, "user": "postgres", "password": pw, "driver": "org.postgresql.Driver"})).await.unwrap();
+                assert_eq!(v["type"], "ok", "{v}");
+                let id = dbs.next.fetch_add(1, Ordering::Relaxed) + 1;
+                dbs.map.lock().unwrap().insert(id, Arc::new(DbConn::new(Engine::Jdbc { side: s }, req("postgres", host, port, &pw), 1, None)));
+                id
+            } else {
+                let engine = match kind {
+                    "pg" => "postgres",
+                    "ms" => "mssql",
+                    _ => "mariadb",
+                };
+                connect(&store, &dbs, req(engine, host, port, &pw), None).await.unwrap().conn_id
+            };
+            let (million, slow) = match kind {
+                "pg" | "jdbc" => (
+                    "SELECT g AS id, 'user ' || g AS name, now() - g * interval '1 minute' AS at FROM generate_series(1, 1000000) g",
+                    "SELECT g, pg_sleep(0.002) FROM generate_series(1, 100000) g",
+                ),
+                "ms" => (
+                    "SELECT TOP 1000000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS id, CONCAT(N'user ', ROW_NUMBER() OVER (ORDER BY (SELECT NULL))) AS name, SYSDATETIME() AS at FROM sys.all_objects a CROSS JOIN sys.all_objects b CROSS JOIN sys.all_objects c",
+                    // 응답을 보내는 중에 멈추기(그 연결은 막히고 새로 접속)
+                    "SELECT TOP 1000000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS id, CONCAT(N'user ', ROW_NUMBER() OVER (ORDER BY (SELECT NULL))) AS name, SYSDATETIME() AS at FROM sys.all_objects a CROSS JOIN sys.all_objects b CROSS JOIN sys.all_objects c",
+                ),
+                _ => ("SELECT seq AS id, CONCAT('user ', seq) AS name, NOW() - INTERVAL seq MINUTE AS at FROM seq_1_to_1000000", "SELECT seq, SLEEP(0.002) FROM seq_1_to_100000"),
+            };
+            // 100만 행 — 첫 알림이 일찍 오는지, 받는 중에도 앞 행을 읽을 수 있는지
+            let t = Instant::now();
+            let q = {
+                let fut = run(&dbs, c, million, 1_000_000, None, &log);
+                pin_mut!(fut);
+                let mut peeked = false;
+                loop {
+                    tokio::select! {
+                        r = &mut fut => break r,
+                        _ = tokio::time::sleep(Duration::from_millis(20)), if !peeked => {
+                            if log.lock().unwrap().first().is_some_and(|x| x.1 > 0) {
+                                let id = dbs.results.lock().unwrap().keys().max().copied().unwrap();
+                                let rows = db_rows_core(&dbs, id, 0, 2);
+                                println!("  받는 중 {} ms 에 앞 두 행 읽기 {:?}", t.elapsed().as_millis(), rows);
+                                peeked = true;
+                            }
+                        }
+                    }
+                }
+            };
+            report("100만 행", &q, &log, t);
+            let q = q.unwrap();
+            assert!(q.row_count >= 999_000, "{}", q.row_count);
+            assert!(log.lock().unwrap().len() >= 2);
+            // 행 상한
+            let t = Instant::now();
+            let q = run(&dbs, c, million, 10_000, None, &log).await;
+            report("상한 1만", &q, &log, t);
+            assert!(q.as_ref().unwrap().truncated && q.as_ref().unwrap().row_count == 10_000);
+            // 취소 — 받은 행은 남는다
+            let t = Instant::now();
+            let q = {
+                let fut = run(&dbs, c, slow, 1_000_000, None, &log);
+                let cancel = async {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    cancel_conn(&dbs.get(c).unwrap()).await
+                };
+                let (q, k) = tokio::join!(fut, cancel);
+                println!("  취소 요청 → {:?}", k.err().map(|x| x.message));
+                q
+            };
+            report("취소(1.2초 뒤)", &q, &log, t);
+            let next = query(&dbs, c, "SELECT 1".into(), None).await;
+            println!("  다음 문장 {:?}", next.as_ref().map(|x| x.row_count).map_err(|x| x.message.clone()));
+            if next.is_err() && kind == "ms" && dbs.any(c).unwrap().broken.load(Ordering::Relaxed) {
+                println!("  (SQL Server 응답 중 멈춤 → 연결 막음, 새로 접속)");
+                c = connect(&store, &dbs, req("mssql", host, port, &pw), None).await.unwrap().conn_id;
+            } else {
+                assert!(next.is_ok());
+            }
+            // 시간 상한 — 받은 행은 남는다
+            let t = Instant::now();
+            let q = run(&dbs, c, slow, 1_000_000, Some(1000), &log).await;
+            report("시간 상한 1초", &q, &log, t);
+            let next = query(&dbs, c, "SELECT 1".into(), None).await;
+            println!("  다음 문장 {:?}", next.as_ref().map(|x| x.row_count).map_err(|x| x.message.clone()));
+            if next.is_err() && kind == "ms" && dbs.any(c).unwrap().broken.load(Ordering::Relaxed) {
+                println!("  (SQL Server 응답 중 멈춤 → 연결 막음, 새로 접속)");
+                c = connect(&store, &dbs, req("mssql", host, port, &pw), None).await.unwrap().conn_id;
+            } else {
+                assert!(next.is_ok());
+            }
+            if kind == "ms" {
+                // 계산 중(아직 보낸 응답 없음)에 취소 — 실측: 이때도 tiberius 0.13 이 확인을 못 읽어 연결을 막는다
+                let t = Instant::now();
+                let fut = run(&dbs, c, "WAITFOR DELAY '00:00:05'; SELECT 1 AS n", 100, None, &log);
+                let cancel = async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    cancel_conn(&dbs.get(c).unwrap()).await
+                };
+                let (q, _) = tokio::join!(fut, cancel);
+                report("계산 중 취소", &q, &log, t);
+                let next = query(&dbs, c, "SELECT 1".into(), None).await;
+                let broken = dbs.any(c).unwrap().broken.load(Ordering::Relaxed);
+                println!("  다음 문장 {:?} · 막힘 {broken}", next.as_ref().map(|x| x.row_count).map_err(|x| x.message.clone()));
+                assert!(next.is_ok() || broken);
+            }
+            dbs.map.lock().unwrap().remove(&c);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

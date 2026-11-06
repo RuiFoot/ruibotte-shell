@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Copy } from "lucide-react";
 import { useEffect, useState } from "react";
-import { api, type LegacyLevel, type Profile } from "../lib/ipc";
+import { api, type LegacyLevel, type Profile, routes as routeApi } from "../lib/ipc";
 
 type Candidate = {
 	source: "ssh-config" | "putty";
@@ -13,6 +13,10 @@ type Candidate = {
 	keyPath?: string | null;
 	legacy: LegacyLevel;
 	duplicate: boolean;
+	/** ssh config 의 ProxyJump(쉼표로 여러 단계) */
+	proxyJump?: string | null;
+	/** ssh config 의 ProxyCommand */
+	proxyCommand?: string | null;
 };
 
 /** 가져오기 — ~/.ssh/config·PuTTY 세션에서 골라 내 연결로 */
@@ -22,6 +26,8 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 	const [err, setErr] = useState("");
 	// 같은 주소·포트의 다른 사용자는 서버 하나의 계정 여럿으로
 	const [merge, setMerge] = useState(true);
+	// 경로(ProxyJump·ProxyCommand)를 넣으며 알릴 말 — 있으면 닫기 전에 보여 준다
+	const [notes, setNotes] = useState<string[] | null>(null);
 
 	useEffect(() => {
 		invoke<Candidate[]>("import_candidates", { sshConfigPath: null })
@@ -48,7 +54,7 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 			const same = (p: Profile, kind: "ssh" | "db", host: string, port: number, extra?: (p: Profile) => boolean) =>
 				p.kind === kind && p.host.toLowerCase() === host.toLowerCase() && p.port === port && (!extra || extra(p));
 			/** 같은 서버가 있으면 계정만 더하고, 없으면 서버(기본 계정 포함)를 만든다 */
-			const put = async (target: Profile | undefined, make: Profile, auth: "password" | "key", keyPath: string | null) => {
+			const put = async (target: Profile | undefined, make: Profile, auth: "password" | "key", keyPath: string | null): Promise<number | undefined> => {
 				if (merge && target?.id != null) {
 					if ((target.accounts ?? []).some((x) => x.username === make.username)) return;
 					await api.accountSave({ profileId: target.id, username: make.username, auth, keyPath, sudo: "off", sudoUser: "root", isDefault: false, label: null });
@@ -57,7 +63,9 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 				}
 				const id = await api.profileSave(make);
 				have.push({ ...make, id, accounts: [{ profileId: id, username: make.username, auth, keyPath, sudo: "off", sudoUser: "root", isDefault: true }] });
+				return id;
 			};
+			const routeItems: { profileId: number; proxyJump?: string | null; proxyCommand?: string | null }[] = [];
 			for (const d of dbs) {
 				const make: Profile = { kind: "db", name: d.name, host: d.host, port: d.port, username: d.username, engine: d.engine, database: d.database || null, favorite: false, color: "#30d158", auth: "password", keyPath: null, legacy: "off", defaultPath: null };
 				await put(
@@ -84,12 +92,20 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 					defaultPath: null,
 					database: null,
 				};
-				await put(
+				const id = await put(
 					have.find((p) => same(p, "ssh", c.host, c.port)),
 					make,
 					auth,
 					c.keyPath ?? null,
 				);
+				// 새로 만든 서버만 — 이미 있던 서버의 경로는 건드리지 않는다
+				if (id != null && (c.proxyJump || c.proxyCommand)) routeItems.push({ profileId: id, proxyJump: c.proxyJump, proxyCommand: c.proxyCommand });
+			}
+			// 점프 단계는 같이 가져온 별칭을 가리킬 수 있어 모두 만든 뒤에
+			const said = routeItems.length ? await routeApi.importRoutes(routeItems) : [];
+			if (said.length) {
+				setNotes(said);
+				return;
 			}
 			onDone();
 		} catch (e) {
@@ -132,11 +148,28 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 									</small>
 								</span>
 								{c.legacy !== "off" && <span className="badge warn">구형 {c.legacy}</span>}
+								{c.proxyJump && (
+									<span className="badge" title={`ProxyJump ${c.proxyJump} — 경로의 점프 단계로 넣습니다`}>
+										점프 {c.proxyJump.split(",").filter((x) => x.trim()).length}단
+									</span>
+								)}
+								{c.proxyCommand && (
+									<span className="badge" title={`ProxyCommand ${c.proxyCommand} — 경로의 프록시 명령으로 넣습니다`}>
+										프록시 명령
+									</span>
+								)}
 								<span className="badge">{c.source === "putty" ? "PuTTY" : "ssh config"}</span>
 								{c.duplicate && <span className="badge">이미 있음</span>}
 							</label>
 						))}
 					</div>
+				)}
+				{notes && (
+					<ul className="cd-attempts" aria-label="경로 가져오기 알림">
+						{notes.map((n) => (
+							<li key={n}>{n}</li>
+						))}
+					</ul>
 				)}
 				<label className="check" title="예: 같은 서버에 root·deploy 두 줄이 있으면 서버 하나에 계정 두 개로 넣습니다">
 					<input type="checkbox" checked={merge} onChange={(e) => setMerge(e.target.checked)} /> 같은 주소·포트의 다른 사용자는 한 서버의 계정으로 합치기(이미 있는 서버에도)
@@ -148,9 +181,15 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 					<button type="button" className="btn" onClick={() => void pickDbFile()} title="DataGrip dataSources.xml · DBeaver data-sources.json">
 						DB 파일…{dbs.length ? ` (${dbs.length})` : ""}
 					</button>
-					<button type="button" className="btn primary" disabled={!pick.size && !dbs.length} onClick={() => void run()}>
-						{pick.size + dbs.length}개 가져오기
-					</button>
+					{notes ? (
+						<button type="button" className="btn primary" onClick={onDone}>
+							가져오기 끝 — 닫기
+						</button>
+					) : (
+						<button type="button" className="btn primary" disabled={!pick.size && !dbs.length} onClick={() => void run()}>
+							{pick.size + dbs.length}개 가져오기
+						</button>
+					)}
 				</div>
 			</div>
 		</div>

@@ -1,8 +1,9 @@
 // RuiBotte Shell JDBC 브리지 — Rust 앱이 띄우는 별도 프로세스. Java 11+, 외부 라이브러리 없음.
 // 표준입력으로 한 줄 JSON 요청을 받고, 표준출력으로 한 줄 JSON 응답을 보낸다(로그는 표준오류).
 //   {"id":1,"op":"connect","url":"jdbc:…","user":"u","password":"p","driver":"oracle.jdbc.OracleDriver","readOnly":true}
-//   {"id":2,"op":"query","sql":"select …","maxRows":10000}   → columns · rows(500행씩) · done | error
-//   {"id":3,"op":"cancel"}                                      → 실행 중인 문장 Statement.cancel()
+//   {"id":2,"op":"query","sql":"select …","maxRows":10000,"firstBatch":50,"firstBatchMs":15,"batch":500}
+//        → columns · rows(첫 묶음은 firstBatch 행 또는 첫 행 뒤 firstBatchMs 가 지나면, 그다음 batch 행씩) · done{cancelled} | error
+//   {"id":3,"op":"cancel"}                                      → 실행 중인 문장 Statement.cancel() + 받는 루프 멈춤(드라이버가 취소를 못 해도)
 //   {"id":4,"op":"tree","path":["SCHEMA","TABLE"]}             → DatabaseMetaData 로 스키마·표·열
 //   {"id":5,"op":"close"}
 // 암호는 메모리에만 두고 출력하지 않는다.
@@ -31,6 +32,8 @@ public final class RbJdbc {
     private static final PrintStream OUT = new PrintStream(System.out, true, StandardCharsets.UTF_8);
     private static volatile Connection conn;
     private static volatile Statement running;
+    /** 취소를 눌렀는지 — 행을 읽는 루프가 묶음 사이에서 본다 */
+    private static volatile boolean stopRequested;
     private static final Object WRITE = new Object();
 
     public static void main(String[] args) throws Exception {
@@ -51,6 +54,7 @@ public final class RbJdbc {
             String op = String.valueOf(req.get("op"));
             switch (op) {
                 case "cancel": {
+                    stopRequested = true;
                     Statement s = running;
                     if (s != null) {
                         try {
@@ -161,14 +165,20 @@ public final class RbJdbc {
         Connection c = need();
         String sql = (String) req.get("sql");
         int max = req.get("maxRows") instanceof Number ? ((Number) req.get("maxRows")).intValue() : 10000;
+        // 첫 묶음을 빨리 보내 화면이 바로 그리게 — 예전 요청(값 없음)은 500행씩 그대로
+        int every = req.get("batch") instanceof Number ? Math.max(1, ((Number) req.get("batch")).intValue()) : 500;
+        int first = req.get("firstBatch") instanceof Number ? Math.max(1, ((Number) req.get("firstBatch")).intValue()) : every;
+        long firstNs = req.get("firstBatchMs") instanceof Number ? ((Number) req.get("firstBatchMs")).longValue() * 1_000_000L : Long.MAX_VALUE;
         long t0 = System.nanoTime();
+        stopRequested = false;
         try (Statement st = c.createStatement()) {
             running = st;
-            st.setFetchSize(500);
+            st.setFetchSize(Math.min(every, 500));
             boolean isSet = st.execute(sql);
             Long firstRow = null;
             int count = 0;
             boolean truncated = false;
+            boolean cancelled = false;
             long affected = -1;
             if (isSet) {
                 try (ResultSet rs = st.getResultSet()) {
@@ -178,8 +188,13 @@ public final class RbJdbc {
                     for (int i = 1; i <= n; i++) cols.add(Map.of("name", md.getColumnLabel(i), "kind", kind(md.getColumnType(i))));
                     send(Map.of("id", id, "type", "columns", "columns", cols));
                     List<Object> batch = new ArrayList<>();
-                    while (rs.next()) {
-                        if (firstRow == null) firstRow = (System.nanoTime() - t0) / 1_000_000;
+                    boolean sentFirst = false;
+                    long firstAt = 0;
+                    while (!stopRequested && rs.next()) {
+                        if (firstRow == null) {
+                            firstRow = (System.nanoTime() - t0) / 1_000_000;
+                            firstAt = System.nanoTime();
+                        }
                         if (count >= max) {
                             truncated = true;
                             try { st.cancel(); } catch (SQLException ignored) { }
@@ -197,11 +212,14 @@ public final class RbJdbc {
                         }
                         batch.add(row);
                         count++;
-                        if (batch.size() >= 500) {
+                        boolean due = sentFirst ? batch.size() >= every : batch.size() >= first || System.nanoTime() - firstAt >= firstNs;
+                        if (due) {
                             send(Map.of("id", id, "type", "rows", "rows", batch));
                             batch = new ArrayList<>();
+                            sentFirst = true;
                         }
                     }
+                    if (stopRequested) cancelled = true;
                     if (!batch.isEmpty()) send(Map.of("id", id, "type", "rows", "rows", batch));
                 }
             } else {
@@ -214,6 +232,7 @@ public final class RbJdbc {
             done.put("rowCount", count);
             done.put("affected", affected < 0 ? null : affected);
             done.put("truncated", truncated);
+            done.put("cancelled", cancelled);
             done.put("ms", (System.nanoTime() - t0) / 1_000_000);
             done.put("firstRowMs", firstRow);
             send(done);

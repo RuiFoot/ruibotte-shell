@@ -20,6 +20,12 @@ pub struct Candidate {
     pub legacy: String,
     /// 같은 주소·포트 서버에 같은 사용자 계정이 이미 있으면
     pub duplicate: bool,
+    /// ssh config 의 ProxyJump(쉼표로 여러 단계) — 가져온 뒤 경로의 점프 단계로
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
+    /// ssh config 의 ProxyCommand — 경로의 프록시 명령으로
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_command: Option<String>,
 }
 
 fn home() -> PathBuf {
@@ -82,7 +88,18 @@ pub fn parse_ssh_config(text: &str) -> Vec<Candidate> {
                 let names = v.split_whitespace().map(String::from).collect();
                 cur = Some((
                     names,
-                    Candidate { source: "ssh-config", name: String::new(), host: String::new(), port: 22, username: String::new(), key_path: None, legacy: "off".into(), duplicate: false },
+                    Candidate {
+                        source: "ssh-config",
+                        name: String::new(),
+                        host: String::new(),
+                        port: 22,
+                        username: String::new(),
+                        key_path: None,
+                        legacy: "off".into(),
+                        duplicate: false,
+                        proxy_jump: None,
+                        proxy_command: None,
+                    },
                     String::new(),
                 ));
             }
@@ -94,6 +111,8 @@ pub fn parse_ssh_config(text: &str) -> Vec<Candidate> {
                         "port" => c.port = v.parse().unwrap_or(22),
                         "user" => c.username = v,
                         "identityfile" => c.key_path = Some(expand(&v)),
+                        "proxyjump" if !v.eq_ignore_ascii_case("none") => c.proxy_jump = Some(v),
+                        "proxycommand" if !v.eq_ignore_ascii_case("none") => c.proxy_command = Some(v),
                         "hostkeyalgorithms" | "pubkeyacceptedalgorithms" | "pubkeyacceptedkeytypes" | "kexalgorithms" | "ciphers" | "macs" => {
                             algos.push(' ');
                             algos.push_str(&v);
@@ -149,6 +168,8 @@ fn putty_sessions() -> Vec<Candidate> {
                 legacy_from(&format!("{} {}", above(&kex).replace("dh-group1-sha1", "diffie-hellman-group1-sha1").replace("dh-group14-sha1", "diffie-hellman-group14-sha1").replace("dh-gex-sha1", "diffie-hellman-group-exchange-sha1"), above(&hk).replace("dsa", "ssh-dss")))
             },
             duplicate: false,
+            proxy_jump: None,
+            proxy_command: None,
         });
     }
     out
@@ -172,6 +193,106 @@ pub fn import_candidates(store: State<'_, Store>, ssh_config_path: Option<String
             .any(|p| p.kind == "ssh" && p.host.eq_ignore_ascii_case(&c.host) && p.port == c.port && p.accounts.iter().any(|a| a.username == c.username));
     }
     Ok(all)
+}
+
+/// ProxyJump 한 단계 "[user@]host[:port]"(ssh://user@host:port 도) → (사용자, 호스트, 포트)
+fn parse_jump(s: &str) -> Option<(Option<String>, String, Option<u16>)> {
+    let s = s.trim().trim_start_matches("ssh://");
+    if s.is_empty() {
+        return None;
+    }
+    let (user, rest) = match s.rsplit_once('@') {
+        Some((u, r)) => (Some(u.to_string()), r),
+        None => (None, s),
+    };
+    let (host, port) = if let Some(r) = rest.strip_prefix('[') {
+        let (h, tail) = r.split_once(']')?;
+        (h.to_string(), tail.strip_prefix(':').and_then(|p| p.parse().ok()))
+    } else {
+        match rest.rsplit_once(':') {
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') => (h.to_string(), p.parse().ok()),
+            _ => (rest.to_string(), None),
+        }
+    };
+    (!host.is_empty()).then_some((user, host, port))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteImport {
+    pub profile_id: i64,
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+    #[serde(default)]
+    pub proxy_command: Option<String>,
+}
+
+/// 가져온 서버의 첫 경로에 ProxyJump(여러 단계)·ProxyCommand 를 넣는다.
+/// 점프 단계는 같은 이름(별칭) 또는 주소·포트의 서버를 쓰고, 없으면 서버를 새로 만든다. 돌려주는 것은 알릴 말
+#[tauri::command]
+pub fn import_routes(store: State<'_, Store>, items: Vec<RouteImport>) -> Result<Vec<String>, String> {
+    import_routes_core(&store, items)
+}
+
+pub(crate) fn import_routes_core(store: &Store, items: Vec<RouteImport>) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    for it in items {
+        let Some(mut r) = store.routes(it.profile_id)?.into_iter().next() else { continue };
+        let name = store.profile(it.profile_id).map(|p| p.name).unwrap_or_default();
+        let mut hops = Vec::new();
+        for spec in it.proxy_jump.as_deref().unwrap_or("").split(',') {
+            let Some((user, host, port)) = parse_jump(spec) else { continue };
+            let pid = match store.find_ssh_profile(&host, port) {
+                Some(id) => id,
+                None => {
+                    let p = Profile {
+                        id: None,
+                        kind: "ssh".into(),
+                        name: host.clone(),
+                        host: host.clone(),
+                        port: port.unwrap_or(22),
+                        username: user.clone().unwrap_or_default(),
+                        engine: None,
+                        color: None,
+                        favorite: false,
+                        last_used_at: None,
+                        auth: "password".into(),
+                        key_path: None,
+                        legacy: "off".into(),
+                        default_path: None,
+                        database: None,
+                        secret_saved: false,
+                        jump_id: None,
+                        group_name: None,
+                        ssl: None,
+                        memo: Some("가져오기: ProxyJump 단계로 만든 서버".into()),
+                        accounts: Vec::new(),
+                        ssh_tunnel_profile_id: None,
+                        ssh_tunnel_account_id: None,
+                        tmux: false,
+                    };
+                    let id = store.profile_save(&p)?;
+                    notes.push(format!("{name}: 점프 서버 {host} 를 새로 만들었습니다(호스트 키 확인·암호 저장을 위해 한 번 직접 접속하세요)"));
+                    id
+                }
+            };
+            if pid == it.profile_id || hops.iter().any(|h: &crate::store::Hop| h.profile_id == pid) {
+                notes.push(format!("{name}: 점프 {host} 는 돌고 도는 길이라 뺐습니다"));
+                continue;
+            }
+            let account_id = user.and_then(|u| store.accounts(pid).ok()?.into_iter().find(|a| a.username == u)?.id);
+            hops.push(crate::store::Hop { profile_id: pid, account_id });
+        }
+        r.jumps = hops;
+        if let Some(cmd) = it.proxy_command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            r.proxy_kind = Some("command".into());
+            r.proxy_command = Some(cmd.to_string());
+        }
+        if let Err(e) = store.route_save(&r) {
+            notes.push(format!("{name}: 경로를 넣지 못했습니다 — {e}"));
+        }
+    }
+    Ok(notes)
 }
 
 /// 내 SSH 서버를 ssh config 로(암호 없음, 계정은 기본 계정). 구형 단계는 켠 만큼 알고리즘 줄을 붙인다
@@ -222,6 +343,69 @@ mod tests {
         assert_eq!((c[0].name.as_str(), c[0].host.as_str(), c[0].port, c[0].username.as_str()), ("dev", "10.0.0.5", 2222, "app"));
         assert_eq!(c[1].name, "web");
         assert_eq!(c[2].legacy, "sha1");
+    }
+
+    #[test]
+    fn parses_proxy_lines_and_jumps() {
+        let c = parse_ssh_config("Host in\n  HostName 10.0.0.9\n  ProxyJump gw1,ops@gw2:2222\nHost px\n  ProxyCommand nc -X connect -x proxy:3128 %h %p\n");
+        assert_eq!(c[0].proxy_jump.as_deref(), Some("gw1,ops@gw2:2222"));
+        assert_eq!(c[1].proxy_command.as_deref(), Some("nc -X connect -x proxy:3128 %h %p"));
+        assert_eq!(parse_jump("ops@gw2:2222"), Some((Some("ops".into()), "gw2".into(), Some(2222))));
+        assert_eq!(parse_jump("gw1"), Some((None, "gw1".into(), None)));
+        assert_eq!(parse_jump("ssh://a@[::1]:22"), Some((Some("a".into()), "::1".into(), Some(22))));
+    }
+
+    #[test]
+    fn import_routes_builds_chain() {
+        let dir = std::env::temp_dir().join(format!("rbshell-imp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(dir.clone(), false).unwrap();
+        let mk = |name: &str, host: &str| {
+            let p = Profile {
+                id: None,
+                kind: "ssh".into(),
+                name: name.into(),
+                host: host.into(),
+                port: 22,
+                username: "u".into(),
+                engine: None,
+                color: None,
+                favorite: false,
+                last_used_at: None,
+                auth: "password".into(),
+                key_path: None,
+                legacy: "off".into(),
+                default_path: None,
+                database: None,
+                secret_saved: false,
+                jump_id: None,
+                group_name: None,
+                ssl: None,
+                memo: None,
+                accounts: Vec::new(),
+                ssh_tunnel_profile_id: None,
+                ssh_tunnel_account_id: None,
+                tmux: false,
+            };
+            store.profile_save(&p).unwrap()
+        };
+        let gw1 = mk("gw1", "gw1.example");
+        let target = mk("in", "10.0.0.9");
+        let notes = import_routes_core(
+            &store,
+            vec![RouteImport { profile_id: target, proxy_jump: Some("gw1,ops@gw2.example:2222,in".into()), proxy_command: None }],
+        )
+        .unwrap();
+        let r = &store.routes(target).unwrap()[0];
+        assert_eq!(r.jumps.len(), 2, "{notes:?}");
+        assert_eq!(r.jumps[0].profile_id, gw1);
+        let gw2 = store.profile(r.jumps[1].profile_id).unwrap();
+        assert_eq!((gw2.host.as_str(), gw2.port), ("gw2.example", 2222));
+        assert!(notes.iter().any(|n| n.contains("돌고 도는")), "자기 자신은 뺀다");
+        // 서버의 jump_id 는 첫 단계로
+        assert_eq!(store.profile(target).unwrap().jump_id, Some(gw1));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

@@ -2,6 +2,7 @@
 #![allow(clippy::result_large_err)]
 
 mod db;
+mod diag;
 mod grid;
 mod importer;
 mod jdbc;
@@ -9,8 +10,10 @@ mod keys;
 mod localfs;
 mod monitor;
 mod pty;
+mod route;
 mod secrets;
 mod sessionlog;
+mod srvtools;
 mod ssh;
 mod store;
 mod sudo;
@@ -129,6 +132,14 @@ pub fn run() {
             store::account_secret_set,
             store::account_sudo_secret_set,
             store::host_key_get,
+            store::route_list,
+            store::route_save,
+            store::route_delete,
+            store::route_reorder,
+            route::net_info_get,
+            ssh::ssh_conn_route,
+            diag::ssh_diagnose,
+            importer::import_routes,
             ssh::ssh_shell_sudo_pw,
             ssh::ssh_tmux_list,
             ssh::ssh_tmux_kill,
@@ -242,6 +253,13 @@ pub fn run() {
             keys::keys_generate,
             keys::keys_convert,
             keys::keys_install,
+            srvtools::srv_run,
+            srvtools::srv_stream_open,
+            srvtools::srv_stream_close,
+            srvtools::local_grep,
+            srvtools::web_forward_open,
+            srvtools::web_forward_list,
+            srvtools::web_forward_close,
         ])
         .run(tauri::generate_context!())
         .expect("RuiBotte Shell 을 시작하지 못했습니다");

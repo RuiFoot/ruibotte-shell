@@ -185,12 +185,14 @@ export function DataGrid({
 	const [widths, setWidths] = useState<number[]>(() => columns.map(widthOf));
 	const fitted = useRef(false);
 	const userSized = useRef(false);
+	// 열 배열은 부르는 쪽이 그릴 때마다 새로 만든다(받는 중엔 자주) — 이름·형식이 바뀔 때만 다시 짐작
+	const colKey = columns.map((c) => `${c.name}${c.kind}`).join("");
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 열이 바뀔 때만 다시 짐작
 	useEffect(() => {
 		setWidths(columns.map(widthOf));
 		fitted.current = false;
 		userSized.current = false;
-	}, [columns]);
+	}, [colKey]);
 	const tpl = useMemo(() => ["64px", ...widths.map((w) => `${w}px`)].join(" "), [widths]);
 	const total = 64 + widths.reduce((a, b) => a + b, 0);
 
@@ -198,7 +200,10 @@ export function DataGrid({
 
 	const ensure = useCallback(
 		(page: number) => {
-			if (page * PAGE >= rowCount || pages.current.has(page) || loading.current.has(page)) return;
+			if (page * PAGE >= rowCount || loading.current.has(page)) return;
+			// 받는 중(rowCount 가 늘어남) — 덜 찬 채로 받아 둔 묶음은 다시 받는다
+			const have = pages.current.get(page);
+			if (have && (have.length >= PAGE || page * PAGE + have.length >= rowCount)) return;
 			loading.current.add(page);
 			void fetchRows(page * PAGE, page * PAGE + PAGE).then((r) => {
 				pages.current.set(page, r);

@@ -40,8 +40,9 @@
 	--term-fg: #1d1d1f;
 }
 
+/* 어두운 모드 — OS 를 따르거나(설정 › 화면 › 시스템 따라) html[data-theme="dark"] 로 강제 */
 @media (prefers-color-scheme: dark) {
-	:root {
+	:root:not([data-theme="light"]) {
 		--window-solid: #1c1c1f;
 		--sidebar: rgb(40 40 46 / 0.55);
 		--sidebar-solid: #26262b;
@@ -60,6 +61,31 @@
 		--term-bg: #161618;
 		--term-fg: #e8e8ed;
 	}
+}
+:root[data-theme="dark"] {
+	--window-solid: #1c1c1f;
+	--sidebar: rgb(40 40 46 / 0.55);
+	--sidebar-solid: #26262b;
+	--surface: #1e1e21;
+	--surface-2: #252529;
+	--elevated: rgb(44 44 50 / 0.78);
+	--hairline: rgb(255 255 255 / 0.08);
+	--hairline-strong: rgb(255 255 255 / 0.14);
+	--text: #f5f5f7;
+	--text-2: rgb(235 235 245 / 0.72);
+	--text-3: rgb(235 235 245 / 0.42);
+	--fill: rgb(120 120 128 / 0.24);
+	--fill-hover: rgb(120 120 128 / 0.32);
+	--shadow-pop: 0 0 0 0.5px rgb(255 255 255 / 0.1), 0 16px 48px rgb(0 0 0 / 0.5);
+	--shadow-card: 0 0 0 0.5px rgb(255 255 255 / 0.07), 0 1px 2px rgb(0 0 0 / 0.3);
+	--term-bg: #161618;
+	--term-fg: #e8e8ed;
+}
+:root[data-theme="light"] {
+	color-scheme: light;
+}
+:root[data-theme="dark"] {
+	color-scheme: dark;
 }
 
 * {
@@ -2397,7 +2423,7 @@ html[data-os="macos"] .sidebar {
 	--syn-meta: #643820;
 }
 @media (prefers-color-scheme: dark) {
-	:root {
+	:root:not([data-theme="light"]) {
 		--syn-keyword: #ff7ab2;
 		--syn-string: #ff8170;
 		--syn-number: #d9c97c;
@@ -2409,6 +2435,18 @@ html[data-os="macos"] .sidebar {
 		--syn-punct: var(--text-2);
 		--syn-meta: #fd8f3f;
 	}
+}
+:root[data-theme="dark"] {
+	--syn-keyword: #ff7ab2;
+	--syn-string: #ff8170;
+	--syn-number: #d9c97c;
+	--syn-comment: #7f8c98;
+	--syn-prop: #78c2b3;
+	--syn-type: #6bdfff;
+	--syn-func: #67b7a4;
+	--syn-var: var(--text);
+	--syn-punct: var(--text-2);
+	--syn-meta: #fd8f3f;
 }
 input[type="checkbox"],
 input[type="radio"] {
@@ -4335,4 +4373,166 @@ p.keys-empty.muted {
 	padding: 0 3px;
 	border-radius: 3px;
 	background: var(--fill);
+}
+
+/* ── 편집기 글꼴(설정 › 화면) — CodeMirror 테마보다 앞서게 :root 를 붙인다 ── */
+:root {
+	--editor-font: var(--font-mono);
+	--editor-size: 13px;
+	--editor-line: 1.55;
+}
+:root .cm-editor {
+	font-size: var(--editor-size);
+}
+:root .cm-editor .cm-scroller {
+	font-family: var(--editor-font);
+	line-height: var(--editor-line);
+}
+
+/* ── 명령 팔레트(Ctrl+Shift+P) ───────────── */
+.palette.cp {
+	width: min(640px, calc(100vw - 32px));
+}
+.cp-list {
+	max-height: min(56vh, 520px);
+}
+.cp-head {
+	padding: 8px 10px 4px;
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--text-3);
+}
+.cp-head:first-child {
+	padding-top: 2px;
+}
+.cp-item {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-width: 0;
+	padding: 6px 10px;
+	border-radius: 8px;
+}
+.cp-item[aria-selected="true"] {
+	background: var(--accent);
+	color: #fff;
+}
+.cp-item.off {
+	opacity: 0.5;
+}
+.cp-title {
+	flex: none;
+	max-width: 60%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cp-hint {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 12px;
+	color: var(--text-3);
+}
+.cp-item[aria-selected="true"] .cp-hint {
+	color: rgb(255 255 255 / 0.75);
+}
+.cp-keys {
+	flex: none;
+	margin-left: auto;
+	padding: 1px 6px;
+	border-radius: 5px;
+	background: var(--fill);
+	font-family: var(--font-ui);
+	font-size: 11px;
+	color: var(--text-2);
+}
+.cp-item[aria-selected="true"] .cp-keys {
+	background: rgb(255 255 255 / 0.2);
+	color: #fff;
+}
+.titlebar .cp-open {
+	flex: none;
+	margin-right: 6px;
+	color: var(--text-2);
+}
+
+/* ── 설정 › 화면 ───────────────────────── */
+.set-group + .set-group {
+	margin-top: 10px;
+}
+.settings h4.flash {
+	color: var(--accent);
+	transition: color 300ms ease;
+}
+.scheme-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+	gap: 10px;
+	margin-top: 10px;
+}
+.scheme-card {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 6px;
+	border: 0;
+	border-radius: var(--r-md);
+	background: transparent;
+	box-shadow: 0 0 0 1px var(--hairline);
+	text-align: left;
+}
+.scheme-card:hover {
+	background: var(--fill);
+}
+.scheme-card.on {
+	box-shadow: 0 0 0 2px var(--accent);
+}
+.scheme-screen {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 9px;
+	border-radius: var(--r-sm);
+	box-shadow: inset 0 0 0 0.5px var(--hairline);
+	font-size: 11px;
+	line-height: 1.35;
+	white-space: nowrap;
+	overflow: hidden;
+}
+.scheme-screen b {
+	font-weight: 600;
+}
+.scheme-swatches {
+	display: flex;
+	gap: 3px;
+	margin-top: 4px;
+}
+.scheme-swatches i {
+	width: 12px;
+	height: 8px;
+	border-radius: 2px;
+}
+.scheme-name {
+	padding: 0 2px;
+	font-size: 12px;
+	color: var(--text-2);
+}
+.scheme-card.on .scheme-name {
+	color: var(--accent);
+	font-weight: 600;
+}
+.syn-preview {
+	margin: 10px 0 0;
+	padding: 10px 12px;
+	border-radius: var(--r-sm);
+	background: var(--surface);
+	box-shadow: inset 0 0 0 0.5px var(--hairline);
+	font-size: 12.5px;
+	line-height: 1.55;
+	white-space: pre;
+	overflow: auto;
+	user-select: text;
 }

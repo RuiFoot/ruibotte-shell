@@ -253,3 +253,32 @@
 	gap: 6px;
 	padding: 4px 2px 2px;
 }
+
+/* 받는 중 — 결과 상태 줄 */
+.db-streaming {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	color: var(--text);
+	font-variant-numeric: tabular-nums;
+}
+.db-streaming-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--accent, #3b82f6);
+	animation: db-streaming-pulse 1s ease-in-out infinite;
+}
+@keyframes db-streaming-pulse {
+	50% {
+		opacity: 0.25;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.db-streaming-dot {
+		animation: none;
+	}
+}
+.db-stopped {
+	color: color-mix(in srgb, var(--danger) 75%, var(--text));
+}

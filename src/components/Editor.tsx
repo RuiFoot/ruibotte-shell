@@ -56,16 +56,30 @@ export function EditorView_({
 	active,
 	onDirtyChange,
 	onTail,
+	line,
 }: {
 	fs: FsBackend;
 	path: string;
 	active: boolean;
 	onDirtyChange: (dirty: boolean) => void;
+	/** 이 줄로 가서 열기(내용 찾기 결과) — 값이 { n, seq } 로 바뀔 때마다 다시 간다 */
+	line?: { n: number; seq: number };
 	/** 실시간 보기(tail -F) 칸 열기 */
 	onTail?: () => void;
 }) {
 	const host = useRef<HTMLDivElement>(null);
 	const view = useRef<EditorView | null>(null);
+	const lineRef = useRef(line);
+	lineRef.current = line;
+	const loadedRef = useRef(false);
+	const goLine = useCallback(() => {
+		const v = view.current;
+		const want = lineRef.current?.n;
+		if (!v || !want || !loadedRef.current) return;
+		const ln = v.state.doc.line(Math.min(Math.max(1, want), v.state.doc.lines));
+		v.dispatch({ selection: { anchor: ln.from, head: ln.to }, effects: EditorView.scrollIntoView(ln.from, { y: "center" }) });
+		v.focus();
+	}, []);
 	const lang = useRef(new Compartment());
 	const ro = useRef(new Compartment());
 	const ws = useRef(new Compartment());
@@ -98,6 +112,10 @@ export function EditorView_({
 
 	const readOnly = !file || file.binary || file.tooLarge || file.meta.guessed;
 
+	// 이미 열려 있을 때 줄 요청이 바뀌면 그 줄로
+	// biome-ignore lint/correctness/useExhaustiveDependencies: line.seq 가 바뀔 때만
+	useEffect(() => goLine(), [line?.seq, goLine]);
+
 	// 파일 읽기(인코딩을 바꾸면 다시)
 	useEffect(() => {
 		let gone = false;
@@ -116,6 +134,8 @@ export function EditorView_({
 						changes: { from: 0, to: v.state.doc.length, insert: text },
 						effects: ro.current.reconfigure(EditorState.readOnly.of(f.binary || f.tooLarge || f.meta.guessed)),
 					});
+					loadedRef.current = true;
+					goLine();
 				}
 				const ms = Math.round(performance.now() - t0);
 				if (f.tooLarge)

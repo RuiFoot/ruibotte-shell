@@ -49,6 +49,17 @@ pub struct SshError {
     theirs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggest: Option<&'static str>,
+    /// 쉬운 원인 설명(방화벽·사내망 등)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hint: Option<String>,
+    /// 어느 경로에서 난 오류인지(지문 확인 뒤 같은 경로로 다시)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) route_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) route_label: Option<String>,
+    /// 앞서 실패·건너뛴 경로들
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attempts: Option<Vec<String>>,
 }
 
 impl SshError {
@@ -82,13 +93,22 @@ fn suggest_level(theirs: &[String]) -> Option<&'static str> {
     None
 }
 
-fn map_russh(e: russh::Error) -> SshError {
+pub(crate) fn map_russh(e: russh::Error) -> SshError {
     match e {
         russh::Error::NoCommonAlgo { kind, ours: _, theirs } => {
             let suggest = suggest_level(&theirs);
+            let name = |l: &str| match l {
+                "rsa" => "RSA",
+                "sha1" => "SHA1",
+                _ => "최후",
+            };
             SshError {
                 code: "NEGOTIATION",
                 message: format!("서버와 맞는 {kind:?} 알고리즘이 없습니다"),
+                hint: Some(match suggest {
+                    Some(l) => format!("오래된 서버라 구형 알고리즘이 필요합니다 — 서버 설정의 구형 호환을 '{}' 단계로 올리세요.", name(l)),
+                    None => "켤 수 있는 구형 호환 단계로도 맞지 않습니다 — 서버의 SSH 설정을 확인하세요.".into(),
+                }),
                 kind: Some(format!("{kind:?}")),
                 suggest,
                 theirs: Some(theirs),
@@ -140,9 +160,18 @@ fn preferred(level: &str) -> Preferred {
 pub(crate) struct Client {
     pinned: Option<PinnedKey>,
     trust: Option<String>,
+    /// 이 주소에 고정한 키가 없을 때 — 같은 서버의 다른 경로에서 고정한 지문들(같으면 믿는다)
+    also: Vec<String>,
     seen: Arc<Mutex<Option<PinnedKey>>>,
     /// 원격 포워딩(서버 포트 → 내 PC 쪽 대상) — 서버가 그 포트로 들어온 연결을 채널로 열어 준다
     remote: crate::tunnel::RemoteMap,
+}
+
+impl Client {
+    /// 진단용 — 고정 키·다른 경로 지문으로만 판정(묻지 않는다)
+    pub(crate) fn probe(pinned: Option<PinnedKey>, also: Vec<String>, seen: Arc<Mutex<Option<PinnedKey>>>) -> Self {
+        Client { pinned, trust: None, also, seen, remote: Default::default() }
+    }
 }
 
 impl client::Handler for Client {
@@ -184,7 +213,7 @@ impl client::Handler for Client {
         let ok = match (&self.pinned, &self.trust) {
             (_, Some(t)) => *t == seen.fingerprint,
             (Some(p), None) => p.fingerprint == seen.fingerprint,
-            (None, None) => false,
+            (None, None) => self.also.contains(&seen.fingerprint),
         };
         *self.seen.lock().unwrap() = Some(seen);
         Ok(ok)
@@ -195,8 +224,10 @@ impl client::Handler for Client {
 
 pub(crate) struct Conn {
     handle: Handle<Client>,
-    /// 점프 호스트 연결 — 대상 연결이 살아 있는 동안 함께 둔다
-    _jump: Option<Handle<Client>>,
+    /// 점프 단계 연결들 — 대상 연결이 살아 있는 동안 함께 둔다
+    _jump: Vec<Handle<Client>>,
+    /// 붙은 경로
+    route: RouteUsed,
     pub(crate) sftp: SftpSession,
     shells: tokio::sync::Mutex<HashMap<u32, ChannelWriteHalf<Msg>>>,
     next_shell: AtomicU32,
@@ -275,6 +306,9 @@ pub struct ConnectReq {
     /// 거쳐 갈 SSH 프로필(점프 호스트) — 그 프로필의 호스트 키가 고정돼 있고 비밀이 저장돼 있어야 한다
     #[serde(default)]
     jump_id: Option<i64>,
+    /// 이 경로로만(지문 확인 뒤 같은 경로로 다시 붙을 때)
+    #[serde(default)]
+    pub(crate) route_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -291,6 +325,8 @@ pub struct ConnectOk {
     username: String,
     sudo: String,
     sudo_user: String,
+    /// 붙은 경로
+    route: RouteUsed,
 }
 
 #[derive(Serialize, Clone)]
@@ -341,12 +377,13 @@ pub async fn ssh_connect(app: AppHandle, store: State<'_, Store>, conns: State<'
 /// 붙어서 인증까지 끝낸 SSH 세션(SFTP 없이) — 작업대 연결과 DB 터널이 함께 쓴다
 pub(crate) struct Authed {
     pub(crate) handle: Handle<Client>,
-    pub(crate) jump: Option<Handle<Client>>,
+    pub(crate) jump: Vec<Handle<Client>>,
     seen_key: PinnedKey,
     newly_pinned: bool,
     used_saved: bool,
     account: Option<Account>,
     remote: crate::tunnel::RemoteMap,
+    pub(crate) route: RouteUsed,
 }
 
 impl SshError {
@@ -380,6 +417,7 @@ pub(crate) fn tunnel_req(store: &Store, profile_id: i64, account_id: Option<i64>
         trust_fingerprint: trust,
         save_secret: save,
         jump_id: p.jump_id,
+        route_id: None,
     })
 }
 
@@ -390,7 +428,7 @@ pub(crate) fn req_account(req: &ConnectReq) -> Option<i64> {
 
 pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) -> R<ConnectOk> {
     let a = open_authed(store, &req).await?;
-    let Authed { handle, jump, seen_key, newly_pinned, used_saved, account, remote } = a;
+    let Authed { handle, jump, seen_key, newly_pinned, used_saved, account, remote, route } = a;
     let aid = account.as_ref().and_then(|a| a.id);
     let ch = handle.channel_open_session().await.map_err(map_russh)?;
     ch.request_subsystem(true, "sftp").await.map_err(map_russh)?;
@@ -416,6 +454,7 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
             tmux_ok: Default::default(),
             tmux_used: Default::default(),
             remote,
+            route: route.clone(),
         }),
     );
     let sudo = SudoCfg::of(account.as_ref());
@@ -430,64 +469,246 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
         username: req.username.clone(),
         sudo: sudo.mode,
         sudo_user: sudo.user,
+        route,
     })
 }
 
-/// 붙고(점프 호스트를 거치면 거쳐) 호스트 키를 확인하고 인증한다. 처음 키면 고정, 원하면 비밀 저장
-pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
-    let pinned = store.host_key(&req.host, req.port);
-    let seen = Arc::new(Mutex::new(None));
-    let remote = crate::tunnel::RemoteMap::default();
-    let handler = Client { pinned: pinned.clone(), trust: req.trust_fingerprint.clone(), seen: seen.clone(), remote: remote.clone() };
-    let config = Arc::new(client::Config {
-        preferred: preferred(&req.legacy),
+/// 열린 연결이 붙은 경로(상태 줄)
+#[tauri::command]
+pub fn ssh_conn_route(conns: State<'_, SshConns>, conn: u32) -> Option<RouteUsed> {
+    conns.get(conn).ok().map(|c| c.route.clone())
+}
+
+/// 어느 경로로 붙었는지 — 탭·상태 줄·서버 카드가 보인다
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteUsed {
+    pub(crate) id: Option<i64>,
+    pub(crate) label: String,
+    pub(crate) summary: String,
+    /// 이 서버에 저장한 경로 수(1 이하면 화면에 굳이 보이지 않는다)
+    pub(crate) total: usize,
+    /// 앞 경로가 실패했거나 건너뛰어 이 경로로 왔을 때
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+}
+
+/// 경로마다 기다릴 시간(경로가 여럿일 때) — 설정 "ssh.routeTimeoutSec", 기본 4초
+pub(crate) fn route_timeout(store: &Store) -> Duration {
+    let s = store.setting("ssh.routeTimeoutSec").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4);
+    Duration::from_secs(s.clamp(2, 30))
+}
+
+pub(crate) fn ssh_config(level: &str) -> Arc<client::Config> {
+    Arc::new(client::Config {
+        preferred: preferred(level),
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 4,
         nodelay: true,
         ..Default::default()
-    });
+    })
+}
 
-    // 점프 호스트를 거치면: 점프 서버에 붙어 인증하고, 그 안에서 대상으로 TCP 채널을 열어 그 위에 SSH 를 다시 연다
-    let jump = match req.jump_id {
-        Some(jid) => Some(connect_jump(store, jid).await?),
-        None => None,
-    };
-    let connected = match &jump {
-        Some(j) => {
-            let ch = j
-                .channel_open_direct_tcpip(req.host.clone(), req.port as u32, "127.0.0.1", 0)
-                .await
-                .map_err(|e| err("NETWORK", format!("점프 호스트에서 {}:{} 로 가는 길을 열지 못했습니다: {e}", req.host, req.port)))?;
-            tokio::time::timeout(CONNECT_TIMEOUT, client::connect_stream(config, ch.into_stream(), handler)).await
-        }
-        None => tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, (req.host.as_str(), req.port), handler)).await,
+/// 전송로를 못 연 오류 → 화면 오류(쉬운 설명을 hint 로)
+pub(crate) fn leg_err(e: crate::route::LegErr, prefix: Option<&str>) -> SshError {
+    SshError {
+        code: "NETWORK",
+        message: match prefix {
+            Some(p) => format!("{p}: {}", e.message),
+            None => e.message,
+        },
+        hint: e.hint,
+        ..Default::default()
     }
-    .map_err(|_| err("NETWORK", format!("{}:{} 에 {}초 안에 닿지 못했습니다", req.host, req.port, CONNECT_TIMEOUT.as_secs())))?;
-    let mut handle = match connected {
+}
+
+/// 경로 하나로 대상 서버의 SSH 인사·키 교환까지 — 인증 전
+pub(crate) struct Linked {
+    pub(crate) handle: Handle<Client>,
+    pub(crate) jumps: Vec<Handle<Client>>,
+    pub(crate) seen: PinnedKey,
+    pub(crate) pinned: Option<PinnedKey>,
+    remote: crate::tunnel::RemoteMap,
+}
+
+/// 경로의 점프 단계를 차례로 붙이고(각 단계는 그 서버의 고정 키·저장 비밀), 마지막 단계에서 대상까지 길을 연다.
+/// 실패하면 (오류, 다음 경로로 넘어가도 되는지)
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn link_route(
+    store: &Store,
+    target_profile: Option<i64>,
+    username: &str,
+    legacy: &str,
+    r: &crate::store::Route,
+    trust: Option<&str>,
+    also: &[String],
+    limit: Duration,
+) -> Result<Linked, (SshError, bool)> {
+    use crate::route::{first_leg, ProxyAuth};
+    let fall = |e: SshError| (e, true);
+    let mut seen_hops = std::collections::HashSet::new();
+    for h in &r.jumps {
+        if Some(h.profile_id) == target_profile || !seen_hops.insert(h.profile_id) {
+            return Err(fall(err("OTHER", "점프 단계가 돌고 돕니다(같은 서버를 두 번 거침) — 경로 설정을 고치세요")));
+        }
+    }
+    if r.jumps.len() > 5 {
+        return Err(fall(err("OTHER", "점프는 다섯 단계까지입니다")));
+    }
+    let proxy_auth = ProxyAuth {
+        user: r.proxy_user.clone(),
+        pass: r.id.filter(|_| r.proxy_secret_saved).and_then(|id| secrets::get(&crate::store::route_proxy_key(id))),
+    };
+    let mut hops: Vec<Handle<Client>> = Vec::new();
+    for (i, hop) in r.jumps.iter().enumerate() {
+        let p = store.profile(hop.profile_id).map_err(|_| fall(err("OTHER", format!("점프 {} 단계의 서버가 지워졌습니다", i + 1))))?;
+        let a = hop
+            .account_id
+            .and_then(|id| store.account(id).ok())
+            .filter(|a| a.profile_id == hop.profile_id)
+            .or_else(|| store.default_account(hop.profile_id).ok())
+            .ok_or_else(|| fall(err("OTHER", format!("점프 서버 {} 에 계정이 없습니다", p.name))))?;
+        let io: crate::route::BoxIo = match hops.last() {
+            None => first_leg(r, &p.host, p.port, &a.username, &proxy_auth, limit)
+                .await
+                .map_err(|e| fall(leg_err(e, Some(&format!("점프 서버 {}", p.name)))))?,
+            Some(prev) => {
+                let ch = tokio::time::timeout(limit, prev.channel_open_direct_tcpip(p.host.clone(), p.port as u32, "127.0.0.1", 0))
+                    .await
+                    .map_err(|_| fall(err("NETWORK", format!("앞 점프 서버에서 {} 로 가는 길이 제때 열리지 않았습니다", p.name))))?
+                    .map_err(|e| fall(err("NETWORK", format!("앞 점프 서버에서 {}({}:{}) 로 가는 길을 열지 못했습니다: {e}", p.name, p.host, p.port))))?;
+                Box::new(ch.into_stream())
+            }
+        };
+        let h = hop_session(store, &p, &a, io, limit).await.map_err(fall)?;
+        hops.push(h);
+    }
+
+    // 대상 — 이 경로 주소에 고정한 키, 없으면 같은 서버 다른 경로에서 고정한 키와 같으면 믿는다
+    let pinned = store.host_key(&r.host, r.port);
+    let seen = Arc::new(Mutex::new(None));
+    let remote = crate::tunnel::RemoteMap::default();
+    let handler = Client {
+        pinned: pinned.clone(),
+        trust: trust.map(str::to_string),
+        also: if pinned.is_none() { also.to_vec() } else { Vec::new() },
+        seen: seen.clone(),
+        remote: remote.clone(),
+    };
+    let config = ssh_config(legacy);
+    let connected = match hops.last() {
+        Some(j) => {
+            let ch = tokio::time::timeout(limit, j.channel_open_direct_tcpip(r.host.clone(), r.port as u32, "127.0.0.1", 0))
+                .await
+                .map_err(|_| fall(err("NETWORK", format!("점프 서버에서 {}:{} 로 가는 길이 제때 열리지 않았습니다", r.host, r.port))))?
+                .map_err(|e| {
+                    let mut x = err("NETWORK", format!("점프 서버에서 {}:{} 로 가는 길을 열지 못했습니다: {e}", r.host, r.port));
+                    x.hint = Some("점프 서버에서 그 주소·포트가 닿는지, 점프 서버 sshd 가 포워딩(AllowTcpForwarding)을 허용하는지 확인하세요.".into());
+                    fall(x)
+                })?;
+            tokio::time::timeout(limit, client::connect_stream(config, ch.into_stream(), handler)).await
+        }
+        None => {
+            let io = first_leg(r, &r.host, r.port, username, &proxy_auth, limit).await.map_err(|e| fall(leg_err(e, None)))?;
+            tokio::time::timeout(limit, client::connect_stream(config, io, handler)).await
+        }
+    }
+    .map_err(|_| {
+        let mut x = err("NETWORK", format!("{}:{} 에서 {}초 안에 SSH 인사가 오지 않았습니다", r.host, r.port, limit.as_secs()));
+        x.hint = Some("연결은 됐지만 SSH 서버가 답하지 않습니다 — 중간 장비가 막았거나, 프록시 명령이 제대로 이어 주지 않을 수 있습니다.".into());
+        fall(x)
+    })?;
+    let handle = match connected {
         Ok(h) => h,
         Err(e) => {
-            // 호스트 키를 거절한 경우: 모르는 키인지 바뀐 키인지 알려 준다
+            // 호스트 키를 거절한 경우: 모르는 키인지 바뀐 키인지 알려 준다(다음 경로로 넘어가지 않는다)
             if let Some(s) = seen.lock().unwrap().clone() {
-                let accepted = req.trust_fingerprint.as_deref() == Some(&s.fingerprint)
-                    || pinned.as_ref().map(|p| p.fingerprint == s.fingerprint).unwrap_or(false);
+                let accepted = trust == Some(s.fingerprint.as_str())
+                    || pinned.as_ref().map(|p| p.fingerprint == s.fingerprint).unwrap_or(false)
+                    || (pinned.is_none() && also.contains(&s.fingerprint));
                 if !accepted {
                     let mismatch = pinned.is_some();
-                    return Err(SshError {
-                        code: if mismatch { "HOSTKEY_MISMATCH" } else { "HOSTKEY_UNKNOWN" },
-                        message: if mismatch {
-                            "서버의 호스트 키가 고정한 키와 다릅니다. 서버를 다시 설치했거나 다른 서버로 연결되고 있을 수 있습니다.".into()
-                        } else {
-                            "처음 접속하는 서버입니다. 지문을 확인하세요.".into()
+                    return Err((
+                        SshError {
+                            code: if mismatch { "HOSTKEY_MISMATCH" } else { "HOSTKEY_UNKNOWN" },
+                            message: if mismatch {
+                                "서버의 호스트 키가 고정한 키와 다릅니다. 서버를 다시 설치했거나 다른 서버로 연결되고 있을 수 있습니다.".into()
+                            } else {
+                                "처음 접속하는 서버입니다. 지문을 확인하세요.".into()
+                            },
+                            fingerprint: Some(s.fingerprint),
+                            algorithm: Some(s.algorithm),
+                            pinned_fingerprint: pinned.map(|p| p.fingerprint),
+                            ..Default::default()
                         },
-                        fingerprint: Some(s.fingerprint),
-                        algorithm: Some(s.algorithm),
-                        pinned_fingerprint: pinned.map(|p| p.fingerprint),
-                        ..Default::default()
-                    });
+                        false,
+                    ));
                 }
             }
-            return Err(map_russh(e));
+            let x = map_russh(e);
+            let next = matches!(x.code, "NETWORK" | "CLOSED");
+            return Err((x, next));
         }
+    };
+    let seen_key = seen.lock().unwrap().clone().ok_or_else(|| (err("OTHER", "호스트 키를 받지 못했습니다"), false))?;
+    Ok(Linked { handle, jumps: hops, seen: seen_key, pinned, remote })
+}
+
+/// 붙고(경로를 차례로 시도하며) 호스트 키를 확인하고 인증한다. 처음 키면 고정, 원하면 비밀 저장
+pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
+    use crate::route::{plan, route_name, route_summary};
+    // 저장한 경로 — 요청 주소가 첫 경로와 같을 때만(설정 화면에서 고치는 중인 주소로 시험할 때는 그 주소 하나로)
+    let saved = req.profile_id.map(|pid| store.routes(pid).unwrap_or_default()).unwrap_or_default();
+    let use_saved = saved.first().is_some_and(|r| r.host.eq_ignore_ascii_case(req.host.trim()) && r.port == req.port);
+    let (mut cands, mut skipped) = if use_saved {
+        plan(saved.clone()).await
+    } else {
+        (vec![crate::route::adhoc(req.profile_id.unwrap_or(0), req.host.trim(), req.port, req.jump_id)], Vec::new())
+    };
+    if let Some(rid) = req.route_id {
+        let mut all = cands.iter().chain(skipped.iter().map(|(r, _)| r));
+        if let Some(r) = all.find(|r| r.id == Some(rid)).cloned() {
+            cands = vec![r];
+            skipped.clear();
+        }
+    }
+    let total = if use_saved { saved.len() } else { 1 };
+    let limit = if cands.len() > 1 { route_timeout(store) } else { CONNECT_TIMEOUT };
+    let also: Vec<String> = saved.iter().filter_map(|r| store.host_key(&r.host, r.port)).map(|k| k.fingerprint).collect();
+    let hop_name = |h: &crate::store::Hop| store.profile(h.profile_id).map(|p| p.name).unwrap_or_else(|_| "(지워진 서버)".into());
+    let mut notes: Vec<String> = skipped.iter().map(|(r, why)| format!("{} 건너뜀 — 망 조건이 맞지 않음({why})", route_name(r))).collect();
+    let mut linked = None;
+    let n = cands.len();
+    for (i, r) in cands.iter().enumerate() {
+        match link_route(store, req.profile_id, &req.username, &req.legacy, r, req.trust_fingerprint.as_deref(), &also, limit).await {
+            Ok(l) => {
+                linked = Some((l, r.clone()));
+                break;
+            }
+            Err((mut e, next)) => {
+                e.route_id = r.id;
+                e.route_label = (total > 1).then(|| route_name(r));
+                if !next || i + 1 == n {
+                    if n > 1 && next {
+                        notes.push(format!("{}: {}", route_name(r), e.message));
+                        e.message = format!("경로 {n}개를 모두 시도했지만 붙지 못했습니다. 마지막 오류: {}", e.message);
+                    }
+                    if !notes.is_empty() {
+                        e.attempts = Some(notes);
+                    }
+                    return Err(e);
+                }
+                notes.push(format!("{}: {}", route_name(r), e.message));
+            }
+        }
+    }
+    let (Linked { mut handle, jumps, seen: seen_key, pinned, remote }, route) = linked.ok_or_else(|| err("NETWORK", "시도할 경로가 없습니다"))?;
+    let used = RouteUsed {
+        id: route.id,
+        label: route_name(&route),
+        summary: route_summary(&route, hop_name),
+        total,
+        note: (!notes.is_empty()).then(|| notes.join("\n")),
     };
 
     // 인증 — 비밀은 계정 키에서(계정을 안 주면 서버의 기본 계정)
@@ -506,32 +727,7 @@ pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
             saved
         }
     };
-    let ok = if req.auth == "agent" {
-        agent_auth(&mut handle, &req.username).await?
-    } else if req.auth == "key" {
-        let path = req.key_path.clone().filter(|p| !p.is_empty()).ok_or_else(|| err("OTHER", "개인키 파일을 고르세요"))?;
-        let key = match load_secret_key(&path, secret.as_deref()) {
-            Ok(k) => k,
-            Err(russh::keys::Error::KeyIsEncrypted) => return Err(err("NEED_SECRET", "개인키 암호를 입력하세요")),
-            Err(e) => return Err(err("AUTH_FAILED", format!("개인키를 읽지 못했습니다: {e}"))),
-        };
-        let hash = handle.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
-        handle
-            .authenticate_publickey(&req.username, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
-            .await
-            .map_err(map_russh)?
-            .success()
-    } else {
-        let Some(pw) = secret.clone() else {
-            return Err(err("NEED_SECRET", "암호를 입력하세요"));
-        };
-        let mut ok = handle.authenticate_password(&req.username, &pw).await.map_err(map_russh)?.success();
-        if !ok {
-            // 암호 방식이 꺼지고 keyboard-interactive 만 켠 서버(흔함)
-            ok = keyboard_interactive(&mut handle, &req.username, &pw).await.unwrap_or(false);
-        }
-        ok
-    };
+    let ok = authenticate(&mut handle, &req.auth, &req.username, req.key_path.as_deref(), secret.as_deref()).await?;
     if !ok {
         if used_saved {
             if let Some(id) = aid {
@@ -542,11 +738,13 @@ pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
         return Err(err("AUTH_FAILED", if used_saved { "저장한 암호가 맞지 않아 지웠습니다. 다시 입력하세요." } else { "계정 또는 암호가 맞지 않습니다" }));
     }
 
-    // 접속 성공 — 처음 키면 고정, 원하면 비밀 저장
-    let seen_key = seen.lock().unwrap().clone().ok_or_else(|| err("OTHER", "호스트 키를 받지 못했습니다"))?;
+    // 접속 성공 — 처음 키면 고정(이 경로 주소로), 원하면 비밀 저장
     let newly_pinned = pinned.as_ref().map(|p| p.fingerprint != seen_key.fingerprint).unwrap_or(true);
     if newly_pinned {
-        store.pin_host_key(&req.host, req.port, &seen_key).map_err(|e| err("OTHER", e))?;
+        store.pin_host_key(&route.host, route.port, &seen_key).map_err(|e| err("OTHER", e))?;
+    }
+    if let Some(rid) = route.id {
+        store.route_mark_ok(rid);
     }
     if let Some(id) = aid {
         let mut saved = None;
@@ -559,55 +757,68 @@ pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
     } else if let Some(pid) = req.profile_id {
         store.mark_used(pid);
     }
-    Ok(Authed { handle, jump, seen_key, newly_pinned, used_saved, account, remote })
+    Ok(Authed { handle, jump: jumps, seen_key, newly_pinned, used_saved, account, remote, route: used })
 }
 
-/// 점프 호스트 접속 — 고정된 호스트 키·저장된 비밀만 쓴다(여기서는 묻지 않는다)
-async fn connect_jump(store: &Store, jid: i64) -> R<Handle<Client>> {
-    let p = store.profile(jid).map_err(|e| err("OTHER", format!("점프 호스트 프로필: {e}")))?;
-    let pinned = store
-        .host_key(&p.host, p.port)
-        .ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 호스트 키가 아직 고정되지 않았습니다. 그 프로필로 한 번 직접 접속해 지문을 확인하세요.", p.name)))?;
-    let handler = Client { pinned: Some(pinned), trust: None, seen: Arc::new(Mutex::new(None)), remote: Default::default() };
-    let config = Arc::new(client::Config {
-        preferred: preferred(&p.legacy),
-        keepalive_interval: Some(Duration::from_secs(30)),
-        keepalive_max: 4,
-        nodelay: true,
-        ..Default::default()
-    });
-    let mut h = tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, (p.host.as_str(), p.port), handler))
-        .await
-        .map_err(|_| err("NETWORK", format!("점프 호스트 {} 에 닿지 못했습니다", p.name)))?
-        .map_err(|e| {
-            let mut x = map_russh(e);
-            x.message = format!("점프 호스트 {}: {}", p.name, x.message);
-            x
-        })?;
-    // 점프 호스트는 그 서버의 기본 계정으로
-    let a = store.default_account(jid).map_err(|e| err("OTHER", format!("점프 호스트 {}: {e}", p.name)))?;
-    let p = crate::store::Profile { username: a.username.clone(), auth: a.auth.clone(), key_path: a.key_path.clone(), ..p };
-    let secret = a.id.and_then(|id| secrets::get(&secrets::account_key(id)));
-    let ok = if p.auth == "agent" {
-        agent_auth(&mut h, &p.username).await.map_err(|mut x| {
-            x.message = format!("점프 호스트 {}: {}", p.name, x.message);
-            x
-        })?
-    } else if p.auth == "key" {
-        let path = p.key_path.clone().unwrap_or_default();
-        let key = load_secret_key(&path, secret.as_deref()).map_err(|e| err("AUTH_FAILED", format!("점프 호스트 개인키: {e}")))?;
-        let hash = h.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
-        h.authenticate_publickey(&p.username, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(map_russh)?.success()
+/// 인증 하나 — 에이전트·개인키·암호(안 되면 keyboard-interactive). 비밀이 모자라면 NEED_SECRET
+pub(crate) async fn authenticate(handle: &mut Handle<Client>, auth: &str, user: &str, key_path: Option<&str>, secret: Option<&str>) -> R<bool> {
+    if auth == "agent" {
+        agent_auth(handle, user).await
+    } else if auth == "key" {
+        let path = key_path.filter(|p| !p.is_empty()).ok_or_else(|| err("OTHER", "개인키 파일을 고르세요"))?;
+        let key = match load_secret_key(path, secret) {
+            Ok(k) => k,
+            Err(russh::keys::Error::KeyIsEncrypted) => return Err(err("NEED_SECRET", "개인키 암호를 입력하세요")),
+            Err(e) => return Err(err("AUTH_FAILED", format!("개인키를 읽지 못했습니다: {e}"))),
+        };
+        let hash = handle.best_supported_rsa_hash().await.map_err(map_russh)?.flatten();
+        Ok(handle.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(map_russh)?.success())
     } else {
-        let pw = secret.ok_or_else(|| err("OTHER", format!("점프 호스트 {} 의 암호가 저장돼 있지 않습니다. 그 서버의 기본 계정으로 접속하며 \"암호 저장\"을 켜 주세요.", p.name)))?;
-        let mut ok = h.authenticate_password(&p.username, &pw).await.map_err(map_russh)?.success();
+        let Some(pw) = secret else {
+            return Err(err("NEED_SECRET", "암호를 입력하세요"));
+        };
+        let mut ok = handle.authenticate_password(user, pw).await.map_err(map_russh)?.success();
         if !ok {
-            ok = keyboard_interactive(&mut h, &p.username, &pw).await.unwrap_or(false);
+            // 암호 방식이 꺼지고 keyboard-interactive 만 켠 서버(흔함)
+            ok = keyboard_interactive(handle, user, pw).await.unwrap_or(false);
         }
-        ok
+        Ok(ok)
+    }
+}
+
+/// 점프 단계 하나 — 받은 전송로 위에 SSH 를 열고, 고정된 호스트 키·저장된 비밀만 쓴다(여기서는 묻지 않는다)
+pub(crate) async fn hop_session(store: &Store, p: &crate::store::Profile, a: &Account, io: crate::route::BoxIo, limit: Duration) -> R<Handle<Client>> {
+    let pinned = store.host_key(&p.host, p.port).ok_or_else(|| {
+        err("OTHER", format!("점프 서버 {} 의 호스트 키가 아직 고정되지 않았습니다. 그 서버로 한 번 접속해 지문을 확인하세요.", p.name))
+    })?;
+    let seen = Arc::new(Mutex::new(None));
+    let handler = Client { pinned: Some(pinned.clone()), trust: None, also: Vec::new(), seen: seen.clone(), remote: Default::default() };
+    let named = |mut x: SshError| {
+        x.message = format!("점프 서버 {}: {}", p.name, x.message);
+        x
     };
+    let mut h = tokio::time::timeout(limit, client::connect_stream(ssh_config(&p.legacy), io, handler))
+        .await
+        .map_err(|_| err("NETWORK", format!("점프 서버 {} 에서 {}초 안에 SSH 인사가 오지 않았습니다", p.name, limit.as_secs())))?
+        .map_err(|e| {
+            if let Some(s) = seen.lock().unwrap().as_ref().filter(|s| s.fingerprint != pinned.fingerprint) {
+                return err("HOSTKEY_MISMATCH", format!("점프 서버 {} 의 호스트 키가 고정한 키와 다릅니다({}). 그 서버로 직접 접속해 확인하세요.", p.name, s.fingerprint));
+            }
+            named(map_russh(e))
+        })?;
+    let secret = a.id.and_then(|id| secrets::get(&secrets::account_key(id)));
+    let ok = authenticate(&mut h, &a.auth, &a.username, a.key_path.as_deref(), secret.as_deref()).await.map_err(|x| {
+        if x.code == "NEED_SECRET" {
+            err(
+                "OTHER",
+                format!("점프 서버 {} 의 계정 {} 비밀이 저장돼 있지 않습니다. 그 계정으로 한 번 접속하며 \"암호 저장\"을 켜 주세요.", p.name, a.username),
+            )
+        } else {
+            named(x)
+        }
+    })?;
     if !ok {
-        return Err(err("AUTH_FAILED", format!("점프 호스트 {} 인증에 실패했습니다", p.name)));
+        return Err(err("AUTH_FAILED", format!("점프 서버 {} 인증에 실패했습니다(계정 {})", p.name, a.username)));
     }
     Ok(h)
 }
@@ -1201,6 +1412,7 @@ pub(crate) async fn test_connect(store: &Store, conns: &SshConns, host: &str, po
         save_secret: false,
         jump_id: None,
         account_id: None,
+        route_id: None,
     };
     match connect(store, conns, req(None)).await {
         Ok(ok) => ok.conn_id,
@@ -1248,6 +1460,7 @@ mod tests {
             save_secret: false,
             jump_id: None,
             account_id: None,
+            route_id: None,
         };
 
         // 1) 처음 → 지문 확인 요구
@@ -1360,6 +1573,7 @@ mod live_jump {
             save_secret: false,
             jump_id: Some(jid),
             account_id: None,
+            route_id: None,
         };
         let t = std::time::Instant::now();
         let ok = match connect(&store, &conns, req(None)).await {

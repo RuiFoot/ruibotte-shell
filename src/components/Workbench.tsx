@@ -11,7 +11,7 @@ import {
 import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ArrowDownUp, ArrowLeftRight, ArrowRightLeft, Columns2, FileText, FolderTree, Layers, LayoutTemplate, Monitor, Plus, Radio, RefreshCcw, Rows2, ShieldAlert, X } from "lucide-react";
+import { Activity, Cog, Container, Globe, TextSearch, ArrowDownUp, ArrowLeftRight, ArrowRightLeft, Columns2, FileText, FolderTree, Layers, LayoutTemplate, Monitor, Plus, Radio, RefreshCcw, Rows2, ShieldAlert, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -39,6 +39,7 @@ import { BinaryPreview, previewKind } from "./Preview";
 import { freeName, useConflictAsk } from "./ConflictSheet";
 import { ContextMenu } from "./ContextMenu";
 import { ForwardChips, ForwardSheet, TmuxSheet } from "./ForwardPanel";
+import { RouteChip } from "./RouteChip";
 import { MiniMonitor } from "./MiniMonitor";
 import { QuickOpen } from "./QuickOpen";
 import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
@@ -51,6 +52,12 @@ import type { CompletionSource } from "../lib/termComplete";
 import { type DragEntry, FileTree } from "./FileTree";
 import { TerminalView } from "./Terminal";
 import { askText } from "../lib/ask";
+import type { SudoCtx } from "./panels/common";
+import { ContentSearch } from "./panels/ContentSearch";
+import { DockerPanel } from "./panels/DockerPanel";
+import { ServicesPanel } from "./panels/ServicesPanel";
+import { WebPortsPanel } from "./panels/WebPortsPanel";
+import { type Command, useCommands } from "../lib/commands";
 
 /**
  * IDE식 작업대 — 트리·편집기·터미널이 모두 도킹 칸이다.
@@ -67,7 +74,7 @@ type Ctx = {
 	term: TermBackend;
 	label: string;
 	startPath?: string;
-	openFile: (which: Which, e: FsEntry) => void;
+	openFile: (which: Which, e: FsEntry, line?: number) => void;
 	activePanel: string | null;
 	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string) => void;
 	sendTo: (from: Which, e: FsEntry) => void;
@@ -119,8 +126,16 @@ type Ctx = {
 	addTerminalNear: (panelId?: string) => void;
 	/** 큰 자원 칸 열기 */
 	openMonitor: () => void;
+	/** 연결한 계정의 sudo 설정(서비스·Docker 칸) */
+	sudo?: SudoCtx;
+	/** 새 터미널을 열고 명령 실행(컨테이너 셸·journal 등) */
+	openTerminalCmd: (cmd: string, title: string) => void;
+	/** 지금 터미널 폴더 */
+	cwdNow: () => string | null;
 	/** 원격: 포트 포워딩 관리 창 열기(상태 줄 표시를 누르면) */
 	openForwards?: () => void;
+	/** 원격: 이 서버 번호(서버별 터미널 색) */
+	profileId?: number;
 };
 const WbCtx = createContext<Ctx | null>(null);
 const useWb = () => useContext(WbCtx) as Ctx;
@@ -179,7 +194,7 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 	);
 }
 
-function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string }>) {
+function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string; line?: { n: number; seq: number } }>) {
 	const ctx = useWb();
 	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
 	const onDirty = useCallback(
@@ -201,6 +216,7 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 					path={props.params.path}
 					active={ctx.activePanel === props.api.id}
 					onDirtyChange={onDirty}
+					line={props.params.line}
 					onTail={() => ctx.openTail(props.params.which, { name: props.params.name, path: props.params.path, kind: "file", size: 0 })}
 				/>
 			)}
@@ -252,12 +268,14 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 				statusExtra={
 					visible && ctx.fs.side === "remote" && ctx.fs.conn != null ? (
 						<>
+							<RouteChip conn={ctx.fs.conn} />
 							{ctx.openForwards && <ForwardChips conn={ctx.fs.conn} onOpen={ctx.openForwards} />}
 							<MiniMonitor conn={ctx.fs.conn} onOpen={ctx.openMonitor} />
 						</>
 					) : undefined
 				}
 				onRootShell={ctx.rootShell ? (on) => ctx.rootShell?.(props.api.id, on) : undefined}
+				profileId={ctx.profileId}
 				onRecording={(on) => {
 					// 기록 중이면 탭 이름 앞(동시 입력 표시 뒤)에 ●
 					const m = /^(⇉ )?(● )?([\s\S]*)$/.exec(props.api.title ?? "");
@@ -289,6 +307,48 @@ function SyncDock() {
 	const ctx = useWb();
 	if (ctx.fs.conn == null || !ctx.syncInfo) return null;
 	return <SyncPanel conn={ctx.fs.conn} remoteHome={ctx.fs.home} user={ctx.syncInfo.user} host={ctx.syncInfo.host} port={ctx.syncInfo.port} onRun={ctx.showTransfers} />;
+}
+
+/** 칸이 보이는지(자동 새로 고침·실시간 보기는 보일 때만) */
+function usePanelVisible(api: IDockviewPanelProps["api"]) {
+	const [visible, setVisible] = useState(api.isVisible);
+	useEffect(() => {
+		const d = api.onDidVisibilityChange((e) => setVisible(e.isVisible));
+		return () => d.dispose();
+	}, [api]);
+	return visible;
+}
+const remoteOnly = <div className="panel-fill mon-empty"><p>원격 서버 작업대에서만 볼 수 있습니다</p></div>;
+
+function ServicesDock(props: IDockviewPanelProps) {
+	const ctx = useWb();
+	const visible = usePanelVisible(props.api);
+	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return remoteOnly;
+	return <ServicesPanel conn={ctx.fs.conn} sudo={ctx.sudo} sudoOn={ctx.sudoOn} visible={visible} onOpenTerminal={ctx.openTerminalCmd} />;
+}
+function DockerDock(props: IDockviewPanelProps) {
+	const ctx = useWb();
+	const visible = usePanelVisible(props.api);
+	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return remoteOnly;
+	return <DockerPanel conn={ctx.fs.conn} sudo={ctx.sudo} visible={visible} onOpenTerminal={ctx.openTerminalCmd} />;
+}
+function WebPortsDock(props: IDockviewPanelProps) {
+	const ctx = useWb();
+	const visible = usePanelVisible(props.api);
+	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return remoteOnly;
+	return <WebPortsPanel conn={ctx.fs.conn} sudo={ctx.sudo} visible={visible} />;
+}
+function SearchDock(_props: IDockviewPanelProps) {
+	const ctx = useWb();
+	return (
+		<ContentSearch
+			side={ctx.fs.side}
+			conn={ctx.fs.conn}
+			sudo={ctx.sudo}
+			startDir={ctx.cwdNow() ?? ctx.fs.home}
+			onOpenFile={(p, line) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 }, line)}
+		/>
+	);
 }
 
 function MonitorDock(props: IDockviewPanelProps) {
@@ -477,7 +537,20 @@ function TransfersPanel() {
 	);
 }
 
-const components = { tree: TreePanel, editor: EditorPanel, terminal: TerminalPanel, transfers: TransfersPanel, tail: TailPanel, diff: DiffPanel, sync: SyncDock, monitor: MonitorDock };
+const components = {
+	tree: TreePanel,
+	editor: EditorPanel,
+	terminal: TerminalPanel,
+	transfers: TransfersPanel,
+	tail: TailPanel,
+	diff: DiffPanel,
+	sync: SyncDock,
+	monitor: MonitorDock,
+	services: ServicesDock,
+	docker: DockerDock,
+	webports: WebPortsDock,
+	search: SearchDock,
+};
 const FIXED = /^(tree|localtree|transfers|term-\d+)$/;
 
 /**
@@ -702,16 +775,42 @@ export function Workbench({
 	const termSeq = useRef(1);
 	const saveTimer = useRef<number | undefined>(undefined);
 
-	const openFile = useCallback((which: Which, e: FsEntry) => {
+	// 최근 연 파일(작업대 종류·서버별로 앱 설정에) — 명령 팔레트의 "최근 파일"
+	const recentKey = `recent.files.${fs.side === "remote" ? label : "local"}`;
+	const recentFiles = useRef<{ which: Which; path: string; name: string }[]>([]);
+	useEffect(() => {
+		void api.settingGet(recentKey).then((v) => {
+			try {
+				const a = v ? (JSON.parse(v) as unknown) : [];
+				recentFiles.current = Array.isArray(a) ? (a as { which: Which; path: string; name: string }[]).filter((x) => typeof x?.path === "string").slice(0, 15) : [];
+			} catch {
+				recentFiles.current = [];
+			}
+		});
+	}, [recentKey]);
+	const rememberFile = useCallback(
+		(which: Which, e: FsEntry) => {
+			recentFiles.current = [{ which, path: e.path, name: e.name }, ...recentFiles.current.filter((x) => !(x.which === which && x.path === e.path))].slice(0, 15);
+			void api.settingSet(recentKey, JSON.stringify(recentFiles.current));
+		},
+		[recentKey],
+	);
+	const rememberRef = useRef(rememberFile);
+	rememberRef.current = rememberFile;
+
+	const openFile = useCallback((which: Which, e: FsEntry, lineNo?: number) => {
 		const d = dock.current;
 		if (!d) return;
+		rememberRef.current(which, e);
 		const id = `edit:${which}:${e.path}`;
+		const line = lineNo ? { n: lineNo, seq: Date.now() } : undefined;
 		const existing = d.getPanel(id);
 		if (existing) {
+			if (line) existing.api.updateParameters({ line });
 			existing.api.setActive();
 			return;
 		}
-		addDoc(d, { id, component: "editor", title: e.name, params: { which, path: e.path, name: e.name } });
+		addDoc(d, { id, component: "editor", title: e.name, params: { which, path: e.path, name: e.name, line } });
 	}, []);
 
 	// 동시 입력: 받는 터미널 탭에 ⇉ 표시
@@ -953,6 +1052,31 @@ export function Workbench({
 		addDoc(d, { id: "monitor", component: "monitor", title: "자원" });
 	};
 	openMonitorRef.current = openMonitor;
+	/** 문서 칸에 도구 칸 하나(있으면 앞으로) */
+	const openTool = (id: "services" | "docker" | "webports" | "search", title: string) => {
+		const d = dock.current;
+		if (!d) return;
+		if (d.getPanel(id)) return void d.getPanel(id)?.api.setActive();
+		addDoc(d, { id, component: id, title });
+	};
+	/** 새 터미널을 열고, 셸이 준비되면 명령을 보낸다 */
+	const openTerminalCmdRef = useRef<(cmd: string, title: string) => void>(() => {});
+	openTerminalCmdRef.current = (cmd: string, title: string) => {
+		const d = dock.current;
+		if (!d) return;
+		termSeq.current += 1;
+		const n = termSeq.current;
+		const id = `term-${n}`;
+		const ref = d.panels.find((p) => p.id.startsWith("term-"));
+		d.addPanel({ id, component: "terminal", title, params: { n }, renderer: "always", position: ref ? { referencePanel: ref.id, direction: "within" } : undefined });
+		let tries = 0;
+		const send = () => {
+			const h = shells.current.get(id);
+			if (h && (!h.idle || h.idle())) return void h.send(`${cmd}\r`);
+			if (++tries < 60) window.setTimeout(send, 150);
+		};
+		window.setTimeout(send, 300);
+	};
 
 	const addTerminalRef = useRef<(cwd?: string, shell?: string, near?: string) => void>(() => {});
 	const addTerminal = (cwd?: string, shell?: string, near?: string) => {
@@ -1112,10 +1236,14 @@ export function Workbench({
 			setBroadcast: setBroadcastOn,
 			addTerminalNear: (id?: string) => addTerminalRef.current(undefined, undefined, id),
 			openMonitor: () => openMonitorRef.current(),
+			sudo: sudo ? { mode: sudo.mode, user: sudo.user || "root" } : undefined,
+			openTerminalCmd: (cmd: string, title: string) => openTerminalCmdRef.current(cmd, title),
+			cwdNow: () => lastCwd.current,
 			openForwards: server ? () => setFwdOpen(true) : undefined,
+			profileId: server?.profileId,
 			rootShell: fs.side === "remote" && sudoMode !== "off" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server, sudo],
 	);
 
 	useEffect(() => {
@@ -1126,6 +1254,102 @@ export function Workbench({
 		};
 	}, []);
 
+	/** 그 종류 칸으로 옮기고 안에 포커스(Alt+1·2·3, 명령 팔레트) */
+	const focusPanel = (pred: (id: string) => boolean) => {
+		const d = dock.current;
+		if (!d) return;
+		const p = d.panels.find((x) => pred(x.id) && x.api.isVisible) ?? d.panels.find((x) => pred(x.id));
+		if (p) {
+			p.api.setActive();
+			requestAnimationFrame(() => (p.view.content.element.querySelector("textarea, .tree-body, .cm-content, [tabindex]") as HTMLElement | null)?.focus());
+		}
+	};
+	const toggleTermPane = () => {
+		const t = dock.current?.panels.find((x) => x.id.startsWith("term-"));
+		if (t) t.group.api.setVisible(!t.group.api.isVisible);
+	};
+	const resetLayout = () => {
+		if (dock.current && !blockedByLock()) {
+			termSeq.current = 1;
+			defaultLayout(dock.current);
+		}
+	};
+	/** 명령 대상 터미널 — 보이는(없으면 첫) 터미널 칸 */
+	const targetTerm = () => visibleShell()?.id ?? dock.current?.panels.find((p) => p.id.startsWith("term-"))?.id;
+
+	// 명령 팔레트 — 이 작업대가 앞에 보일 때만 자기 명령을 등록한다
+	useCommands(`workbench:${instance.current}`, active, () => {
+		const w = (id: string, title: string, run: () => void, extra?: Partial<Command>): Command => ({ id: `wb.${id}`, title, group: "work", run, ...extra });
+		const lockHint = locked ? "배치가 잠겨 있음(Ctrl+Alt+L 로 풀기)" : undefined;
+		const split = (dir: "right" | "below") => () => {
+			const t = targetTerm();
+			if (t) splitTerminal(t, dir);
+		};
+		const list: Command[] = [
+			w("quickOpen", "파일 빠른 열기", () => setQuickOpen(true), { keys: "Alt+O", keywords: "찾기 열기 이름 경로 file open" }),
+			w("newTerminal", "새 터미널", () => addTerminalRef.current(lastCwd.current ?? undefined, undefined, targetTerm()), { hint: "지금 폴더에서, 같은 칸의 탭으로", keywords: "terminal shell 셸" }),
+			w("splitRight", "터미널 오른쪽으로 나누기", split("right"), { disabled: locked, hint: lockHint, keywords: "split 분할" }),
+			w("splitBelow", "터미널 아래로 나누기", split("below"), { disabled: locked, hint: lockHint, keywords: "split 분할" }),
+			w("broadcast", broadcastOn ? "동시 입력 끄기" : "동시 입력 켜기", () => setBroadcastOn(!broadcastRef.current), { hint: "한 터미널에 친 것을 이 작업대의 모든 터미널에", keywords: "broadcast 브로드캐스트" }),
+			w("termPane", "터미널 칸 숨기기·보이기", toggleTermPane, { keys: "Ctrl+`" }),
+			w("focusTree", "트리로 옮기기", () => focusPanel((id) => id === "tree" || id === "localtree"), { keys: "Alt+1" }),
+			w("focusDoc", "문서(편집기)로 옮기기", () => focusPanel((id) => /^(edit|tail|diff):/.test(id) || id === "monitor"), { keys: "Alt+2" }),
+			w("focusTerm", "터미널로 옮기기", () => focusPanel((id) => id.startsWith("term-")), { keys: "Alt+3" }),
+			w("lock", locked ? "배치 잠금 풀기" : "배치 잠그기", () => setLocked(!lockedRef.current), { keys: "Ctrl+Alt+L", keywords: "lock 고정" }),
+			w("defaultLayout", "기본 배치로 되돌리기", resetLayout, { disabled: locked, hint: lockHint ?? "왼쪽 트리 · 가운데 문서 · 아래 터미널", keywords: "layout reset 초기화" }),
+			w("tree", has("tree") ? "파일 칸 닫기" : "파일 칸 열기", () => toggle("tree"), { disabled: locked, hint: lockHint, keywords: "트리 tree" }),
+			w("help", "단축키 도움말", () => setHelp(true), { keys: "F1", keywords: "도움말 help shortcut" }),
+		];
+		if (local) {
+			list.push(
+				w("localtree", has("localtree") ? "내 PC 칸 닫기" : "내 PC 칸 열기", () => toggle("localtree"), { disabled: locked, hint: lockHint ?? "서버 트리와 끌어 놓아 주고받기" }),
+				w("transfers", "전송 칸 보기", () => showTransfers(true), { keywords: "올리기 받기 upload download" }),
+			);
+		}
+		if (fs.side === "remote" && fs.conn != null) {
+			list.push(w("monitor", "자원 칸 보기", openMonitor, { hint: "CPU·메모리·디스크·네트워크·프로세스", keywords: "monitor 모니터 top" }));
+			list.push(w("services", "서비스 칸 보기", () => openTool("services", "서비스"), { hint: "systemd 서비스·journal", keywords: "systemctl systemd journal 서비스" }));
+			list.push(w("docker", "Docker 칸 보기", () => openTool("docker", "Docker"), { hint: "컨테이너·로그·셸", keywords: "docker container 컨테이너 podman" }));
+			list.push(w("webports", "서버 웹 화면 열기", () => openTool("webports", "웹 화면"), { hint: "듣고 있는 포트 → 포워딩 → 브라우저", keywords: "port 포트 web 웹 브라우저" }));
+		}
+		list.push(w("search", "파일 내용 찾기", () => openTool("search", "내용 찾기"), { hint: "grep — Ctrl+Shift+F", keywords: "grep 검색 찾기 search" }));
+		if (local && syncInfo) list.push(w("sync", "동기화 칸 보기", openSync, { hint: "내 PC 폴더 ↔ 이 서버 폴더", keywords: "rsync sync" }));
+		if (server) {
+			list.push(
+				w("forwards", "포트 포워딩", () => setFwdOpen(true), { hint: "로컬·원격·SOCKS 규칙", keywords: "port forward tunnel 터널" }),
+				w("tmux", "tmux 세션", () => setTmuxOpen(true), { hint: "세션 보기·끝내기", keywords: "tmux session" }),
+			);
+		}
+		if (sudoFs) {
+			list.push(
+				w("sudo", sudoOn ? "sudo 끄기" : "sudo 켜기", () => (sudoOn ? disableSudo() : void enableSudo(null, false)), {
+					hint: `${sudoUser || "root"} 권한으로 파일 작업${sudoPlace === "together" ? " + 보이는 터미널" : ""}`,
+					keywords: "root 권한 관리자",
+				}),
+			);
+			const t = targetTerm();
+			if (t) list.push(w("rootShell", "보이는 터미널을 root 셸로(sudo -i)", () => void rootShell(t, true), { keywords: "sudo root" }));
+		}
+		if (fs.side === "local") {
+			list.push(
+				w("adminWindow", "관리자 권한 새 창 — 지금 셸", () => void invoke("pty_admin_window", { shell: defaultShell, cwd: lastCwd.current }).catch((e) => alert(String(e))), { keywords: "admin 관리자 elevated" }),
+				...(shellList ?? []).filter((x) => x.admin).map((x) => w(`admin.${x.id}`, `관리자 셸 열기 — ${x.label}`, () => addTerminalRef.current(undefined, x.id), { keywords: "admin 관리자" })),
+			);
+		}
+		for (const f of recentFiles.current) {
+			const dir = f.path.slice(0, Math.max(0, f.path.lastIndexOf("/"))) || "/";
+			list.push({
+				id: `file.${recentKey}.${f.which}:${f.path}`,
+				title: f.name,
+				hint: `${f.which === "local" && local ? "내 PC · " : ""}${dir}`,
+				group: "files",
+				keywords: f.path,
+				run: () => openFile(f.which, { name: f.name, path: f.path, kind: "file", size: 0 }),
+			});
+		}
+		return list;
+	});
+
 	return (
 		<WbCtx.Provider value={ctx}>
 			<div
@@ -1133,18 +1357,10 @@ export function Workbench({
 				onKeyDownCapture={(e) => {
 					const d = dock.current;
 					if (!d) return;
-					const focusPanel = (pred: (id: string) => boolean) => {
-						const p = d.panels.find((x) => pred(x.id) && x.api.isVisible) ?? d.panels.find((x) => pred(x.id));
-						if (p) {
-							p.api.setActive();
-							requestAnimationFrame(() => (p.view.content.element.querySelector("textarea, .tree-body, .cm-content, [tabindex]") as HTMLElement | null)?.focus());
-						}
-					};
 					if (e.ctrlKey && e.key === "`") {
 						// 터미널 칸 숨기기·보이기
 						e.preventDefault();
-						const t = d.panels.find((x) => x.id.startsWith("term-"));
-						if (t) t.group.api.setVisible(!t.group.api.isVisible);
+						toggleTermPane();
 					} else if (e.altKey && !e.ctrlKey && (e.key === "1" || e.key === "2" || e.key === "3")) {
 						e.preventDefault();
 						if (e.key === "1") focusPanel((id) => id === "tree" || id === "localtree");
@@ -1160,6 +1376,11 @@ export function Workbench({
 						e.preventDefault();
 						e.stopPropagation();
 						setQuickOpen(true);
+					} else if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.code === "KeyF") {
+						// 파일 내용 찾기 칸
+						e.preventDefault();
+						e.stopPropagation();
+						openTool("search", "내용 찾기");
 					} else if (e.key === "F1") {
 						e.preventDefault();
 						setHelp(true);
@@ -1187,6 +1408,22 @@ export function Workbench({
 								<Activity size={14} /> <span className="lbl">자원</span>
 							</button>
 						)}
+						{fs.side === "remote" && fs.conn != null && (
+							<>
+								<button type="button" className={`btn ghost${has("services") ? " on" : ""}`} onClick={() => openTool("services", "서비스")} title="서비스 칸 — systemd 서비스 상태·시작·중지·재시작·journal 로그">
+									<Cog size={14} /> <span className="lbl">서비스</span>
+								</button>
+								<button type="button" className={`btn ghost${has("docker") ? " on" : ""}`} onClick={() => openTool("docker", "Docker")} title="Docker 칸 — 컨테이너 목록·로그·안에 셸 열기·재시작·이미지">
+									<Container size={14} /> <span className="lbl">Docker</span>
+								</button>
+								<button type="button" className={`btn ghost${has("webports") ? " on" : ""}`} onClick={() => openTool("webports", "웹 화면")} title="웹 화면 — 서버에서 듣고 있는 포트, 눌러 포워딩 켜고 브라우저로 열기">
+									<Globe size={14} /> <span className="lbl">웹</span>
+								</button>
+							</>
+						)}
+						<button type="button" className={`btn ghost${has("search") ? " on" : ""}`} onClick={() => openTool("search", "내용 찾기")} title="내용 찾기 — 폴더 안 파일 내용을 grep 으로 찾고 그 줄로 열기(Ctrl+Shift+F)">
+							<TextSearch size={14} /> <span className="lbl">찾기</span>
+						</button>
 						{local && syncInfo && (
 							<button type="button" className={`btn ghost${has("sync") ? " on" : ""}`} onClick={openSync} title="동기화 칸 — 내 PC 폴더 ↔ 이 서버 폴더(rsync 모드)·자동 반영">
 								<RefreshCcw size={14} /> <span className="lbl">동기화</span>
@@ -1258,12 +1495,7 @@ export function Workbench({
 							className="btn ghost"
 							title={locked ? "배치가 잠겨 있어 초기화할 수 없습니다" : "기본 배치 — 이 작업대의 칸을 왼쪽 트리·가운데 문서·아래 터미널로 되돌리기"}
 							disabled={locked}
-							onClick={() => {
-								if (dock.current && !blockedByLock()) {
-									termSeq.current = 1;
-									defaultLayout(dock.current);
-								}
-							}}
+							onClick={resetLayout}
 						>
 							<LayoutTemplate size={14} /> <span className="lbl">기본 배치</span>
 						</button>
@@ -1359,11 +1591,18 @@ export function Workbench({
 
 /** F1 — 단축키 모음 */
 function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => void }) {
+	const mac = document.documentElement.dataset.os === "macos";
 	const rows: [string, string][] = [
+		["앱", ""],
+		[mac ? "⌘⇧P" : "Ctrl+Shift+P", "명령 팔레트 — 서버·탭·작업대 동작·설정을 한 칸에서 찾아 실행(초성도)"],
+		[mac ? "⌘T · ⌘W" : "Ctrl+T · Ctrl+W", "내 PC 터미널 · 탭 닫기"],
+		[mac ? "⌘K" : "Ctrl+K", "홈에서 연결 찾기"],
+		[mac ? "⌘B" : "Ctrl+B", "사이드바 접기·펴기"],
 		["작업대", ""],
 		["Alt+1 · 2 · 3", "트리 · 문서 · 터미널로"],
 		["Ctrl+`", "터미널 칸 숨기기·보이기"],
 		["Alt+O", "파일 빠른 열기(이름으로 찾기 · /경로 바로 열기)"],
+		["Ctrl+Shift+F", "파일 내용 찾기(grep — 결과를 누르면 그 줄로)"],
 		["Ctrl+Alt+L", `배치 잠그기·풀기 — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`],
 		["F1", "이 도움말"],
 		["파일 트리", ""],

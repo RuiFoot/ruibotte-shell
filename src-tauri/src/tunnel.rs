@@ -508,7 +508,8 @@ pub async fn forward_delete(store: State<'_, Store>, id: i64) -> Result<(), Stri
 /// DB 터널 전용 SSH 연결 — 같은 계정을 거치는 DB 연결끼리 나눠 쓴다
 pub(crate) struct Link {
     handle: Option<Handle<Client>>,
-    jump: Option<Handle<Client>>,
+    /// 점프 단계 연결들(경로가 점프를 거치면)
+    jump: Vec<Handle<Client>>,
 }
 
 impl Link {
@@ -523,7 +524,7 @@ impl Link {
 impl Drop for Link {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
-            let j = self.jump.take();
+            let j = std::mem::take(&mut self.jump);
             tauri::async_runtime::spawn(async move {
                 let _ = tokio::time::timeout(Duration::from_secs(5), h.disconnect(Disconnect::ByApplication, "", "ko")).await;
                 drop(j);

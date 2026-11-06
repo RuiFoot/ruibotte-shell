@@ -183,7 +183,7 @@ export function installMock() {
 					const req = (args as { req: Record<string, any> }).req;
 					const a = accounts.find((x) => x.id === req.accountId);
 					if (a) a.lastUsedAt = Date.now();
-					return { connId: 1, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false, usedSavedSecret: true, accountId: a?.id ?? null, username: a?.username ?? req.username, sudo: a?.sudo ?? "ask", sudoUser: a?.sudoUser ?? "root" };
+					return { connId: 1, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false, usedSavedSecret: true, accountId: a?.id ?? null, username: a?.username ?? req.username, sudo: a?.sudo ?? "ask", sudoUser: a?.sudoUser ?? "root", route: { id: 12, label: "외부 · 점프", summary: "점프 구형 로그 서버 · 10.0.0.5:22", total: 3, note: "사내 직접 건너뜀 — 망 조건이 맞지 않음" } };
 				}
 				case "ssh_shell_open":
 				case "pty_open":
@@ -239,6 +239,64 @@ export function installMock() {
 					];
 				case "jdbc_status":
 					return { java: false, drivers: [] };
+				// 경로·진단(화면 점검용)
+				case "route_list":
+					return Number(args.profileId) === 1
+						? [
+								{ id: 11, profileId: 1, ord: 0, label: "사내 직접", host: "dev.example.com", port: 22, jumps: [], condKind: "dns", condValue: "corp.example", condNot: false, lastOkAt: now - 3600 },
+								{ id: 12, profileId: 1, ord: 1, label: "외부 · 점프", host: "10.0.0.5", port: 22, jumps: [{ profileId: 2 }], lastOkAt: null },
+								{ id: 13, profileId: 1, ord: 2, label: "프록시", host: "dev.example.com", port: 22, jumps: [], proxyKind: "socks5", proxyHost: "127.0.0.1", proxyPort: 1080, proxyUser: "u", proxySecretSaved: true },
+							]
+						: [{ id: 20 + Number(args.profileId), profileId: Number(args.profileId), ord: 0, host: "x", port: 22, jumps: [] }];
+				case "route_save":
+					return 99;
+				case "net_info_get":
+					return { gateways: ["192.0.2.1"], dnsSuffixes: ["corp.example"], wifi: [], supportsGateway: true, supportsDns: true, supportsWifi: true, wifiNote: "Wi-Fi 이름을 읽을 권한이 없습니다 — 위치 권한을 켜세요" };
+				case "ssh_conn_route":
+					return { id: 12, label: "외부 · 점프", summary: "점프 구형 로그 서버 · 10.0.0.5:22", total: 3, note: "사내 직접: dev.example.com:22 이(가) 4초 안에 답하지 않았습니다" };
+				case "ssh_diagnose":
+					return new Promise((r) =>
+						setTimeout(
+							() =>
+								r({
+									profile: "개발 서버",
+									account: "deploy",
+									at: Date.now(),
+									net: { gateways: ["192.0.2.1"], dnsSuffixes: [], wifi: [], supportsGateway: true, supportsDns: true, supportsWifi: false },
+									routes: [
+										{
+											routeId: 11,
+											label: "사내 직접",
+											summary: "dev.example.com:22",
+											cond: "DNS 접미사 corp.example 일 때",
+											condState: "noMatch",
+											ok: false,
+											steps: [
+												{ name: "망 조건", status: "warn", detail: "안 맞음 — 지금: 없음. 접속할 때는 이 경로를 건너뜁니다" },
+												{ name: "이름 풀이 · 대상", status: "fail", detail: "dev.example.com 이름을 찾지 못했습니다", hint: "주소에 오타가 있거나, 사내 DNS 에서만 풀리는 이름일 수 있습니다(사내망·VPN 연결을 확인하세요)" },
+											],
+										},
+										{
+											routeId: 12,
+											label: "외부 · 점프",
+											summary: "점프 구형 로그 서버 · 10.0.0.5:22",
+											condState: "none",
+											ok: true,
+											steps: [
+												{ name: "이름 풀이 · 점프 서버 구형 로그 서버", status: "info", detail: "IP 주소라 풀이할 이름이 없습니다" },
+												{ name: "TCP 연결 · 점프 서버 구형 로그 서버", status: "ok", ms: 3.4, detail: "10.0.0.6:22 평균 3.4ms (3.9 · 3.1 · 3.2)" },
+												{ name: "점프 1 · 구형 로그 서버", status: "ok", ms: 88, detail: "10.0.0.6:22 · 계정 root 인증까지" },
+												{ name: "점프 서버 → 대상", status: "ok", ms: 4.2, detail: "10.0.0.5:22 길 열기 평균 4.2ms" },
+												{ name: "SSH 인사", status: "ok", ms: 12, detail: "SSH-2.0-OpenSSH_9.6" },
+												{ name: "키 교환·호스트 키", status: "ok", ms: 30, detail: "고정한 키와 같습니다 · ssh-ed25519 SHA256:abcd" },
+												{ name: "인증", status: "ok", ms: 40, detail: "계정 deploy · 개인키" },
+											],
+										},
+									],
+								}),
+							700,
+						),
+					);
 				default:
 					return null;
 			}

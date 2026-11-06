@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, BookOpen, Copy, CornerDownLeft, Search, SquareTerminal, Star } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { activeTerminal, DANGER } from "../lib/activeTerm";
-
+import { initials, isCho } from "../lib/hangul";
 import { type Dict, type DictCmd, loadDict } from "../lib/dict";
 
 const SYN: string[][] = [
@@ -17,17 +17,6 @@ const SYN: string[][] = [
 	["폴더", "디렉터리", "디렉토리"],
 ];
 
-/** 한글 초성(ㄱ~ㅎ) — "ㅇㅊ" 로 "압축" 찾기 */
-const CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ";
-function initials(s: string) {
-	let out = "";
-	for (const ch of s) {
-		const c = ch.charCodeAt(0) - 0xac00;
-		out += c >= 0 && c < 11172 ? CHO[Math.floor(c / 588)] : ch;
-	}
-	return out;
-}
-const isCho = (w: string) => /^[ㄱ-ㅎ]+$/.test(w);
 
 function score(name: string, c: DictCmd, words: string[]): number {
 	let s = 0;

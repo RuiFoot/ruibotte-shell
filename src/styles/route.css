@@ -1,0 +1,308 @@
+/* 서버 경로(주소 여럿·점프·프록시·망 조건)·접속 진단 */
+
+/* ── 서버 설정의 경로 목록 ──────────────── */
+.rt-list {
+	display: grid;
+	gap: 4px;
+	margin-bottom: 6px;
+}
+.rt-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 8px;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	min-width: 0;
+}
+.rt-n {
+	flex: none;
+	display: grid;
+	place-items: center;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: var(--accent-soft);
+	color: var(--accent);
+	font-size: 11px;
+	font-weight: 600;
+}
+.rt-main {
+	display: grid;
+	gap: 1px;
+	flex: 1;
+	min-width: 0;
+}
+.rt-main b {
+	font-size: 12.5px;
+	font-weight: 600;
+}
+.rt-sum {
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	color: var(--text-2);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.rt-meta {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	font-size: 11px;
+	color: var(--text-3);
+}
+.rt-acts {
+	flex: none;
+	display: inline-flex;
+	gap: 2px;
+}
+.rt-foot {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+.rt-wait {
+	font-size: 12px;
+	color: var(--text-2);
+}
+
+/* ── 경로 고치기 시트 ───────────────────── */
+.rt-sheet h3 {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.rt-two {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	gap: 10px;
+}
+.rt-hop {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1.3fr) minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 6px;
+	margin-bottom: 6px;
+}
+.rt-chain {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px;
+	margin: 2px 0 8px;
+	font-size: 11.5px;
+	color: var(--text-3);
+}
+.rt-chain-seg {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.rt-chip {
+	padding: 1px 7px;
+	border-radius: 999px;
+	background: var(--fill);
+	color: var(--text-2);
+}
+.rt-chip.on {
+	background: var(--accent-soft);
+	color: var(--accent);
+}
+.rt-now {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px;
+	margin: -4px 0 6px;
+}
+.rt-now small {
+	color: var(--text-3);
+	font-size: 11px;
+}
+.rt-sheet input.mono {
+	font-family: var(--font-mono);
+	font-size: 12px;
+}
+
+/* ── 서버 카드의 경로 ───────────────────── */
+.sc-routes {
+	display: grid;
+	gap: 2px;
+	margin: 0 0 10px;
+}
+.sc-route {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+	font-size: 12px;
+	color: var(--text-2);
+}
+.sc-route .rt-n {
+	align-self: center;
+}
+.sc-route b {
+	flex: none;
+	font-weight: 600;
+	color: var(--text);
+}
+.sc-route .rt-sum {
+	flex: 1;
+	min-width: 0;
+}
+.sc-route .badge {
+	flex: none;
+}
+.sc-route.now b {
+	color: var(--accent);
+}
+
+/* ── 탭·상태 줄 ─────────────────────────── */
+.tab-route {
+	max-width: 96px;
+	padding: 0 6px;
+	border-radius: 999px;
+	background: var(--accent-soft);
+	color: var(--accent);
+	font-size: 10.5px;
+	line-height: 16px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.route-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 0 6px;
+	border-radius: 999px;
+	background: var(--accent-soft);
+	color: var(--accent);
+	white-space: nowrap;
+}
+.route-chip.fell {
+	background: color-mix(in srgb, #ff9f0a 16%, transparent);
+	color: #c77700;
+}
+
+/* ── 접속 실패 화면 ─────────────────────── */
+.cd-hint {
+	margin: -4px 0 10px;
+	font-size: 12.5px;
+	color: var(--text-2);
+}
+.cd-attempts {
+	margin: 0 0 10px;
+	padding: 8px 10px 8px 26px;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	font-size: 12px;
+	color: var(--text-2);
+}
+.cd-route {
+	margin: -10px 0 12px;
+	font-size: 12px;
+	color: var(--text-3);
+}
+
+/* ── 진단 ───────────────────────────────── */
+.sheet.dg-sheet {
+	width: min(680px, calc(100vw - 32px));
+}
+.dg-sheet h3 {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.dg-busy,
+.dg-net {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: -6px 0 12px;
+	font-size: 12px;
+	color: var(--text-2);
+}
+.dg-route {
+	margin-bottom: 10px;
+	padding: 8px 10px;
+	border-radius: var(--r-md);
+	background: var(--fill);
+}
+.dg-route header {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	margin-bottom: 4px;
+}
+.dg-route header small {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	color: var(--text-3);
+}
+.dg-steps {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	display: grid;
+	gap: 3px;
+}
+.dg-step {
+	display: grid;
+	grid-template-columns: 16px 168px 52px minmax(0, 1fr);
+	align-items: baseline;
+	column-gap: 8px;
+	font-size: 12px;
+}
+.dg-step .dg-ic {
+	align-self: center;
+}
+.dg-name {
+	color: var(--text);
+	min-width: 0;
+}
+.dg-ms {
+	text-align: right;
+	font-family: var(--font-mono);
+	font-size: 11px;
+	color: var(--text-3);
+}
+.dg-detail {
+	min-width: 0;
+	color: var(--text-2);
+	word-break: break-word;
+	user-select: text;
+}
+.dg-hint {
+	grid-column: 2 / -1;
+	color: var(--text-2);
+	padding: 2px 0 4px;
+}
+.dg-step.fail .dg-hint {
+	color: var(--danger);
+}
+.dg-step.skip,
+.dg-step.skip .dg-name {
+	color: var(--text-3);
+}
+.dg-ic.ok {
+	color: var(--ok);
+}
+.dg-ic.fail {
+	color: var(--danger);
+}
+.dg-ic.warn {
+	color: #ff9f0a;
+}
+.dg-ic.skip,
+.dg-ic.info {
+	color: var(--text-3);
+}

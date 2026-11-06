@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, ListTree, PanelLeftClose, PanelLeftOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, Command as CommandIcon, ListTree, PanelLeftClose, PanelLeftOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
@@ -14,9 +14,13 @@ import { ContextMenu, type MenuItem } from "./components/ContextMenu";
 import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
+import { routeTitle, routeWorthShowing } from "./components/RouteChip";
 import { agoMs, ServerCard } from "./components/ServerCard";
 import { type Account, accountName, type AppInfo, api, type ConnectOk, defaultAccount, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm, withAccount } from "./lib/ipc";
-import { installNow, startUpdater, useUpdate } from "./lib/updater";
+import { checkNow, installNow, startUpdater, useUpdate } from "./lib/updater";
+import { CommandPalette } from "./components/CommandPalette";
+import { type Command, OPEN_PALETTE_EVENT, requestSettingsSection, SETTINGS_SECTIONS, type SettingsSection, useCommands } from "./lib/commands";
+import { type AppTheme, getAppearance, loadAppearance, setAppearance, TERM_SCHEMES } from "./lib/theme";
 
 // 무거운 칸(xterm·편집기·표·사전)은 처음 열 때 받는다 — 첫 화면(홈)은 가볍게
 const Workbench = lazy(() => import("./components/Workbench").then((m) => ({ default: m.Workbench })));
@@ -54,6 +58,17 @@ function parseSession(v: string | null): SessionItem[] {
 }
 /** 탭 제목 — 계정@서버 */
 const tabTitle = (p: Profile) => (p.username ? `${p.username}@${p.name}` : p.name);
+const KIND_LABEL: Record<TabKind, string> = {
+	home: "홈",
+	local: "내 PC 터미널",
+	ssh: "SSH",
+	db: "DB",
+	grid: "결과 표",
+	dict: "명령어 사전",
+	settings: "설정",
+	connections: "연결 관리",
+	keys: "키 관리",
+};
 const LEVEL_BADGE: Record<string, string> = { rsa: "구형 SSH · RSA", sha1: "구형 SSH · SHA-1", weakest: "구형 SSH · 최후" };
 
 // 탭 번호는 겹치면 안 된다 — 모듈이 다시 읽혀(개발 중 새로 고침) 숫자가 처음으로 돌아가도 겹치지 않게 무작위 꼬리를 붙인다
@@ -87,6 +102,12 @@ export function App() {
 	const [pmenu, setPmenu] = useState<{ x: number; y: number; p: Profile } | null>(null);
 	const [folded, setFolded] = useState<Set<string>>(new Set());
 	const upd = useUpdate();
+	/** 명령 팔레트(열려 있으면 처음 찾는 말) */
+	const [palette, setPalette] = useState<string | null>(null);
+	// 화면 설정(앱 테마·터미널 색·글꼴)은 첫 화면 전에 반영
+	useEffect(() => {
+		void loadAppearance();
+	}, []);
 
 	// 지난번 열려 있던 연결(앱을 다시 켜면 홈에서 한 번에 다시 열기)
 	// 지난번 열려 있던 연결(서버 + 그때 쓴 계정) — 앱을 다시 켜면 홈에서 한 번에 다시 열기
@@ -207,6 +228,24 @@ export function App() {
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
 	}, [info?.os, open, close, active]);
+
+	// 명령 팔레트: Ctrl+Shift+P(맥 ⌘⇧P) — 터미널(xterm)·편집기에 가기 전에 잡는다(셸에 ^P 가 가지 않게)
+	useEffect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			const mod = info?.os === "macos" ? e.metaKey : e.ctrlKey;
+			if (!mod || !e.shiftKey || e.altKey || e.code !== "KeyP") return;
+			e.preventDefault();
+			e.stopPropagation();
+			setPalette((v) => (v === null ? "" : null));
+		};
+		const onOpen = (e: Event) => setPalette((e as CustomEvent<string>).detail ?? "");
+		window.addEventListener("keydown", onKey, { capture: true });
+		window.addEventListener(OPEN_PALETTE_EVENT, onOpen);
+		return () => {
+			window.removeEventListener("keydown", onKey, { capture: true });
+			window.removeEventListener(OPEN_PALETTE_EVENT, onOpen);
+		};
+	}, [info?.os]);
 
 	// 내 연결 조회 — 종류·묶음 거르기·정렬, 지금 조회를 시작 화면으로 고정, 묶음 고정(맨 위·펼침)
 	const [kindF, setKindF] = useState<"all" | "ssh" | "db" | "fav">("all");
@@ -399,6 +438,79 @@ export function App() {
 	};
 	const card = cardId != null ? profiles.find((p) => p.id === cardId) : undefined;
 
+	/** 설정의 그 묶음으로 */
+	const gotoSettings = (id: SettingsSection) => {
+		requestSettingsSection(id);
+		open("settings", "설정", true);
+	};
+	const focusHomeSearch = () => {
+		open("home", "홈", true);
+		requestAnimationFrame(() => document.getElementById("home-search")?.focus());
+	};
+	// 명령 팔레트 — 연결·열린 탭·앱(작업대·DB 작업대는 자기 화면이 앞에 있을 때 따로 등록)
+	useCommands("app", true, () => {
+		const out: Command[] = [];
+		for (const p of profiles) {
+			if (p.id == null) continue;
+			const where = `${p.kind === "db" ? `${p.engine ?? "DB"} · ` : ""}${p.host}:${p.port}`;
+			const kw = [p.host, p.groupName, p.memo, p.kind, p.engine, ...(p.accounts ?? []).map((a) => `${a.username} ${a.label ?? ""}`)].filter(Boolean).join(" ");
+			const def = defaultAccount(p);
+			out.push(
+				{ id: `conn.card.${p.id}`, group: "conn", title: p.name, hint: `${where} · 서버 카드`, keywords: kw, run: () => connect(p) },
+				{ id: `conn.go.${p.id}`, group: "conn", title: `${p.name} — 기본 계정으로 접속`, hint: def ? accountName(def) : undefined, keywords: `${kw} 접속 연결 connect`, run: () => connectAs(p) },
+			);
+			if ((p.accounts?.length ?? 0) > 1) {
+				for (const a of p.accounts ?? []) {
+					out.push({
+						id: `conn.as.${p.id}.${a.id}`,
+						group: "conn",
+						title: `${p.name} › ${accountName(a)}`,
+						hint: `${a.label?.trim() ? `${a.username} · ` : ""}이 계정으로 접속${a.isDefault ? " · 기본" : ""}`,
+						keywords: `${kw} 계정 접속`,
+						run: () => connectAs(p, a),
+					});
+				}
+			}
+			out.push({ id: `conn.edit.${p.id}`, group: "conn", title: `${p.name} — 서버 설정`, hint: where, keywords: `${kw} 고치기 편집 설정`, run: () => editProfile(p) });
+		}
+		for (const t of tabsRef.current) {
+			out.push({ id: `tab.${t.id}`, group: "tabs", title: t.title, hint: `${KIND_LABEL[t.kind]}${t.id === active ? " · 지금 탭" : ""}`, keywords: "탭 tab 옮기기", run: () => setActive(t.id) });
+		}
+		const a = (id: string, title: string, run: () => void, extra?: Partial<Command>): Command => ({ id: `app.${id}`, group: "app", title, run, ...extra });
+		out.push(
+			a("home", "홈", () => open("home", "홈", true)),
+			a("homeSearch", "홈에서 연결 찾기", focusHomeSearch, { keys: "Mod+K" }),
+			a("local", "내 PC 터미널 새로 열기", () => open("local", "내 PC"), { keys: "Mod+T", keywords: "로컬 터미널 셸 local" }),
+			a("closeTab", "지금 탭 닫기", () => close(active), { keys: "Mod+W", disabled: tabsRef.current.length <= 1 }),
+			a("connections", "연결 관리", () => open("connections", "연결 관리", true), { keywords: "서버 목록 프로필" }),
+			a("keys", "키 관리", () => open("keys", "키 관리", true), { keywords: "ssh key 공개키 ppk" }),
+			a("dict", "명령어 사전", () => open("dict", "명령어 사전", true), { keywords: "리눅스 명령 도움말" }),
+			a("newSsh", "새 SSH 서버", () => setSheet(blankProfile("ssh")), { keywords: "추가 연결 만들기" }),
+			a("newDb", "새 데이터베이스 연결", () => setSheet(blankProfile("db")), { keywords: "추가 db 만들기" }),
+			a("import", "연결 가져오기", () => setImporting(true), { hint: "~/.ssh/config·PuTTY", keywords: "import" }),
+			a("export", "연결 내보내기", () => setExporting(true), { hint: "ssh config 로", keywords: "export" }),
+			a("sidebar", sbRail ? "사이드바 펴기" : "사이드바 접기", () => setSbManual(!sbRail), { keys: "Mod+B" }),
+			a("settings", "설정", () => open("settings", "설정", true), { keywords: "settings 환경" }),
+			...SETTINGS_SECTIONS.map((x) => a(`settings.${x.id}`, `설정 › ${x.label}`, () => gotoSettings(x.id), { keywords: x.keywords })),
+			a("update", "업데이트 확인", () => {
+				void checkNow(true);
+				gotoSettings("update");
+			}, { keywords: "새 버전 update" }),
+		);
+		const cur = getAppearance();
+		for (const [k, l] of [
+			["system", "시스템 따라"],
+			["light", "밝게"],
+			["dark", "어둡게"],
+		] as [AppTheme, string][]) {
+			out.push(a(`theme.${k}`, `테마: ${l}`, () => setAppearance({ app: k }), { hint: cur.app === k ? "지금" : undefined, keywords: "테마 다크 라이트 dark light theme 화면" }));
+		}
+		for (const sc of TERM_SCHEMES) {
+			out.push(a(`scheme.${sc.id}`, `터미널 색: ${sc.label}`, () => setAppearance({ termScheme: sc.id }), { hint: cur.termScheme === sc.id ? "지금" : undefined, keywords: "터미널 색 구성 테마 color scheme" }));
+		}
+		return out;
+	});
+
 	// 원격·내 PC 백엔드는 탭마다 한 번만 만든다(다시 그릴 때 셸이 다시 열리지 않게)
 	const backends = useRef(new Map<string, { fs: ReturnType<typeof localFs>; term: typeof localTerm; local?: ReturnType<typeof localFs> }>());
 	const backendFor = (t: Tab) => {
@@ -499,6 +611,11 @@ export function App() {
 										⇄
 									</span>
 								) : null}
+								{routeWorthShowing(t.ssh?.ok.route) && t.ssh?.ok.route ? (
+									<span className="tab-route" title={routeTitle(t.ssh.ok.route)}>
+										{t.ssh.ok.route.label}
+									</span>
+								) : null}
 								{tabs.length > 1 && (
 									<span
 										className="x"
@@ -519,6 +636,9 @@ export function App() {
 						</button>
 					</div>
 					<div className="drag" data-tauri-drag-region />
+					<button type="button" className="btn ghost icon cp-open" title={`명령 팔레트 (${info?.os === "macos" ? "⌘⇧P" : "Ctrl+Shift+P"}) — 서버·탭·동작·설정 찾아 실행`} aria-label="명령 팔레트" onClick={() => setPalette("")}>
+						<CommandIcon size={14} />
+					</button>
 					{isWin && (
 						<div className="winctl">
 							<button type="button" aria-label="최소화" onClick={() => void win.minimize()}>
@@ -848,6 +968,7 @@ export function App() {
 				<ServerCard
 					profile={card}
 					via={card.sshTunnelProfileId ? (profiles.find((x) => x.id === card.sshTunnelProfileId)?.name ?? "지워진 SSH 서버") : undefined}
+					servers={profiles}
 					openConn={tabs.find((x) => x.ssh && !x.ssh.closed && x.ssh.profile.id === card.id)?.ssh?.ok.connId}
 					onClose={() => setCardId(null)}
 					onConnect={(a) => connectAs(card, a)}
@@ -889,6 +1010,7 @@ export function App() {
 				/>
 			)}
 			{exporting && <ExportSheet onClose={() => setExporting(false)} />}
+			{palette !== null && <CommandPalette initial={palette} onClose={() => setPalette(null)} />}
 		</div>
 	);
 }

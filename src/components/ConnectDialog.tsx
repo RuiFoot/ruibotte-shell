@@ -1,6 +1,7 @@
-import { KeyRound, ShieldAlert, ShieldCheck, TriangleAlert } from "lucide-react";
+import { KeyRound, ShieldAlert, ShieldCheck, Stethoscope, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, asSshError, type ConnectOk, type LegacyLevel, type Profile, type SshError } from "../lib/ipc";
+import { DiagSheet } from "./DiagSheet";
 
 const LEVEL_NAME: Record<LegacyLevel, string> = {
 	off: "끔",
@@ -37,7 +38,10 @@ export function ConnectDialog({
 	// 내 PC 전용 앱이라 기본은 저장(사용자가 끌 수 있음)
 	const [save, setSave] = useState(true);
 	const trust = useRef<string | null>(null);
+	// 지문을 확인한 경로 — 같은 경로로 다시 붙는다(앞 경로들을 다시 기다리지 않게)
+	const route = useRef<number | null>(null);
 	const started = useRef(false);
+	const [diag, setDiag] = useState(false);
 
 	const run = useCallback(
 		async (prof: Profile, sec: string | null) => {
@@ -56,15 +60,24 @@ export function ConnectDialog({
 					trustFingerprint: trust.current,
 					saveSecret: save,
 					jumpId: prof.jumpId ?? null,
+					routeId: route.current,
 				});
 				onConnected(ok, prof);
 			} catch (raw) {
 				const e = asSshError(raw);
-				if (e.code === "HOSTKEY_UNKNOWN" || e.code === "HOSTKEY_MISMATCH") setStep({ s: "hostkey", e });
-				else if (e.code === "NEGOTIATION") setStep({ s: "negotiation", e });
-				else if (prof.auth === "agent") setStep({ s: "error", e });
+				if (e.code === "HOSTKEY_UNKNOWN" || e.code === "HOSTKEY_MISMATCH") {
+					route.current = e.routeId ?? null;
+					setStep({ s: "hostkey", e });
+				} else if (e.code === "NEGOTIATION") {
+					route.current = e.routeId ?? route.current;
+					setStep({ s: "negotiation", e });
+				} else if (prof.auth === "agent") setStep({ s: "error", e });
 				else if (e.code === "NEED_SECRET" || e.code === "AUTH_FAILED") setStep({ s: "secret", error: e.code === "AUTH_FAILED" ? e.message : undefined });
-				else setStep({ s: "error", e });
+				else {
+					// 길을 못 찾은 오류 — 다시 시도는 모든 경로로
+					route.current = null;
+					setStep({ s: "error", e });
+				}
 			}
 		},
 		[onConnected, save],
@@ -93,6 +106,7 @@ export function ConnectDialog({
 				<p style={{ margin: "0 0 16px", color: "var(--text-2)", fontFamily: "var(--font-mono)", fontSize: 12 }}>{title}</p>
 
 				{step.s === "connecting" && <p style={{ color: "var(--text-2)" }}>접속 중…</p>}
+				{(step.s === "hostkey" || step.s === "negotiation") && step.e.routeLabel && <p className="cd-route">경로: {step.e.routeLabel}</p>}
 
 				{step.s === "secret" && (
 					<form
@@ -195,11 +209,27 @@ export function ConnectDialog({
 
 				{step.s === "error" && (
 					<>
-						<p className="err">{step.e.message}</p>
+						<p className="err">
+							{step.e.routeLabel && !step.e.attempts ? `${step.e.routeLabel}: ` : ""}
+							{step.e.message}
+						</p>
+						{step.e.hint && <p className="cd-hint">{step.e.hint}</p>}
+						{step.e.attempts && step.e.attempts.length > 0 && (
+							<ol className="cd-attempts" aria-label="시도한 경로">
+								{step.e.attempts.map((a) => (
+									<li key={a}>{a}</li>
+								))}
+							</ol>
+						)}
 						<div className="sheet-actions">
 							<button type="button" className="btn" onClick={onCancel}>
 								닫기
 							</button>
+							{p.id != null && (
+								<button type="button" className="btn" onClick={() => setDiag(true)} title="경로마다 이름 풀이·TCP·SSH 인사·호스트 키·인증까지 어디서 막혔는지 봅니다">
+									<Stethoscope size={14} /> 진단
+								</button>
+							)}
 							<button type="button" className="btn primary" onClick={() => void run(p, secret)}>
 								다시 시도
 							</button>
@@ -207,6 +237,7 @@ export function ConnectDialog({
 					</>
 				)}
 			</div>
+			{diag && p.id != null && <DiagSheet profileId={p.id} accountId={p.accountId} title={`${p.name}${p.username ? ` · ${p.username}` : ""}`} onClose={() => setDiag(false)} />}
 		</div>
 	);
 }

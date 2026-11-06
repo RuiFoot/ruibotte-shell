@@ -20,19 +20,9 @@ import { DANGER, setActiveTerminal } from "../lib/activeTerm";
 import { revealLogDir, SessionRecorder } from "../lib/sessionLog";
 import { attachHighlighter } from "../lib/termHighlight";
 import { loadTermPrefs, TERM_PREFS_EVENT } from "../lib/termPrefs";
+import { getAppearance, onAppearance, termFontFamily, termTheme } from "../lib/theme";
 import { createZmodem, type ZmodemBridge, type ZmProgress } from "../lib/zmodemTerm";
 import { Select } from "./Select";
-
-function themeFromCss() {
-	const s = getComputedStyle(document.documentElement);
-	const v = (n: string) => s.getPropertyValue(n).trim();
-	return {
-		background: v("--term-bg"),
-		foreground: v("--term-fg"),
-		cursor: v("--accent"),
-		selectionBackground: "rgba(10,132,255,0.28)",
-	};
-}
 
 type Stat = { label: string; ok?: boolean };
 type Pending = { marker: IMarker; start: number; text: string };
@@ -85,6 +75,7 @@ export function TerminalView({
 	statusExtra,
 	onRecording,
 	logName,
+	profileId,
 }: {
 	backend: TermBackend;
 	active: boolean;
@@ -119,7 +110,11 @@ export function TerminalView({
 	onRecording?: (on: boolean) => void;
 	/** 기록 폴더 이름(서버 이름) — 없으면 label */
 	logName?: string;
+	/** 원격: 이 서버 번호 — 서버별 터미널 색 덮어쓰기(설정 › 화면, 서버 설정) */
+	profileId?: number;
 }) {
+	const profileIdRef = useRef(profileId);
+	profileIdRef.current = profileId;
 	const completionRef = useRef(completion);
 	completionRef.current = completion;
 	const host = useRef<HTMLDivElement>(null);
@@ -145,8 +140,8 @@ export function TerminalView({
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 	const [palette, setPalette] = useState(false);
 	const [last, setLast] = useState<{ code: number; ms: number } | null>(null);
-	/** 글꼴 크기(기본 13 이 아니면 상태 줄에) */
-	const [fontPx, setFontPx] = useState(13);
+	/** 글꼴 크기(설정한 크기가 아니면 상태 줄에) */
+	const [fontPx, setFontPx] = useState(() => getAppearance().termSize);
 	/** 명령 기록(셸 통합) — 명령과 출력 복사·명령 사이 이동 */
 	const cmds = useRef<{ start: IMarker; end?: IMarker; text: string; code?: number }[]>([]);
 	const [findCount, setFindCount] = useState<{ i: number; n: number } | null>(null);
@@ -222,15 +217,18 @@ export function TerminalView({
 	useEffect(() => {
 		const el = host.current;
 		if (!el) return;
+		const look = getAppearance();
+		const th0 = termTheme(profileIdRef.current);
+		el.style.background = th0.background ?? "";
 		const term = new XTerm({
-			fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--font-mono"),
-			fontSize: 13,
-			lineHeight: 1.15,
+			fontFamily: termFontFamily(),
+			fontSize: look.termSize,
+			lineHeight: look.termLine,
 			cursorBlink: true,
 			scrollback: 10000,
 			allowProposedApi: true,
 			overviewRuler: { width: 8 },
-			theme: themeFromCss(),
+			theme: th0,
 		});
 		const fit = new FitAddon();
 		const search = new SearchAddon();
@@ -533,7 +531,7 @@ export function TerminalView({
 			}
 			if (mod && !e.shiftKey && (e.key === "=" || e.key === "+" || e.key === "-" || e.key === "0")) {
 				const cur = term.options.fontSize ?? 13;
-				const next = e.key === "0" ? 13 : Math.min(32, Math.max(8, cur + (e.key === "-" ? -1 : 1)));
+				const next = e.key === "0" ? getAppearance().termSize : Math.min(32, Math.max(8, cur + (e.key === "-" ? -1 : 1)));
 				term.options.fontSize = next;
 				setFontPx(next);
 				fit.fit();
@@ -572,11 +570,22 @@ export function TerminalView({
 				setStat({ label: "셸이 끝났습니다 — Enter 로 같은 폴더에서 다시 열기" });
 			}
 		});
-		const mq = matchMedia("(prefers-color-scheme: dark)");
-		const onScheme = () => {
-			term.options.theme = themeFromCss();
-		};
-		mq.addEventListener("change", onScheme);
+		// 화면 설정(앱 테마·색 구성·글꼴)이 바뀌면 바로 — 글꼴 크기는 설정에서 바꿨을 때만(Ctrl+= 로 이 터미널만 키운 것은 둔다)
+		let lookSize = look.termSize;
+		const unLook = onAppearance(() => {
+			const a = getAppearance();
+			const th = termTheme(profileIdRef.current);
+			term.options.theme = th;
+			el.style.background = th.background ?? "";
+			term.options.fontFamily = termFontFamily();
+			term.options.lineHeight = a.termLine;
+			if (a.termSize !== lookSize) {
+				lookSize = a.termSize;
+				term.options.fontSize = a.termSize;
+				setFontPx(a.termSize);
+			}
+			if (el.offsetWidth > 0) fit.fit();
+		});
 
 		return () => {
 			disposed = true;
@@ -597,7 +606,7 @@ export function TerminalView({
 			cmds.current = [];
 			exited.current = false;
 			onShellRef.current?.(null);
-			mq.removeEventListener("change", onScheme);
+			unLook();
 			void unlisten.then((f) => f());
 			ro.disconnect();
 			onData.dispose();
@@ -831,7 +840,7 @@ export function TerminalView({
 					</span>
 				)}
 				{root && <span className="badge warn">root</span>}
-				{fontPx !== 13 && <span title="터미널 글꼴 — Ctrl+0 기본">글꼴 {fontPx}px</span>}
+				{fontPx !== getAppearance().termSize && <span title="터미널 글꼴 — Ctrl+0 설정한 크기로">글꼴 {fontPx}px</span>}
 				{here && (
 					<button type="button" className="env-chip" title="지금 폴더 — 눌러 경로 복사" onClick={() => void navigator.clipboard.writeText(here)}>
 						{here}

@@ -178,6 +178,13 @@ export type SshError = {
 	kind?: string;
 	theirs?: string[];
 	suggest?: LegacyLevel;
+	/** 쉬운 원인 설명(방화벽·사내망 등) */
+	hint?: string;
+	/** 어느 경로에서 난 오류인지 — 지문 확인 뒤 같은 경로로 다시 */
+	routeId?: number;
+	routeLabel?: string;
+	/** 앞서 실패·건너뛴 경로들 */
+	attempts?: string[];
 };
 
 export type ConnectReq = {
@@ -194,6 +201,8 @@ export type ConnectReq = {
 	trustFingerprint?: string | null;
 	saveSecret?: boolean;
 	jumpId?: number | null;
+	/** 이 경로로만(지문 확인 뒤 같은 경로로 다시) */
+	routeId?: number | null;
 };
 
 export type ConnectOk = {
@@ -208,6 +217,75 @@ export type ConnectOk = {
 	/** 계정의 sudo 설정 — 작업대가 따른다 */
 	sudo: SudoMode;
 	sudoUser: string;
+	/** 붙은 경로 */
+	route?: RouteUsed;
+};
+
+/** 어느 경로로 붙었는지 */
+export type RouteUsed = {
+	id?: number | null;
+	label: string;
+	/** "점프 A → B · host:22" */
+	summary: string;
+	/** 서버에 저장한 경로 수(1 이하면 굳이 보이지 않는다) */
+	total: number;
+	/** 앞 경로가 실패했거나 건너뛰어 이 경로로 왔을 때 */
+	note?: string;
+};
+
+/** 점프 단계 하나 — 거칠 SSH 서버와 그 계정(비우면 기본 계정) */
+export type Hop = { profileId: number; accountId?: number | null };
+export type ProxyKind = "http" | "socks5" | "command";
+export type CondKind = "gateway" | "dns" | "wifi" | "reach";
+/** 서버에 닿는 길 하나 */
+export type Route = {
+	id?: number;
+	profileId: number;
+	ord?: number;
+	label?: string | null;
+	host: string;
+	port: number;
+	jumps: Hop[];
+	proxyKind?: ProxyKind | null;
+	proxyHost?: string | null;
+	proxyPort?: number | null;
+	proxyUser?: string | null;
+	/** %h %p %r %% 를 바꿔 실행 */
+	proxyCommand?: string | null;
+	/** 읽기 전용 */
+	proxySecretSaved?: boolean;
+	condKind?: CondKind | null;
+	condValue?: string | null;
+	condNot?: boolean;
+	/** 읽기 전용 — 이 경로로 마지막에 붙은 때 */
+	lastOkAt?: number | null;
+};
+/** 지금 PC 의 망 값 */
+export type NetInfo = {
+	gateways: string[];
+	dnsSuffixes: string[];
+	wifi: string[];
+	supportsGateway: boolean;
+	supportsDns: boolean;
+	supportsWifi: boolean;
+	wifiNote?: string;
+};
+export type DiagStep = { name: string; status: "ok" | "fail" | "warn" | "skip" | "info"; ms?: number; detail: string; hint?: string };
+export type RouteDiag = { routeId?: number | null; label: string; summary: string; cond?: string; condState: "none" | "match" | "noMatch" | "unknown"; steps: DiagStep[]; ok: boolean };
+export type DiagReport = { profile: string; account: string; net: NetInfo; routes: RouteDiag[]; at: number };
+
+export const routes = {
+	list: (profileId: number) => invoke<Route[] | null>("route_list", { profileId }).then((x) => x ?? []),
+	/** proxySecret: 빈 값 = 지우기, 값 = 저장, undefined = 그대로 */
+	save: (r: Route, proxySecret?: string) => invoke<number>("route_save", { r, proxySecret: proxySecret ?? null }),
+	remove: (id: number) => invoke<void>("route_delete", { id }),
+	reorder: (profileId: number, ids: number[]) => invoke<void>("route_reorder", { profileId, ids }),
+	net: () => invoke<NetInfo>("net_info_get"),
+	diagnose: (profileId: number, accountId?: number | null) => invoke<DiagReport>("ssh_diagnose", { profileId, accountId: accountId ?? null }),
+	/** 열린 연결이 붙은 경로 */
+	ofConn: (conn: number) => invoke<RouteUsed | null>("ssh_conn_route", { conn }),
+	/** 가져온 서버의 첫 경로에 ProxyJump·ProxyCommand → 알릴 말 */
+	importRoutes: (items: { profileId: number; proxyJump?: string | null; proxyCommand?: string | null }[]) => invoke<string[]>("import_routes", { items }),
 };
 
 export type FsEntry = {
