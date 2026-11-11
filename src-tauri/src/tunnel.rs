@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 
@@ -61,8 +61,23 @@ impl Drop for OpenGuard {
     }
 }
 
-/// 양쪽을 이어 준다 — 한쪽이 다 보내면 반대쪽 쓰기를 닫고(EOF), 둘 다 끝나면 끝
-async fn pump<A, B>(a: A, b: B, st: &Stats)
+/// 양쪽을 이어 준다 — a = 내 쪽 소켓, b = SSH 채널. 한쪽이 다 보내면 반대쪽 쓰기를 닫고(EOF), 둘 다 끝나면 끝
+///
+/// 채널 → 내 쪽은 채널 읽기와 소켓 쓰기를 떼어 놓는다: russh 는 한 채널이 안 읽히면 그 연결의 세션 루프 전체가 멈춰
+/// 같은 서버의 터미널·SFTP·다른 포워딩까지 서 버린다(받는 프로그램이 일시정지·느리게 읽을 때). 그래서 채널은 늘 읽어
+/// 앱 안 대기열에 모으고, 대기열이 [`DOWN_CAP`] 을 넘으면(받는 쪽이 사실상 멈춤) 이 연결 하나만 끊는다.
+pub(crate) async fn pump<A, B>(a: A, b: B, st: &Stats)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    pump_counted(a, b, &st.up, &st.down).await;
+}
+
+/// 받는 쪽이 못 따라올 때 채널 → 내 쪽 대기열 상한
+const DOWN_CAP: usize = 32 * 1024 * 1024;
+
+pub(crate) async fn pump_counted<A, B>(a: A, b: B, up_n: &AtomicU64, down_n: &AtomicU64)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -70,12 +85,41 @@ where
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
     let up = async {
-        copy_count(&mut ar, &mut bw, &st.up).await;
+        copy_count(&mut ar, &mut bw, up_n).await;
         let _ = bw.shutdown().await;
     };
     let down = async {
-        copy_count(&mut br, &mut aw, &st.down).await;
-        let _ = aw.shutdown().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let queued = AtomicUsize::new(0);
+        let read = async {
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                match br.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => {
+                        if queued.fetch_add(k, Ordering::AcqRel) + k > DOWN_CAP {
+                            break; // 받는 쪽이 멈춤 — 이 연결만 끊는다(세션 전체를 세우지 않게)
+                        }
+                        if tx.send(buf[..k].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(tx);
+        };
+        let write = async {
+            let mut rx = rx;
+            while let Some(v) = rx.recv().await {
+                queued.fetch_sub(v.len(), Ordering::AcqRel);
+                if aw.write_all(&v).await.is_err() {
+                    break;
+                }
+                down_n.fetch_add(v.len() as u64, Ordering::Relaxed);
+            }
+            let _ = aw.shutdown().await;
+        };
+        tokio::join!(read, write);
     };
     tokio::join!(up, down);
 }

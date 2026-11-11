@@ -439,14 +439,15 @@ async fn open_web(c: &Arc<Conn>, conn: u32, host: Option<String>, port: u16) -> 
         loop {
             tokio::select! {
                 acc = listener.accept() => {
-                    let Ok((mut sock, peer)) = acc else { tokio::time::sleep(Duration::from_millis(200)).await; continue };
+                    let Ok((sock, peer)) = acc else { tokio::time::sleep(Duration::from_millis(200)).await; continue };
                     let Some(c) = w2.upgrade() else { break };
                     let host = h2.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ = sock.set_nodelay(true);
                         let Ok(ch) = c.handle_ref().channel_open_direct_tcpip(host, port as u32, peer.ip().to_string(), peer.port() as u32).await else { return };
-                        let mut s = ch.into_stream();
-                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut s).await;
+                        // 채널을 늘 읽어 앱 안에 모은다(브라우저가 느리게 받아도 같은 연결의 터미널이 멈추지 않게)
+                        let (up, down) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+                        crate::tunnel::pump_counted(sock, ch.into_stream(), &up, &down).await;
                     });
                 }
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {

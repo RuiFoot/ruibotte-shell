@@ -267,8 +267,7 @@ pub async fn sync_run(app: AppHandle, conns: State<'_, SshConns>, transfers: Sta
             } else {
                 c.sftp.remove_file(path).await.map_err(sftp_err)?;
             }
-        } else {
-            let path = lroot.join(&a.path);
+        } else if let Some(path) = local_under(&lroot, &a.path) {
             let _ = trash::delete(&path);
         }
     }
@@ -281,11 +280,12 @@ pub async fn sync_run(app: AppHandle, conns: State<'_, SshConns>, transfers: Sta
         .actions
         .iter()
         .filter(|a| a.action == "copy")
-        .map(|a| {
-            let l = lroot.join(&a.path).to_string_lossy().into_owned();
+        .filter_map(|a| {
+            // 서버 이름에 \·:·.. 가 섞여 내 PC 동기화 폴더 밖을 가리키면 건너뛴다
+            let l = local_under(&lroot, &a.path)?.to_string_lossy().into_owned();
             let r = format!("{rroot}/{}", a.path);
             let (src, dest) = if up { (l, r) } else { (r, l) };
-            Item { src, dest, size: a.size, dir: a.dir }
+            Some(Item { src, dest, size: a.size, dir: a.dir })
         })
         .collect();
     let id = transfers.next.fetch_add(1, Ordering::Relaxed) + 1;
@@ -470,4 +470,19 @@ mod live {
         assert!(!s2.iter().any(|x| x.ends_with(":a.txt")));
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// 동기화 상대 경로(서버 쪽 `/` 구분)를 내 PC 폴더 아래 경로로 — 폴더 밖으로 나가는 이름(`..`, `\`, `C:` 등)이면 None
+fn local_under(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    let mut out = root.to_path_buf();
+    for part in rel.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains('\\') || part.contains(':') {
+            return None;
+        }
+        out.push(part);
+    }
+    Some(out)
 }

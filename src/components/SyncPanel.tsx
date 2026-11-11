@@ -50,6 +50,9 @@ export function SyncPanel({ conn, remoteHome, user, host, port, onRun }: { conn:
 	useEffect(() => {
 		if (local) void api.settingSet(key, JSON.stringify(opts));
 	}, [key, opts, local]);
+	// 설정이 바뀌면 미리보기는 낡았다 — 버린다(옛 미리보기의 "지움 0건"을 보고 실행했는데 새 설정으로 지워지지 않게)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: opts 가 바뀔 때만
+	useEffect(() => setPlan(null), [opts]);
 
 	useEffect(() => {
 		const un = listen<WatchEv>("watch", (e) => {
@@ -71,6 +74,16 @@ export function SyncPanel({ conn, remoteHome, user, host, port, onRun }: { conn:
 		}
 	};
 	const run = async () => {
+		// 실행은 늘 지금 설정으로 다시 세운 계획을 보고 확인한다
+		let fresh: Plan;
+		try {
+			fresh = await invoke<Plan>("sync_plan", { conn, opts });
+		} catch (e) {
+			setMsg((e as { message?: string }).message ?? String(e));
+			return;
+		}
+		setPlan(fresh);
+		const plan = fresh;
 		if (plan?.actions.some((a) => a.action === "delete") && !confirm(`${plan.actions.filter((a) => a.action === "delete").length}개를 지웁니다(${direction === "up" ? "서버에서 — 되살릴 수 없음" : "내 PC 휴지통으로"}). 계속할까요?`)) return;
 		try {
 			await invoke("sync_run", { conn, opts });

@@ -273,6 +273,8 @@ pub struct DbConns {
     next: AtomicU32,
     map: Mutex<HashMap<u32, Arc<DbConn>>>,
     results: Mutex<HashMap<u32, Arc<ResultSet>>>,
+    /// 결과 번호 → 그 결과를 만든 연결 — 연결을 닫을 때 남은 결과(수백 MB 일 수 있다)를 함께 놓는다
+    owners: Mutex<HashMap<u32, u32>>,
 }
 
 impl DbConns {
@@ -645,6 +647,8 @@ async fn open_engine(req: &DbConnectReq, pw: Option<String>, app: Option<&AppHan
                 .db_name(req.database.clone().filter(|d| !d.is_empty()))
                 .prefer_socket(false)
                 .secure_auth(!req.legacy)
+                // 반영 행 수 = 조건에 맞은 행(값이 같아 안 바뀐 행 포함) — 아니면 같은 값으로 고친 셀 저장이 "0행" 으로 되돌려진다
+                .client_found_rows(true)
                 .into()
         };
         let open = |opts: mysql_async::Opts| async move {
@@ -763,6 +767,21 @@ pub async fn db_disconnect(dbs: State<'_, DbConns>, conn: u32) -> R<()> {
 }
 
 async fn close(dbs: &DbConns, conn: u32) {
+    // 이 연결이 만든 결과도 놓는다(DB 탭을 닫거나 끊어도 결과 행이 메모리에 남았다)
+    let gone: Vec<u32> = {
+        let mut o = dbs.owners.lock().unwrap();
+        let ids: Vec<u32> = o.iter().filter(|(_, c)| **c == conn).map(|(r, _)| *r).collect();
+        for r in &ids {
+            o.remove(r);
+        }
+        ids
+    };
+    {
+        let mut m = dbs.results.lock().unwrap();
+        for r in gone {
+            m.remove(&r);
+        }
+    }
     let c = dbs.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
         shutdown(&c).await;
@@ -1208,6 +1227,8 @@ const MEMORY_CAP: usize = 512 * 1024 * 1024;
 struct Live<'a> {
     dbs: &'a DbConns,
     c: &'a DbConn,
+    /// 결과 주인(연결 번호)
+    conn: u32,
     max: usize,
     started: Instant,
     cur: Mutex<Option<(u32, Arc<ResultSet>)>>,
@@ -1221,8 +1242,8 @@ struct Live<'a> {
 }
 
 impl<'a> Live<'a> {
-    fn new(dbs: &'a DbConns, c: &'a DbConn, max: usize, started: Instant) -> Self {
-        Live { dbs, c, max, started, cur: Mutex::new(None), first_row_ms: AtomicU64::new(u64::MAX), bytes: AtomicUsize::new(0), stop: Mutex::new(None), first_batch: Default::default(), pushed: AtomicUsize::new(0) }
+    fn new(dbs: &'a DbConns, c: &'a DbConn, conn: u32, max: usize, started: Instant) -> Self {
+        Live { dbs, c, conn, max, started, cur: Mutex::new(None), first_row_ms: AtomicU64::new(u64::MAX), bytes: AtomicUsize::new(0), stop: Mutex::new(None), first_batch: Default::default(), pushed: AtomicUsize::new(0) }
     }
     /// 새 결과 집합 — 바로 등록해 받는 동안에도 db_rows 로 읽게 한다(앞 집합은 버린다: 여러 집합이면 마지막 것)
     fn begin(&self, columns: Vec<Col>) -> Arc<ResultSet> {
@@ -1234,6 +1255,14 @@ impl<'a> Live<'a> {
             m.remove(&o);
         }
         m.insert(id, rs.clone());
+        drop(m);
+        {
+            let mut o = self.dbs.owners.lock().unwrap();
+            if let Some((old_id, _)) = &old {
+                o.remove(old_id);
+            }
+            o.insert(id, self.conn);
+        }
         self.bytes.store(0, Ordering::Relaxed);
         rs
     }
@@ -1468,7 +1497,7 @@ pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: 
     };
     let stream = progress.is_some();
     let started = Instant::now();
-    let live = Live::new(dbs, &c, max, started);
+    let live = Live::new(dbs, &c, conn, max, started);
     let fut = async {
         let run = exec(&c, &sql, &live);
         let tick = ticker(&live, progress);
@@ -1564,7 +1593,11 @@ async fn exec(c: &DbConn, sql: &str, live: &Live<'_>) -> R<Option<u64>> {
                         let Some(rs) = &set else { continue };
                         if !live.push(rs, (0..r.len()).map(|i| r.get(i).map(String::from)).collect()) {
                             halted = true;
-                            let _ = server_cancel(c).await;
+                            // 트랜잭션 안에서 서버 취소를 보내면 PostgreSQL 은 트랜잭션 전체를 실패 상태로 만든다 —
+                            // 그 뒤 COMMIT 은 조용히 되돌리기가 되어 앞서 고친 것이 사라졌다. 그때는 남은 행을 버리며 끝까지 받는다
+                            if !c.in_tx.load(Ordering::Relaxed) {
+                                let _ = server_cancel(c).await;
+                            }
                             break;
                         }
                         live.pace().await;
@@ -1849,6 +1882,7 @@ pub fn db_view(dbs: State<'_, DbConns>, result: u32, sort: Option<usize>, desc: 
 #[tauri::command]
 pub fn db_result_close(dbs: State<'_, DbConns>, result: u32) {
     dbs.results.lock().unwrap().remove(&result);
+    dbs.owners.lock().unwrap().remove(&result);
 }
 
 /// 결과를 파일로 — csv(UTF-8 BOM, 엑셀이 한글을 바로 읽게) · tsv · json · sql(INSERT 문 — insert_prefix 는 화면이 엔진에 맞게 만든 `INSERT INTO 표 (열…) VALUES `)

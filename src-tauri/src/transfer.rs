@@ -60,23 +60,63 @@ fn rjoin(dir: &str, name: &str) -> String {
     }
 }
 
+/// 받은 .rbpart 로 서버 파일 바꾸기 — 있던 파일은 지우지 않고 옆 이름으로 비켜 두었다가, 바꾸기에 성공하면 지운다
+/// (SFTP rename 은 대상이 있으면 실패해서 지우고 바꿨는데, 그 사이 끊기면 원래 파일을 잃었다)
+async fn remote_replace(sftp: &russh_sftp::client::SftpSession, part: &str, dest: &str) -> Result<(), String> {
+    let had = sftp.try_exists(dest.to_string()).await.unwrap_or(false);
+    let aside = format!("{dest}.rbold");
+    if had {
+        let _ = sftp.remove_file(aside.clone()).await;
+        sftp.rename(dest.to_string(), aside.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    }
+    if let Err(e) = sftp.rename(part.to_string(), dest.to_string()).await {
+        if had {
+            let _ = sftp.rename(aside, dest.to_string()).await; // 되돌리기
+        }
+        return Err(sftp_err(e).message_owned());
+    }
+    if had {
+        let _ = sftp.remove_file(aside).await;
+    }
+    Ok(())
+}
+
 fn base_name(p: &str) -> String {
     p.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(p).to_string()
 }
 
+/// 폴더 안 링크: 파일을 가리키면 그 내용을 보내고, 폴더를 가리키면 들어가지 않는다
+/// (`data -> /` 같은 링크로 루트 전체를 돌거나 `self -> .` 로 끝없이 파고들지 않게). 맨 위(사람이 고른 것)는 따라간다
 fn walk_local(src: &Path, dest: &str, out: &mut Vec<Item>) -> std::io::Result<()> {
+    walk_local_in(src, dest, out, true)
+}
+
+fn walk_local_in(src: &Path, dest: &str, out: &mut Vec<Item>, top: bool) -> std::io::Result<()> {
+    if !top && std::fs::symlink_metadata(src)?.file_type().is_symlink() && std::fs::metadata(src).map(|m| m.is_dir()).unwrap_or(true) {
+        return Ok(());
+    }
     let m = std::fs::metadata(src)?;
     if m.is_dir() {
         out.push(Item { src: src.to_string_lossy().into_owned(), dest: dest.into(), size: 0, dir: true });
         let mut kids: Vec<_> = std::fs::read_dir(src)?.flatten().collect();
         kids.sort_by_key(|e| e.file_name());
         for k in kids {
-            walk_local(&k.path(), &rjoin(dest, &k.file_name().to_string_lossy()), out)?;
+            walk_local_in(&k.path(), &rjoin(dest, &k.file_name().to_string_lossy()), out, false)?;
         }
     } else {
         out.push(Item { src: src.to_string_lossy().into_owned(), dest: dest.into(), size: m.len(), dir: false });
     }
     Ok(())
+}
+
+/// 서버 파일 이름을 내 PC 이름으로 — `\`·`:` 같은 Windows 구분·금지 글자는 `_` 로(받는 폴더 밖에 쓰지 않게)
+fn local_safe_name(name: &str) -> String {
+    let s: String = name.chars().map(|c| if matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c }).collect();
+    if s == "." || s == ".." || s.is_empty() {
+        "_".into()
+    } else {
+        s
+    }
 }
 
 async fn walk_remote(c: &Conn, src: &str, dest: PathBuf, out: &mut Vec<Item>) -> R<()> {
@@ -90,7 +130,12 @@ async fn walk_remote(c: &Conn, src: &str, dest: PathBuf, out: &mut Vec<Item>) ->
             if name == "." || name == ".." {
                 continue;
             }
-            Box::pin(walk_remote(c, &rjoin(src, &name), dest.join(&name), out)).await?;
+            let path = rjoin(src, &name);
+            // 목록의 속성은 링크 자체(lstat) — 폴더를 가리키는 링크는 건너뛴다
+            if k.metadata().is_symlink() && c.sftp.metadata(path.clone()).await.map(|t| t.is_dir()).unwrap_or(true) {
+                continue;
+            }
+            Box::pin(walk_remote(c, &path, dest.join(local_safe_name(&name)), out)).await?;
         }
     } else {
         out.push(Item { src: src.into(), dest: dest.to_string_lossy().into_owned(), size: m.size.unwrap_or(0), dir: false });
@@ -308,10 +353,7 @@ async fn relay_one(a: &Conn, b: &Conn, it: &Item, prog: &Arc<Mutex<Progress>>, c
         let _ = b.sftp.remove_file(part.clone()).await;
         return Err(format!("{} — sha256 이 맞지 않아 지웠습니다", base_name(&it.dest)));
     }
-    if b.sftp.try_exists(it.dest.clone()).await.unwrap_or(false) {
-        b.sftp.remove_file(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
-    }
-    b.sftp.rename(part, it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    remote_replace(&b.sftp, &part, &it.dest).await?;
     Ok(Outcome { verified: ha.is_some() && hb.is_some(), resumed })
 }
 
@@ -420,10 +462,7 @@ pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Pro
                 return Err(format!("{} — 보낸 파일의 sha256 이 맞지 않아 지웠습니다", base_name(&it.dest)));
             }
         }
-        if c.sftp.try_exists(it.dest.clone()).await.unwrap_or(false) {
-            c.sftp.remove_file(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
-        }
-        c.sftp.rename(part, it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+        remote_replace(&c.sftp, &part, &it.dest).await?;
         Ok(Outcome { verified: theirs.is_some(), resumed })
     } else {
         let have = std::fs::metadata(&part).map(|m| m.len()).ok().filter(|s| *s > 0 && *s <= it.size).unwrap_or(0);
@@ -465,9 +504,7 @@ pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Pro
                 return Err(format!("{} — 받은 파일의 sha256 이 맞지 않아 지웠습니다", base_name(&it.dest)));
             }
         }
-        if Path::new(&it.dest).exists() {
-            std::fs::remove_file(&it.dest).map_err(|e| e.to_string())?;
-        }
+        // rename 은 있던 파일을 한 번에 바꾼다 — 먼저 지우면 rename 이 실패할 때(백신이 잡고 있음 등) 원래 파일을 잃는다
         std::fs::rename(&part, &it.dest).map_err(|e| e.to_string())?;
         Ok(Outcome { verified: theirs.is_some(), resumed })
     }
@@ -609,7 +646,8 @@ pub(crate) fn percent_decode(s: &str) -> String {
 #[tauri::command]
 pub async fn ssh_copy(conns: State<'_, SshConns>, conn: u32, from: String, to: String) -> R<()> {
     let c = conns.get(conn)?;
-    let q = |s: &str| format!("'{}'", s.replace('\'', "'\''"));
+    // 작은따옴표 감싸기는 sudo::q 로 — 여기서 쓰던 "'\''" 는 Rust 에서 역슬래시가 빠진 ''' 라 경로가 깨지고 명령이 섞여 들어갔다
+    let q = crate::sudo::q;
     let cmd = format!("[ -e {t} ] && {{ echo '같은 이름이 이미 있습니다' >&2; exit 1; }}; cp -a -- {f} {t}", f = q(&from), t = q(&to));
     let o = crate::sudo::exec(&c, &cmd, None).await?;
     if o.code != Some(0) {

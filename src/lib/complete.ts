@@ -51,6 +51,21 @@ export function words(line: string): string[] {
 	return out;
 }
 
+/** 마지막 낱말의 화면 그대로(따옴표·역슬래시 포함) — 지울 글자 수는 이것으로 센다(벗긴 길이로 세면 덜 지운다) */
+export function rawLastWord(line: string): string {
+	let start = 0;
+	let q: string | null = null;
+	for (let i = 0; i < line.length; i++) {
+		const c = line[i];
+		if (q) {
+			if (c === q) q = null;
+		} else if (c === "'" || c === '"') q = c;
+		else if (c === "\\") i++;
+		else if (c === " ") start = i + 1;
+	}
+	return line.slice(start);
+}
+
 function score(label: string, q: string): number {
 	if (!q) return 1;
 	const l = label.toLowerCase();
@@ -172,7 +187,10 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 	if (!base.startsWith("/")) base = `${ctx.cwd ?? ""}/${base}`;
 	const dir = base.replace(/\/+$/, "") || "/";
 	const list = ctx.listDir(dir);
-	if (!list) return { replace: namePart.length, items: [], pending: dir };
+	// 지울 길이 = 화면에 쳐 있는 마지막 / 뒤(따옴표·역슬래시 그대로). 없으면 낱말 전체(여는 따옴표 포함)
+	const raw = rawLastWord(line);
+	const rawName = raw.includes("/") ? raw.slice(raw.lastIndexOf("/") + 1) : raw;
+	if (!list) return { replace: rawName.length, items: [], pending: dir };
 	const items: Candidate[] = list
 		.filter((e) => !onlyDirs || e.kind === "dir")
 		.filter((e) => namePart.startsWith(".") || !e.name.startsWith("."))
@@ -183,7 +201,7 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 			kind: "path" as const,
 			dir: e.kind === "dir",
 		}));
-	return { replace: namePart.length, items: rank(items, namePart, 80) };
+	return { replace: rawName.length, items: rank(items, namePart, 80) };
 }
 
 /** 흐린 제안 — 지난 명령 가운데 지금 줄로 시작하는 가장 최근 것의 나머지 */

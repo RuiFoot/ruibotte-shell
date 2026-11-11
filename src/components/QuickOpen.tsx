@@ -67,6 +67,12 @@ export function QuickOpen({ fs, base, onClose, onOpen }: { fs: FsBackend; base: 
 					setFiles(r);
 					setIndex(0);
 					setError(null);
+					doneFor.current = q;
+					// 결과가 오기 전에 Enter 를 눌렀으면 지금 검색어의 첫 결과를 연다(직전 검색어의 결과를 열지 않게)
+					if (enterWaiting.current) {
+						enterWaiting.current = false;
+						if (r[0]) onOpen(r[0]);
+					}
 				})
 				.catch((e) => seq.current === my && setError(String((e as { message?: string })?.message ?? e)))
 				.finally(() => seq.current === my && setPending(false));
@@ -78,7 +84,14 @@ export function QuickOpen({ fs, base, onClose, onOpen }: { fs: FsBackend; base: 
 		list.current?.querySelector(`[data-i="${index}"]`)?.scrollIntoView({ block: "nearest" });
 	}, [index]);
 
+	/** 결과가 맞는 검색어 · 결과를 기다리는 Enter */
+	const doneFor = useRef<string | null>(null);
+	const enterWaiting = useRef(false);
 	const open = (i: number) => {
+		if (!direct && doneFor.current !== q) {
+			enterWaiting.current = true; // 아직 찾는 중 — 결과가 오면 첫 것을 연다
+			return;
+		}
 		if (direct) {
 			onOpen(resolvePath(q, base, fs.home));
 			return;
@@ -108,6 +121,7 @@ export function QuickOpen({ fs, base, onClose, onOpen }: { fs: FsBackend; base: 
 								setIndex((i) => Math.max(0, i - 1));
 							} else if (e.key === "Enter") {
 								e.preventDefault();
+								if (e.nativeEvent.isComposing) return; // 한글 조합을 끝내는 Enter 는 열기가 아니다
 								open(index);
 							}
 						}}

@@ -403,7 +403,7 @@ fn is_admin() -> bool {
 }
 
 /// 앱 전체를 관리자 권한으로 다시 열기(UAC 확인 뒤 지금 창은 닫힌다)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn app_relaunch_admin(app: AppHandle) -> Result<(), String> {
     #[cfg(windows)]
     {

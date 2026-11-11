@@ -8,7 +8,7 @@ import {
 	type IDockviewPanelHeaderProps,
 	type IDockviewPanelProps,
 } from "dockview-react";
-import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
+import { CLOSE_DOC_EVENT, confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
 import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Rows2, ShieldAlert, X } from "lucide-react";
@@ -819,6 +819,22 @@ export function Workbench({
 	);
 	const lastCwd = useRef<string | null>(null);
 	const dock = useRef<DockviewApi | null>(null);
+	// Ctrl+W: 보이는 이 작업대에서 문서 칸(편집기·실시간 보기·비교)에 초점이 있으면 그 칸만 닫는다(고친 게 있으면 묻는다)
+	useEffect(() => {
+		if (!active) return;
+		const on = (ev: Event) => {
+			const d = dock.current;
+			const p = d?.activePanel;
+			if (!d || !p || !isDoc(p.id)) return;
+			const focus = document.activeElement;
+			if (!focus || !p.view.content.element.contains(focus)) return;
+			ev.preventDefault();
+			if (isDirty(owner, p.id) && !confirmDiscard([p.title?.replace(/^● /, "") ?? p.id], "이 탭을 닫으면")) return;
+			p.api.close();
+		};
+		window.addEventListener(CLOSE_DOC_EVENT, on);
+		return () => window.removeEventListener(CLOSE_DOC_EVENT, on);
+	}, [active, owner]);
 	const [activePanel, setActivePanel] = useState<string | null>(null);
 	const termSeq = useRef(1);
 	const saveTimer = useRef<number | undefined>(undefined);
@@ -1271,6 +1287,8 @@ export function Workbench({
 	// 기본 배치가 바뀌면 옛 저장 배치는 쓰지 않는다(v3: 터미널 우선 — 빈 문서 자리 없음, 내 PC 셸은 터미널만)
 	const savedKey = `${layoutKey}.v3`;
 	const terminalOnly = fs.side === "local";
+	// 다시 열 편집기 목록은 서버(프로필·계정)마다 — 하나로 두면 다른 서버에서 연 경로가 이 서버에서 열린다
+	const editorsKey = `${savedKey}.editors.${server ? `p${server.profileId}:${label}` : "local"}`;
 	const gone = useRef(false);
 	const onReady = (e: DockviewReadyEvent) => {
 		dock.current = e.api;
@@ -1297,13 +1315,15 @@ export function Workbench({
 			const reopen = (list: { which: Which; path: string; name: string }[]) => {
 				if (gone.current) return;
 				for (const x of list.slice(0, 12)) {
+					// 다른 서버 칸에서 연 파일은 그 칸(연결)이 다시 있어야 하니 되살리지 않는다(같은 경로가 이 서버 탭으로 열리지 않게)
+					if ((x as { peer?: unknown }).peer) continue;
 					if (!e.api.getPanel(`edit:${x.which}:${x.path}`)) addDoc(e.api, { id: `edit:${x.which}:${x.path}`, component: "editor", title: x.name, params: x });
 				}
 			};
 			const mem = openEditors.get(owner);
 			if (mem) reopen(mem);
 			else
-				void api.settingGet(`${savedKey}.editors`).then((v) => {
+				void api.settingGet(editorsKey).then((v) => {
 					try {
 						const list = v ? (JSON.parse(v) as { which: Which; path: string; name: string }[]) : [];
 						if (Array.isArray(list)) reopen(list.filter((x) => x && typeof x.path === "string" && (x.which === "remote" || x.which === "local")));
@@ -1324,7 +1344,7 @@ export function Workbench({
 				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown });
 				openEditors.set(owner, eds);
 				// 다른 서버 칸에서 연 파일은 그 연결이 있어야 하니 앱을 다시 열 때는 빼고 남긴다
-				void api.settingSet(`${savedKey}.editors`, JSON.stringify(eds.filter((x) => !x.peer).map(({ which, path, name }) => ({ which, path, name }))));
+				void api.settingSet(editorsKey, JSON.stringify(eds.filter((x) => !x.peer).map(({ which, path, name }) => ({ which, path, name }))));
 			}, 600);
 		});
 	};
@@ -1760,7 +1780,8 @@ function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => voi
 	const rows: [string, string][] = [
 		["앱", ""],
 		[mac ? "⌘⇧P" : "Ctrl+Shift+P", "명령 팔레트 — 서버·탭·작업대 동작·설정을 한 칸에서 찾아 실행(초성도)"],
-		[mac ? "⌘T · ⌘W" : "Ctrl+T · Ctrl+W", "내 PC 터미널 · 탭 닫기"],
+		[mac ? "⌘T" : "Ctrl+T", "내 PC 터미널"],
+		[mac ? "⌘W · ⇧⌘W" : "Ctrl+W · Ctrl+Shift+W", "편집기 칸 닫기(편집기 밖이면 서버 탭) · 서버 탭 닫기"],
 		[mac ? "⌘K" : "Ctrl+K", "홈에서 연결 찾기"],
 		[mac ? "⌘B" : "Ctrl+B", "사이드바 접기·펴기"],
 		["작업대", ""],

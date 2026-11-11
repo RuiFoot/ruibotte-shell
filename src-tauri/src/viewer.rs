@@ -208,10 +208,11 @@ pub async fn ssh_download_targz(app: AppHandle, conns: State<'_, SshConns>, conn
         }
     }
     drop(file);
-    // tar 는 읽지 못한 파일이 있어도 나머지는 묶고 1 을 돌려준다 — 2 이상만 실패
-    if code.unwrap_or(0) >= 2 || bytes == 0 {
+    // tar 는 읽지 못한 파일이 있어도 나머지는 묶고 1 을 돌려준다 — 0·1 만 성공.
+    // 종료 코드가 안 왔으면(연결 끊김·시그널) 잘린 파일이니 실패로 본다
+    if !matches!(code, Some(0 | 1)) || bytes == 0 {
         let _ = std::fs::remove_file(&part);
-        let msg = stderr.lines().last().unwrap_or("tar 실패").to_string();
+        let msg = if code.is_none() { "연결이 끊겨 받기가 끝나지 않았습니다".to_string() } else { stderr.lines().last().unwrap_or("tar 실패").to_string() };
         let _ = app.emit("archive", ArchiveProgress { path, dest, bytes, state: "error", error: Some(msg.clone()) });
         return Err(err("SFTP", msg));
     }

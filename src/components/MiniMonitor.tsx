@@ -61,6 +61,8 @@ class Poller {
 	snap: Snap = EMPTY;
 	subs = new Set<() => void>();
 	private prev: Ticks | null = null;
+	/** 구독이 모두 빠진 뒤 지우기 예약 */
+	dropTimer = 0;
 	private timer = 0;
 	private gen = 0;
 	constructor(private conn: number) {}
@@ -121,6 +123,7 @@ function subPoller(conn: number, f: () => void) {
 		pollers.set(conn, p);
 	}
 	const first = p.subs.size === 0;
+	window.clearTimeout(p.dropTimer);
 	p.subs.add(f);
 	if (first) p.restart();
 	return () => {
@@ -128,8 +131,12 @@ function subPoller(conn: number, f: () => void) {
 		if (!q) return;
 		q.subs.delete(f);
 		if (!q.subs.size) {
+			// 멈추기만 하고 1분은 남겨 둔다 — 탭을 바꿨다 돌아와도 꺾은선 기록·CPU 이전 표본이 남아 바로 보인다
 			q.stop();
-			pollers.delete(conn);
+			window.clearTimeout(q.dropTimer);
+			q.dropTimer = window.setTimeout(() => {
+				if (!q.subs.size) pollers.delete(conn);
+			}, 60_000);
 		}
 	};
 }

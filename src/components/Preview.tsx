@@ -1,3 +1,4 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
@@ -10,6 +11,18 @@ import { Select } from "./Select";
 
 /** 확장자로 보기 방식 고르기 */
 export type PreviewKind = "image" | "pdf" | "hex" | "sheet" | "docx" | "archive";
+/**
+ * 미리보기 안 링크 — 앱 화면이 그 주소로 넘어가 버리지 않게(작업 중인 화면을 잃는다) 막고,
+ * http(s)·mailto 는 기본 브라우저로 연다. 문서 안 #이동은 그대로 둔다
+ */
+function openLinkOutside(e: React.MouseEvent) {
+	const a = (e.target as HTMLElement).closest("a");
+	const href = a?.getAttribute("href");
+	if (!a || !href || href.startsWith("#")) return;
+	e.preventDefault();
+	if (/^(https?:|mailto:)/i.test(href)) void openUrl(href);
+}
+
 export function previewKind(path: string): PreviewKind | null {
 	const ext = path.split(".").pop()?.toLowerCase() ?? "";
 	if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "avif"].includes(ext)) return "image";
@@ -150,7 +163,7 @@ function BlobPreview({ fs, path, kind }: { fs: FsBackend; path: string; kind: "p
 export function MarkdownView({ text }: { text: string }) {
 	const html = useMemo(() => DOMPurify.sanitize(marked.parse(text, { async: false, gfm: true }) as string), [text]);
 	// biome-ignore lint/security/noDangerouslySetInnerHtml: DOMPurify 로 정화한 HTML
-	return <div className="md-view selectable" dangerouslySetInnerHTML={{ __html: html }} />;
+	return <div className="md-view selectable" onClick={openLinkOutside} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 /** CSV·TSV 를 표로 — 따옴표 안 구분자·줄바꿈 존중 */
@@ -349,7 +362,7 @@ function DocxPreview({ fs, path }: { fs: FsBackend; path: string }) {
 	return (
 		<div className="panel-fill">
 			{/* biome-ignore lint/security/noDangerouslySetInnerHtml: DOMPurify 로 정화한 HTML */}
-			{html !== null ? <div className="md-view docx-view selectable" dangerouslySetInnerHTML={{ __html: html }} /> : <div className="dock-watermark"><p>{info}</p></div>}
+			{html !== null ? <div className="md-view docx-view selectable" onClick={openLinkOutside} dangerouslySetInnerHTML={{ __html: html }} /> : <div className="dock-watermark"><p>{info}</p></div>}
 			<div className="statusbar">
 				<span>{info}</span>
 			</div>

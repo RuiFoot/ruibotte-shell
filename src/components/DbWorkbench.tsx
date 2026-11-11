@@ -3,7 +3,7 @@ import { bracketMatching } from "@codemirror/language";
 import { MSSQL, MySQL, PLSQL, PostgreSQL, StandardSQL, sql } from "@codemirror/lang-sql";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { EditorState, StateEffect, StateField } from "@codemirror/state";
-import { Decoration, type DecorationSet, drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
+import { Decoration, type DecorationSet, drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers, placeholder } from "@codemirror/view";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -261,6 +261,8 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					search({ top: true }),
 					codeHighlight,
 					ranField,
+					// 빈 편집기에 할 수 있는 것을 알려 준다(처음 연 사람이 실행 키를 찾지 않게)
+					placeholder("SQL 을 쓰고 Ctrl+Enter 로 실행 — 커서가 있는 문장만, Ctrl+Shift+Enter 는 전체 · 왼쪽 표를 두 번 누르면 내용 보기"),
 					...editingExtensions(),
 					// DB 이름(스키마·표·열·별칭) 완성 — 키워드 완성은 sql() 이 함께 낸다
 					EditorState.languageData.of(() => [{ autocomplete: completionFor(ctx.conn) }]),
@@ -1578,7 +1580,8 @@ export function DbWorkbench({
 	};
 	const sqlSeq = useRef(1);
 	const saveTimer = useRef<number | undefined>(undefined);
-	const mysql = engine !== "postgres";
+	// MySQL 계열만(SQL Server·Oracle·Tibero 를 MySQL 로 보면 내보내기에서 역슬래시가 두 배가 되고 HEX() 가 없어 실패했다)
+	const mysql = engine === "mysql" || engine === "mariadb";
 	const maxRef = useRef(maxRows);
 	maxRef.current = maxRows;
 
@@ -1676,6 +1679,8 @@ export function DbWorkbench({
 		async (input: string[], source?: Source, tool?: string) => {
 			const d = dock.current;
 			if (!d || !input.length) return;
+			// 이미 실행 중이면 무시 — 두 번째 실행이 받는 중인 결과를 닫고 BUSY 로 덮어 첫 결과가 빈칸이 되었다
+			if (runningRef.current) return; // 실행 중 표시가 떠 있다 — 멈추려면 Esc
 			lastInput.current = Date.now();
 			// 파라미터 — :이름(문자열·주석 밖, ::형변환 제외)과 ?(PostgreSQL 은 JSON 연산자라 빼고) 를 한 화면에서
 			const names = [...new Set(input.flatMap((x) => [...bare(x).matchAll(/(?<![:\w]):([A-Za-z_][\w]*)/g)].map((m) => m[1])))];
@@ -1955,6 +1960,11 @@ export function DbWorkbench({
 				}
 			}
 			if (!ok) defaultLayout(e.api);
+		});
+		// 결과 칸을 닫으면 백엔드에 남은 결과 행(최대 수백 MB)도 놓는다 — 안 놓으면 큰 SELECT 를 거듭할수록 앱 메모리가 계속 늘었다
+		e.api.onDidRemovePanel((p) => {
+			const rid = (p.params as ResultParams | undefined)?.ok?.resultId;
+			if (rid) void db.closeResult(rid);
 		});
 		e.api.onDidLayoutChange(() => {
 			window.clearTimeout(saveTimer.current);

@@ -15,7 +15,8 @@ export type ZmHooks = {
 	/** 원격으로 바이트 보내기 — 차례대로 */
 	send: (bytes: Uint8Array) => Promise<void>;
 	/** ZMODEM 이 아닌 출력 — 터미널로 */
-	toTerminal: (bytes: Uint8Array) => void;
+	/** done: 화면에 다 그린 뒤(흐름 제어 ack) — 그대로 넘긴 출력에만 */
+	toTerminal: (bytes: Uint8Array, done?: () => void) => void;
 	/** 받을 폴더(설정의 기본 폴더 또는 고르기) — null 이면 취소 */
 	pickDir: () => Promise<string | null>;
 	/** 올릴 파일 고르기 — null·빈 배열이면 취소 */
@@ -43,6 +44,8 @@ export function createZmodem(h: ZmHooks) {
 	let latest: Detection | null = null;
 	let session: Session | null = null;
 	let cancelled = false;
+	/** 칸이 사라짐 — 이후 보내기·그리기를 하지 않는다 */
+	let disposed = false;
 	let lastStars = 0;
 	const openFiles = new Set<number>();
 	let pending: Promise<void> = Promise.resolve();
@@ -53,6 +56,7 @@ export function createZmodem(h: ZmHooks) {
 	 */
 	let drain: { until: number; last: number; tick: number; tail: Uint8Array } | null = null;
 	const sendRaw = (b: Uint8Array) => {
+		if (disposed) return;
 		pending = pending.then(() => h.send(b)).catch(() => {});
 	};
 	const utf8 = new TextDecoder("utf-8", { fatal: true });
@@ -330,17 +334,22 @@ export function createZmodem(h: ZmHooks) {
 	}
 
 	return {
-		/** 원격 출력 한 묶음 */
-		consume(b: Uint8Array) {
-			if (drain) return feedDrain(b);
+		/** 원격 출력 한 묶음 — done 은 이 묶음을 화면에 다 그렸거나(그대로 넘김) 여기서 삼켰을 때 한 번 */
+		consume(b: Uint8Array, done?: () => void) {
+			if (drain) {
+				feedDrain(b);
+				done?.();
+				return;
+			}
 			if (!session && !busy && b.indexOf(ZDLE) < 0) {
 				// 시작 신호가 묶음 경계에 걸칠 때를 위해 끝의 '*' 수만 기억
 				let n = 0;
 				while (n < 2 && b[b.length - 1 - n] === STAR) n++;
 				lastStars = n;
-				h.toTerminal(b);
+				h.toTerminal(b, done);
 				return;
 			}
+			done?.();
 			if (session) lastIn = Date.now();
 			let input = b;
 			if (!session && lastStars && b.indexOf(ZDLE) <= 2) {
@@ -372,6 +381,18 @@ export function createZmodem(h: ZmHooks) {
 		},
 		setEnabled(on: boolean) {
 			enabled = on;
+		},
+		/** 터미널 칸이 사라질 때 — 진행 중이면 멈추고, 비우기·감시 타이머를 남기지 않는다(새 셸에 취소 신호가 가지 않게) */
+		dispose() {
+			try {
+				session?.abort();
+			} catch {
+				// 이미 끝남
+			}
+			session = null; // 감시 타이머(watch)는 session 이 바뀌면 스스로 멈춘다
+			if (drain) window.clearInterval(drain.tick);
+			drain = null;
+			disposed = true;
 		},
 	};
 }

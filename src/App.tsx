@@ -7,7 +7,7 @@ import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
 import { Select } from "./components/Select";
 import { confirmOpenTx } from "./lib/dbTx";
-import { confirmDiscard, dirtyTitles } from "./lib/dirty";
+import { CLOSE_DOC_EVENT, confirmDiscard, dirtyTitles } from "./lib/dirty";
 import { ConnectionsPane } from "./components/ConnectionsPane";
 import { KeysPane } from "./components/KeysPane";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
@@ -207,7 +207,7 @@ export function App() {
 		return () => void un.then((f) => f());
 	}, []);
 
-	// 단축키: ⌘/Ctrl+T 새 로컬 터미널, ⌘/Ctrl+W 탭 닫기, ⌘/Ctrl+K 찾기
+	// 단축키: ⌘/Ctrl+T 새 로컬 터미널, ⌘/Ctrl+W 문서 칸(없으면 탭) 닫기, ⌘/Ctrl+Shift+W 탭 닫기, ⌘/Ctrl+K 찾기
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
 			const mod = info?.os === "macos" ? e.metaKey : e.ctrlKey;
@@ -218,6 +218,12 @@ export function App() {
 				open("local", "내 PC");
 			} else if (k === "w") {
 				e.preventDefault();
+				// 편집기 같은 문서 칸에 있으면 그 칸만 닫는다(VS Code 처럼) — 작업대가 받아 처리하면 서버 탭은 그대로. Ctrl+Shift+W 는 늘 서버 탭
+				if (!e.shiftKey) {
+					const ev = new CustomEvent(CLOSE_DOC_EVENT, { cancelable: true });
+					window.dispatchEvent(ev);
+					if (ev.defaultPrevented) return;
+				}
 				close(active);
 			} else if (k === "k") {
 				e.preventDefault();
@@ -373,7 +379,8 @@ export function App() {
 	const isWin = info?.os === "windows";
 	const sessionProfiles = lastSession.map((x) => ({ x, p: profiles.find((p) => p.id === x.p) })).filter((y): y is { x: SessionItem; p: Profile } => !!y.p);
 	const mod = info?.os === "macos" ? "⌘" : "Ctrl+";
-	const win = getCurrentWindow();
+	// 렌더마다 새 객체라 [win] 효과가 매번 닫기·전송 듣기를 풀었다 다시 걸었다 — 한 번만
+	const win = useMemo(() => getCurrentWindow(), []);
 	// 앱을 끌 때: 저장 안 한 편집기가 있으면 묻는다(창 단추·Alt+F4·작업 표시줄 모두)
 	useEffect(() => {
 		const un = win.onCloseRequested((e) => {
@@ -991,6 +998,8 @@ export function App() {
 			{pmenu && <ContextMenu x={pmenu.x} y={pmenu.y} items={profileMenu(pmenu.p)} onClose={() => setPmenu(null)} />}
 			{connecting && (
 				<ConnectDialog
+					// 연결할 탭·서버가 바뀌면 새 창으로(앞 창의 상태·시작 표시가 남아 다른 탭에 붙지 않게)
+					key={`${connecting.tabId ?? "new"}:${connecting.p.id}`}
 					profile={connecting.p}
 					onConnected={(ok, p) => onConnected(ok, p, connecting.tabId)}
 					onCancel={() => setConnecting(null)}

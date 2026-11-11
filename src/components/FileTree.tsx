@@ -1,4 +1,4 @@
-import { ArrowLeft, ArrowRight, ChevronRight, Plus, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronRight, Plus, File, FileCode, FileText, Folder, FolderOpen, House, Link2, RefreshCw, Unlink } from "lucide-react";
 import { memo, type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { asSshError, type FsBackend, type FsEntry, joinPath, notifyFsChanged, parentDir } from "../lib/ipc";
@@ -312,7 +312,14 @@ export const FileTree = memo(function FileTree({
 		const entries = [...items].map((it) => it.webkitGetAsEntry()).filter((x): x is FileSystemEntry => !!x);
 		for (const en of entries) await walkEntry(en, dir);
 		if (!jobs.length && !dirs.length) return;
-		const existing = new Set((nodes[dir]?.entries ?? []).map((x) => x.name));
+		// 펼친 적 없는 폴더는 기억한 목록이 없다 — 늘 새로 읽어 같은 이름을 확인한다(묻지 않고 덮어쓰지 않게)
+		let fresh: FsEntry[] | null = null;
+		try {
+			fresh = await fs.list(dir);
+		} catch {
+			fresh = nodes[dir]?.entries ?? null;
+		}
+		const existing = new Set((fresh ?? []).map((x) => x.name));
 		const clash = entries.filter((en) => existing.has(en.name)).map((en) => en.name);
 		if (clash.length) {
 			// 덮어쓰기·건너뛰기·이름 바꿔 올리기(name (1).ext) — 끌어 놓은 맨 위 항목 기준
@@ -552,40 +559,54 @@ export const FileTree = memo(function FileTree({
 				}
 			}}
 		>
-			{(onSyncChange || onUploadPick) && (
-				<div className="tree-bar">
-					{onSyncChange && sync && (
-						<div className="seg tiny" role="group" title="터미널과 동기화 — 같이: 터미널 cd 를 트리가 따라가고, 트리에서 고른 폴더로 터미널이 cd / 따로: 각자 움직임">
-							<button type="button" aria-pressed={sync === "together"} onClick={() => onSyncChange("together")}>
-								같이
-							</button>
-							<button type="button" aria-pressed={sync === "apart"} onClick={() => onSyncChange("apart")}>
-								따로
-							</button>
-						</div>
-					)}
-					<span style={{ flex: 1 }} />
-					<button
-						type="button"
-						className="btn ghost icon"
-						title="새 파일·폴더, 올리기"
-						onClick={(ev) => {
-							const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-							setMenu({ x: r.left, y: r.bottom + 4, items: menuFor(null, cur && nodes[cur] ? cur : root) });
-						}}
-					>
-						<Plus size={14} />
-					</button>
-				</div>
-			)}
-			{note && <div className="tree-note">{note}</div>}
-			<div className="tree-head">
+			{/* 머리 1줄: 이동 단추 · 터미널 연동 · 새로 만들기 / 2줄: 경로(칸이 좁아도 경로가 다 보이게 한 줄을 통째로) */}
+			<div className="tree-bar">
 				<button type="button" className="btn ghost icon" title="뒤로 (Alt+← · 마우스 뒤로 단추)" onClick={goBack} disabled={!hist.current.back.length}>
 					<ArrowLeft size={14} />
 				</button>
 				<button type="button" className="btn ghost icon" title="앞으로 (Alt+→ · 마우스 앞으로 단추)" onClick={goForward} disabled={!hist.current.fwd.length}>
 					<ArrowRight size={14} />
 				</button>
+				<button type="button" className="btn ghost icon" title="위 폴더 (Backspace · Alt+↑)" onClick={() => onRoot(parentDir(root))} disabled={atTop}>
+					<ChevronRight size={14} style={{ transform: "rotate(-90deg)" }} />
+				</button>
+				<button type="button" className="btn ghost icon" title="홈 폴더" onClick={() => onRoot(fs.home)}>
+					<House size={14} />
+				</button>
+				<button type="button" className="btn ghost icon" title="새로 읽기" onClick={refresh}>
+					<RefreshCw size={13} />
+				</button>
+				<span style={{ flex: 1 }} />
+				{onSyncChange && sync && (
+					<button
+						type="button"
+						className={`btn ghost tree-sync${sync === "together" ? " on" : ""}`}
+						aria-pressed={sync === "together"}
+						title={
+							sync === "together"
+								? "터미널 연동 켜짐 — 터미널에서 cd 하면 트리가 따라가고, 트리에서 고른 폴더로 터미널이 cd 합니다. 눌러서 끄기"
+								: "터미널 연동 꺼짐 — 트리와 터미널이 각자 움직입니다. 눌러서 켜기"
+						}
+						onClick={() => onSyncChange(sync === "together" ? "apart" : "together")}
+					>
+						{sync === "together" ? <Link2 size={13} /> : <Unlink size={13} />}
+						연동
+					</button>
+				)}
+				<button
+					type="button"
+					className="btn ghost icon"
+					title="새 파일·폴더, 올리기"
+					onClick={(ev) => {
+						const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+						setMenu({ x: r.left, y: r.bottom + 4, items: menuFor(null, cur && nodes[cur] ? cur : root) });
+					}}
+				>
+					<Plus size={14} />
+				</button>
+			</div>
+			{note && <div className="tree-note">{note}</div>}
+			<div className="tree-head">
 				<form
 					onSubmit={(ev) => {
 						ev.preventDefault();
@@ -593,17 +614,8 @@ export const FileTree = memo(function FileTree({
 					}}
 					style={{ flex: 1, minWidth: 0 }}
 				>
-					<input className="path-input" value={rootInput} onChange={(e) => setRootInput(e.target.value)} spellCheck={false} title="경로를 치고 Enter" />
+					<input className="path-input" value={rootInput} onChange={(e) => setRootInput(e.target.value)} spellCheck={false} title="경로를 치고 Enter" aria-label="경로" />
 				</form>
-				<button type="button" className="btn ghost icon" title="위 폴더 (Backspace · Alt+↑)" onClick={() => onRoot(parentDir(root))} disabled={atTop}>
-					<ChevronRight size={14} style={{ transform: "rotate(-90deg)" }} />
-				</button>
-				<button type="button" className="btn ghost icon" title="홈" onClick={() => onRoot(fs.home)}>
-					<House size={14} />
-				</button>
-				<button type="button" className="btn ghost icon" title="새로 읽기" onClick={refresh}>
-					<RefreshCw size={13} />
-				</button>
 			</div>
 			{upload && (
 				<div className="tree-upload">

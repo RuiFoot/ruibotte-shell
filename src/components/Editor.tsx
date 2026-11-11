@@ -2,7 +2,7 @@ import { defaultKeymap, history, historyKeymap, indentWithTab, selectAll, toggle
 import { bracketMatching, foldGutter, indentOnInput } from "@codemirror/language";
 import { diff as textDiff, MergeView } from "@codemirror/merge";
 import { gotoLine, highlightSelectionMatches, openSearchPanel, search, searchKeymap } from "@codemirror/search";
-import { Compartment, EditorState } from "@codemirror/state";
+import { Annotation, Compartment, EditorState, type Text } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, highlightActiveLineGutter, highlightWhitespace, keymap, lineNumbers } from "@codemirror/view";
 import { jsonParseLinter } from "@codemirror/lang-json";
 import { linter, lintGutter } from "@codemirror/lint";
@@ -12,6 +12,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { editingExtensions } from "../lib/cmEditing";
 import { codeHighlight } from "../lib/cmTheme";
 import { AUTO_SAVE_DEFAULT, type AutoSave, autoSaveWhenLabel, loadAutoSave, onAutoSave, setAutoSave as storeAutoSave } from "../lib/autoSave";
+import { onDraftFlush } from "../lib/dirty";
 import { api, asSshError, type FileText, type FsBackend, type TextMeta } from "../lib/ipc";
 import { detectLang, LANGS, loadLang } from "../lib/languages";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -34,6 +35,9 @@ const theme = EditorView.theme({
 });
 
 type Status = { text: string; tone?: "ok" | "err" | "warn"; conflict?: boolean };
+
+/** 파일을 불러와 문서를 채운 트랜잭션 — 고침으로 치지 않는다 */
+const LOADED = Annotation.define<boolean>();
 
 const MINIMAP_EVENT = "rb-minimap";
 /** 미니맵 — 글자 대신 덩어리로 그려 가볍게, 보이는 곳 표시는 늘 */
@@ -124,7 +128,13 @@ export function EditorView_({
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 	const [showWs, setShowWs] = useState(false);
 	const original = useRef("");
-	const draftKey = `draft.${fs.side}:${fs.label}:${path}`;
+	// sudo 를 켜고 끄면 fs 가 바뀐다(이름에 "(sudo)") — 초안 열쇠와 다시 읽기는 그와 상관없이 같은 파일로 본다
+	const draftKey = `draft.${fs.side}:${fs.label.replace(/ \(sudo[^)]*\)$/, "")}:${path}`;
+	const fsRef = useRef(fs);
+	fsRef.current = fs; // 저장·비교는 지금 fs(sudo 를 켠 뒤 저장하면 root 로)
+	const readFailed = useRef(false);
+	// 이미 연 파일은 sudo 를 켜고 꺼도 다시 읽지 않는다(고친 내용이 덮이고 사라졌다). 권한이 없어 못 열었던 파일만 새 권한으로 다시 읽는다
+	const fsKey = `${fs.side}:${fs.conn ?? ""}${readFailed.current ? `:${fs.label}` : ""}`;
 	const draftTimer = useRef<number | undefined>(undefined);
 	const altKind = altView(path);
 	useEffect(() => {
@@ -142,8 +152,10 @@ export function EditorView_({
 	useEffect(() => {
 		let gone = false;
 		const t0 = performance.now();
-		fs.read(path, encoding)
+		fsRef.current
+			.read(path, encoding)
 			.then((f) => {
+				readFailed.current = false;
 				if (gone) return;
 				setFile(f);
 				setSaveMeta(f.meta);
@@ -154,6 +166,7 @@ export function EditorView_({
 				if (v) {
 					v.dispatch({
 						changes: { from: 0, to: v.state.doc.length, insert: text },
+						annotations: LOADED.of(true),
 						effects: ro.current.reconfigure(EditorState.readOnly.of(f.binary || f.tooLarge || f.meta.guessed)),
 					});
 					loadedRef.current = true;
@@ -167,7 +180,7 @@ export function EditorView_({
 					});
 				else if (f.binary) setStatus({ text: "바이너리 파일 — 편집할 수 없습니다", tone: "warn" });
 				else if (f.meta.guessed) setStatus({ text: `인코딩을 확신할 수 없어 읽기 전용(${f.meta.encoding}로 추측). 오른쪽에서 인코딩을 골라 다시 여세요.`, tone: "warn" });
-				else setStatus({ text: `${ms} ms에 열림` });
+				else setStatus({ text: ms > 1500 ? `${(ms / 1000).toFixed(1)}초 걸려 열었습니다` : "" }); // 빨리 열리면 상태 줄을 비워 둔다(잡음)
 				// CSV·TSV·마크다운은 처음부터 표·미리보기로(상태 줄 단추로 편집)
 				if (altView(path) && !f.tooLarge) {
 					setAltText(text);
@@ -181,11 +194,16 @@ export function EditorView_({
 					if (!gone && d && d !== text) setDraft(d);
 				});
 			})
-			.catch((e) => !gone && setStatus({ text: asSshError(e).message, tone: "err" }));
+			.catch((e) => {
+				if (gone) return;
+				readFailed.current = true;
+				setStatus({ text: asSshError(e).message, tone: "err" });
+			});
 		return () => {
 			gone = true;
 		};
-	}, [fs, path, encoding, draftKey]);
+		// biome-ignore lint/correctness/useExhaustiveDependencies: fs 는 fsKey 로 본다(sudo 전환만으로 다시 읽지 않게)
+	}, [fsKey, path, encoding, draftKey]);
 
 	// 언어 적용(짐작 또는 상태 줄에서 고른 것)
 	useEffect(() => {
@@ -232,8 +250,12 @@ export function EditorView_({
 					lint.current.of([]),
 					theme,
 					EditorView.updateListener.of((u) => {
-						if (u.docChanged && u.transactions.some((t) => t.isUserEvent("input") || t.isUserEvent("delete") || t.isUserEvent("undo") || t.isUserEvent("redo") || t.isUserEvent("move"))) {
+						// 파일을 불러와 채운 것만 빼고 모든 변경이 고침이다(주석 켜기·들여쓰기처럼 userEvent 가 없는 명령도)
+						if (u.docChanged) docRef.current = u.state.doc;
+						if (u.docChanged && !u.transactions.some((t) => t.annotation(LOADED))) {
 							setDirty(true);
+							// 자동 저장이 실패해 멈춰 있었으면 사람이 다시 고친 지금부터 다시 시도한다
+							setAutoState((a) => (a?.s === "failed" ? null : a));
 						}
 						if (u.selectionSet || u.docChanged) {
 							const s = u.state.selection.main;
@@ -274,6 +296,23 @@ export function EditorView_({
 	}, [langId, path]);
 
 	useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
+	// 탭·앱을 닫기 전에(묻는 창이 타이머를 막는다) 그리고 칸이 사라질 때 — 마지막 입력까지 초안으로
+	const docRef = useRef<Text | null>(null);
+	const flushDraft = useRef(() => {});
+	flushDraft.current = () => {
+		// 칸이 사라질 때는 편집기가 먼저 정리되므로 마지막 문서(Text 참조)를 따로 들고 있다
+		const doc = docRef.current;
+		if (!doc || !dirty || readOnly) return;
+		const now = doc.toString();
+		if (now !== original.current) void api.settingSet(draftKey, now);
+	};
+	useEffect(() => {
+		const off = onDraftFlush(() => flushDraft.current());
+		return () => {
+			flushDraft.current();
+			off();
+		};
+	}, []);
 	useEffect(() => {
 		if (active) requestAnimationFrame(() => view.current?.focus());
 	}, [active]);
@@ -289,11 +328,14 @@ export function EditorView_({
 			const now = view.current?.state.doc.toString() ?? "";
 			setChanged(changedLines(original.current, now));
 			void api.settingSet(draftKey, now === original.current ? "" : now);
+			// 되돌리기로 연 때와 똑같아졌으면 고친 것이 아니다(형식만 바꾼 것은 남긴다)
+			if (now === original.current && !metaChangedRef.current) setDirty(false);
 		}, 800);
 		return () => window.clearTimeout(draftTimer.current);
 	});
 
 	const saving = useRef(false);
+	const metaChangedRef = useRef(false);
 	const save = useCallback(
 		async (force = false, quiet = false) => {
 			const v = view.current;
@@ -304,7 +346,7 @@ export function EditorView_({
 			else setStatus({ text: "저장 중…" });
 			const text = v.state.doc.toString();
 			try {
-				const saved = await fs.write(path, text, saveMeta, force ? null : file.mtime);
+				const saved = await fsRef.current.write(path, text, saveMeta, force ? null : file.mtime);
 				setFile({ ...file, size: saved.size, mtime: saved.mtime, meta: saveMeta });
 				original.current = text;
 				// 저장하는 사이 더 고쳤으면 고친 상태로 남긴다(다음 자동 저장이 이어서)
@@ -329,7 +371,7 @@ export function EditorView_({
 				saving.current = false;
 			}
 		},
-		[fs, path, file, saveMeta, readOnly, draftKey],
+		[path, file, saveMeta, readOnly, draftKey],
 	);
 	saveRef.current = (force?: boolean, quiet?: boolean) => void save(force, quiet);
 
@@ -337,14 +379,15 @@ export function EditorView_({
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 고칠 때마다(렌더마다) 타이머를 다시 건다
 	useEffect(() => {
 		window.clearTimeout(autoTimer.current);
-		if (auto.on && auto.when !== "blur" && dirty && !readOnly && !status.conflict)
+		// 실패하면 다음에 고칠 때까지 쉰다(권한 없음·끊김에서 1.5초마다 끝없이 다시 쓰지 않게)
+		if (auto.on && auto.when !== "blur" && dirty && !readOnly && !status.conflict && autoState?.s !== "failed")
 			autoTimer.current = window.setTimeout(() => saveRef.current(false, true), auto.delayMs);
 		return () => window.clearTimeout(autoTimer.current);
 	});
 	// 자동 저장 ② 포커스가 떠날 때 — 이 편집기에서 다른 곳으로, 또는 앱 창이 뒤로 갈 때
 	const blurSave = useRef(() => {});
 	blurSave.current = () => {
-		if (auto.on && auto.when !== "delay" && dirty && !readOnly && !status.conflict) saveRef.current(false, true);
+		if (auto.on && auto.when !== "delay" && dirty && !readOnly && !status.conflict && autoState?.s !== "failed") saveRef.current(false, true);
 	};
 	useEffect(() => {
 		const onWin = () => blurSave.current();
@@ -399,7 +442,7 @@ export function EditorView_({
 
 	const compareServer = async () => {
 		try {
-			const f = await fs.read(path, saveMeta?.encoding);
+			const f = await fsRef.current.read(path, saveMeta?.encoding);
 			setDiffOf({ title: "서버의 지금 내용과 비교", a: normalize(f.text ?? ""), b: view.current?.state.doc.toString() ?? "", aLabel: "서버(지금)", bLabel: "내가 고친 것" });
 		} catch (e) {
 			setStatus({ text: asSshError(e).message, tone: "err" });
@@ -437,6 +480,7 @@ export function EditorView_({
 			{ label: "찾기·바꾸기  Ctrl+F", run: () => openSearchPanel(v) },
 			{ label: "줄로 가기  Ctrl+G", run: () => gotoLine(v) },
 			{ label: showWs ? "공백 숨기기" : "공백 보이기", run: () => toggleWs() },
+			...(saveMeta && !ro2 ? [{ label: saveMeta.bom ? "BOM 빼기(저장할 때)" : "BOM 붙이기(저장할 때)", run: () => changeMeta({ bom: !saveMeta.bom }) }] : []),
 			...(isJson
 				? [
 						{
@@ -463,6 +507,7 @@ export function EditorView_({
 	if (file?.binary) return <BinaryPreview fs={fs} path={path} kind="hex" />;
 
 	const metaChanged = !!file && !!saveMeta && (file.meta.encoding !== saveMeta.encoding || file.meta.eol !== saveMeta.eol || file.meta.bom !== saveMeta.bom);
+	metaChangedRef.current = metaChanged;
 
 	return (
 		<>
@@ -593,9 +638,11 @@ export function EditorView_({
 						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={readOnly} title="줄 끝 바꾸기(저장할 때 적용)" onClick={() => changeMeta({ eol: saveMeta.eol === "CRLF" ? "LF" : "CRLF" })}>
 							{saveMeta.eol}
 						</button>
-						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={readOnly} title="BOM 붙이기·빼기(저장할 때 적용)" onClick={() => changeMeta({ bom: !saveMeta.bom })}>
-							{saveMeta.bom ? "BOM" : "BOM 없음"}
-						</button>
+						{saveMeta.bom && (
+							<button type="button" className="btn ghost" style={{ height: 20 }} disabled={readOnly} title="BOM 이 붙은 파일 — 눌러서 빼기(저장할 때 적용). 붙이기는 우클릭 메뉴" onClick={() => changeMeta({ bom: false })}>
+								BOM
+							</button>
+						)}
 						{metaChanged && <span className="warn">형식 바꿈 — 저장하면 적용</span>}
 						{readOnly ? <span>읽기 전용</span> : null}
 						<AutoSaveSwitch

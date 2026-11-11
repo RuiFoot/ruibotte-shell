@@ -26,6 +26,8 @@ struct LogFile {
     /// 줄 앞 시각(분 단위 시간대 차이) — None 이면 붙이지 않는다
     stamp: Option<i32>,
     line_start: bool,
+    /// 마지막으로 디스크에 내린 때 — 묶음마다 flush 하면 메인 스레드에서 매번 디스크(NAS 면 네트워크)를 기다린다
+    flushed: std::time::Instant,
 }
 
 #[derive(Serialize)]
@@ -216,6 +218,7 @@ pub fn session_log_open(
         clean: strip_ansi.then(Cleaner::default),
         stamp: timestamps.then_some(tz_offset_min),
         line_start: true,
+        flushed: std::time::Instant::now(),
     };
     let head = format!("# RuiBotte Shell 터미널 기록 — {server} · 시작 {}\n", now_full(tz_offset_min));
     lf.w.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
@@ -233,7 +236,13 @@ pub fn session_log_write(logs: State<'_, SessionLogs>, request: tauri::ipc::Requ
     let id: u32 = request.headers().get("x-id").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).ok_or("기록 번호가 없습니다")?;
     let mut map = logs.map.lock().unwrap();
     let lf = map.get_mut(&id).ok_or("기록이 닫혔습니다")?;
-    lf.write_chunk(data).and_then(|_| lf.w.flush()).map_err(|e| format!("기록하지 못했습니다: {e}"))
+    lf.write_chunk(data).map_err(|e| format!("기록하지 못했습니다: {e}"))?;
+    // 버퍼(64KB)가 차면 저절로 내려가고, 그 밖에는 1초에 한 번만 — 앱이 죽어도 잃는 것은 길어야 1초
+    if lf.flushed.elapsed() >= std::time::Duration::from_secs(1) {
+        lf.flushed = std::time::Instant::now();
+        lf.w.flush().map_err(|e| format!("기록하지 못했습니다: {e}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

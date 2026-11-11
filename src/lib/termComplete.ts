@@ -58,16 +58,43 @@ export type Completer = {
 	dispose: () => void;
 };
 
+/** 서버(키)별 지난 명령 — 같은 서버 터미널 여러 개가 한 목록을 함께 쓴다(각자 들고 있다가 통째로 덮어쓰면 서로 지운다) */
+const histories = new Map<string, { list: string[]; add: (c: string) => void }>();
+function sharedHistory(key: string) {
+	let h = histories.get(key);
+	if (h) return h;
+	let loaded = false;
+	const pending: string[] = [];
+	const store = () => void api.settingSet(`hist.${key}`, JSON.stringify(h?.list ?? []));
+	h = {
+		list: [],
+		add(c) {
+			const self = h as { list: string[] };
+			self.list = [c, ...self.list.filter((x) => x !== c)].slice(0, 500);
+			// 불러오기 전에 친 명령은 불러온 뒤 합친다(빈 목록으로 저장해 옛 기록을 지우지 않게)
+			if (loaded) store();
+			else pending.push(c);
+		},
+	};
+	histories.set(key, h);
+	void api.settingGet(`hist.${key}`).then((v) => {
+		let old: string[] = [];
+		try {
+			old = v ? (JSON.parse(v) as string[]) : [];
+		} catch {
+			old = [];
+		}
+		const self = h as { list: string[] };
+		self.list = [...self.list, ...old.filter((x) => !self.list.includes(x))].slice(0, 500);
+		loaded = true;
+		if (pending.length) store();
+	});
+	return h;
+}
+
 export function attachCompletion(term: Terminal, host: HTMLElement, src: CompletionSource, send: (s: string) => void, onPop?: (open: boolean) => void): Completer {
 	void loadDict();
-	let history: string[] = [];
-	void api.settingGet(`hist.${src.key}`).then((v) => {
-		try {
-			history = v ? (JSON.parse(v) as string[]) : [];
-		} catch {
-			history = [];
-		}
-	});
+	const hist = sharedHistory(src.key);
 	let commands: string[] = [];
 	let commandsAsked = false;
 	let units: string[] = [];
@@ -120,14 +147,15 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		const b = term.buffer.active;
 		const y = b.cursorY + b.baseY;
 		if (y !== inputStart.y) return null; // 여러 줄 입력은 다루지 않는다
-		const line = b.getLine(y)?.translateToString(false) ?? "";
-		return line.slice(inputStart.x, b.cursorX);
+		// 칸 번호로 자른다 — 한글 같은 두 칸 글자가 앞에 있으면 문자열 위치와 칸 위치가 어긋난다
+		if (b.cursorX < inputStart.x) return "";
+		return b.getLine(y)?.translateToString(false, inputStart.x, b.cursorX) ?? "";
 	};
 
 	const atLineEnd = () => {
 		const b = term.buffer.active;
-		const line = b.getLine(b.cursorY + b.baseY)?.translateToString(true) ?? "";
-		return b.cursorX >= line.length;
+		// 커서 뒤(칸 기준)에 글자가 없으면 줄 끝
+		return (b.getLine(b.cursorY + b.baseY)?.translateToString(true, b.cursorX) ?? "").length === 0;
 	};
 
 	const listDirCached = (dir: string): FsEntry[] | null => {
@@ -136,7 +164,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		return null;
 	};
 
-	const ctx = () => ({ commands, history, listDir: listDirCached, cwd, home: src.home ?? null, units, containers, shellKind: src.shellKind ?? "linux" });
+	const ctx = () => ({ commands, history: hist.list, listDir: listDirCached, cwd, home: src.home ?? null, units, containers, shellKind: src.shellKind ?? "linux" });
 
 	const hideGhost = () => {
 		ghostEl.textContent = "";
@@ -164,7 +192,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		const line = currentInput();
 		if (held || line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
 		// 치는 동안에는 목록을 띄우지 않는다 — 흐린 제안은 지난 명령에서만(서버에 묻지 않음), 목록은 Tab
-		const g = ghost(line, history);
+		const g = ghost(line, hist.list);
 		ghostEl.textContent = g;
 		if (g) placeAtCursor(ghostEl, false);
 	};
@@ -228,6 +256,19 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		if (wasHidden) onPop?.(true);
 	};
 
+	/** 선택만 옮기기 — 목록 전체를 다시 그리지 않고 표시와 아래 줄 숫자만 바꾼다 */
+	const moveSel = (next: number) => {
+		const rows = pop.querySelectorAll<HTMLElement>(".term-pop-item");
+		rows[sel]?.classList.remove("sel");
+		sel = next;
+		moved = true;
+		const row = rows[sel];
+		row?.classList.add("sel");
+		row?.scrollIntoView({ block: "nearest" });
+		const foot = pop.querySelector(".term-pop-more");
+		if (foot) foot.textContent = `${Math.min(sel + 1, items.length)}/${items.length > MAX_POP ? `${MAX_POP}+` : items.length} · ↑↓ 고르기 · Tab·Enter 넣기 · Esc 닫기`;
+	};
+
 	const accept = () => {
 		const c = items[sel];
 		if (!c) return closePop();
@@ -267,12 +308,15 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		if (tabBusy) return; // 앞 Tab 이 아직 계산 중 — 겹쳐 돌리지 않는다
 		tabBusy = true;
 		let has = false;
+		const before = currentInput();
 		try {
 			has = await compute(false, true);
 		} finally {
 			tabBusy = false;
 		}
 		try {
+			// 계산하는 사이 줄이 바뀌었으면 아무것도 하지 않는다(셸에 Tab 을 넘기지도 않는다)
+			if (currentInput() !== before) return;
 			tabShow(has);
 		} finally {
 			runQueuedTab();
@@ -313,6 +357,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			} catch {
 				dirCache.set(r.pending, { at: Date.now(), list: [] });
 			}
+			// 목록을 받아 오는 사이 사람이 더 쳤으면 이 결과는 버린다(지울 글자 수가 어긋나 엉뚱하게 고쳐 쓴다)
+			if (currentInput() !== line) return false;
 			r = complete(line, ctx());
 		}
 		if (!open && !quiet && pop.hidden) return false;
@@ -373,10 +419,19 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const remember = (cmd: string) => {
 		const c = cmd.trim();
 		if (!c || c.startsWith(" ")) return;
-		history = [c, ...history.filter((h) => h !== c)].slice(0, 500);
-		void api.settingSet(`hist.${src.key}`, JSON.stringify(history));
+		hist.add(c);
 	};
 
+	/**
+	 * 프롬프트가 뜬 뒤 첫 키 전까지는 출력이 끝날 때마다 커서 = 입력 시작(프롬프트 끝).
+	 * 첫 키부터는 고정 — ↑·Ctrl+R 로 불러온 줄도 프롬프트 끝부터 입력으로 본다(첫 글자 직전 커서로 잡으면 불러온 줄 끝이 시작이 된다)
+	 */
+	let keyed = false;
+	const onParsed = term.onWriteParsed(() => {
+		if (!promptOn || keyed) return;
+		const b = term.buffer.active;
+		inputStart = { x: b.cursorX, y: b.cursorY + b.baseY };
+	});
 	let lastLine = "";
 	const onRender = term.onRender(() => {
 		if (promptOn) {
@@ -391,6 +446,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	return {
 		prompt: () => {
 			promptOn = true;
+			keyed = false;
 			inputStart = null;
 			tabQueued = 0;
 			lastLine = "";
@@ -417,6 +473,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			cwd = p;
 		},
 		key: (e) => {
+			if (e.type === "keydown" && promptOn && !["Shift", "Control", "Alt", "Meta"].includes(e.key)) keyed = true;
 			if (e.type !== "keydown" || !promptOn || mode === "off" || held) return true;
 			const plainTab = e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
 			// 파고드는 중·계산 중에 온 Tab 은 세어 두었다가 끝나면 차례로(버리지 않는다)
@@ -427,15 +484,11 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			if (!pop.hidden) {
 				const n = Math.min(items.length, MAX_POP);
 				if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-					sel = (sel + (e.key === "ArrowUp" ? -1 : 1) + n) % n;
-					moved = true;
-					renderPop();
+					moveSel((sel + (e.key === "ArrowUp" ? -1 : 1) + n) % n);
 					return false;
 				}
 				if (e.key === "Tab" && e.shiftKey) {
-					sel = (sel - 1 + n) % n;
-					moved = true;
-					renderPop();
+					moveSel((sel - 1 + n) % n);
 					return false;
 				}
 				if (e.key === "Enter" && autoOpen && !moved) {
@@ -464,15 +517,21 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 				else void compute(true);
 				return false;
 			}
-			if (e.key === "ArrowRight" && !e.ctrlKey && ghostEl.textContent && atLineEnd()) {
-				send(ghostEl.textContent);
-				hideGhost();
-				return false;
-			}
-			if (e.key === "ArrowRight" && e.ctrlKey && ghostEl.textContent && atLineEnd()) {
-				// 흐린 제안에서 한 낱말만
-				const m = /^\s*\S+/.exec(ghostEl.textContent);
-				if (m) send(m[0]);
+			if (e.key === "ArrowRight" && ghostEl.textContent && atLineEnd()) {
+				// 그려 둔 제안은 60ms 늦을 수 있다 — 지금 줄로 다시 계산해 같을 때만 받는다(어긋나면 → 는 셸로)
+				const now = ghost(currentInput() ?? "", hist.list);
+				if (now !== ghostEl.textContent) {
+					hideGhost();
+					return true;
+				}
+				if (!e.ctrlKey) {
+					send(now);
+					hideGhost();
+				} else {
+					// 흐린 제안에서 한 낱말만
+					const m = /^\s*\S+/.exec(now);
+					if (m) send(m[0]);
+				}
 				return false;
 			}
 			return true;
@@ -497,6 +556,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			window.clearTimeout(timer);
 			window.clearTimeout(autoTimer);
 			onRender.dispose();
+			onParsed.dispose();
 			ghostEl.remove();
 			pop.remove();
 		},

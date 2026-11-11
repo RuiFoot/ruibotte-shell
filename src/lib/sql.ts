@@ -7,7 +7,17 @@ export type Stmt = { from: number; to: number; text: string };
 /** PL/SQL·T-SQL 블록(BEGIN·DECLARE·CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER) — 안의 ; 로 나누지 않고 / 줄(또는 GO·끝)까지 */
 function inBlock(head: string): boolean {
 	const t = head.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "").trimStart();
-	return /^(begin\b(?!\s+(tran|transaction|work)\b)|declare\b|create\s+(or\s+replace\s+)?(editionable\s+)?(procedure|function|package|trigger|type\s+body)\b)/i.test(t);
+	// "BEGIN;" 한 줄은 트랜잭션 시작이지 블록이 아니다(블록으로 보면 뒤 문장이 모두 한 문장으로 합쳐져 위험 문장 확인이 빠진다)
+	if (/^begin\s*$/i.test(t)) return false;
+	if (/^(begin\b(?!\s+(tran|transaction|work)\b)|declare\b)/i.test(t)) return true;
+	if (/^create\s+(or\s+replace\s+)?(editionable\s+)?(procedure|function|package|trigger|type\s+body)\b/i.test(t)) {
+		// PostgreSQL 은 본문을 $$ 로 감싸므로(그 안의 ; 는 이미 건너뜀) 끝의 ; 가 문장 끝이다
+		if (/\$[A-Za-z_]*\$/.test(t)) return false;
+		// PostgreSQL CREATE TRIGGER … EXECUTE FUNCTION f() — 본문이 없는 한 문장
+		if (/\bexecute\s+(function|procedure)\b/i.test(t)) return false;
+		return true;
+	}
+	return false;
 }
 
 export function splitSql(src: string): Stmt[] {

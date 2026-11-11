@@ -15,6 +15,18 @@ window.addEventListener(
 	{ capture: true },
 );
 
+// 도구 막대가 창보다 넓을 때(좁은 창) — 세로 휠로도 옆으로 밀어 가려진 단추에 닿게
+window.addEventListener(
+	"wheel",
+	(e) => {
+		const bar = (e.target as HTMLElement | null)?.closest?.(".wb-bar") as HTMLElement | null;
+		if (!bar || bar.scrollWidth <= bar.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+		bar.scrollLeft += e.deltaY;
+		e.preventDefault();
+	},
+	{ passive: false },
+);
+
 // 웹 흔적 지우기: 브라우저 기본 우클릭 메뉴는 앱 전체에서 끈다(입력칸만 예외). 자체 메뉴는 각 칸이 띄운다.
 window.addEventListener(
 	"contextmenu",

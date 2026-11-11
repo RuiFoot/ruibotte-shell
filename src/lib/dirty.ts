@@ -28,9 +28,29 @@ export function forgetOwner(owner: string) {
 	reg.delete(owner);
 }
 
+/** 열린 편집기들의 "초안 지금 쓰기" — 묻기 전에 불러 마지막 입력까지 초안에 남긴다(0.8초 멈춤을 기다리지 않고) */
+const flushers = new Set<() => void>();
+export function onDraftFlush(f: () => void): () => void {
+	flushers.add(f);
+	return () => flushers.delete(f);
+}
+export function flushDrafts() {
+	for (const f of flushers) {
+		try {
+			f();
+		} catch {
+			// 한 편집기가 실패해도 나머지는 쓴다
+		}
+	}
+}
+
 /** 저장 안 한 것이 있으면 묻는다 — 계속하면 true */
 export function confirmDiscard(titles: string[], what: string): boolean {
 	if (!titles.length) return true;
+	flushDrafts();
 	const list = titles.slice(0, 8).join("\n· ");
 	return confirm(`저장하지 않은 파일이 ${titles.length}개 있습니다.\n· ${list}${titles.length > 8 ? "\n…" : ""}\n\n${what} 고친 내용은 초안으로 남아 다음에 열 때 되살릴 수 있습니다. 계속할까요?`);
 }
+
+/** Ctrl+W — 앱이 보내고, 문서 칸에 초점이 있는 작업대가 그 칸만 닫고 preventDefault(서버 탭은 그대로) */
+export const CLOSE_DOC_EVENT = "rb-close-doc";

@@ -61,6 +61,11 @@ const NO_LRZSZ = /(?:^|[\s:])[rs]z: (?:command )?not found|command not found: [r
 /** 출력의 경로 — 절대 경로(/…, C:/…)와 뒤에 붙은 :줄 */
 const PATH_RE = /(?:^|[\s'"(=:])((?:\/|[A-Za-z]:[\\/])[\w.@+~\-\\/]*[\w])(?::(\d+))?/g;
 
+/** 터미널 찾기 — 다음·이전도 같은 강조를 넘겨야 "1/n" 과 현재 일치 강조가 유지된다 */
+const FIND_OPTS = {
+	decorations: { matchOverviewRuler: "#ff9f0a", activeMatchColorOverviewRuler: "#0a84ff", matchBackground: "#ff9f0a55", activeMatchBackground: "#0a84ff88" },
+};
+
 export function TerminalView({
 	backend,
 	active,
@@ -374,9 +379,17 @@ export function TerminalView({
 		void api.settingGet("term.copyOnSelect").then((v) => {
 			copyOnSelect = v === "1";
 		});
+		// 끄는 동안 선택이 바뀔 때마다 복사하면 클립보드 쓰기·알림·재렌더가 매 움직임마다 일어난다 — 마우스를 놓을 때 한 번
+		let selDirty = false;
 		const onSel = term.onSelectionChange(() => {
-			if (copyOnSelect && term.hasSelection()) void copyRef.current(term.getSelection());
+			if (copyOnSelect) selDirty = true;
 		});
+		const onSelUp = () => {
+			if (!selDirty) return;
+			selDirty = false;
+			if (copyOnSelect && term.hasSelection()) void copyRef.current(term.getSelection());
+		};
+		el.addEventListener("mouseup", onSelUp);
 		try {
 			const webgl = new WebglAddon();
 			webgl.onContextLoss(() => webgl.dispose());
@@ -428,10 +441,8 @@ export function TerminalView({
 			ackTimer = undefined;
 			const id = idRef.current;
 			if (!ackPending || disposed) return;
-			if (id == null) {
-				ackTimer = window.setTimeout(flushAck, 50);
-				return;
-			}
+			// 셸이 아직 없거나 끝났으면 미뤄 두기만 한다(다음 출력 때 함께) — 끝없이 다시 걸지 않는다
+			if (id == null) return;
 			const n = ackPending;
 			ackPending = 0;
 			void backend.ack?.(id, n).catch(() => undefined);
@@ -505,10 +516,9 @@ export function TerminalView({
 			}
 			axRef.current?.output(b.length);
 			const n = b.length;
-			if (zmb) {
-				zmb.consume(b);
-				drawn(n);
-			} else show(b, () => drawn(n));
+			// 그린 뒤에 ack — rz/sz 다리를 거쳐도(원격) 그대로 넘긴 출력은 화면이 다 그린 다음에 알린다
+			if (zmb) zmb.consume(b, () => drawn(n));
+			else show(b, () => drawn(n));
 			if (zmWatch) {
 				if (Date.now() > zmWatch) zmWatch = 0;
 				else {
@@ -747,7 +757,10 @@ export function TerminalView({
 				return false;
 			}
 			if (mod && e.shiftKey && e.code === "KeyF") {
-				setFind((f) => (f === null ? term.getSelection() || "" : null));
+				setFind((f) => {
+					if (f !== null) searchRef.current?.clearDecorations(); // 닫을 때 강조를 남기지 않는다
+					return f === null ? term.getSelection() || "" : null;
+				});
 				return false;
 			}
 			if (mod && !e.shiftKey && (e.key === "=" || e.key === "+" || e.key === "-" || e.key === "0")) {
@@ -777,7 +790,8 @@ export function TerminalView({
 		ta?.addEventListener("focus", onFocusIn);
 		const onPaste = (ev: ClipboardEvent) => {
 			const text = ev.clipboardData?.getData("text/plain") ?? "";
-			if (text.replace(/\r?\n$/, "").includes("\n")) {
+			// 여러 줄이거나 위험 명령이 든 한 줄(Shift+Insert·가운데 클릭으로 붙여도) — 확인을 거친다
+			if (text.replace(/\r?\n$/, "").includes("\n") || text.split(/\r?\n/).some((l) => DANGER.test(l))) {
 				ev.preventDefault();
 				ev.stopImmediatePropagation();
 				paste(text);
@@ -785,8 +799,13 @@ export function TerminalView({
 		};
 		ta?.addEventListener("paste", onPaste, true);
 
+		// 칸 경계를 끄는 동안 프레임마다 다시 맞추면 스크롤백을 매번 다시 흘리고 서버에 크기 변경을 연달아 보낸다 — 멈추면(80ms) 한 번
+		let fitTimer: number | undefined;
 		const ro = new ResizeObserver(() => {
-			if (el.offsetWidth > 0 && el.offsetHeight > 0) fit.fit();
+			window.clearTimeout(fitTimer);
+			fitTimer = window.setTimeout(() => {
+				if (!disposed && el.offsetWidth > 0 && el.offsetHeight > 0) fit.fit();
+			}, 80);
 		});
 		ro.observe(el);
 		const unlisten = listen(backend.exitEvent, (e) => {
@@ -817,9 +836,10 @@ export function TerminalView({
 			disposed = true;
 			window.clearInterval(lagTimer);
 			window.clearTimeout(ackTimer);
+			window.clearTimeout(fitTimer);
 			setLag(null);
 			window.removeEventListener(TERM_PREFS_EVENT, applyPrefs);
-			zmb?.cancel();
+			zmb?.dispose();
 			zmRef.current = null;
 			setZm(null);
 			hi.dispose();
@@ -834,6 +854,7 @@ export function TerminalView({
 			osc6974.dispose();
 			pathLinks.dispose();
 			onSel.dispose();
+			el.removeEventListener("mouseup", onSelUp);
 			onResults.dispose();
 			cmds.current = [];
 			exited.current = false;
@@ -998,15 +1019,12 @@ export function TerminalView({
 						placeholder="찾기 — Enter 다음, Shift+Enter 이전"
 						onChange={(e) => {
 							setFind(e.target.value);
-							searchRef.current?.findNext(e.target.value, {
-								incremental: true,
-								decorations: { matchOverviewRuler: "#ff9f0a", activeMatchColorOverviewRuler: "#0a84ff", matchBackground: "#ff9f0a55", activeMatchBackground: "#0a84ff88" },
-							});
+							searchRef.current?.findNext(e.target.value, { ...FIND_OPTS, incremental: true });
 						}}
 						onKeyDown={(e) => {
 							if (e.key === "Enter") {
-								if (e.shiftKey) searchRef.current?.findPrevious(find);
-								else searchRef.current?.findNext(find);
+								if (e.shiftKey) searchRef.current?.findPrevious(find, FIND_OPTS);
+								else searchRef.current?.findNext(find, FIND_OPTS);
 							}
 							if (e.key === "Escape") {
 								searchRef.current?.clearDecorations();
@@ -1016,10 +1034,10 @@ export function TerminalView({
 						}}
 					/>
 					{findCount && find ? <span className="find-count">{findCount.n ? `${findCount.i}/${findCount.n}` : "없음"}</span> : null}
-					<button type="button" className="btn ghost icon" onClick={() => searchRef.current?.findPrevious(find)} title="이전(Shift+Enter)">
+					<button type="button" className="btn ghost icon" onClick={() => searchRef.current?.findPrevious(find, FIND_OPTS)} title="이전(Shift+Enter)">
 						<ChevronUp size={14} />
 					</button>
-					<button type="button" className="btn ghost icon" onClick={() => searchRef.current?.findNext(find)} title="다음(Enter)">
+					<button type="button" className="btn ghost icon" onClick={() => searchRef.current?.findNext(find, FIND_OPTS)} title="다음(Enter)">
 						<ChevronDown size={14} />
 					</button>
 					<button
