@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, Command as CommandIcon, ListTree, PanelLeftClose, PanelLeftOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X } from "lucide-react";
+import { BookOpen, Command as CommandIcon, ListTree, PanelLeftClose, PanelLeftOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X, Star, Pin, ArrowLeftRight, Route } from "lucide-react";
 import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
 import { ConnectDialog } from "./components/ConnectDialog";
@@ -624,12 +624,12 @@ export function App() {
 								<span>{t.title}</span>
 								{t.db?.profile.sshTunnelProfileId ? (
 									<span className="tab-via" title={`SSH 경유 — ${profiles.find((x) => x.id === t.db?.profile.sshTunnelProfileId)?.name ?? "SSH 서버"} 를 거쳐 접속`}>
-										⇄
+										<ArrowLeftRight size={11} aria-hidden />
 									</span>
 								) : null}
 								{routeWorthShowing(t.ssh?.ok.route) && t.ssh?.ok.route ? (
 									<span className="tab-route" title={routeTitle(t.ssh.ok.route)} aria-label={`경로: ${t.ssh.ok.route.label}`}>
-										⇢
+										<Route size={11} aria-hidden />
 									</span>
 								) : null}
 								{tabs.length > 1 && (
@@ -737,10 +737,11 @@ export function App() {
 													["all", "전체"],
 													["ssh", "SSH"],
 													["db", "DB"],
-													["fav", "★ 즐겨찾기"],
+													["fav", "즐겨찾기"],
 												] as const
 											).map(([k, l]) => (
 												<button key={k} type="button" aria-pressed={kindF === k} onClick={() => setKindF(k)}>
+													{k === "fav" && <Star size={11} className="ic-inline" aria-hidden />}
 													{l}
 												</button>
 											))}
@@ -749,7 +750,7 @@ export function App() {
 											<div className="chips" style={{ margin: 0 }}>
 												{allGroups.map((g) => (
 													<button key={g} type="button" className={`chip${groupF === g ? " on" : ""}`} onClick={() => setGroupF(groupF === g ? null : g)}>
-														{pinnedGroups.includes(g) ? "📌 " : ""}
+														{pinnedGroups.includes(g) && <Pin size={11} className="ic-inline" aria-label="고정" />}
 														{g}
 													</button>
 												))}
@@ -774,7 +775,7 @@ export function App() {
 											title={viewPinned ? "시작 화면 고정 풀기" : "지금 조회(검색어·종류·묶음·정렬)를 앱을 켤 때 그대로 보이게 고정"}
 											onClick={() => pinView(!viewPinned)}
 										>
-											📌 {viewPinned ? "고정됨" : "이 조회 고정"}
+											<Pin size={12} className="ic-inline" aria-hidden /> {viewPinned ? "고정됨" : "이 조회 고정"}
 										</button>
 										{(q || kindF !== "all" || groupF !== null) && (
 											<button
@@ -808,7 +809,7 @@ export function App() {
 																	togglePinGroup(g);
 																}}
 															>
-																📌
+																<Pin size={12} aria-hidden />
 															</span>
 														)}
 													</button>
@@ -841,7 +842,7 @@ export function App() {
 																				void api.profileSave({ ...p, favorite: !p.favorite }).then(reload);
 																			}}
 																		>
-																			{p.favorite ? "★" : "☆"}
+																			<Star size={13} fill={p.favorite ? "currentColor" : "none"} aria-hidden />
 																		</button>
 																		<span className="nm">{p.name}</span>
 																	</b>

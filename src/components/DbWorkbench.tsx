@@ -18,7 +18,7 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import "../styles/db-extra.css";
-import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, KeyRound, LayoutTemplate, Lock, Play, PlayCircle, Search, Square, Table, WrapText } from "lucide-react";
+import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, KeyRound, LayoutTemplate, Lock, Play, PlayCircle, Search, Square, Table, WrapText, Star } from "lucide-react";
 import { DbActivityPanel } from "./panels/DbActivityPanel";
 import { createContext, lazy, type ReactElement, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ComparePanel, HistoryPanel } from "./DbPanels";
@@ -2136,7 +2136,7 @@ export function DbWorkbench({
 							도구 ▾
 						</button>
 						<button type="button" className="btn ghost" onClick={() => setSnip(true)} title="즐겨찾는 SQL(스니펫)">
-							★ SQL
+							<Star size={12} /> SQL
 						</button>
 						<span className="sep" />
 						<button

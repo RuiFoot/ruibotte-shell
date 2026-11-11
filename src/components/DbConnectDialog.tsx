@@ -138,7 +138,7 @@ export function DbConnectDialog({
 								<span>{install.what}</span>
 								<small>{install.state === "error" ? install.message : install.total ? `${Math.round((100 * install.done) / install.total)}%` : ""}</small>
 								<div className={`bar ${install.state}`}>
-									<i style={{ width: install.total ? `${(100 * install.done) / install.total}%` : install.state === "done" ? "100%" : "8%" }} />
+									<i style={{ transform: `scaleX(${install.total ? install.done / install.total : install.state === "done" ? 1 : 0.08})` }} />
 								</div>
 							</div>
 						)}

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronLeft, FolderSearch, Pause, Play, Search, Square, Zap } from "lucide-react";
+import { ChevronLeft, FolderSearch, Pause, Play, Search, Square, Zap, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Select } from "./Select";
 
@@ -191,7 +191,7 @@ export function MonitorPanel({ conn, sudoOn, visible }: { conn: number; sudoOn: 
 					</small>
 				</div>
 				<div className="mon-ctl">
-					{error && <span className="err" title={error}>⚠ 마지막 측정 실패</span>}
+					{error && <span className="err" title={error}><TriangleAlert size={12} aria-hidden /> 마지막 측정 실패</span>}
 					<Select size="sm" value={every} onChange={setEvery} title="측정 간격" options={[1, 2, 3, 5, 10, 30].map((s) => ({ value: s, label: `${s}초마다` }))} />
 					<button type="button" className="btn ghost" onClick={() => setPaused((x) => !x)} title={paused ? "다시 재기" : "멈추기"}>
 						{paused ? <Play size={14} /> : <Pause size={14} />}
@@ -244,7 +244,7 @@ export function MonitorPanel({ conn, sudoOn, visible }: { conn: number; sudoOn: 
 					{delta.cpu.slice(1).map((c, i) => (
 						// biome-ignore lint/suspicious/noArrayIndexKey: 코어 번호
 						<div key={i} className="mon-core" title={`코어 ${i}: ${pct(c)}`}>
-							<div style={{ height: `${Math.min(100, c * 100)}%` }} className={level(c)} />
+							<div style={{ transform: `scaleY(${Math.min(1, c)})` }} className={level(c)} />
 						</div>
 					))}
 				</section>

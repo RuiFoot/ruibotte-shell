@@ -10,7 +10,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type IMarker, Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ChevronDown, ChevronUp, Gauge, RotateCcw, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Gauge, RotateCcw, X, Check, TriangleAlert } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ipc";
 import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
@@ -1072,7 +1072,7 @@ export function TerminalView({
 						{zm.name}
 					</span>
 					<div className="bar">
-						<i style={{ width: `${zm.total ? Math.min(100, (zm.done / zm.total) * 100) : 0}%` }} />
+						<i style={{ transform: `scaleX(${zm.total ? Math.min(1, zm.done / zm.total) : 0})` }} />
 					</div>
 					<small>
 						{fmtBytes(zm.done)}
@@ -1092,7 +1092,7 @@ export function TerminalView({
 				<span className={stat.ok ? "ok" : undefined}>{stat.label}</span>
 				{clipNote && (
 					<span className={clipNote.ok ? "ok" : "err"} role="status">
-						{clipNote.ok ? "✓ " : "⚠ "}
+						{clipNote.ok ? <Check size={12} aria-hidden /> : <TriangleAlert size={12} aria-hidden />}
 						{clipNote.text}
 					</span>
 				)}

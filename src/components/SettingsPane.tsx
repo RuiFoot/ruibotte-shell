@@ -433,7 +433,7 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 					<div className="set-row">
 						<div className="xfer-row" style={{ border: 0, flex: 1, padding: 0 }}>
 							<div className="bar">
-								<i style={{ width: `${u.pct ?? 0}%` }} />
+								<i style={{ transform: `scaleX(${(u.pct ?? 0) / 100})` }} />
 							</div>
 						</div>
 					</div>

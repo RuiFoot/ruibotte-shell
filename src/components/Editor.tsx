@@ -7,7 +7,7 @@ import { drawSelection, EditorView, highlightActiveLine, highlightActiveLineGutt
 import { jsonParseLinter } from "@codemirror/lang-json";
 import { linter, lintGutter } from "@codemirror/lint";
 import { showMinimap } from "@replit/codemirror-minimap";
-import { Braces, Eye, GitCompare, Map as MapIcon, Save, Table2 } from "lucide-react";
+import { Braces, Eye, GitCompare, Map as MapIcon, Save, Table2, Radio } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { editingExtensions } from "../lib/cmEditing";
 import { codeHighlight } from "../lib/cmTheme";
@@ -589,7 +589,7 @@ export function EditorView_({
 						<span>읽기 전용 · 앞부분만</span>
 						{onTail && (
 							<button type="button" className="btn ghost" style={{ height: 20 }} onClick={onTail} title="실시간 보기(tail -F) — 끝부분을 보고 새 줄을 따라간다">
-								⟳ 실시간
+								<Radio size={12} /> 실시간
 							</button>
 						)}
 					</>
@@ -673,7 +673,7 @@ export function EditorView_({
 						)}
 						{onTail && (langId === "log" || autoLang === "log") && (
 							<button type="button" className="btn ghost" style={{ height: 20 }} onClick={onTail} title="실시간 보기(tail -F) — 새 줄을 따라간다">
-								⟳ 실시간
+								<Radio size={12} /> 실시간
 							</button>
 						)}
 						{canTidy && !readOnly && (

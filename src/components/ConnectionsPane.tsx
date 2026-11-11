@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Database, FileDown, FileUp, Folder, FolderPlus, KeyRound, Pencil, Plus, Search, Server, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Database, FileDown, FileUp, Folder, FolderPlus, KeyRound, Pencil, Plus, Search, Server, Trash2, Star } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, type Profile } from "../lib/ipc";
 import { blankProfile, ProfileSheet } from "./ProfileSheet";
@@ -276,7 +276,7 @@ export function ConnectionsPane({
 										<span className="dot" style={{ background: p.color ?? "var(--accent)" }} />
 										{p.kind === "ssh" ? <Server size={12} className="ti" /> : <Database size={12} className="ti" />}
 										<span className="conn-name">
-											{p.favorite ? "★ " : ""}
+											{p.favorite && <Star size={11} fill="currentColor" className="ic-inline" aria-label="즐겨찾기" />}
 											{p.name}
 										</span>
 										{p.secretSaved && <KeyRound size={10} className="ti" />}

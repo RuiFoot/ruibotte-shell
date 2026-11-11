@@ -11,7 +11,7 @@ import {
 import { CLOSE_DOC_EVENT, confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Rows2, ShieldAlert, X } from "lucide-react";
+import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Rows2, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -514,7 +514,7 @@ function TransfersPanel() {
 					</span>
 					<small>{a.state === "running" ? "받는 중" : a.state === "done" ? "완료" : "실패"}</small>
 					<div className={`bar ${a.state}`}>
-						<i style={{ width: a.state === "running" ? "40%" : "100%" }} />
+						<i style={{ transform: `scaleX(${a.state === "running" ? 0.4 : 1})` }} />
 					</div>
 					<small>
 						{fmtBytes(a.bytes)}
@@ -529,7 +529,7 @@ function TransfersPanel() {
 				return (
 					<div key={p.id} className="xfer-row">
 						<span>
-							{p.direction === "up" ? "↑ 올리기" : p.direction === "relay" ? "⇄ 중계" : "↓ 받기"} <b>{p.name}</b>
+							{p.direction === "up" ? <><ArrowUp size={12} aria-hidden /> 올리기</> : p.direction === "relay" ? <><ArrowLeftRight size={12} aria-hidden /> 중계</> : <><ArrowDown size={12} aria-hidden /> 받기</>} <b>{p.name}</b>
 						</span>
 						{p.state === "running" ? (
 							<button type="button" className="btn ghost icon" style={{ height: 20, width: 20 }} title="취소" onClick={() => void transfers.cancel(p.id)}>
@@ -555,7 +555,7 @@ function TransfersPanel() {
 							</span>
 						)}
 						<div className={`bar ${p.state}`}>
-							<i style={{ width: `${pct}%` }} />
+							<i style={{ transform: `scaleX(${pct / 100})` }} />
 						</div>
 						<small>
 							{fmtBytes(p.bytesDone)} / {fmtBytes(p.bytesTotal)} · 파일 {p.filesDone}/{p.filesTotal}
