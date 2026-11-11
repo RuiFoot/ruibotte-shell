@@ -29,7 +29,14 @@ impl Flow {
         self.unacked.fetch_add(n, Ordering::AcqRel);
     }
     pub(crate) fn ack(&self, n: usize) {
-        let _ = self.unacked.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(n)));
+        // 0 아래로 내려가지 않게(늦게 온 ack·reset 뒤의 ack) — fetch_update 는 새 툴체인에서 폐기 경고라 직접 돌린다
+        let mut cur = self.unacked.load(Ordering::Acquire);
+        loop {
+            match self.unacked.compare_exchange_weak(cur, cur.saturating_sub(n), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
         self.wake();
     }
     /// 화면이 사라졌거나 오래 답이 없을 때 — 막힌 것을 푼다
