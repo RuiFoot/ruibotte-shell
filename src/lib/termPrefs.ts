@@ -20,6 +20,8 @@ export type TermPrefs = {
 	tabList: boolean;
 	/** 입력 줄 위 명령 서명 줄(기본 끔) */
 	sigHint: boolean;
+	/** Ctrl+V 를 서버로 ^V 로 보내기(기본 끔 = 붙여넣기) */
+	ctrlVSend: boolean;
 };
 
 export const TERM_PREFS_EVENT = "rb-term-prefs";
@@ -35,6 +37,7 @@ export const PREF_KEYS = {
 	zmDir: "term.zmodem.dir",
 	tabList: "term.tabList",
 	sigHint: "term.sigHint",
+	ctrlVSend: "term.ctrlVSend",
 } as const;
 
 /** 고를 수 있는 색(어두운·밝은 바탕 모두에서 읽히는 것) */
@@ -60,7 +63,7 @@ export function parseWords(v: string | null): HiRule[] {
 
 export async function loadTermPrefs(): Promise<TermPrefs> {
 	const g = (k: string) => api.settingGet(k).catch(() => null);
-	const [la, ld, ls, lt, ho, hw, zo, zd, tl, sh] = await Promise.all([
+	const [la, ld, ls, lt, ho, hw, zo, zd, tl, sh, cv] = await Promise.all([
 		g(PREF_KEYS.logAuto),
 		g(PREF_KEYS.logDir),
 		g(PREF_KEYS.logStrip),
@@ -71,6 +74,7 @@ export async function loadTermPrefs(): Promise<TermPrefs> {
 		g(PREF_KEYS.zmDir),
 		g(PREF_KEYS.tabList),
 		g(PREF_KEYS.sigHint),
+		g(PREF_KEYS.ctrlVSend),
 	]);
 	return {
 		logAuto: la === "1",
@@ -83,6 +87,7 @@ export async function loadTermPrefs(): Promise<TermPrefs> {
 		zmDir: zd ?? "",
 		tabList: tl === "1",
 		sigHint: sh === "1",
+		ctrlVSend: cv === "1",
 	};
 }
 

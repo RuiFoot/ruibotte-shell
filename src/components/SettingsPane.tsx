@@ -319,6 +319,7 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 	const [zmDir, setZmDir] = useTermSetting(PREF_KEYS.zmDir, "");
 	const [tabList, setTabList] = useTermSetting(PREF_KEYS.tabList, "0");
 	const [sigHint, setSigHint] = useTermSetting(PREF_KEYS.sigHint, "0");
+	const [ctrlVSend, setCtrlVSend] = useTermSetting(PREF_KEYS.ctrlVSend, "0");
 	const [logBase, setLogBase] = useState("");
 	useEffect(() => {
 		void defaultLogDir()
@@ -501,6 +502,12 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 						onChange={setScrollback}
 						options={["5000", "10000", "50000", "100000"].map((n) => ({ value: n, label: `${Number(n).toLocaleString()}줄` }))}
 					/>
+				</Row>
+				<Row
+					label="Ctrl+V 를 서버로 보내기(^V)"
+					sub="끄면(기본) Ctrl+V 는 붙여넣기입니다. 켜면 Ctrl+V 가 서버로 ^V(다음 글자 그대로 넣기)로 가고, 붙여넣기는 Ctrl+Shift+V 로 합니다. Ctrl+C 는 고른 글이 있으면 복사, 없으면 ^C(중단)입니다. macOS 는 ⌘C·⌘V 로 복사·붙여넣기하고 Ctrl+C·Ctrl+V 는 늘 서버로 갑니다"
+				>
+					<Toggle on={ctrlVSend === "1"} label="Ctrl+V 를 서버로 보내기" onChange={(v) => setCtrlVSend(v ? "1" : "0")} />
 				</Row>
 				<Row label="고르면 바로 복사" sub="터미널에서 끌어 고른 글을 곧바로 클립보드로(리눅스 터미널처럼)">
 					<Toggle on={copyOnSelect === "1"} label="고르면 바로 복사" onChange={(v) => setCopyOnSelect(v ? "1" : "0")} />

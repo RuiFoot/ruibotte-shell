@@ -50,6 +50,9 @@ function bytesAsUserDefined(b: Uint8Array) {
 	return out;
 }
 
+/** macOS — ⌘C/⌘V 가 복사·붙여넣기, Ctrl 은 늘 서버로 */
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
 const fmtBytes = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`);
 
 /** rz/sz 를 쳤는데 서버에 없을 때 나오는 말 */
@@ -147,6 +150,54 @@ export function TerminalView({
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 	const [palette, setPalette] = useState(false);
 	const [last, setLast] = useState<{ code: number; ms: number } | null>(null);
+	/** 복사·붙여넣기 짧은 알림(성공 1.5초, 실패 5초) */
+	const [clipNote, setClipNote] = useState<{ text: string; ok: boolean } | null>(null);
+	const clipTimer = useRef<number | undefined>(undefined);
+	const noteClip = (text: string, ok: boolean) => {
+		window.clearTimeout(clipTimer.current);
+		setClipNote({ text, ok });
+		clipTimer.current = window.setTimeout(() => setClipNote(null), ok ? 1500 : 5000);
+	};
+	useEffect(() => () => window.clearTimeout(clipTimer.current), []);
+	/** 클립보드에 쓰기 — 실패를 삼키지 않는다(웹뷰 클립보드 API 가 막히면 execCommand 로 한 번 더) */
+	const copyText = async (text: string, what = "복사됨") => {
+		if (!text) return false;
+		try {
+			await navigator.clipboard.writeText(text);
+		} catch (e) {
+			const ta = document.createElement("textarea");
+			ta.value = text;
+			ta.style.position = "fixed";
+			ta.style.opacity = "0";
+			document.body.append(ta);
+			ta.select();
+			let ok = false;
+			try {
+				ok = document.execCommand("copy");
+			} catch {
+				ok = false;
+			}
+			ta.remove();
+			termRef.current?.focus();
+			if (!ok) {
+				noteClip(`복사하지 못했습니다 — ${e instanceof Error ? e.message : String(e)}`, false);
+				return false;
+			}
+		}
+		const lines = text.split("\n").length;
+		noteClip(`${what}${lines > 1 ? ` · ${lines}줄` : ` · ${text.length}자`}`, true);
+		return true;
+	};
+	const copyRef = useRef(copyText);
+	copyRef.current = copyText;
+	/** 클립보드 읽어 붙여넣기(여러 줄·위험 명령 확인을 거친다) */
+	const pasteClipboard = () =>
+		navigator.clipboard
+			.readText()
+			.then((t) => paste(t))
+			.catch((e) => noteClip(`클립보드를 읽지 못했습니다 — ${e instanceof Error ? e.message : String(e)}`, false));
+	const pasteRef = useRef(pasteClipboard);
+	pasteRef.current = pasteClipboard;
 	/** 입력 지연(키 → 첫 출력) p50/p95 — 1초마다 한 번만 상태로 올린다 */
 	const [lag, setLag] = useState<{ p50: number; p95: number; n: number } | null>(null);
 	/** 글꼴 크기(설정한 크기가 아니면 상태 줄에) */
@@ -324,7 +375,7 @@ export function TerminalView({
 			copyOnSelect = v === "1";
 		});
 		const onSel = term.onSelectionChange(() => {
-			if (copyOnSelect && term.hasSelection()) void navigator.clipboard.writeText(term.getSelection());
+			if (copyOnSelect && term.hasSelection()) void copyRef.current(term.getSelection());
 		});
 		try {
 			const webgl = new WebglAddon();
@@ -413,9 +464,12 @@ export function TerminalView({
 				})
 			: null;
 		zmRef.current = zmb;
+		/** Ctrl+V 를 서버로 ^V(설정) — 끄면 붙여넣기 */
+		let ctrlVSend = false;
 		const applyPrefs = () =>
 			void loadTermPrefs().then((p) => {
 				if (disposed) return;
+				ctrlVSend = p.ctrlVSend;
 				completerRef.current?.setTabList(p.tabList);
 				axRef.current?.setSig(p.sigHint);
 				hi.setRules(p.hiOn ? p.hiWords : null);
@@ -663,13 +717,33 @@ export function TerminalView({
 				else if (e.key === "ArrowDown") term.scrollToBottom();
 				return false;
 			}
-			if (mod && e.shiftKey && e.code === "KeyC") {
+			// 복사·붙여넣기(Windows Terminal·VS Code 와 같은 규칙)
+			//  - Ctrl+C: 고른 글이 있으면 복사하고 고르기를 푼다(^C 는 보내지 않음), 없으면 ^C(중단)
+			//  - Ctrl+V: 붙여넣기(설정 "Ctrl+V 를 서버로 보내기" 면 ^V) · Ctrl+Shift+C/V: 늘 복사·붙여넣기
+			//  - macOS: ⌘C/⌘V 가 복사·붙여넣기, Ctrl+C·Ctrl+V 는 늘 서버로
+			const plainCtrl = IS_MAC ? e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey : e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+			if (plainCtrl && e.code === "KeyC") {
+				if (!term.hasSelection()) return !IS_MAC; // Windows·리눅스: ^C 로 / macOS ⌘C 는 고른 게 없으면 아무것도 안 함
+				e.preventDefault();
 				const s = term.getSelection();
-				if (s) void navigator.clipboard.writeText(s);
+				term.clearSelection();
+				void copyRef.current(s);
+				return false;
+			}
+			if (plainCtrl && e.code === "KeyV" && (IS_MAC || !ctrlVSend)) {
+				e.preventDefault();
+				void pasteRef.current();
+				return false;
+			}
+			if (mod && e.shiftKey && e.code === "KeyC") {
+				e.preventDefault();
+				const s = term.getSelection();
+				if (s) void copyRef.current(s);
 				return false;
 			}
 			if (mod && e.shiftKey && e.code === "KeyV") {
-				void navigator.clipboard.readText().then(paste);
+				e.preventDefault();
+				void pasteRef.current();
 				return false;
 			}
 			if (mod && e.shiftKey && e.code === "KeyF") {
@@ -860,14 +934,14 @@ export function TerminalView({
 	const menuItems: MenuItem[] = [
 		...(hitCmd
 			? ([
-					{ label: `명령과 출력 복사 — ${hitCmd.text.slice(0, 30)}`, run: () => void navigator.clipboard.writeText(linesOf(hitCmd.start.line, (hitCmd.end?.line ?? hitCmd.start.line) - 1)) },
-					{ label: "출력만 복사", run: () => void navigator.clipboard.writeText(linesOf(hitCmd.start.line + 1, (hitCmd.end?.line ?? hitCmd.start.line + 1) - 1)) },
-					{ label: "명령만 복사", run: () => void navigator.clipboard.writeText(hitCmd.text.replace(/^.*?[$#>]\s/, "")) },
+					{ label: `명령과 출력 복사 — ${hitCmd.text.slice(0, 30)}`, run: () => void copyText(linesOf(hitCmd.start.line, (hitCmd.end?.line ?? hitCmd.start.line) - 1)) },
+					{ label: "출력만 복사", run: () => void copyText(linesOf(hitCmd.start.line + 1, (hitCmd.end?.line ?? hitCmd.start.line + 1) - 1)) },
+					{ label: "명령만 복사", run: () => void copyText(hitCmd.text.replace(/^.*?[$#>]\s/, "")) },
 					{ sep: true },
 				] as MenuItem[])
 			: []),
-		{ label: "복사  Ctrl+Shift+C", run: () => void navigator.clipboard.writeText(termRef.current?.getSelection() ?? ""), disabled: !termRef.current?.hasSelection() },
-		{ label: "붙여넣기  Ctrl+Shift+V", run: () => void navigator.clipboard.readText().then(paste) },
+		{ label: `복사  ${IS_MAC ? "⌘C" : "Ctrl+C"}`, run: () => void copyText(termRef.current?.getSelection() ?? ""), disabled: !termRef.current?.hasSelection() },
+		{ label: `붙여넣기  ${IS_MAC ? "⌘V" : "Ctrl+V"}`, run: () => void pasteClipboard() },
 		{ label: "모두 선택", run: () => termRef.current?.selectAll() },
 		{ sep: true },
 		{ label: "찾기  Ctrl+Shift+F", run: () => setFind("") },
@@ -998,6 +1072,12 @@ export function TerminalView({
 					</button>
 				)}
 				<span className={stat.ok ? "ok" : undefined}>{stat.label}</span>
+				{clipNote && (
+					<span className={clipNote.ok ? "ok" : "err"} role="status">
+						{clipNote.ok ? "✓ " : "⚠ "}
+						{clipNote.text}
+					</span>
+				)}
 				{last && (
 					<span className={last.code === 0 ? "ok" : "err"}>
 						{last.code === 0 ? "✓" : `✗ ${last.code}`} {last.ms < 1000 ? `${last.ms}ms` : `${(last.ms / 1000).toFixed(1)}초`}
@@ -1011,7 +1091,7 @@ export function TerminalView({
 				)}
 				{fontPx !== getAppearance().termSize && <span title="터미널 글꼴 — Ctrl+0 설정한 크기로">글꼴 {fontPx}px</span>}
 				{here && (
-					<button type="button" className="env-chip" title="지금 폴더 — 눌러 경로 복사" onClick={() => void navigator.clipboard.writeText(here)}>
+					<button type="button" className="env-chip" title="지금 폴더 — 눌러 경로 복사" onClick={() => void copyText(here, "경로 복사됨")}>
 						{here}
 					</button>
 				)}
