@@ -122,7 +122,7 @@ pub struct JdbcStatus {
     engines: Vec<EngineStatus>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn jdbc_status(app: AppHandle) -> Result<JdbcStatus, String> {
     let r = root(&app)?;
     Ok(JdbcStatus {
@@ -298,7 +298,7 @@ pub(crate) async fn install_driver(dir: &Path, engine: &str, progress: Progress<
 }
 
 /// 사용자가 고른 jar 를 드라이버로
-#[tauri::command]
+#[tauri::command(async)]
 pub fn jdbc_add_driver_file(app: AppHandle, engine: String, path: String) -> Result<String, String> {
     self::engine(&engine).ok_or("알 수 없는 엔진")?;
     let src = PathBuf::from(&path);

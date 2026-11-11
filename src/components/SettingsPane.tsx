@@ -317,6 +317,8 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 	const [hiWords, setHiWords] = useTermSetting(PREF_KEYS.hiWords, "[]");
 	const [zmOn, setZmOn] = useTermSetting(PREF_KEYS.zmOn, "1");
 	const [zmDir, setZmDir] = useTermSetting(PREF_KEYS.zmDir, "");
+	const [tabList, setTabList] = useTermSetting(PREF_KEYS.tabList, "0");
+	const [sigHint, setSigHint] = useTermSetting(PREF_KEYS.sigHint, "0");
 	const [logBase, setLogBase] = useState("");
 	useEffect(() => {
 		void defaultLogDir()
@@ -471,12 +473,26 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 						value={completeMode}
 						onChange={setCompleteMode}
 						options={[
-							{ value: "ghost", label: "흐린 제안 + Tab 목록", hint: "기본" },
+							{ value: "ghost", label: "흐린 제안 + 목록", hint: "기본" },
 							{ value: "auto", label: "치다 멈추면 목록" },
-							{ value: "tab", label: "Tab 목록만" },
+							{ value: "tab", label: "목록만(흐린 제안 없음)" },
 							{ value: "off", label: "끔(셸 완성만)" },
 						]}
 					/>
+				</Row>
+				<Row label="Tab 키" sub="셸 완성: Tab 은 서버 셸(bash)이 완성하고 앱 목록은 Ctrl+Space 로 엽니다. 앱 목록: Tab 으로 앱 목록(명령·옵션 설명·경로)을 엽니다 — 원격에서는 경로마다 서버 목록을 받아 와 느릴 수 있습니다">
+					<Select
+						size="sm"
+						value={tabList === "1" ? "1" : "0"}
+						onChange={setTabList}
+						options={[
+							{ value: "0", label: "셸 완성", hint: "기본" },
+							{ value: "1", label: "앱 목록" },
+						]}
+					/>
+				</Row>
+				<Row label="명령 서명 줄" sub="입력 줄 바로 위에 지금 명령의 옵션·인자 자리를 보입니다(직전 출력 마지막 줄을 가립니다). 조각 풀이(Ctrl+Shift+E)는 꺼도 됩니다">
+					<Toggle on={sigHint === "1"} label="명령 서명 줄" onChange={(v) => setSigHint(v ? "1" : "0")} />
 				</Row>
 				<Row label="스크롤백" sub="터미널마다 기억하는 줄 수 — 많을수록 메모리를 더 씁니다">
 					<Select

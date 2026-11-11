@@ -50,7 +50,7 @@ pub fn local_home() -> String {
     path_str(&home)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn local_list(path: String) -> Result<Vec<FsEntry>, String> {
     let rd = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -91,7 +91,7 @@ pub struct FileText {
     too_large: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn local_read_text(path: String, encoding: Option<String>) -> Result<FileText, String> {
     let m = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if m.len() > MAX_TEXT {
@@ -114,7 +114,7 @@ pub struct Saved {
     mtime: Option<u32>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn local_write_text(path: String, text: String, meta: TextMeta, expect_mtime: Option<u32>) -> Result<Saved, String> {
     if let (Some(exp), Ok(m)) = (expect_mtime, std::fs::metadata(&path)) {
         if mtime(&m).is_some_and(|t| t != exp) {

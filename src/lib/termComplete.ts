@@ -1,7 +1,8 @@
 /**
- * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 받기, Ctrl+→ 한 낱말)과 Tab 목록.
- * Tab(이전 판과 같은 규칙): 후보 하나면 바로 넣기, 여럿이면 공통 앞부분까지 채우고 목록, 목록에서 Tab·Enter 는 넣기, 폴더를 넣으면 그 안을 다시 보인다(연타로 파고들기).
- * ↑↓ 고르기, Esc 닫기, Ctrl+Space 열기. 방식(설정): 흐린 제안+Tab / 치다 멈추면 목록 / Tab 만 / 끔.
+ * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 받기, Ctrl+→ 한 낱말)과 목록(Ctrl+Space).
+ * Tab 은 기본으로 셸 몫(bash 완성 그대로) — 앱 목록은 Ctrl+Space 로 연다. 설정 "Tab 키 = 앱 목록"이면 예전 규칙:
+ * 후보 하나면 바로 넣기, 여럿이면 공통 앞부분까지 채우고 목록, 폴더를 넣으면 그 안을 다시 보인다(연타로 파고들기).
+ * 목록이 떠 있으면 Tab·Enter 는 넣기, ↑↓ 고르기, Esc 닫기. 방식(설정): 흐린 제안+목록 / 치다 멈추면 목록 / 목록만 / 끔.
  * 키 입력 경로를 막지 않도록 React 상태 없이 DOM 을 직접 그린다. 프롬프트(OSC 133 A) 뒤 입력에서만 켜진다.
  * 목록이 비면 Tab 은 원래대로 셸(bash 완성)에 넘긴다. 지난 명령은 서버별로 앱 DB 에 500개까지.
  */
@@ -48,6 +49,8 @@ export type Completer = {
 	mode: () => string;
 	/** 잠깐 멈추기(빈칸 템플릿 동안 — 목록·흐린 제안·Tab 을 쓰지 않는다) */
 	hold: (on: boolean) => void;
+	/** Tab 으로 앱 목록 열기(설정 — 기본 끔: Tab 은 셸 완성) */
+	setTabList: (on: boolean) => void;
 	dispose: () => void;
 };
 
@@ -83,6 +86,9 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	let replace = 0;
 	let timer: number | undefined;
 	let held = false;
+	let tabList = false;
+	/** Tab 계산 중(겹쳐 돌지 않게) */
+	let tabBusy = false;
 
 	const ghostEl = document.createElement("div");
 	ghostEl.className = "term-ghost";
@@ -228,7 +234,14 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	};
 	/** Tab(목록 닫힘): 하나면 바로, 여럿이면 공통 앞부분 채우고 목록 */
 	const tabOpen = async () => {
-		const has = await compute(false, true);
+		if (tabBusy) return; // 앞 Tab 이 아직 계산 중 — 겹쳐 돌리지 않는다
+		tabBusy = true;
+		let has = false;
+		try {
+			has = await compute(false, true);
+		} finally {
+			tabBusy = false;
+		}
 		if (!has) {
 			send("\t"); // 후보가 없으면 셸 완성으로
 			return;
@@ -380,7 +393,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 				}
 				return true;
 			}
-			const openKey = (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey) || (e.ctrlKey && e.code === "Space");
+			const openKey = (tabList && e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey) || (e.ctrlKey && e.code === "Space");
 			if (openKey) {
 				if (!inputStart) {
 					const b = term.buffer.active;
@@ -415,6 +428,9 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 				closePop();
 				hideGhost();
 			}
+		},
+		setTabList: (on) => {
+			tabList = on;
 		},
 		dispose: () => {
 			window.clearTimeout(timer);

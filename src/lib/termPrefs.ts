@@ -16,6 +16,10 @@ export type TermPrefs = {
 	zmOn: boolean;
 	/** rz/sz 기본 받기 폴더(비우면 그때그때 고르기) */
 	zmDir: string;
+	/** Tab 으로 앱 자동완성 목록(끄면 Tab 은 셸 완성 — 기본) */
+	tabList: boolean;
+	/** 입력 줄 위 명령 서명 줄(기본 끔) */
+	sigHint: boolean;
 };
 
 export const TERM_PREFS_EVENT = "rb-term-prefs";
@@ -29,6 +33,8 @@ export const PREF_KEYS = {
 	hiWords: "term.highlight.words",
 	zmOn: "term.zmodem",
 	zmDir: "term.zmodem.dir",
+	tabList: "term.tabList",
+	sigHint: "term.sigHint",
 } as const;
 
 /** 고를 수 있는 색(어두운·밝은 바탕 모두에서 읽히는 것) */
@@ -54,7 +60,7 @@ export function parseWords(v: string | null): HiRule[] {
 
 export async function loadTermPrefs(): Promise<TermPrefs> {
 	const g = (k: string) => api.settingGet(k).catch(() => null);
-	const [la, ld, ls, lt, ho, hw, zo, zd] = await Promise.all([
+	const [la, ld, ls, lt, ho, hw, zo, zd, tl, sh] = await Promise.all([
 		g(PREF_KEYS.logAuto),
 		g(PREF_KEYS.logDir),
 		g(PREF_KEYS.logStrip),
@@ -63,6 +69,8 @@ export async function loadTermPrefs(): Promise<TermPrefs> {
 		g(PREF_KEYS.hiWords),
 		g(PREF_KEYS.zmOn),
 		g(PREF_KEYS.zmDir),
+		g(PREF_KEYS.tabList),
+		g(PREF_KEYS.sigHint),
 	]);
 	return {
 		logAuto: la === "1",
@@ -73,6 +81,8 @@ export async function loadTermPrefs(): Promise<TermPrefs> {
 		hiWords: parseWords(hw),
 		zmOn: zo !== "0",
 		zmDir: zd ?? "",
+		tabList: tl === "1",
+		sigHint: sh === "1",
 	};
 }
 

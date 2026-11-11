@@ -91,17 +91,21 @@ export function parseMan(text: string): ManInfo {
 	return { whatis, opts };
 }
 
-/** 원격이면 그 명령 man 을 백그라운드로 한 번 받는다 — 받으면 onReady */
-export function requestMan(exec: Exec | undefined, cmd: string, onReady: () => void) {
-	if (!exec || !/^[A-Za-z0-9._+-]+$/.test(cmd) || manCache.has(cmd)) return;
+/**
+ * 원격이면 그 명령 man 을 한 번 받는다(캐시) — 조각 풀이를 열 때만 부른다.
+ * 입력 중에 자동으로 받지 않는다: 같은 SSH 연결로 수백 KB 가 흐르면 에코가 그 뒤로 밀린다.
+ */
+export function requestMan(exec: Exec | undefined, cmd: string): Promise<void> {
+	if (!exec || !/^[A-Za-z0-9._+-]+$/.test(cmd) || manCache.has(cmd)) return Promise.resolve();
 	manCache.set(cmd, "pending");
-	exec(`MANWIDTH=160 man -P cat -- ${cmd} 2>/dev/null | head -c 400000`)
+	return exec(`MANWIDTH=160 man -P cat -- ${cmd} 2>/dev/null | head -c 200000`)
 		.then((out) => {
 			manCache.set(cmd, out.trim() ? parseMan(out) : null);
 			bump();
-			onReady();
 		})
-		.catch(() => manCache.set(cmd, null));
+		.catch(() => {
+			manCache.set(cmd, null);
+		});
 }
 const manOf = (cmd: string) => {
 	const m = manCache.get(cmd);

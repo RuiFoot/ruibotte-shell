@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -22,7 +23,8 @@ use tauri::{AppHandle, Emitter, State};
 const READ_BUF: usize = 64 * 1024;
 
 struct Session {
-    writer: Box<dyn Write + Send>,
+    /// 입력 큐 — 쓰기 전용 스레드가 차례대로 PTY 에 쓴다(메인 스레드는 넣기만 하고 바로 돌아간다)
+    input: Sender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -170,9 +172,15 @@ pub(crate) fn shells() -> Vec<ShellInfo> {
     v
 }
 
+/// 셸 목록은 앱이 도는 동안 한 번만 찾는다(wsl -l -q 가 수백 ms 걸린다 — 터미널을 열 때마다 돌리지 않게)
+pub(crate) fn shells_cached() -> Vec<ShellInfo> {
+    static CACHE: OnceLock<Vec<ShellInfo>> = OnceLock::new();
+    CACHE.get_or_init(shells).clone()
+}
+
 #[tauri::command]
-pub fn pty_shells() -> Vec<ShellInfo> {
-    shells()
+pub async fn pty_shells() -> Vec<ShellInfo> {
+    tauri::async_runtime::spawn_blocking(shells_cached).await.unwrap_or_default()
 }
 
 /// 셸 하나를 띄울 명령 — 셸 통합은 인자·환경으로
@@ -227,7 +235,8 @@ fn zsh_dotdir() -> Option<String> {
     Some(dir.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
+// async: 셸 띄우기가 메인 스레드(창·다른 터미널 에코)를 막지 않게 작업 스레드에서
+#[tauri::command(async)]
 pub fn pty_open(
     app: AppHandle,
     ptys: State<'_, Ptys>,
@@ -237,7 +246,7 @@ pub fn pty_open(
     cwd: Option<String>,
     shell: Option<String>,
 ) -> Result<u32, String> {
-    let all = shells();
+    let all = shells_cached();
     let sh = shell
         .as_deref()
         .and_then(|id| all.iter().find(|s| s.id == id))
@@ -260,13 +269,29 @@ pub fn pty_open(
     let child = pair.slave.spawn_command(cmd).map_err(|e| format!("{} 를 띄우지 못했습니다: {e}", sh.label))?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
     let id = ptys.next.fetch_add(1, Ordering::Relaxed) + 1;
+    // 쓰기 전용 스레드 — 셸이 입력을 늦게 읽어도(파이프가 차도) 메인 스레드는 막히지 않는다. 세션이 닫히면 큐가 끊겨 끝난다
+    let (input, rx) = channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name(format!("pty-w-{id}"))
+        .spawn(move || {
+            while let Ok(mut buf) = rx.recv() {
+                // 밀린 입력은 한 번에(붙여넣기·빠른 타이핑)
+                while let Ok(more) = rx.try_recv() {
+                    buf.extend_from_slice(&more);
+                }
+                if writer.write_all(&buf).and_then(|_| writer.flush()).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
     ptys.map
         .lock()
         .unwrap()
-        .insert(id, Session { writer, master: pair.master, child });
+        .insert(id, Session { input, master: pair.master, child });
 
     std::thread::Builder::new()
         .name(format!("pty-{id}"))
@@ -288,12 +313,12 @@ pub fn pty_open(
     Ok(id)
 }
 
+/// 동기 명령으로 둔다 — 큐에 넣기만 해서 즉시 끝나고, 메인 스레드가 받은 차례대로 넣으니 입력 순서가 지켜진다
 #[tauri::command]
 pub fn pty_write(ptys: State<'_, Ptys>, id: u32, data: String) -> Result<(), String> {
-    let mut map = ptys.map.lock().unwrap();
-    let s = map.get_mut(&id).ok_or("터미널이 닫혔습니다")?;
-    s.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    s.writer.flush().map_err(|e| e.to_string())
+    let map = ptys.map.lock().unwrap();
+    let s = map.get(&id).ok_or("터미널이 닫혔습니다")?;
+    s.input.send(data.into_bytes()).map_err(|_| "터미널이 닫혔습니다".to_string())
 }
 
 #[tauri::command]
@@ -313,12 +338,12 @@ pub fn pty_close(ptys: State<'_, Ptys>, id: u32) {
 }
 
 /// 관리자 권한으로 — 셸을 새 창으로(UAC 확인). 앱 안 ConPTY 로는 권한을 올릴 수 없어서 따로 띄운다
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pty_admin_window(shell: Option<String>, cwd: Option<String>) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let all = shells();
+        let all = shells_cached();
         let sh = shell.as_deref().and_then(|id| all.iter().find(|s| s.id == id && !s.admin)).or_else(|| all.first()).ok_or("셸이 없습니다")?;
         let q = |s: &str| format!("'{}'", s.replace('\'', "''"));
         let args = if sh.args.is_empty() { String::new() } else { format!(" -ArgumentList {}", sh.args.iter().map(|a| q(a)).collect::<Vec<_>>().join(",")) };
@@ -340,7 +365,11 @@ pub fn pty_admin_window(shell: Option<String>, cwd: Option<String>) -> Result<()
 
 /// 지금 앱이 관리자 권한으로 돌고 있는지(Windows: net session 이 되면 관리자)
 #[tauri::command]
-pub fn app_is_admin() -> bool {
+pub async fn app_is_admin() -> bool {
+    tauri::async_runtime::spawn_blocking(is_admin).await.unwrap_or(false)
+}
+
+fn is_admin() -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

@@ -225,7 +225,7 @@ pub fn keys_list(store: State<'_, Store>) -> Vec<KeyInfo> {
 }
 
 /// 파일 하나(바꾸기 전에 형식·암호 여부 보기)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn keys_inspect(path: String) -> Result<KeyInfo, String> {
     inspect(Path::new(&path), "other").ok_or_else(|| "SSH 개인키 파일이 아닙니다".into())
 }

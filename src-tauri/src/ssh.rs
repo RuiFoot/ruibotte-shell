@@ -229,7 +229,8 @@ pub(crate) struct Conn {
     /// 붙은 경로
     route: RouteUsed,
     pub(crate) sftp: SftpSession,
-    shells: tokio::sync::Mutex<HashMap<u32, ChannelWriteHalf<Msg>>>,
+    /// 터미널 채널 → 입력 큐. 셸마다 쓰기 전용 작업이 차례대로 보낸다(키 입력 순서 보장, 한 셸이 막혀도 다른 셸은 그대로)
+    shells: Mutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<ShellOp>>>,
     next_shell: AtomicU32,
     /// 이 연결의 계정(sudo 암호 키)·sudo 설정 — 접속할 때의 계정 설정을 따른다
     pub(crate) account_id: Option<i64>,
@@ -953,7 +954,7 @@ pub async fn ssh_shell_open(
     if use_tmux {
         let n = c.tmux_alloc(shell);
         let _ = write.data(tmux_line(n, cwd.as_deref()).as_bytes()).await;
-        c.shells.lock().await.insert(shell, write);
+        c.shells.lock().unwrap().insert(shell, spawn_shell_writer(write));
         spawn_shell_reader(app, c.clone(), conn, shell, read, on_data);
         return Ok(shell);
     }
@@ -974,9 +975,67 @@ pub async fn ssh_shell_open(
     }
     line.push('\n');
     let _ = write.data(line.as_bytes()).await;
-    c.shells.lock().await.insert(shell, write);
+    c.shells.lock().unwrap().insert(shell, spawn_shell_writer(write));
     spawn_shell_reader(app, c.clone(), conn, shell, read, on_data);
     Ok(shell)
+}
+
+/// 터미널 채널에 할 일 — 입력·크기·닫기를 한 줄로 세워 차례대로
+pub(crate) enum ShellOp {
+    Data(Vec<u8>),
+    Resize(u32, u32),
+    Close,
+}
+
+/// 셸 하나의 쓰기 전용 작업 — 명령(invoke)은 큐에 넣고 바로 돌아간다.
+/// 밀린 입력(빠른 타이핑·붙여넣기)은 한 번에 묶어 보낸다. 큐가 끊기면(셸 닫힘) 끝난다
+fn spawn_shell_writer(write: ChannelWriteHalf<Msg>) -> tokio::sync::mpsc::UnboundedSender<ShellOp> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ShellOp>();
+    tauri::async_runtime::spawn(async move {
+        let mut next: Option<ShellOp> = None;
+        loop {
+            let op = match next.take() {
+                Some(op) => op,
+                None => match rx.recv().await {
+                    Some(op) => op,
+                    None => break,
+                },
+            };
+            match op {
+                ShellOp::Data(mut buf) => {
+                    while let Ok(more) = rx.try_recv() {
+                        match more {
+                            ShellOp::Data(b) => buf.extend_from_slice(&b),
+                            other => {
+                                next = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                    if write.data(&buf[..]).await.is_err() {
+                        break;
+                    }
+                }
+                ShellOp::Resize(cols, rows) => {
+                    let _ = write.window_change(cols, rows, 0, 0).await;
+                }
+                ShellOp::Close => {
+                    let _ = write.close().await;
+                    break;
+                }
+            }
+        }
+    });
+    tx
+}
+
+impl Conn {
+    /// 이 셸의 입력 큐에 넣기 — 셸이 닫혔으면 CLOSED
+    fn shell_send(&self, shell: u32, op: ShellOp) -> R<()> {
+        let shells = self.shells.lock().unwrap();
+        let tx = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
+        tx.send(op).map_err(|_| err("CLOSED", "터미널이 닫혔습니다"))
+    }
 }
 
 /// 셸 출력을 화면으로 — 끝나면 채널·tmux 번호를 정리하고 알린다
@@ -998,7 +1057,7 @@ fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut r
                 _ => {}
             }
         }
-        c.shells.lock().await.remove(&shell);
+        c.shells.lock().unwrap().remove(&shell);
         c.tmux_used.lock().unwrap().remove(&shell);
         let _ = app.emit("ssh-shell-exit", ShellExit { conn, shell, code });
     });
@@ -1118,20 +1177,20 @@ pub async fn ssh_tmux_kill(conns: State<'_, SshConns>, conn: u32, name: String) 
     Ok(())
 }
 
+/// 키 입력 — 동기 명령으로 둔다: 큐에 넣기만 해서 바로 끝나고, 메인 스레드가 받은 차례대로 넣으니 순서가 지켜진다
+/// (async 명령은 호출마다 따로 작업이 돼 빠른 타이핑에서 순서가 섞일 수 있었다)
 #[tauri::command]
-pub async fn ssh_shell_write(conns: State<'_, SshConns>, conn: u32, shell: u32, data: String, encoding: Option<String>) -> R<()> {
+pub fn ssh_shell_write(conns: State<'_, SshConns>, conn: u32, shell: u32, data: String, encoding: Option<String>) -> R<()> {
     let c = conns.get(conn)?;
-    let shells = c.shells.lock().await;
-    let w = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
     // 터미널 인코딩이 UTF-8 이 아니면(EUC-KR 서버) 입력 글자를 그 인코딩으로 바꿔 보낸다
-    match encoding.as_deref().filter(|e| !e.eq_ignore_ascii_case("utf-8")) {
+    let bytes = match encoding.as_deref().filter(|e| !e.eq_ignore_ascii_case("utf-8")) {
         Some(label) => {
             let enc = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-            let (bytes, _, _) = enc.encode(&data);
-            w.data(bytes.as_ref()).await.map_err(map_russh)
+            enc.encode(&data).0.into_owned()
         }
-        None => w.data(data.as_bytes()).await.map_err(map_russh),
-    }
+        None => data.into_bytes(),
+    };
+    c.shell_send(shell, ShellOp::Data(bytes))
 }
 
 /// sudo 암호를 이 터미널에 넣는다(암호 묻는 줄에서) — 값은 화면으로 돌아가지 않는다. 넣을 암호가 없으면 false
@@ -1141,27 +1200,24 @@ pub async fn ssh_shell_sudo_pw(conns: State<'_, SshConns>, conn: u32, shell: u32
     let Some(pw) = crate::sudo::password_of(&c) else {
         return Ok(false);
     };
-    let shells = c.shells.lock().await;
-    let w = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
-    w.data(format!("{pw}\n").as_bytes()).await.map_err(map_russh)?;
+    c.shell_send(shell, ShellOp::Data(format!("{pw}\n").into_bytes()))?;
     Ok(true)
 }
 
 #[tauri::command]
-pub async fn ssh_shell_resize(conns: State<'_, SshConns>, conn: u32, shell: u32, cols: u32, rows: u32) -> R<()> {
+pub fn ssh_shell_resize(conns: State<'_, SshConns>, conn: u32, shell: u32, cols: u32, rows: u32) -> R<()> {
     let c = conns.get(conn)?;
-    let shells = c.shells.lock().await;
-    if let Some(w) = shells.get(&shell) {
-        w.window_change(cols, rows, 0, 0).await.map_err(map_russh)?;
-    }
+    // 닫힌 셸의 크기 변경은 조용히 넘긴다(칸을 닫는 중에 올 수 있다)
+    let _ = c.shell_send(shell, ShellOp::Resize(cols, rows));
     Ok(())
 }
 
 #[tauri::command]
 pub async fn ssh_shell_close(conns: State<'_, SshConns>, conn: u32, shell: u32) -> R<()> {
     if let Ok(c) = conns.get(conn) {
-        if let Some(w) = c.shells.lock().await.remove(&shell) {
-            let _ = w.close().await;
+        let tx = c.shells.lock().unwrap().remove(&shell);
+        if let Some(tx) = tx {
+            let _ = tx.send(ShellOp::Close);
         }
     }
     Ok(())

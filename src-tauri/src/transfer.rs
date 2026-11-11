@@ -602,7 +602,7 @@ pub async fn ssh_copy(conns: State<'_, SshConns>, conn: u32, from: String, to: S
 }
 
 /// 내 PC 안 복사(폴더는 안까지, 같은 이름이 있으면 거절)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn local_copy(from: String, to: String) -> Result<(), String> {
     fn copy(a: &Path, b: &Path) -> std::io::Result<()> {
         if a.is_dir() {

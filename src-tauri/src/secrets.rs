@@ -63,13 +63,13 @@ pub fn move_key(old: &str, new: &str) -> Result<bool, String> {
 }
 
 /// 예전 명령(서버 기준) — 그 서버의 기본 계정 암호를 저장·바꾸기. 빈 값이면 지운다
-#[tauri::command]
+#[tauri::command(async)]
 pub fn secret_set(profile_id: i64, secret: String, store: tauri::State<'_, crate::store::Store>) -> Result<(), String> {
     let a = store.default_account(profile_id)?;
     store.account_secret_set(a.id.unwrap_or_default(), &secret)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn secret_forget(profile_id: i64, store: tauri::State<'_, crate::store::Store>) -> Result<(), String> {
     let a = store.default_account(profile_id)?;
     store.account_secret_set(a.id.unwrap_or_default(), "")

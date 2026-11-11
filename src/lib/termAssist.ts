@@ -6,13 +6,11 @@
  */
 import type { IDecoration, IMarker, Terminal } from "@xterm/xterm";
 import {
-	assistVersion,
 	ensureDict,
 	type Exec,
 	knownCmd,
 	optLookup,
 	parseTemplate,
-	requestMan,
 	type SigView,
 	signatureAt,
 	subsOf,
@@ -35,6 +33,8 @@ export type TermAssist = {
 	reset: () => void;
 	/** 자동완성 목록이 열리고 닫힐 때 */
 	popChanged: (open: boolean) => void;
+	/** 서명 줄 켜기·끄기(설정 — 기본 끔) */
+	setSig: (on: boolean) => void;
 	dispose: () => void;
 };
 
@@ -91,7 +91,8 @@ export function attachAssist(o: {
 		return s;
 	};
 
-	// ── ② 서명 ──
+	// ── ② 서명(기본 끔 — 입력 줄 바로 위 = 직전 출력 마지막 줄을 가린다) ──
+	let sigOn = false;
 	let sigTimer = 0;
 	let burst = 0;
 	let burstAt = 0;
@@ -117,6 +118,7 @@ export function attachAssist(o: {
 	const updateSig = () => {
 		sigTimer = 0;
 		if (tpl) return;
+		if (!sigOn) return hide();
 		const buf = term.buffer.active;
 		// 큰 출력이 흐르는 중이면 나중에
 		if (performance.now() - burstAt < 150 && burst > 8192) {
@@ -131,15 +133,7 @@ export function attachAssist(o: {
 		if (!input?.trim() || !start) return hide();
 		const view = signatureAt(input, optLookup, subsOf, knownCmd);
 		if (!view) return hide();
-		// 옵션 설명을 못 찾았으면 서버 man 을 한 번 받아 둔다(원격만)
-		if (o.exec && !view.desc) {
-			const first = input.trim().split(/\s+/);
-			const cmd = (first[0] === "sudo" ? first[1] : first[0]) ?? "";
-			const v = assistVersion();
-			requestMan(o.exec, cmd, () => {
-				if (assistVersion() !== v) schedule();
-			});
-		}
+		// 서버 man 은 여기서 받지 않는다(입력 중 같은 연결로 큰 출력이 흐르면 에코가 밀린다) — 조각 풀이를 열 때만
 		drawSig(view, start.x);
 	};
 	const schedule = () => {
@@ -147,7 +141,7 @@ export function attachAssist(o: {
 		sigTimer = window.setTimeout(updateSig, SIG_DELAY);
 	};
 	const onCursor = term.onCursorMove(() => {
-		if (tpl) return;
+		if (tpl || !sigOn) return;
 		// 프롬프트가 아니면(명령이 도는 중) 계산 안 함 — 줄을 읽지 않고 바로 끝
 		if (!completer.inputStart()) {
 			if (!bar.hidden) hide();
@@ -161,7 +155,7 @@ export function attachAssist(o: {
 	const onResize = term.onResize(() => {
 		hide();
 		if (tpl) endTemplate();
-		else schedule();
+		else if (sigOn) schedule();
 	});
 
 	// ── ① 빈칸 템플릿 ──
@@ -353,7 +347,15 @@ export function attachAssist(o: {
 		},
 		popChanged: (open) => {
 			if (open) hide();
-			else if (!tpl) schedule();
+			else if (!tpl && sigOn) schedule();
+		},
+		setSig: (on) => {
+			sigOn = on;
+			lastKey = "";
+			if (!on && !tpl) {
+				window.clearTimeout(sigTimer);
+				hide();
+			}
 		},
 		dispose: () => {
 			window.clearTimeout(sigTimer);

@@ -181,7 +181,7 @@ fn putty_sessions() -> Vec<Candidate> {
 }
 
 /// 가져올 후보 — `~/.ssh/config` 와 PuTTY 세션. 이미 있는 것은 duplicate 표시
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_candidates(store: State<'_, Store>, ssh_config_path: Option<String>) -> Result<Vec<Candidate>, String> {
     let path = ssh_config_path.map(PathBuf::from).unwrap_or_else(|| home().join(".ssh").join("config"));
     let mut all = std::fs::read_to_string(&path).map(|t| parse_ssh_config(&t)).unwrap_or_default();
@@ -229,7 +229,7 @@ pub struct RouteImport {
 
 /// 가져온 서버의 첫 경로에 ProxyJump(여러 단계)·ProxyCommand 를 넣는다.
 /// 점프 단계는 같은 이름(별칭) 또는 주소·포트의 서버를 쓰고, 없으면 서버를 새로 만든다. 돌려주는 것은 알릴 말
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_routes(store: State<'_, Store>, items: Vec<RouteImport>) -> Result<Vec<String>, String> {
     import_routes_core(&store, items)
 }
@@ -296,7 +296,7 @@ pub(crate) fn import_routes_core(store: &Store, items: Vec<RouteImport>) -> Resu
 }
 
 /// 내 SSH 서버를 ssh config 로(암호 없음, 계정은 기본 계정). 구형 단계는 켠 만큼 알고리즘 줄을 붙인다
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_ssh_config(store: State<'_, Store>) -> Result<String, String> {
     let list: Vec<Profile> = crate::store::profiles_list(store)?;
     let mut s = String::from("# RuiBotte Shell 에서 내보냄 — 암호는 들어 있지 않습니다\n");
@@ -431,7 +431,7 @@ fn jdbc_url(p: &Profile) -> String {
 }
 
 /// 내보내기 — ssh-config · hosts · putty-reg · mobaxterm · datagrip · dbeaver · jdbc-csv (암호는 넣지 않는다)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_profiles(store: State<'_, Store>, format: String) -> Result<String, String> {
     if format == "ssh-config" {
         return export_ssh_config(store);
@@ -582,7 +582,7 @@ pub struct DbCandidate {
 }
 
 /// DataGrip(dataSources.xml·dataSources.local.xml)·DBeaver(data-sources.json) 파일에서 DB 접속 가져오기
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_db_file(path: String) -> Result<Vec<DbCandidate>, String> {
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut out = Vec::new();

@@ -24,7 +24,7 @@ import { getAppearance, onAppearance, termFontFamily, termTheme } from "../lib/t
 import { createZmodem, type ZmodemBridge, type ZmProgress } from "../lib/zmodemTerm";
 import { Select } from "./Select";
 import { AssistFormSheet, ExplainCard } from "./CmdAssist";
-import { candidatesFor, cmdDesc, ensureDict, type ExplainPart, explainLine, fillTemplate, hasTemplateFields, optLookup, subDesc } from "../lib/cmdAssist";
+import { candidatesFor, cmdDesc, ensureDict, type ExplainPart, explainLine, fillTemplate, hasTemplateFields, optLookup, requestMan, subDesc } from "../lib/cmdAssist";
 import { attachAssist, type TermAssist } from "../lib/termAssist";
 
 type Stat = { label: string; ok?: boolean };
@@ -94,7 +94,7 @@ export function TerminalView({
 	onCwd?: (path: string) => void;
 	/** 사람이 친 입력(동시 입력용) */
 	onInput?: (data: string) => void;
-	/** 자동완성(흐린 제안·Tab 목록) 출처 */
+	/** 자동완성(흐린 제안·Ctrl+Space 목록) 출처 */
 	completion?: CompletionSource;
 	/** 출력의 경로를 Ctrl+누르면 편집기로 */
 	onOpenPath?: (path: string) => void;
@@ -147,6 +147,8 @@ export function TerminalView({
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 	const [palette, setPalette] = useState(false);
 	const [last, setLast] = useState<{ code: number; ms: number } | null>(null);
+	/** 입력 지연(키 → 첫 출력) p50/p95 — 1초마다 한 번만 상태로 올린다 */
+	const [lag, setLag] = useState<{ p50: number; p95: number; n: number } | null>(null);
 	/** 글꼴 크기(설정한 크기가 아니면 상태 줄에) */
 	const [fontPx, setFontPx] = useState(() => getAppearance().termSize);
 	/** 명령 기록(셸 통합) — 명령과 출력 복사·명령 사이 이동 */
@@ -196,6 +198,13 @@ export function TerminalView({
 		}
 		await ensureDict();
 		const line = text.split("\n")[0] ?? "";
+		// 원격: 사전에 없는 옵션 설명은 서버 man 에서 — 풀이를 열 때만 한 번 받는다(최대 2.5초 기다림)
+		const exec = completionRef.current?.exec;
+		if (exec) {
+			const w = line.trim().split(/\s+/);
+			const cmd = (w[0] === "sudo" ? w[1] : w[0]) ?? "";
+			await Promise.race([requestMan(exec, cmd), new Promise((r) => window.setTimeout(r, 2500))]);
+		}
 		setExplain({ text: line, parts: explainLine(line, optLookup, cmdDesc, subDesc) });
 	};
 	const openExplainRef = useRef(openExplain);
@@ -385,6 +394,8 @@ export function TerminalView({
 		const applyPrefs = () =>
 			void loadTermPrefs().then((p) => {
 				if (disposed) return;
+				completerRef.current?.setTabList(p.tabList);
+				axRef.current?.setSig(p.sigHint);
 				hi.setRules(p.hiOn ? p.hiWords : null);
 				zmb?.setEnabled(p.zmOn);
 				if (p.logAuto && !recRef.current) void startRec();
@@ -394,7 +405,28 @@ export function TerminalView({
 		/** rz/sz 를 친 직후 몇 초 — 서버에 lrzsz 가 없다는 말을 찾는다 */
 		let zmWatch = 0;
 		let zmTail = "";
+		// 입력 지연 — 키를 보낸 시각부터 다음 출력이 올 때까지(에코). 최근 100개
+		let lagAt = 0;
+		const lagSamples: number[] = [];
+		let lagDirty = false;
+		const lagTimer = window.setInterval(() => {
+			if (!lagDirty || disposed) return;
+			lagDirty = false;
+			const sorted = [...lagSamples].sort((a, b) => a - b);
+			const at = (q: number) => Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? 0);
+			setLag({ p50: at(0.5), p95: at(0.95), n: sorted.length });
+		}, 1000);
 		const ch = bytesChannel((b) => {
+			if (lagAt) {
+				const ms = performance.now() - lagAt;
+				lagAt = 0;
+				// 에코가 없는 입력(암호 줄 등) 뒤의 늦은 출력은 지연이 아니다
+				if (ms < 3000) {
+					lagSamples.push(ms);
+					if (lagSamples.length > 100) lagSamples.shift();
+					lagDirty = true;
+				}
+			}
 			axRef.current?.output(b.length);
 			if (zmb) zmb.consume(b);
 			else show(b);
@@ -470,6 +502,8 @@ export function TerminalView({
 				const text = `${code === 0 ? "✓" : `✗ ${code}`} ${ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`}`;
 				const deco = term.registerDecoration({ marker: p.marker, anchor: "right", x: 0, width: text.length + 1, layer: "top" });
 				deco?.onRender((d) => {
+					// 렌더마다 불린다 — 처음 한 번만 쓴다(에코마다 DOM 을 다시 쓰지 않게)
+					if (d.textContent === text) return;
 					d.textContent = text;
 					d.className = `cmd-mark ${code === 0 ? "ok" : "bad"}`;
 					d.title = `${p.text}\n종료 코드 ${code} · ${ms} ms`;
@@ -566,6 +600,7 @@ export function TerminalView({
 				if (marker) pending = { marker, start: Date.now(), text: line.trim() };
 				atPrompt = false;
 			}
+			if (!lagAt) lagAt = performance.now();
 			write(d);
 			onInputRef.current?.(d);
 			if (d.includes("\r")) ax?.reset();
@@ -681,6 +716,8 @@ export function TerminalView({
 
 		return () => {
 			disposed = true;
+			window.clearInterval(lagTimer);
+			setLag(null);
 			window.removeEventListener(TERM_PREFS_EVENT, applyPrefs);
 			zmb?.cancel();
 			zmRef.current = null;
@@ -941,6 +978,11 @@ export function TerminalView({
 					</span>
 				)}
 				{root && <span className="badge warn">root</span>}
+				{lag && lag.n >= 5 && (
+					<span className={lag.p95 > 150 ? "err" : undefined} title={`입력 지연 — 키를 보낸 뒤 첫 출력(에코)이 올 때까지, 최근 ${lag.n}번\n중앙값 ${lag.p50} ms · 느린 쪽 5% ${lag.p95} ms`}>
+						입력 {lag.p50}/{lag.p95}ms
+					</span>
+				)}
 				{fontPx !== getAppearance().termSize && <span title="터미널 글꼴 — Ctrl+0 설정한 크기로">글꼴 {fontPx}px</span>}
 				{here && (
 					<button type="button" className="env-chip" title="지금 폴더 — 눌러 경로 복사" onClick={() => void navigator.clipboard.writeText(here)}>

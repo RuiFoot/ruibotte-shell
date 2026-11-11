@@ -51,7 +51,7 @@ pub async fn sftp_read_bytes(conns: State<'_, SshConns>, conn: u32, path: String
     Ok(Response::new(out))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn local_read_bytes(path: String, max: Option<u64>, offset: Option<i64>) -> Result<Response, String> {
     let max = max.unwrap_or(MAX_PREVIEW).min(MAX_PREVIEW);
     let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;

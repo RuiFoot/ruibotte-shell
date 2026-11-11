@@ -1852,7 +1852,7 @@ pub fn db_result_close(dbs: State<'_, DbConns>, result: u32) {
 }
 
 /// 결과를 파일로 — csv(UTF-8 BOM, 엑셀이 한글을 바로 읽게) · tsv · json · sql(INSERT 문 — insert_prefix 는 화면이 엔진에 맞게 만든 `INSERT INTO 표 (열…) VALUES `)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: String, insert_prefix: Option<String>, mysql: Option<bool>) -> R<usize> {
     let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
     r.need_done()?;
@@ -2047,7 +2047,7 @@ pub(crate) fn parse_csv(text: &str, delim: char) -> Vec<Vec<String>> {
 }
 
 /// CSV 파일 읽기 — 인코딩(UTF-8·EUC-KR 등)과 구분자를 짐작한다. 행 상한 100만
-#[tauri::command]
+#[tauri::command(async)]
 pub fn db_read_csv(path: String) -> R<CsvData> {
     let bytes = std::fs::read(&path).map_err(|x| e("OTHER", x.to_string()))?;
     let d = crate::textcodec::decode(&bytes, None);
@@ -2067,7 +2067,7 @@ pub fn db_read_csv(path: String) -> R<CsvData> {
 }
 
 /// 바이너리 칸 저장 — 16진 글(0x… 또는 \x…)을 바이트로 바꿔 파일에 쓴다
-#[tauri::command]
+#[tauri::command(async)]
 pub fn db_save_hex(path: String, hex: String) -> R<usize> {
     let h = hex.trim();
     let h = h.strip_prefix("0x").or_else(|| h.strip_prefix("0X")).or_else(|| h.strip_prefix("\\x")).unwrap_or(h);
