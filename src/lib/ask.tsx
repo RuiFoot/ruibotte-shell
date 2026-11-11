@@ -14,7 +14,8 @@ export type AskOptions = {
 	okLabel?: string;
 	danger?: boolean;
 	/** 누르면 입력칸에 넣는 고르기 칩(묶음 이름·서버 등) */
-	choices?: { value: string; label?: string }[];
+	/** desc 가 있으면 칩 대신 설명 붙은 큰 선택지(세로로) */
+	choices?: { value: string; label?: string; desc?: string }[];
 	/** 칩만 고르게(입력칸 숨김) */
 	choiceOnly?: boolean;
 	/** 이 값과 같아야 확인 단추가 켜짐(이름을 그대로 쳐서 지우기 확인 등) */
@@ -71,11 +72,18 @@ function AskSheet({ o, done }: { o: AskOptions; done: (v: string | null) => void
 							<button
 								key={c.value}
 								type="button"
-								className={`chip${v === c.value ? " on" : ""}`}
+								className={`chip${c.desc ? " chip-card" : ""}${v === c.value ? " on" : ""}`}
 								onClick={() => (o.choiceOnly ? done(c.value) : setV(c.value))}
-								title={c.value}
+								title={c.desc ? undefined : c.value}
 							>
-								{c.label ?? c.value}
+								{c.desc ? (
+									<>
+										<b>{c.label ?? c.value}</b>
+										<small>{c.desc}</small>
+									</>
+								) : (
+									(c.label ?? c.value)
+								)}
 							</button>
 						))}
 					</div>

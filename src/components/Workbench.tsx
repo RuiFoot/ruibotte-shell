@@ -11,7 +11,7 @@ import {
 import { CLOSE_DOC_EVENT, confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Rows2, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
+import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Route, Rows2, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -31,6 +31,7 @@ import {
 	localShells,
 	type ShellInfo,
 	transferArgs,
+	directArgs,
 } from "../lib/ipc";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
@@ -71,7 +72,8 @@ const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 
 
 type Which = "remote" | "local";
 /** 같은 앱에 열려 있는 다른 SSH 연결(서버 ↔ 서버 주고받기) */
-type Peer = { conn: number; label: string; home: string };
+type Target = { user: string; host: string; port: number };
+type Peer = { conn: number; label: string; home: string; /** 다른 서버에서 이 서버로 접속할 주소(서버끼리 바로 보내기) */ target?: Target };
 type Ctx = {
 	fs: FsBackend;
 	local?: FsBackend;
@@ -477,6 +479,28 @@ function fmtEta(s: number) {
 	return h ? `${h}시간 ${m}분` : m ? `${m}분 ${sec}초` : `${sec}초`;
 }
 
+/** 서버 → 서버 보내는 방식(지난번에 고른 것을 위에) */
+let s2sLast: "direct" | "relay" = "relay";
+async function askServerToServer(name: string, from: string, to: string, t: Target): Promise<"direct" | "relay" | null> {
+	const opts = [
+		{
+			value: "direct",
+			label: "서버끼리 바로",
+			desc: `${from}에서 ${t.user}@${t.host} 로 직접 접속해 rsync(없으면 scp)로 보냅니다. 내 PC 회선을 쓰지 않아 빠릅니다 — 보내는 서버의 키가 받는 서버에 등록돼 있어야 합니다.`,
+		},
+		{
+			value: "relay",
+			label: "내 PC 거쳐서",
+			desc: "내 PC 가 두 서버에 연결된 채로 흘려 보냅니다. 서버끼리 막혀 있어도 되고, sha256 확인·끊기면 이어 보내기를 합니다.",
+		},
+	];
+	if (s2sLast === "relay") opts.reverse();
+	const v = await askText({ title: `${name} 보내기`, message: `${from} → ${to}`, choiceOnly: true, choices: opts });
+	if (v !== "direct" && v !== "relay") return null;
+	s2sLast = v;
+	return v;
+}
+
 function TransfersPanel() {
 	const ctx = useWb();
 	const [list, setList] = useState<TransferProgress[]>([]);
@@ -491,7 +515,9 @@ function TransfersPanel() {
 				return n;
 			});
 			if (p.state === "done" || p.state === "cancelled") {
-				notifyFsChanged(p.direction === "up" ? "remote" : "local", parentDir(p.dest), ctx.fs.conn);
+				// 서버 → 서버는 받는 서버 트리를, 아니면 받은 쪽(올리기=이 서버, 받기=내 PC)
+				if (p.destConn != null) notifyFsChanged("remote", parentDir(p.dest), p.destConn);
+				else notifyFsChanged(p.direction === "up" ? "remote" : "local", parentDir(p.dest), ctx.fs.conn);
 			}
 		});
 		return () => void un.then((f) => f());
@@ -529,7 +555,16 @@ function TransfersPanel() {
 				return (
 					<div key={p.id} className="xfer-row">
 						<span>
-							{p.direction === "up" ? <><ArrowUp size={12} aria-hidden /> 올리기</> : p.direction === "relay" ? <><ArrowLeftRight size={12} aria-hidden /> 중계</> : <><ArrowDown size={12} aria-hidden /> 받기</>} <b>{p.name}</b>
+							{p.direction === "up" ? (
+								<><ArrowUp size={12} aria-hidden /> 올리기</>
+							) : p.direction === "relay" ? (
+								<><ArrowLeftRight size={12} aria-hidden /> 내 PC 거쳐</>
+							) : p.direction === "direct" ? (
+								<><Route size={12} aria-hidden /> 서버끼리</>
+							) : (
+								<><ArrowDown size={12} aria-hidden /> 받기</>
+							)}{" "}
+							<b>{p.name}</b>
 						</span>
 						{p.state === "running" ? (
 							<button type="button" className="btn ghost icon" style={{ height: 20, width: 20 }} title="취소" onClick={() => void transfers.cancel(p.id)}>
@@ -550,6 +585,20 @@ function TransfersPanel() {
 										}}
 									>
 										다시(이어서)
+									</button>
+								)}
+								{p.state === "error" && directArgs.has(p.id) && (
+									<button
+										type="button"
+										className="btn ghost"
+										style={{ height: 20 }}
+										title="서버끼리 바로 보내지 못했을 때 — 내 PC 가 양쪽에 연결된 채로 흘려 보냅니다(sha256 확인·이어 보내기)"
+										onClick={() => {
+											const a = directArgs.get(p.id);
+											if (a) void invoke("relay_start", { ...a, destName: a.destName ?? null }).catch((e) => alert(asSshError(e).message));
+										}}
+									>
+										내 PC 거쳐서
 									</button>
 								)}
 							</span>
@@ -704,6 +753,7 @@ export function Workbench({
 	syncInfo,
 	ownerId,
 	server,
+	onConnectOther,
 }: {
 	fs: FsBackend;
 	/** 원격 작업대일 때 내 PC 트리(전송용) */
@@ -717,8 +767,10 @@ export function Workbench({
 	layoutKey: string;
 	/** 연결한 계정의 sudo 설정 — off 면 sudo 단추·root 셸을 숨긴다(원격만) */
 	sudo?: { mode: SudoMode; user: string };
-	/** 열려 있는 다른 SSH 연결(중계 대상) */
-	peers?: { conn: number; label: string; home: string }[];
+	/** 열려 있는 다른 SSH 연결(서버 ↔ 서버 대상) */
+	peers?: Peer[];
+	/** 다른 서버를 골라 연결 — 연결되면 이 작업대 옆 칸에 그 서버 트리를 연다(rb-open-peer) */
+	onConnectOther?: () => void;
 	syncInfo?: { user: string; host: string; port: number };
 	/** 앱 탭 이름 — 저장 안 한 편집기를 앱 탭 단위로 묻기 위해 */
 	ownerId?: string;
@@ -1017,12 +1069,26 @@ export function Workbench({
 					overwrite = choice === "overwrite";
 					if (choice === "rename") destName = freeName(src.name, new Set(existing.map((x) => x.name)));
 				}
-				showTransfers();
 				if (src.side === "remote" && destSide === "remote" && srcConn != null && destConn != null) {
-					// 서버 A → 서버 B(내 PC 를 거쳐 흘려 보냄, 디스크에 남기지 않음)
-					await invoke("relay_start", { fromConn: srcConn, src: src.path, toConn: destConn, destDir, overwrite, destName: destName ?? null });
+					const peerOf = (c: number) => peersRef.current.find((p) => p.conn === c);
+					const target = destConn === fs.conn ? syncInfo : peerOf(destConn)?.target;
+					const from = srcConn === fs.conn ? fs.label : (peerOf(srcConn)?.label ?? "보내는 서버");
+					const to = destConn === fs.conn ? fs.label : (peerOf(destConn)?.label ?? "받는 서버");
+					const how = target ? await askServerToServer(src.name, from, to, target) : "relay";
+					if (!how) return;
+					showTransfers();
+					const args = { fromConn: srcConn, src: src.path, toConn: destConn, destDir, overwrite, destName };
+					if (how === "direct" && target) {
+						// 보내는 서버가 받는 서버에 직접 접속(rsync, 없으면 scp) — 안 되면 전송 칸에서 "내 PC 거쳐서" 로 다시
+						const id = await invoke<number>("direct_start", { ...args, destName: destName ?? null, target });
+						directArgs.set(id, args);
+						return;
+					}
+					// 내 PC 를 거쳐 흘려 보냄(디스크에 남기지 않음)
+					await invoke("relay_start", { ...args, destName: destName ?? null });
 					return;
 				}
+				showTransfers();
 				const conn = src.side === "remote" ? srcConn : destConn;
 				if (conn == null) return;
 				await transfers.start(conn, src.side === "local" ? "up" : "down", src.path, destDir, overwrite, destName);
@@ -1030,7 +1096,7 @@ export function Workbench({
 				alert(asSshError(e).message);
 			}
 		},
-		[fs, fsOf, conflict.ask],
+		[fs, fsOf, conflict.ask, syncInfo],
 	);
 
 	/** 우클릭 › 올리기/받기 — 반대편 홈 폴더로 */
@@ -1229,7 +1295,10 @@ export function Workbench({
 		if (!d || blockedByLock()) return;
 		let p = conn != null ? peers.find((x) => x.conn === conn) : undefined;
 		if (!p) {
-			if (!peers.length) return;
+			if (!peers.length) {
+				onConnectOther?.();
+				return;
+			}
 			p =
 				peers.length === 1
 					? peers[0]
@@ -1255,6 +1324,25 @@ export function Workbench({
 	};
 	const togglePeerRef = useRef(togglePeer);
 	togglePeerRef.current = togglePeer;
+	// 여기서 골라 연결한 서버 — 연결이 peers 에 들어오면 옆 칸에 연다
+	const pendingPeer = useRef<number | null>(null);
+	useEffect(() => {
+		const h = (e: Event) => {
+			const d = (e as CustomEvent<{ owner: string; conn: number }>).detail;
+			if (d.owner !== owner) return;
+			if (peersRef.current.some((x) => x.conn === d.conn)) void togglePeerRef.current(d.conn);
+			else pendingPeer.current = d.conn;
+		};
+		window.addEventListener("rb-open-peer", h);
+		return () => window.removeEventListener("rb-open-peer", h);
+	}, [owner]);
+	useEffect(() => {
+		const c = pendingPeer.current;
+		if (c != null && peers.some((x) => x.conn === c)) {
+			pendingPeer.current = null;
+			void togglePeerRef.current(c);
+		}
+	}, [peers]);
 	// 다른 연결이 닫히면 그 칸도 닫는다
 	useEffect(() => {
 		const d = dock.current;
@@ -1576,12 +1664,12 @@ export function Workbench({
 								<Monitor size={14} /> <span className="lbl">내 PC</span>
 							</button>
 						)}
-						{fs.side === "remote" && peers.length > 0 && (
+						{fs.side === "remote" && (peers.length > 0 || onConnectOther) && (
 							<button
 								type="button"
 								className={`btn ghost${shownIds.includes("peer:") ? " on" : ""}`}
 								onClick={() => void togglePeer()}
-								title="다른 서버 칸 — 열려 있는 다른 SSH 연결의 파일 트리를 옆에(트리끼리 끌어 놓으면 서버 ↔ 서버로 보냄)"
+								title={peers.length ? "다른 서버 칸 — 열려 있는 다른 서버의 파일 트리를 옆에(트리끼리 끌어 놓으면 서버 ↔ 서버로 보냄)" : "다른 서버 칸 — 서버를 골라 연결하고 그 파일 트리를 옆에 엽니다(트리끼리 끌어 놓으면 서버 ↔ 서버로 보냄)"}
 								aria-pressed={shownIds.includes("peer:")}
 							>
 								<Server size={14} /> <span className="lbl">다른 서버</span>

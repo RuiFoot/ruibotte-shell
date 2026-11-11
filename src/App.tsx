@@ -17,6 +17,7 @@ import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
 import { routeTitle, routeWorthShowing } from "./components/RouteChip";
 import { agoMs, ServerCard } from "./components/ServerCard";
 import { type Account, accountName, type AppInfo, api, type ConnectOk, defaultAccount, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm, withAccount } from "./lib/ipc";
+import { askText } from "./lib/ask";
 import { checkNow, installNow, startUpdater, useUpdate } from "./lib/updater";
 import { CommandPalette } from "./components/CommandPalette";
 import { type Command, OPEN_PALETTE_EVENT, requestSettingsSection, SETTINGS_SECTIONS, type SettingsSection, useCommands } from "./lib/commands";
@@ -90,7 +91,8 @@ export function App() {
 	const [active, setActive] = useState(tabs[0].id);
 	const [profiles, setProfiles] = useState<Profile[]>([]);
 	const [sheet, setSheet] = useState<Profile | null>(null);
-	const [connecting, setConnecting] = useState<{ p: Profile; tabId?: string } | null>(null);
+	/** besideOf: 그 탭 작업대에서 "다른 서버" 로 고른 연결 — 새 탭은 만들되 그 탭에 머물고 옆 칸에 연다 */
+	const [connecting, setConnecting] = useState<{ p: Profile; tabId?: string; besideOf?: string } | null>(null);
 	/** 서버 카드(누르면 계정 고르기) — 서버 번호 */
 	const [cardId, setCardId] = useState<number | null>(null);
 	const [dbConnecting, setDbConnecting] = useState<Profile | null>(null);
@@ -181,9 +183,15 @@ export function App() {
 	);
 
 	const onConnected = useCallback(
-		(ok: ConnectOk, p: Profile, tabId?: string) => {
+		(ok: ConnectOk, p: Profile, tabId?: string, besideOf?: string) => {
 			setConnecting(null);
 			reload();
+			if (besideOf && tabsRef.current.some((t) => t.id === besideOf)) {
+				const t = newTab("ssh", tabTitle({ ...p, username: ok.username || p.username }), { ssh: { ok, profile: p }, color: p.color });
+				setTabs((ts) => [...ts, t]);
+				window.dispatchEvent(new CustomEvent("rb-open-peer", { detail: { owner: besideOf, conn: ok.connId } }));
+				return;
+			}
 			if (tabId) {
 				// 다시 연결 — 같은 탭에 새 연결(작업대는 새로 그려지고 배치는 저장본 그대로)
 				backends.current.delete(tabId);
@@ -447,6 +455,23 @@ export function App() {
 			return;
 		}
 		setConnecting({ p: eff });
+	};
+	/** 작업대의 "다른 서버" — 저장한 서버를 골라 연결하고, 그 탭에 머문 채 옆 칸에 트리를 연다 */
+	const connectBeside = async (tabId: string) => {
+		const list = profiles.filter((p) => p.kind !== "db" && p.id != null);
+		if (!list.length) {
+			alert("저장한 서버가 없습니다 — 왼쪽 목록에서 서버를 먼저 추가하세요");
+			return;
+		}
+		const pick = await askText({
+			title: "옆에 열 서버",
+			message: "연결하면 새 탭이 생기고, 지금 작업대 옆 칸에 그 서버 파일 트리가 열립니다. 트리끼리 끌어 놓으면 서버끼리 주고받습니다.",
+			choiceOnly: true,
+			choices: list.map((p) => ({ value: String(p.id), label: p.name || p.host })),
+		});
+		const p = list.find((x) => String(x.id) === pick);
+		if (!p) return;
+		setConnecting({ p: withAccount(p, defaultAccount(p)), besideOf: tabId });
 	};
 	const quickTitle = (p: Profile) => {
 		const a = defaultAccount(p);
@@ -915,7 +940,13 @@ export function App() {
 											sudo={{ mode: t.ssh.ok.sudo ?? "ask", user: t.ssh.ok.sudoUser ?? "root" }}
 											peers={tabs
 											.filter((x) => x.ssh && x.id !== t.id && !x.ssh.closed)
-												.map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.ssh ? tabTitle({ ...x.ssh.profile, username: x.ssh.ok.username || x.ssh.profile.username }) : "", home: x.ssh?.ok.home ?? "/" }))}
+												.map((x) => ({
+												conn: x.ssh?.ok.connId as number,
+												label: x.ssh ? tabTitle({ ...x.ssh.profile, username: x.ssh.ok.username || x.ssh.profile.username }) : "",
+												home: x.ssh?.ok.home ?? "/",
+												target: x.ssh ? { user: x.ssh.ok.username || x.ssh.profile.username, host: x.ssh.profile.host, port: x.ssh.profile.port } : undefined,
+											}))}
+										onConnectOther={() => void connectBeside(t.id)}
 											syncInfo={{ user: t.ssh.ok.username || t.ssh.profile.username, host: t.ssh.profile.host, port: t.ssh.profile.port }}
 											active={t.id === active}
 											label={`${t.ssh.ok.username || t.ssh.profile.username}@${t.ssh.profile.host}`}
@@ -1002,7 +1033,7 @@ export function App() {
 					// 연결할 탭·서버가 바뀌면 새 창으로(앞 창의 상태·시작 표시가 남아 다른 탭에 붙지 않게)
 					key={`${connecting.tabId ?? "new"}:${connecting.p.id}`}
 					profile={connecting.p}
-					onConnected={(ok, p) => onConnected(ok, p, connecting.tabId)}
+					onConnected={(ok, p) => onConnected(ok, p, connecting.tabId, connecting.besideOf)}
 					onCancel={() => setConnecting(null)}
 					onProfileChanged={reload}
 				/>

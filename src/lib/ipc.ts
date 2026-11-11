@@ -338,7 +338,8 @@ export type FsBackend = {
 
 export type TransferProgress = {
 	id: number;
-	direction: "up" | "down" | "relay";
+	/** relay = 내 PC 거쳐 서버 → 서버, direct = 서버끼리 바로 */
+	direction: "up" | "down" | "relay" | "direct";
 	name: string;
 	dest: string;
 	bytesDone: number;
@@ -351,10 +352,14 @@ export type TransferProgress = {
 	state: "running" | "done" | "error" | "cancelled";
 	error?: string | null;
 	ms: number;
+	/** 받는 서버 연결(서버 → 서버) — 끝나면 그 서버 트리를 새로 읽는다 */
+	destConn?: number;
 };
 
 /** 시작한 전송의 조건 — 실패·취소 뒤 "다시(이어서)" 에 쓴다 */
 export const transferArgs = new Map<number, { conn: number; direction: "up" | "down"; src: string; destDir: string; destName?: string }>();
+/** 서버끼리 바로 보낸 전송의 조건 — 실패하면 "내 PC 거쳐서" 로 다시 보낼 때 쓴다 */
+export const directArgs = new Map<number, { fromConn: number; src: string; toConn: number; destDir: string; overwrite: boolean; destName?: string }>();
 /** 지금 도는 전송(앱을 끌 때 묻기) */
 export const runningTransfers = new Set<number>();
 

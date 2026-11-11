@@ -590,7 +590,7 @@ export const FileTree = memo(function FileTree({
 						onClick={() => onSyncChange(sync === "together" ? "apart" : "together")}
 					>
 						{sync === "together" ? <Link2 size={13} /> : <Unlink size={13} />}
-						연동
+						<span className="tree-sync-label">연동</span>
 					</button>
 				)}
 				<button

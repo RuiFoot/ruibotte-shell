@@ -3084,6 +3084,12 @@ input[type="radio"] {
 	gap: 2px;
 	padding: 4px 6px 0;
 	flex: none;
+	container: tree-bar / inline-size;
+	overflow: hidden;
+}
+/* 단추는 줄어들지 않는다 — 칸이 좁으면 연동 글자부터 접는다(글자가 세로로 쪼개지지 않게) */
+.tree-bar > .btn {
+	flex: none;
 }
 /* 터미널 연동 — 켜면 강조색, 끄면 흐리게(한 단추로 켜고 끄기) */
 .btn.tree-sync {
@@ -3091,7 +3097,18 @@ input[type="radio"] {
 	padding: 0 7px;
 	gap: 4px;
 	font-size: 12px;
+	white-space: nowrap;
 	color: var(--text-3);
+}
+@container tree-bar (max-width: 236px) {
+	.tree-bar > .btn.icon,
+	.btn.tree-sync {
+		width: 24px;
+		padding: 0;
+	}
+	.tree-sync-label {
+		display: none;
+	}
 }
 .btn.tree-sync.on {
 	color: var(--accent);
@@ -3754,6 +3771,36 @@ h2 .count {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
+}
+/* 설명 붙은 선택지 — 한 줄에 하나, 제목 + 한 줄 풀이 */
+.ask-chips:has(.chip-card) {
+	flex-direction: column;
+	gap: 8px;
+}
+.chip.chip-card {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 3px;
+	height: auto;
+	padding: 10px 12px;
+	border-radius: var(--r-sm);
+	text-align: left;
+	font-size: 13px;
+	color: var(--text);
+}
+.chip.chip-card b {
+	font-weight: 600;
+}
+.chip.chip-card small {
+	font-size: 11.5px;
+	line-height: 1.45;
+	color: var(--text-3);
+	white-space: normal;
+}
+.chip.chip-card:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
 }
 .btn.danger-solid {
 	background: #ff3b30;

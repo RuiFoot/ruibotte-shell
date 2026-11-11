@@ -3,6 +3,7 @@
 
 mod db;
 mod diag;
+mod direct;
 mod flow;
 mod grid;
 mod importer;
@@ -230,6 +231,7 @@ pub fn run() {
             sudo::sudo_op,
             transfer::transfer_cancel,
             transfer::relay_start,
+            direct::direct_start,
             sync::sync_plan,
             sync::sync_run,
             sync::sync_rsync_command,

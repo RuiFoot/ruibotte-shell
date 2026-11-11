@@ -26,23 +26,27 @@ pub struct Transfers {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Progress {
-    id: u32,
-    direction: &'static str,
-    name: String,
-    dest: String,
-    bytes_done: u64,
-    bytes_total: u64,
-    files_done: u32,
-    files_total: u32,
-    skipped: u32,
+    pub(crate) id: u32,
+    /// up | down | relay(내 PC 거쳐 서버 → 서버) | direct(서버끼리 바로)
+    pub(crate) direction: &'static str,
+    pub(crate) name: String,
+    pub(crate) dest: String,
+    pub(crate) bytes_done: u64,
+    pub(crate) bytes_total: u64,
+    pub(crate) files_done: u32,
+    pub(crate) files_total: u32,
+    pub(crate) skipped: u32,
     /// sha256 을 서버와 맞춰 본 파일 수
-    verified: u32,
+    pub(crate) verified: u32,
     /// .rbpart 에서 이어 받은/보낸 파일 수
-    resumed: u32,
+    pub(crate) resumed: u32,
     /// running | done | error | cancelled
-    state: &'static str,
-    error: Option<String>,
-    ms: u64,
+    pub(crate) state: &'static str,
+    pub(crate) error: Option<String>,
+    pub(crate) ms: u64,
+    /// 받는 서버 연결(서버 → 서버) — 끝나면 그 서버 트리를 새로 읽게
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dest_conn: Option<u32>,
 }
 
 pub(crate) struct Item {
@@ -52,7 +56,7 @@ pub(crate) struct Item {
     pub(crate) dir: bool,
 }
 
-fn rjoin(dir: &str, name: &str) -> String {
+pub(crate) fn rjoin(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         format!("{dir}{name}")
     } else {
@@ -81,7 +85,7 @@ async fn remote_replace(sftp: &russh_sftp::client::SftpSession, part: &str, dest
     Ok(())
 }
 
-fn base_name(p: &str) -> String {
+pub(crate) fn base_name(p: &str) -> String {
     p.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(p).to_string()
 }
 
@@ -119,7 +123,7 @@ fn local_safe_name(name: &str) -> String {
     }
 }
 
-async fn walk_remote(c: &Conn, src: &str, dest: PathBuf, out: &mut Vec<Item>) -> R<()> {
+pub(crate) async fn walk_remote(c: &Conn, src: &str, dest: PathBuf, out: &mut Vec<Item>) -> R<()> {
     let m = c.sftp.metadata(src.to_string()).await.map_err(sftp_err)?;
     if m.is_dir() {
         out.push(Item { src: src.into(), dest: dest.to_string_lossy().into_owned(), size: 0, dir: true });
@@ -179,7 +183,7 @@ pub(crate) enum Mode {
     Up,
     Down,
     /// 서버 A → 서버 B(같은 앱 안의 다른 연결)
-    Relay(Arc<Conn>),
+    Relay(Arc<Conn>, u32),
 }
 
 /// 항목 목록을 뒤에서 옮긴다(진행률 transfer 이벤트) — 전송·동기화·중계 공용
@@ -198,7 +202,7 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
             direction: match mode {
                 Mode::Up => "up",
                 Mode::Down => "down",
-                Mode::Relay(_) => "relay",
+                Mode::Relay(..) => "relay",
             },
             name,
             dest,
@@ -212,6 +216,10 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
             state: "running",
             error: None,
             ms: 0,
+            dest_conn: match &mode {
+                Mode::Relay(_, to) => Some(*to),
+                _ => None,
+            },
         }));
         let _ = app2.emit("transfer", prog.lock().unwrap().clone());
         // 진행률은 따로 150 ms 마다
@@ -235,7 +243,7 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
         let result: Result<(), String> = async {
             // 폴더 먼저(순서대로)
             for it in items.iter().filter(|i| i.dir) {
-                if let Mode::Relay(b) = &mode {
+                if let Mode::Relay(b, _) = &mode {
                     if b.sftp.metadata(it.dest.clone()).await.is_err() {
                         b.sftp.create_dir(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
                     }
@@ -262,7 +270,7 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
                         let exists = match &mode {
                             Mode::Up => c2.sftp.try_exists(it.dest.clone()).await.unwrap_or(false),
                             Mode::Down => Path::new(&it.dest).exists(),
-                            Mode::Relay(b) => b.sftp.try_exists(it.dest.clone()).await.unwrap_or(false),
+                            Mode::Relay(b, _) => b.sftp.try_exists(it.dest.clone()).await.unwrap_or(false),
                         };
                         if exists && !overwrite {
                             let mut p = prog.lock().unwrap();
@@ -271,7 +279,7 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
                             return Ok(());
                         }
                         let outcome = match &mode {
-                            Mode::Relay(b) => relay_one(&c2, b, it, &prog, &cancel, id).await?,
+                            Mode::Relay(b, _) => relay_one(&c2, b, it, &prog, &cancel, id).await?,
                             _ => copy_one(&c2, it, up, &prog, &cancel, id).await?,
                         };
                         let mut p = prog.lock().unwrap();
@@ -382,7 +390,7 @@ pub async fn relay_start(
     for it in &mut items {
         it.dest = it.dest.replace('\\', "/");
     }
-    spawn_items(app, transfers.cancel.clone(), a, id, Mode::Relay(b), name, items, overwrite);
+    spawn_items(app, transfers.cancel.clone(), a, id, Mode::Relay(b, to_conn), name, items, overwrite);
     Ok(id)
 }
 
@@ -532,6 +540,7 @@ pub(crate) fn dummy_progress() -> Arc<Mutex<Progress>> {
         state: "running",
         error: None,
         ms: 0,
+        dest_conn: None,
     }))
 }
 
@@ -561,7 +570,7 @@ mod live {
         std::fs::write(&src, &data).unwrap();
         let prog = Arc::new(Mutex::new(Progress {
             id: 1, direction: "up", name: String::new(), dest: String::new(), bytes_done: 0, bytes_total: 0,
-            files_done: 0, files_total: 0, skipped: 0, verified: 0, resumed: 0, state: "running", error: None, ms: 0,
+            files_done: 0, files_total: 0, skipped: 0, verified: 0, resumed: 0, state: "running", error: None, ms: 0, dest_conn: None,
         }));
         let cancel: Arc<Mutex<HashSet<u32>>> = Default::default();
         let up = Item { src: src.to_string_lossy().into(), dest: "/home/rbtest/big.bin".into(), size: data.len() as u64, dir: false };

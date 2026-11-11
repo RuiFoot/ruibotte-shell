@@ -18,6 +18,8 @@ const profiles: Record<string, any>[] = [
 
 // 계정 — 서버 하나에 여럿(기본 계정이 앞)
 let accSeq = 100;
+/** 연결마다 번호를 달리(서버 ↔ 서버 화면 점검) */
+let connSeq = 0;
 const accounts: Record<string, any>[] = profiles.map((p) => ({
 	id: ++accSeq,
 	profileId: p.id,
@@ -224,11 +226,14 @@ export function installMock() {
 					return dir(String(args.path ?? "/"));
 				case "sftp_realpath":
 					return String(args.path ?? "/home/deploy");
+				case "relay_start":
+				case "direct_start":
+					return 900 + connSeq;
 				case "ssh_connect": {
 					const req = (args as { req: Record<string, any> }).req;
 					const a = accounts.find((x) => x.id === req.accountId);
 					if (a) a.lastUsedAt = Date.now();
-					return { connId: 1, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false, usedSavedSecret: true, accountId: a?.id ?? null, username: a?.username ?? req.username, sudo: a?.sudo ?? "ask", sudoUser: a?.sudoUser ?? "root", route: { id: 12, label: "외부 · 점프", summary: "점프 구형 로그 서버 · 10.0.0.5:22", total: 3, note: "사내 직접 건너뜀 — 망 조건이 맞지 않음" } };
+					return { connId: ++connSeq, home: "/home/deploy", fingerprint: "SHA256:abcd", algorithm: "ssh-ed25519", newlyPinned: false, usedSavedSecret: true, accountId: a?.id ?? null, username: a?.username ?? req.username, sudo: a?.sudo ?? "ask", sudoUser: a?.sudoUser ?? "root", route: { id: 12, label: "외부 · 점프", summary: "점프 구형 로그 서버 · 10.0.0.5:22", total: 3, note: "사내 직접 건너뜀 — 망 조건이 맞지 않음" } };
 				}
 				case "ssh_shell_open":
 				case "pty_open":
