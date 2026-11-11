@@ -11,7 +11,7 @@ import {
 import { confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, Cog, Container, Globe, TextSearch, ArrowDownUp, ArrowLeftRight, ArrowRightLeft, Columns2, FileText, FolderTree, Layers, LayoutTemplate, Monitor, Plus, Radio, RefreshCcw, Rows2, ShieldAlert, X } from "lucide-react";
+import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Rows2, ShieldAlert, X } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -37,7 +37,7 @@ import { DiffView } from "./DiffView";
 import { EditorView_ } from "./Editor";
 import { BinaryPreview, previewKind } from "./Preview";
 import { freeName, useConflictAsk } from "./ConflictSheet";
-import { ContextMenu } from "./ContextMenu";
+import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { ForwardChips, ForwardSheet, TmuxSheet } from "./ForwardPanel";
 import { RouteChip } from "./RouteChip";
 import { MiniMonitor } from "./MiniMonitor";
@@ -50,6 +50,7 @@ import { TailView } from "./TailView";
 import { invoke } from "@tauri-apps/api/core";
 import type { CompletionSource } from "../lib/termComplete";
 import { type DragEntry, FileTree } from "./FileTree";
+import { sshFs } from "../lib/ipc";
 import { TerminalView } from "./Terminal";
 import { askText } from "../lib/ask";
 import type { SudoCtx } from "./panels/common";
@@ -69,15 +70,20 @@ import { FORMS } from "../lib/cmdAssist";
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
 type Which = "remote" | "local";
+/** 같은 앱에 열려 있는 다른 SSH 연결(서버 ↔ 서버 주고받기) */
+type Peer = { conn: number; label: string; home: string };
 type Ctx = {
 	fs: FsBackend;
 	local?: FsBackend;
 	term: TermBackend;
 	label: string;
 	startPath?: string;
-	openFile: (which: Which, e: FsEntry, line?: number) => void;
+	openFile: (which: Which, e: FsEntry, line?: number, peer?: Peer) => void;
 	activePanel: string | null;
-	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string) => void;
+	/** 끌어 놓기 — destConn: 받는 트리의 연결(다른 서버 칸이면 그 서버). 서버가 다르면 중계 */
+	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string, destConn?: number) => void;
+	/** 다른 서버 칸의 파일 접근 */
+	peerFs: (p: Peer) => FsBackend;
 	sendTo: (from: Which, e: FsEntry) => void;
 	/** 지금 터미널을 그 폴더로 — 프롬프트가 아니면 보내지 않고 false */
 	cd: (dir: string, quiet?: boolean) => boolean;
@@ -102,7 +108,8 @@ type Ctx = {
 	compare: (which: Which, e: FsEntry) => void;
 	compareLabel: (which: Which, e: FsEntry) => string;
 	archive: (e: FsEntry) => void;
-	relay: (e: FsEntry) => void;
+	/** 다른 서버로 보내기 — fromConn 이 없으면 이 작업대 서버에서 */
+	relay: (e: FsEntry, fromConn?: number) => void;
 	hasPeers: boolean;
 	showTransfers: () => void;
 	syncInfo?: { user: string; host: string; port: number };
@@ -195,9 +202,36 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 	);
 }
 
-function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string; line?: { n: number; seq: number } }>) {
+/**
+ * 다른 서버 칸 — 같은 앱에 열려 있는 다른 SSH 연결의 파일 트리(IntelliJ 의 원격 호스트 여러 개처럼).
+ * 이 작업대 서버 트리·내 PC 트리와 서로 끌어 놓으면 주고받는다(서버끼리는 내 PC 를 거쳐 중계, sha256 확인·이어 보내기).
+ */
+function PeerTreePanel(props: IDockviewPanelProps<{ peer: Peer }>) {
 	const ctx = useWb();
-	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+	const peer = props.params.peer;
+	const fs = ctx.peerFs(peer);
+	const [root, setRoot] = useState("/");
+	const [reveal] = useState(() => ({ path: peer.home, nonce: 1 }));
+	return (
+		<div className="panel-fill">
+			<FileTree
+				fs={fs}
+				root={root}
+				onRoot={setRoot}
+				reveal={reveal}
+				onOpen={(e) => ctx.openFile("remote", e, undefined, peer)}
+				onDrop={(src, dir) => ctx.drop(src, "remote", dir, peer.conn)}
+				onSend={ctx.local ? (e) => ctx.drop({ side: "remote", conn: peer.conn, path: e.path, name: e.name, kind: e.kind }, "local", ctx.local?.home ?? "") : undefined}
+				sendLabel="내 PC로 받기"
+				onRelay={(e) => ctx.relay(e, peer.conn)}
+			/>
+		</div>
+	);
+}
+
+function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string; line?: { n: number; seq: number }; peer?: Peer }>) {
+	const ctx = useWb();
+	const fs = props.params.peer ? ctx.peerFs(props.params.peer) : props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
 	const onDirty = useCallback(
 		(dirty: boolean) => {
 			setDirty(ctx.owner, props.api.id, props.params.name, dirty);
@@ -543,6 +577,7 @@ function TransfersPanel() {
 
 const components = {
 	tree: TreePanel,
+	peertree: PeerTreePanel,
 	editor: EditorPanel,
 	terminal: TerminalPanel,
 	transfers: TransfersPanel,
@@ -596,11 +631,17 @@ function addBottom(d: DockviewApi, opts: { id: string; component: string; title:
 }
 
 /**
- * 기본 배치(Orbit 작업대와 같은 틀): 왼쪽 트리 · 가운데 문서 자리(비어 있으면 안내) · 아래 터미널.
- * 내 PC 트리는 기본으로 두지 않고, 주고받을 때 도구 막대의 "내 PC" 로 오른쪽에 연다.
+ * 기본 배치 — 터미널 우선. 서버 작업대는 왼쪽 트리 + 나머지 전부 터미널, 내 PC 작업대는 터미널만.
+ * 문서 칸(편집기·tail·비교·도구)은 파일을 열 때 터미널 위에 생긴다(addDoc). 빈 문서 자리를 미리 두지 않는다.
+ * 내 PC 트리·다른 서버 칸은 주고받을 때 도구 막대에서 오른쪽에 연다.
  */
-function defaultLayout(d: DockviewApi) {
+function defaultLayout(d: DockviewApi, terminalOnly = false) {
 	d.clear();
+	if (terminalOnly) {
+		const term = d.addPanel({ id: "term-1", component: "terminal", title: "터미널", params: { n: 1 }, renderer: "always" });
+		term.api.setActive();
+		return;
+	}
 	d.addPanel({ id: "tree", component: "tree", title: "파일", params: { which: "remote" }, renderer: "always" });
 	const term = d.addPanel({
 		id: "term-1",
@@ -610,10 +651,7 @@ function defaultLayout(d: DockviewApi) {
 		renderer: "always",
 		position: { referencePanel: "tree", direction: "right" },
 	});
-	const docs = d.addGroup({ referencePanel: "term-1", direction: "above" });
-	d.getPanel("tree")?.api.setSize({ width: 280 });
-	const total = docs.height + term.group.height;
-	if (total > 0) docs.api.setSize({ height: Math.round(total * 0.6) });
+	d.getPanel("tree")?.api.setSize({ width: 250 });
 	term.api.setActive();
 }
 
@@ -646,6 +684,9 @@ function stripEditors(json: ReturnType<DockviewApi["toJSON"]>) {
  */
 /** 동시 입력이 켜졌을 때 터미널 탭 이름 앞 표시 */
 const BCAST = "⇉ ";
+
+/** 키 이벤트가 터미널 안에서 났는지 */
+const inTerminal = (t: EventTarget | null) => !!(t as HTMLElement | null)?.closest?.(".xterm");
 
 const openEditors = new Map<string, { which: Which; path: string; name: string }[]>();
 
@@ -730,6 +771,7 @@ export function Workbench({
 	const [defaultShell, setDefaultShell] = useState<string | undefined>(undefined);
 	const [isAdmin, setIsAdmin] = useState(false);
 	const [adminMenu, setAdminMenu] = useState<{ x: number; y: number } | null>(null);
+	const [toolMenu, setToolMenu] = useState<{ x: number; y: number } | null>(null);
 	useEffect(() => {
 		if (fs.side !== "local") return;
 		void localShells().then(async (l) => {
@@ -804,11 +846,11 @@ export function Workbench({
 	const rememberRef = useRef(rememberFile);
 	rememberRef.current = rememberFile;
 
-	const openFile = useCallback((which: Which, e: FsEntry, lineNo?: number) => {
+	const openFile = useCallback((which: Which, e: FsEntry, lineNo?: number, peer?: Peer) => {
 		const d = dock.current;
 		if (!d) return;
-		rememberRef.current(which, e);
-		const id = `edit:${which}:${e.path}`;
+		if (!peer) rememberRef.current(which, e);
+		const id = peer ? `edit:peer${peer.conn}:${e.path}` : `edit:${which}:${e.path}`;
 		const line = lineNo ? { n: lineNo, seq: Date.now() } : undefined;
 		const existing = d.getPanel(id);
 		if (existing) {
@@ -816,7 +858,7 @@ export function Workbench({
 			existing.api.setActive();
 			return;
 		}
-		addDoc(d, { id, component: "editor", title: e.name, params: { which, path: e.path, name: e.name, line } });
+		addDoc(d, { id, component: "editor", title: peer ? `${e.name} · ${peer.label}` : e.name, params: { which, path: e.path, name: e.name, line, peer } });
 	}, []);
 
 	// 동시 입력: 받는 터미널 탭에 ⇉ 표시
@@ -911,22 +953,45 @@ export function Workbench({
 		addBottom(d, { id: "transfers", component: "transfers", title: "전송" }, focus);
 	};
 
-	const fsOf = useCallback((side: "remote" | "local") => (side === "local" && local ? local : fs), [fs, local]);
+	const peerFsMap = useRef(new Map<number, FsBackend>());
+	const peerFs = useCallback((p: Peer) => {
+		let f = peerFsMap.current.get(p.conn);
+		if (!f) {
+			f = sshFs(p.conn, p.label, p.home);
+			peerFsMap.current.set(p.conn, f);
+		}
+		return f;
+	}, []);
+	const peersRef = useRef(peers);
+	peersRef.current = peers;
+	/** 연결 번호 → 그 쪽 파일 접근(이 작업대 서버·다른 서버) */
+	const fsOfConn = useCallback(
+		(conn: number | undefined) => {
+			if (conn == null || conn === fs.conn) return fs;
+			const p = peersRef.current.find((x) => x.conn === conn);
+			return p ? peerFs(p) : fs;
+		},
+		[fs, peerFs],
+	);
+	const fsOf = useCallback((side: "remote" | "local", conn?: number) => (side === "local" && local ? local : fsOfConn(conn)), [fsOfConn, local]);
 
 	const drop = useCallback(
-		async (src: DragEntry, destSide: "remote" | "local", destDir: string) => {
+		async (src: DragEntry, destSide: "remote" | "local", destDir: string, destConnArg?: number) => {
 			try {
-				if (src.side === destSide) {
+				const srcConn = src.side === "remote" ? (src.conn ?? fs.conn) : undefined;
+				const destConn = destSide === "remote" ? (destConnArg ?? fs.conn) : undefined;
+				const sameServer = src.side === "remote" && destSide === "remote" && srcConn === destConn;
+				if ((src.side === "local" && destSide === "local") || sameServer) {
 					// 같은 쪽 = 옮기기
 					if (parentDir(src.path) === destDir || destDir === src.path || destDir.startsWith(`${src.path}/`)) return;
 					if (!confirm(`${src.name} 을(를) ${destDir} 로 옮길까요?`)) return;
-					await fsOf(destSide).rename(src.path, joinPath(destDir, src.name));
-					notifyFsChanged(destSide, destDir, fs.conn);
-					notifyFsChanged(src.side, parentDir(src.path), fs.conn);
+					await fsOf(destSide, destConn).rename(src.path, joinPath(destDir, src.name));
+					notifyFsChanged(destSide, destDir, destConn);
+					notifyFsChanged(src.side, parentDir(src.path), srcConn);
 					return;
 				}
-				if (fs.conn == null) return;
-				const existing = await fsOf(destSide).list(destDir);
+				const destFs = fsOf(destSide, destConn);
+				const existing = await destFs.list(destDir);
 				let overwrite = false;
 				let destName: string | undefined;
 				if (existing.some((x) => x.name === src.name)) {
@@ -937,7 +1002,14 @@ export function Workbench({
 					if (choice === "rename") destName = freeName(src.name, new Set(existing.map((x) => x.name)));
 				}
 				showTransfers();
-				await transfers.start(fs.conn, src.side === "local" ? "up" : "down", src.path, destDir, overwrite, destName);
+				if (src.side === "remote" && destSide === "remote" && srcConn != null && destConn != null) {
+					// 서버 A → 서버 B(내 PC 를 거쳐 흘려 보냄, 디스크에 남기지 않음)
+					await invoke("relay_start", { fromConn: srcConn, src: src.path, toConn: destConn, destDir, overwrite, destName: destName ?? null });
+					return;
+				}
+				const conn = src.side === "remote" ? srcConn : destConn;
+				if (conn == null) return;
+				await transfers.start(conn, src.side === "local" ? "up" : "down", src.path, destDir, overwrite, destName);
 			} catch (e) {
 				alert(asSshError(e).message);
 			}
@@ -1024,23 +1096,22 @@ export function Workbench({
 	);
 
 	const relay = useCallback(
-		async (e: FsEntry) => {
-			if (fs.conn == null || !peers.length) return;
+		async (e: FsEntry, fromConn?: number) => {
+			const from = fromConn ?? fs.conn;
+			if (from == null) return;
+			const targets: Peer[] = [...(fs.conn != null ? [{ conn: fs.conn, label: fs.label, home: fs.home }] : []), ...peers].filter((p) => p.conn !== from);
+			if (!targets.length) return;
 			const pick =
-				peers.length === 1
-					? peers[0]
-					: peers[Number((await askText({ title: "어느 서버로 보낼까요?", choiceOnly: true, choices: peers.map((p, i) => ({ value: String(i), label: p.label })) })) ?? -1)];
+				targets.length === 1
+					? targets[0]
+					: targets[Number((await askText({ title: "어느 서버로 보낼까요?", choiceOnly: true, choices: targets.map((p, i) => ({ value: String(i), label: p.label })) })) ?? -1)];
 			if (!pick) return;
-			const dest = await askText({ title: `${pick.label} 로 보내기`, message: "받을 폴더", value: pick.home, okLabel: "보내기" });
+			const dest = await askText({ title: `${pick.label} 로 보내기`, message: "받을 폴더 — 다른 서버 칸을 열고 끌어 놓아도 됩니다", value: pick.home, okLabel: "보내기" });
 			if (!dest) return;
-			showTransfers();
-			try {
-				await invoke("relay_start", { fromConn: fs.conn, src: e.path, toConn: pick.conn, destDir: dest, overwrite: confirm("같은 이름이 있으면 덮어쓸까요? (취소 = 건너뛰기)") });
-			} catch (x) {
-				alert(asSshError(x).message);
-			}
+			// 같은 이름 처리는 끌어 놓기와 같은 시트로
+			void drop({ side: "remote", conn: from, path: e.path, name: e.name, kind: e.kind }, "remote", dest, pick.conn);
 		},
-		[fs, peers],
+		[fs, peers, drop],
 	);
 
 	const openSync = () => {
@@ -1136,6 +1207,47 @@ export function Workbench({
 		if (await h.expect(/assword[^\n]*:\s*$/, 2500)) await h.sudoPw?.();
 	}, [sudoAs]);
 
+	/** 다른 서버 칸 — 열려 있는 다른 SSH 연결을 골라 오른쪽에(이미 있으면 닫기) */
+	const togglePeer = async (conn?: number) => {
+		const d = dock.current;
+		if (!d || blockedByLock()) return;
+		let p = conn != null ? peers.find((x) => x.conn === conn) : undefined;
+		if (!p) {
+			if (!peers.length) return;
+			p =
+				peers.length === 1
+					? peers[0]
+					: peers[Number((await askText({ title: "어느 서버를 옆에 열까요?", choiceOnly: true, choices: peers.map((x, i) => ({ value: String(i), label: `${d.getPanel(`peer:${x.conn}`) ? "닫기 — " : ""}${x.label}` })) })) ?? -1)];
+			if (!p) return;
+		}
+		const id = `peer:${p.conn}`;
+		const ex = d.getPanel(id);
+		if (ex) {
+			d.removePanel(ex);
+			return;
+		}
+		const beside = d.getPanel("localtree") ?? d.panels.find((x) => x.id.startsWith("peer:"));
+		d.addPanel({
+			id,
+			component: "peertree",
+			title: p.label,
+			params: { peer: p },
+			renderer: "always",
+			position: beside ? { referencePanel: beside.id, direction: "below" } : { direction: "right" },
+		});
+		if (!beside) d.getPanel(id)?.api.setSize({ width: 300 });
+	};
+	const togglePeerRef = useRef(togglePeer);
+	togglePeerRef.current = togglePeer;
+	// 다른 연결이 닫히면 그 칸도 닫는다
+	useEffect(() => {
+		const d = dock.current;
+		if (!d) return;
+		const alive = new Set(peers.map((x) => `peer:${x.conn}`));
+		for (const p of [...d.panels]) if (p.id.startsWith("peer:") && !alive.has(p.id)) d.removePanel(p);
+		for (const [c] of peerFsMap.current) if (!peers.some((x) => x.conn === c)) peerFsMap.current.delete(c);
+	}, [peers]);
+
 	const toggle = (id: "tree" | "localtree") => {
 		const d = dock.current;
 		if (!d || blockedByLock()) return;
@@ -1156,8 +1268,9 @@ export function Workbench({
 		if (id === "localtree") d.getPanel(id)?.api.setSize({ width: 300 });
 	};
 
-	// 기본 배치가 바뀌면(v2: 트리·문서·아래 터미널) 옛 저장 배치는 쓰지 않는다
-	const savedKey = `${layoutKey}.v2`;
+	// 기본 배치가 바뀌면 옛 저장 배치는 쓰지 않는다(v3: 터미널 우선 — 빈 문서 자리 없음, 내 PC 셸은 터미널만)
+	const savedKey = `${layoutKey}.v3`;
+	const terminalOnly = fs.side === "local";
 	const gone = useRef(false);
 	const onReady = (e: DockviewReadyEvent) => {
 		dock.current = e.api;
@@ -1178,7 +1291,7 @@ export function Workbench({
 					ok = false;
 				}
 			}
-			if (!ok) defaultLayout(e.api);
+			if (!ok) defaultLayout(e.api, terminalOnly);
 			// 다시 연결한 뒤: 끊기기 전에 열려 있던 편집기 탭을 다시 연다(초안은 편집기가 되살리기를 묻는다)
 			for (const x of openEditors.get(owner) ?? []) {
 				if (!e.api.getPanel(`edit:${x.which}:${x.path}`)) addDoc(e.api, { id: `edit:${x.which}:${x.path}`, component: "editor", title: x.name, params: x });
@@ -1210,7 +1323,8 @@ export function Workbench({
 			startPath,
 			openFile,
 			activePanel: active ? activePanel : null,
-			drop: (src: DragEntry, side: "remote" | "local", dir: string) => void drop(src, side, dir),
+			drop: (src: DragEntry, side: "remote" | "local", dir: string, destConn?: number) => void drop(src, side, dir, destConn),
+			peerFs,
 			sendTo,
 			cd,
 			follow,
@@ -1229,7 +1343,7 @@ export function Workbench({
 			compare,
 			compareLabel,
 			archive: (e: FsEntry) => void archive(e),
-			relay: (e: FsEntry) => void relay(e),
+			relay: (e: FsEntry, fromConn?: number) => void relay(e, fromConn),
 			hasPeers: peers.length > 0,
 			showTransfers: () => showTransfers(true),
 			syncInfo,
@@ -1249,7 +1363,7 @@ export function Workbench({
 			profileId: server?.profileId,
 			rootShell: fs.side === "remote" && sudoMode !== "off" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server, sudo],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, peerFs, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server, sudo],
 	);
 
 	useEffect(() => {
@@ -1277,7 +1391,7 @@ export function Workbench({
 	const resetLayout = () => {
 		if (dock.current && !blockedByLock()) {
 			termSeq.current = 1;
-			defaultLayout(dock.current);
+			defaultLayout(dock.current, terminalOnly);
 		}
 	};
 	/** 명령 대상 터미널 — 보이는(없으면 첫) 터미널 칸 */
@@ -1302,7 +1416,7 @@ export function Workbench({
 			w("focusDoc", "문서(편집기)로 옮기기", () => focusPanel((id) => /^(edit|tail|diff):/.test(id) || id === "monitor"), { keys: "Alt+2" }),
 			w("focusTerm", "터미널로 옮기기", () => focusPanel((id) => id.startsWith("term-")), { keys: "Alt+3" }),
 			w("lock", locked ? "배치 잠금 풀기" : "배치 잠그기", () => setLocked(!lockedRef.current), { keys: "Ctrl+Alt+L", keywords: "lock 고정" }),
-			w("defaultLayout", "기본 배치로 되돌리기", resetLayout, { disabled: locked, hint: lockHint ?? "왼쪽 트리 · 가운데 문서 · 아래 터미널", keywords: "layout reset 초기화" }),
+			w("defaultLayout", "기본 배치로 되돌리기", resetLayout, { disabled: locked, hint: lockHint ?? (terminalOnly ? "터미널만" : "왼쪽 트리 · 오른쪽 터미널(파일을 열면 터미널 위에)"), keywords: "layout reset 초기화" }),
 			w("tree", has("tree") ? "파일 칸 닫기" : "파일 칸 열기", () => toggle("tree"), { disabled: locked, hint: lockHint, keywords: "트리 tree" }),
 			w("help", "단축키 도움말", () => setHelp(true), { keys: "F1", keywords: "도움말 help shortcut" }),
 		];
@@ -1325,6 +1439,14 @@ export function Workbench({
 			);
 		}
 		if (fs.side === "remote" && fs.conn != null) {
+			for (const p of peers)
+				list.push(
+					w(`peer.${p.conn}`, `다른 서버 칸: ${p.label}`, () => void togglePeerRef.current(p.conn), {
+						disabled: locked,
+						hint: "트리끼리 끌어 놓으면 서버 ↔ 서버로 보냄",
+						keywords: "server relay 중계 서버 전송 scp",
+					}),
+				);
 			list.push(w("monitor", "자원 칸 보기", openMonitor, { hint: "CPU·메모리·디스크·네트워크·프로세스", keywords: "monitor 모니터 top" }));
 			list.push(w("services", "서비스 칸 보기", () => openTool("services", "서비스"), { hint: "systemd 서비스·journal", keywords: "systemctl systemd journal 서비스" }));
 			list.push(w("docker", "Docker 칸 보기", () => openTool("docker", "Docker"), { hint: "컨테이너·로그·셸", keywords: "docker container 컨테이너 podman" }));
@@ -1395,11 +1517,14 @@ export function Workbench({
 						e.stopPropagation();
 						setQuickOpen(true);
 					} else if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.code === "KeyF") {
-						// 파일 내용 찾기 칸
+						// 터미널 안이면 터미널 찾기(터미널이 처리), 밖이면 파일 내용 찾기 칸
+						if (inTerminal(e.target)) return;
 						e.preventDefault();
 						e.stopPropagation();
 						openTool("search", "내용 찾기");
 					} else if (e.key === "F1") {
+						// 터미널 안의 F1 은 셸 프로그램 몫(htop·mc 등)
+						if (inTerminal(e.target)) return;
 						e.preventDefault();
 						setHelp(true);
 					}
@@ -1416,6 +1541,17 @@ export function Workbench({
 								<Monitor size={14} /> <span className="lbl">내 PC</span>
 							</button>
 						)}
+						{fs.side === "remote" && peers.length > 0 && (
+							<button
+								type="button"
+								className={`btn ghost${shownIds.includes("peer:") ? " on" : ""}`}
+								onClick={() => void togglePeer()}
+								title="다른 서버 칸 — 열려 있는 다른 SSH 연결의 파일 트리를 옆에(트리끼리 끌어 놓으면 서버 ↔ 서버로 보냄)"
+								aria-pressed={shownIds.includes("peer:")}
+							>
+								<Server size={14} /> <span className="lbl">다른 서버</span>
+							</button>
+						)}
 						{local && (
 							<button type="button" className={`btn ghost${has("transfers") ? " on" : ""}`} onClick={() => showTransfers(true)} title="전송 칸 — 올리기·받기 진행 목록(터미널 칸의 탭으로)">
 								<ArrowDownUp size={14} /> <span className="lbl">전송</span>
@@ -1426,42 +1562,19 @@ export function Workbench({
 								<Activity size={14} /> <span className="lbl">자원</span>
 							</button>
 						)}
-						{fs.side === "remote" && fs.conn != null && (
-							<>
-								<button type="button" className={`btn ghost${has("services") ? " on" : ""}`} onClick={() => openTool("services", "서비스")} title="서비스 칸 — systemd 서비스 상태·시작·중지·재시작·journal 로그">
-									<Cog size={14} /> <span className="lbl">서비스</span>
-								</button>
-								<button type="button" className={`btn ghost${has("docker") ? " on" : ""}`} onClick={() => openTool("docker", "Docker")} title="Docker 칸 — 컨테이너 목록·로그·안에 셸 열기·재시작·이미지">
-									<Container size={14} /> <span className="lbl">Docker</span>
-								</button>
-								<button type="button" className={`btn ghost${has("webports") ? " on" : ""}`} onClick={() => openTool("webports", "웹 화면")} title="웹 화면 — 서버에서 듣고 있는 포트, 눌러 포워딩 켜고 브라우저로 열기">
-									<Globe size={14} /> <span className="lbl">웹</span>
-								</button>
-							</>
-						)}
-						<button type="button" className={`btn ghost${has("search") ? " on" : ""}`} onClick={() => openTool("search", "내용 찾기")} title="내용 찾기 — 폴더 안 파일 내용을 grep 으로 찾고 그 줄로 열기(Ctrl+Shift+F)">
-							<TextSearch size={14} /> <span className="lbl">찾기</span>
+						<button
+							type="button"
+							className={`btn ghost${toolMenu ? " on" : ""}`}
+							onClick={(e) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								setToolMenu({ x: r.left, y: r.bottom + 4 });
+							}}
+							title="도구 — 서비스·Docker·웹 화면·내용 찾기·동기화·포트 포워딩·tmux·기본 배치(명령 팔레트 Ctrl+Shift+P 로도 찾습니다)"
+							aria-haspopup="menu"
+						>
+							<Wrench size={14} /> <span className="lbl">도구</span> <ChevronDown size={12} />
 						</button>
-						{local && syncInfo && (
-							<button type="button" className={`btn ghost${has("sync") ? " on" : ""}`} onClick={openSync} title="동기화 칸 — 내 PC 폴더 ↔ 이 서버 폴더(rsync 모드)·자동 반영">
-								<RefreshCcw size={14} /> <span className="lbl">동기화</span>
-							</button>
-						)}
 					</span>
-					{server && (
-						<>
-							<span className="sep" />
-							<span className="wb-group" role="group" aria-label="연결">
-								<span className="wb-group-label">연결</span>
-								<button type="button" className={`btn ghost${fwdOpen ? " on" : ""}`} onClick={() => setFwdOpen(true)} title="포트 포워딩 — 로컬·원격·SOCKS 규칙 추가·고치기·켜고 끄기(켜진 것은 터미널 상태 줄에 ⇄ 로)">
-									<ArrowRightLeft size={14} /> <span className="lbl">포워딩</span>
-								</button>
-								<button type="button" className={`btn ghost${tmuxOpen ? " on" : ""}`} onClick={() => setTmuxOpen(true)} title={`tmux 세션 보기·끝내기${server.tmux ? " — 이 서버는 터미널을 tmux 로 엽니다(끊겨도 이어짐)" : ""}`}>
-									<Layers size={14} /> <span className="lbl">tmux{server.tmux ? " ●" : ""}</span>
-								</button>
-							</span>
-						</>
-					)}
 					{(sudoFs || fs.side === "local") && <span className="sep" />}
 					{(sudoFs || fs.side === "local") && (
 						<span className="wb-group" role="group" aria-label="권한">
@@ -1508,15 +1621,6 @@ export function Workbench({
 					<span className="sep" />
 					<span className="wb-group" role="group" aria-label="배치">
 						<span className="wb-group-label">배치</span>
-						<button
-							type="button"
-							className="btn ghost"
-							title={locked ? "배치가 잠겨 있어 초기화할 수 없습니다" : "기본 배치 — 이 작업대의 칸을 왼쪽 트리·가운데 문서·아래 터미널로 되돌리기"}
-							disabled={locked}
-							onClick={resetLayout}
-						>
-							<LayoutTemplate size={14} /> <span className="lbl">기본 배치</span>
-						</button>
 						<LayoutLockButton locked={locked} onChange={setLocked} />
 					</span>
 					{lockNote && <span className="badge warn">배치가 잠겨 있습니다 — 자물쇠(Ctrl+Alt+L)로 푸세요</span>}
@@ -1588,6 +1692,34 @@ export function Workbench({
 				/>
 			)}
 			{conflict.element}
+			{toolMenu && (
+				<ContextMenu
+					x={toolMenu.x}
+					y={toolMenu.y}
+					onClose={() => setToolMenu(null)}
+					items={[
+						...(fs.side === "remote" && fs.conn != null
+							? ([
+									{ label: `${has("monitor") ? "✓ " : ""}자원 — CPU·메모리·디스크·프로세스`, run: openMonitor },
+									{ label: `${has("services") ? "✓ " : ""}서비스 — systemd·journal`, run: () => openTool("services", "서비스") },
+									{ label: `${has("docker") ? "✓ " : ""}Docker — 컨테이너·로그·셸`, run: () => openTool("docker", "Docker") },
+									{ label: `${has("webports") ? "✓ " : ""}웹 화면 — 듣는 포트 → 포워딩 → 브라우저`, run: () => openTool("webports", "웹 화면") },
+								] as MenuItem[])
+							: []),
+						{ label: `${has("search") ? "✓ " : ""}내용 찾기 — grep  Ctrl+Shift+F`, run: () => openTool("search", "내용 찾기") },
+						...(local && syncInfo ? ([{ label: `${has("sync") ? "✓ " : ""}동기화 — 내 PC 폴더 ↔ 서버 폴더(rsync 모드)`, run: openSync }] as MenuItem[]) : []),
+						...(server
+							? ([
+									{ sep: true },
+									{ label: "포트 포워딩…", run: () => setFwdOpen(true) },
+									{ label: `tmux 세션…${server.tmux ? " (이 서버는 tmux 로 열기)" : ""}`, run: () => setTmuxOpen(true) },
+								] as MenuItem[])
+							: []),
+						{ sep: true },
+						{ label: terminalOnly ? "기본 배치 — 터미널만" : "기본 배치 — 왼쪽 트리 · 오른쪽 터미널", run: resetLayout, disabled: locked },
+					]}
+				/>
+			)}
 			{adminMenu && (
 				<ContextMenu
 					x={adminMenu.x}
@@ -1620,9 +1752,9 @@ function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => voi
 		["Alt+1 · 2 · 3", "트리 · 문서 · 터미널로"],
 		["Ctrl+`", "터미널 칸 숨기기·보이기"],
 		["Alt+O", "파일 빠른 열기(이름으로 찾기 · /경로 바로 열기)"],
-		["Ctrl+Shift+F", "파일 내용 찾기(grep — 결과를 누르면 그 줄로)"],
+		["Ctrl+Shift+F", "파일 내용 찾기(grep — 결과를 누르면 그 줄로). 터미널 안에서는 터미널 찾기"],
 		["Ctrl+Alt+L", `배치 잠그기·풀기 — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`],
-		["F1", "이 도움말"],
+		["F1", "이 도움말(터미널 안에서는 셸 프로그램 몫 — 명령 팔레트에서 '단축키')"],
 		["파일 트리", ""],
 		["↑ ↓ ← → · Enter", "옮기기 · 접고 펴기 · 열기"],
 		["F2 · Del", "이름 바꾸기 · 지우기"],

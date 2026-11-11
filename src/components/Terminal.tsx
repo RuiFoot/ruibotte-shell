@@ -357,18 +357,40 @@ export function TerminalView({
 		// ── 단어 색칠·기록·rz/sz 설정(설정 화면이 바꾸면 다시 읽는다) ──
 		const hi = attachHighlighter(term);
 		const utf8 = new TextEncoder();
-		/** 화면에 그리고 기록에도 — EUC-KR 이면 기록은 UTF-8 로 */
-		const show = (b: Uint8Array) => {
+		/** 화면에 그리고 기록에도 — EUC-KR 이면 기록은 UTF-8 로. done: xterm 이 다 그린 뒤(흐름 제어 ack) */
+		const show = (b: Uint8Array, done?: () => void) => {
 			const dec = decoderRef.current;
 			const rec = recRef.current;
 			if (dec) {
 				const t = dec.decode(b, { stream: true });
-				term.write(t);
+				term.write(t, done);
 				rec?.push(utf8.encode(t));
 			} else {
-				term.write(b);
+				term.write(b, done);
 				rec?.push(b);
 			}
+		};
+		// 흐름 제어 — 그린 바이트를 모아 64 KB 마다(작으면 30 ms 뒤) 알린다. 백엔드는 화면에 떠 있는 양을 창 안으로 묶는다
+		let ackPending = 0;
+		let ackTimer: number | undefined;
+		const flushAck = () => {
+			ackTimer = undefined;
+			const id = idRef.current;
+			if (!ackPending || disposed) return;
+			if (id == null) {
+				ackTimer = window.setTimeout(flushAck, 50);
+				return;
+			}
+			const n = ackPending;
+			ackPending = 0;
+			void backend.ack?.(id, n).catch(() => undefined);
+		};
+		const drawn = (n: number) => {
+			ackPending += n;
+			if (ackPending >= 65536) {
+				window.clearTimeout(ackTimer);
+				flushAck();
+			} else if (ackTimer === undefined) ackTimer = window.setTimeout(flushAck, 30);
 		};
 		const zmb = isRemote
 			? createZmodem({
@@ -428,8 +450,11 @@ export function TerminalView({
 				}
 			}
 			axRef.current?.output(b.length);
-			if (zmb) zmb.consume(b);
-			else show(b);
+			const n = b.length;
+			if (zmb) {
+				zmb.consume(b);
+				drawn(n);
+			} else show(b, () => drawn(n));
 			if (zmWatch) {
 				if (Date.now() > zmWatch) zmWatch = 0;
 				else {
@@ -717,6 +742,7 @@ export function TerminalView({
 		return () => {
 			disposed = true;
 			window.clearInterval(lagTimer);
+			window.clearTimeout(ackTimer);
 			setLag(null);
 			window.removeEventListener(TERM_PREFS_EVENT, applyPrefs);
 			zmb?.cancel();

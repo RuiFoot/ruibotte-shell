@@ -264,12 +264,27 @@ pub(crate) struct Outcome {
     pub(crate) resumed: bool,
 }
 
-/// 서버 A 의 파일을 서버 B 로 — 내 PC 를 거쳐 흘려 보낸다(디스크에 남기지 않음). 양쪽 sha256 을 맞춰 본다
+/// 서버 A 의 파일을 서버 B 로 — 내 PC 를 거쳐 흘려 보낸다(디스크에 남기지 않음). 양쪽 sha256 을 맞춰 본다.
+/// 이어 보내기: B 에 같은 크기 이하의 `.rbpart` 가 있으면 A 를 그 자리부터 읽어 뒤에 붙인다(이때 확인은 양쪽 서버 sha256 으로만)
 async fn relay_one(a: &Conn, b: &Conn, it: &Item, prog: &Arc<Mutex<Progress>>, cancel: &Arc<Mutex<HashSet<u32>>>, id: u32) -> Result<Outcome, String> {
     use sha2::Digest;
     let part = format!("{}.rbpart", it.dest);
     let mut src = a.sftp.open(it.src.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
-    let mut dst = b.sftp.create(part.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
+    let have = b.sftp.metadata(part.clone()).await.ok().and_then(|m| m.size).filter(|s| *s > 0 && *s <= it.size).unwrap_or(0);
+    let resumed = have > 0;
+    let mut dst = if resumed {
+        let mut f = b
+            .sftp
+            .open_with_flags(part.clone(), russh_sftp::protocol::OpenFlags::WRITE)
+            .await
+            .map_err(|e| sftp_err(e).message_owned())?;
+        f.seek(std::io::SeekFrom::Start(have)).await.map_err(|e| e.to_string())?;
+        src.seek(std::io::SeekFrom::Start(have)).await.map_err(|e| e.to_string())?;
+        prog.lock().unwrap().bytes_done += have;
+        f
+    } else {
+        b.sftp.create(part.clone()).await.map_err(|e| sftp_err(e).message_owned())?
+    };
     let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -287,17 +302,17 @@ async fn relay_one(a: &Conn, b: &Conn, it: &Item, prog: &Arc<Mutex<Progress>>, c
     dst.shutdown().await.map_err(|e| e.to_string())?;
     let mine = hex::encode(hasher.finalize());
     let (ha, hb) = (remote_sha256(a, &it.src).await, remote_sha256(b, &part).await);
-    for h in [&ha, &hb].into_iter().flatten() {
-        if *h != mine {
-            let _ = b.sftp.remove_file(part.clone()).await;
-            return Err(format!("{} — sha256 이 맞지 않아 지웠습니다", base_name(&it.dest)));
-        }
+    // 이어 보냈으면 앞부분을 이번에 읽지 않았으므로 내 해시는 쓰지 않고 양쪽 서버 해시끼리만 맞춘다
+    let bad = if resumed { matches!((&ha, &hb), (Some(x), Some(y)) if x != y) } else { [&ha, &hb].into_iter().flatten().any(|h| *h != mine) };
+    if bad {
+        let _ = b.sftp.remove_file(part.clone()).await;
+        return Err(format!("{} — sha256 이 맞지 않아 지웠습니다", base_name(&it.dest)));
     }
     if b.sftp.try_exists(it.dest.clone()).await.unwrap_or(false) {
         b.sftp.remove_file(it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
     }
     b.sftp.rename(part, it.dest.clone()).await.map_err(|e| sftp_err(e).message_owned())?;
-    Ok(Outcome { verified: ha.is_some() && hb.is_some(), resumed: false })
+    Ok(Outcome { verified: ha.is_some() && hb.is_some(), resumed })
 }
 
 /// 서버 A → 서버 B 중계 시작
@@ -312,11 +327,13 @@ pub async fn relay_start(
     to_conn: u32,
     dest_dir: String,
     overwrite: bool,
+    // 받는 쪽 이름(같은 이름이 있어 "이름 바꿔 보내기" 를 고른 때) — 없으면 원래 이름
+    dest_name: Option<String>,
 ) -> R<u32> {
     let a = conns.get(from_conn)?;
     let b = conns.get(to_conn)?;
     let id = transfers.next.fetch_add(1, Ordering::Relaxed) + 1;
-    let name = base_name(&src);
+    let name = dest_name.filter(|n| !n.is_empty() && !n.contains('/') && !n.contains('\\')).unwrap_or_else(|| base_name(&src));
     let mut items = Vec::new();
     walk_remote(&a, &src, Path::new(&dest_dir).join(&name), &mut items).await?;
     // 원격 경로는 늘 / — Windows 의 PathBuf 가 \ 로 이은 것을 바로잡는다

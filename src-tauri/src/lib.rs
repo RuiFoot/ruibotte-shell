@@ -3,6 +3,7 @@
 
 mod db;
 mod diag;
+mod flow;
 mod grid;
 mod importer;
 mod jdbc;
@@ -117,6 +118,7 @@ pub fn run() {
             pty::app_relaunch_admin,
             pty::pty_write,
             pty::pty_resize,
+            pty::pty_ack,
             pty::pty_close,
             pty::bench_stream,
             grid::grid_demo_open,
@@ -162,6 +164,7 @@ pub fn run() {
             ssh::ssh_shell_open,
             ssh::ssh_shell_write,
             ssh::ssh_shell_resize,
+            ssh::ssh_shell_ack,
             ssh::ssh_shell_close,
             ssh::sftp_list,
             ssh::sftp_read_text,

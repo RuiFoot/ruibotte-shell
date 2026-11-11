@@ -23,22 +23,20 @@ function compile(user: HiRule[]) {
 	return [...rules, ...DEFAULTS];
 }
 
-/** 한 번에 살펴볼 새 줄 상한 — 대량 출력은 끝쪽만 칠한다 */
-const MAX_LINES = 400;
-/** 붙여 둘 꾸밈 상한 — 넘으면 오래된 것부터 뗀다 */
-const MAX_DECOS = 3000;
-
 /**
  * 터미널 출력 단어 색칠 — xterm 버퍼(글자·색)는 건드리지 않고 꾸밈(decoration)으로 글자색만 덧입힌다.
- * - 출력이 그려진 뒤 묶어서(120ms) 새로 끝난 줄만 본다 · 전체 화면 앱(vim·less 등 대체 화면)에서는 하지 않는다
+ * - 화면에 보이는 줄만 칠한다(출력·스크롤이 멈춘 뒤 묶어서). 꾸밈은 늘 화면 한 장 분량이라 쌓이지 않는다
+ *   (꾸밈은 렌더마다 전부 다시 놓이므로, 스크롤백 전체에 수천 개를 달아 두면 타이핑 에코마다 비용이 붙는다)
+ * - 끝난 줄만(커서 줄은 아직 쓰는 중) · 전체 화면 앱(vim·less 등 대체 화면)에서는 하지 않는다
  * - 프로그램이 이미 색을 준 글자(기본색이 아닌 칸)는 그대로 둔다
  */
 export function attachHighlighter(term: Terminal) {
 	let rules: { re: RegExp; color: string }[] = [];
 	let decos: { d: IDecoration; m: IMarker }[] = [];
-	let last: IMarker | null = null;
 	let timer: number | undefined;
 	let cell: IBufferCell | undefined;
+	/** 지난번에 칠한 화면(같으면 다시 칠하지 않는다) */
+	let lastKey = "";
 
 	const clear = () => {
 		for (const x of decos) {
@@ -46,19 +44,21 @@ export function attachHighlighter(term: Terminal) {
 			x.m.dispose();
 		}
 		decos = [];
-		last?.dispose();
-		last = null;
+		lastKey = "";
 	};
 
 	const scan = () => {
 		timer = undefined;
 		if (!rules.length) return;
 		const buf = term.buffer.active;
-		if (buf.type !== "normal") return;
+		if (buf.type !== "normal") return clear();
 		const cursor = buf.baseY + buf.cursorY;
-		const to = cursor - 1; // 끝난 줄까지만(커서 줄은 아직 쓰는 중)
-		let from = last && !last.isDisposed && last.line >= 0 ? last.line : Math.max(0, cursor - 200);
-		if (to - from > MAX_LINES) from = to - MAX_LINES;
+		const from = buf.viewportY;
+		const to = Math.min(cursor - 1, buf.viewportY + term.rows - 1); // 끝난 줄까지만
+		const key = `${from}:${to}:${buf.length}:${buf.getLine(to)?.translateToString(true) ?? ""}`;
+		if (key === lastKey) return;
+		clear();
+		lastKey = key;
 		for (let y = from; y <= to; y++) {
 			const line = buf.getLine(y);
 			if (!line) continue;
@@ -101,19 +101,14 @@ export function attachHighlighter(term: Terminal) {
 				decos.push({ d, m });
 			}
 		}
-		if (decos.length > MAX_DECOS) {
-			for (const x of decos.splice(0, decos.length - MAX_DECOS)) {
-				x.d.dispose();
-				x.m.dispose();
-			}
-		}
-		last?.dispose();
-		last = term.registerMarker(0) ?? null;
+	};
+	const later = (ms: number) => {
+		if (rules.length && timer === undefined) timer = window.setTimeout(scan, ms);
 	};
 
-	const sub = term.onWriteParsed(() => {
-		if (rules.length && timer === undefined) timer = window.setTimeout(scan, 120);
-	});
+	const sub = term.onWriteParsed(() => later(120));
+	const subScroll = term.onScroll(() => later(60));
+	const subResize = term.onResize(() => later(60));
 
 	return {
 		/** null = 끔 */
@@ -125,6 +120,8 @@ export function attachHighlighter(term: Terminal) {
 		dispose() {
 			window.clearTimeout(timer);
 			sub.dispose();
+			subScroll.dispose();
+			subResize.dispose();
 			clear();
 		},
 	};

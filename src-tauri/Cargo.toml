@@ -63,6 +63,28 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
+# 앱 전체는 크기 우선(s)이지만, 매 바이트를 지나는 암호·압축·해시는 속도 우선(3) — SSH 처리량·전송 sha256
+[profile.release.package.ring]
+opt-level = 3
+[profile.release.package.russh]
+opt-level = 3
+[profile.release.package.russh-cryptovec]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.aes]
+opt-level = 3
+[profile.release.package.ctr]
+opt-level = 3
+[profile.release.package.chacha20]
+opt-level = 3
+[profile.release.package.poly1305]
+opt-level = 3
+[profile.release.package.ghash]
+opt-level = 3
+[profile.release.package.miniz_oxide]
+opt-level = 3
+
 [target."cfg(windows)".dependencies]
 winreg = "0.55"
 # 망 판별(기본 게이트웨이·DNS 접미사·Wi-Fi 이름) — 이미 의존성 트리에 있는 판

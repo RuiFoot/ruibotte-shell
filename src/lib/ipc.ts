@@ -397,6 +397,8 @@ export type TermBackend = {
 	isMine(payload: unknown, id: number): boolean;
 	/** 원격: sudo 암호를 그 셸에 넣기 */
 	sudoPw?(id: number): Promise<boolean>;
+	/** 흐름 제어 — 화면이 그린 바이트 수(그만큼 더 보낸다) */
+	ack?(id: number, n: number): Promise<void>;
 };
 
 export function localFs(home: string): FsBackend {
@@ -429,6 +431,7 @@ export const localTerm: TermBackend = {
 	write: (id, data) => invoke("pty_write", { id, data }),
 	resize: (id, cols, rows) => invoke("pty_resize", { id, cols, rows }),
 	close: (id) => invoke("pty_close", { id }),
+	ack: (id, n) => invoke("pty_ack", { id, n }),
 	exitEvent: "pty-exit",
 	isMine: (p, id) => (p as { id: number }).id === id,
 };
@@ -494,6 +497,7 @@ export function sshTerm(conn: number): TermBackend {
 		resize: (shell, cols, rows) => invoke("ssh_shell_resize", { conn, shell, cols, rows }),
 		close: (shell) => invoke("ssh_shell_close", { conn, shell }),
 		sudoPw: (shell) => invoke<boolean>("ssh_shell_sudo_pw", { conn, shell }),
+		ack: (shell, n) => invoke("ssh_shell_ack", { conn, shell, n }),
 		exitEvent: "ssh-shell-exit",
 		isMine: (p, id) => {
 			const x = p as { conn: number; shell: number };

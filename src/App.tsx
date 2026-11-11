@@ -309,7 +309,7 @@ export function App() {
 		setSheet(p);
 	};
 	const profileMenu = (p: Profile): MenuItem[] => [
-		{ label: "서버 카드(계정 고르기)…", run: () => connect(p) },
+		{ label: "서버 카드(계정 고르기)…", run: () => { if (p.id != null) setCardId(p.id); } },
 		...(p.accounts ?? []).map((a) => ({ label: `${accountName(a)}${a.label?.trim() ? ` (${a.username})` : ""} 계정으로 접속${a.isDefault ? " ★" : ""}`, run: () => connectAs(p, a) })),
 		{ sep: true as const },
 		{ label: "설정…", run: () => editProfile(p) },
@@ -417,9 +417,18 @@ export function App() {
 		return () => window.removeEventListener("keydown", onKey);
 	}, [sbRail]);
 
-	/** 서버를 누르면 — 바로 접속하지 않고 서버 카드(서버 정보·계정 고르기) */
+	/**
+	 * 서버를 누르면 — 계정이 하나뿐이고 더 물을 것이 없으면(암호 저장됨·키·에이전트) 바로 접속,
+	 * 아니면 서버 카드(서버 정보·계정 고르기). 카드는 우클릭 › 서버 카드로 언제든 연다
+	 */
 	const connect = (p: Profile) => {
 		if (p.id == null) return;
+		const accts = p.accounts ?? [];
+		const only = accts.length === 1 ? accts[0] : undefined;
+		if (only && (only.secretSaved || only.auth !== "password")) {
+			connectAs(p, only);
+			return;
+		}
 		setCardId(p.id);
 	};
 	/** 그 계정으로(안 주면 기본 계정) 접속 */
@@ -456,7 +465,7 @@ export function App() {
 			const kw = [p.host, p.groupName, p.memo, p.kind, p.engine, ...(p.accounts ?? []).map((a) => `${a.username} ${a.label ?? ""}`)].filter(Boolean).join(" ");
 			const def = defaultAccount(p);
 			out.push(
-				{ id: `conn.card.${p.id}`, group: "conn", title: p.name, hint: `${where} · 서버 카드`, keywords: kw, run: () => connect(p) },
+				{ id: `conn.card.${p.id}`, group: "conn", title: p.name, hint: `${where} · 서버 카드`, keywords: kw, run: () => { if (p.id != null) setCardId(p.id); } },
 				{ id: `conn.go.${p.id}`, group: "conn", title: `${p.name} — 기본 계정으로 접속`, hint: def ? accountName(def) : undefined, keywords: `${kw} 접속 연결 connect`, run: () => connectAs(p) },
 			);
 			if ((p.accounts?.length ?? 0) > 1) {

@@ -25,6 +25,7 @@ const READ_BUF: usize = 64 * 1024;
 struct Session {
     /// 입력 큐 — 쓰기 전용 스레드가 차례대로 PTY 에 쓴다(메인 스레드는 넣기만 하고 바로 돌아간다)
     input: Sender<Vec<u8>>,
+    flow: std::sync::Arc<crate::flow::Flow>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -288,19 +289,23 @@ pub fn pty_open(
             }
         })
         .map_err(|e| e.to_string())?;
+    let flow = std::sync::Arc::new(crate::flow::Flow::default());
     ptys.map
         .lock()
         .unwrap()
-        .insert(id, Session { input, master: pair.master, child });
+        .insert(id, Session { input, flow: flow.clone(), master: pair.master, child });
 
+    // 출력 — 화면이 그린 만큼만 더 보낸다(흐름 제어). 창이 차면 읽기를 쉬어 셸 쪽이 기다린다
     std::thread::Builder::new()
         .name(format!("pty-{id}"))
         .spawn(move || {
             let mut buf = vec![0u8; READ_BUF];
             loop {
+                flow.wait_room_blocking();
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        flow.sent(n);
                         if on_data.send(InvokeResponseBody::Raw(buf[..n].to_vec())).is_err() {
                             break;
                         }
@@ -321,6 +326,14 @@ pub fn pty_write(ptys: State<'_, Ptys>, id: u32, data: String) -> Result<(), Str
     s.input.send(data.into_bytes()).map_err(|_| "터미널이 닫혔습니다".to_string())
 }
 
+/// 화면이 그린 바이트 수 — 흐름 제어
+#[tauri::command]
+pub fn pty_ack(ptys: State<'_, Ptys>, id: u32, n: usize) {
+    if let Some(s) = ptys.map.lock().unwrap().get(&id) {
+        s.flow.ack(n);
+    }
+}
+
 #[tauri::command]
 pub fn pty_resize(ptys: State<'_, Ptys>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
     let map = ptys.map.lock().unwrap();
@@ -333,6 +346,7 @@ pub fn pty_resize(ptys: State<'_, Ptys>, id: u32, cols: u16, rows: u16) -> Resul
 #[tauri::command]
 pub fn pty_close(ptys: State<'_, Ptys>, id: u32) {
     if let Some(mut s) = ptys.map.lock().unwrap().remove(&id) {
+        s.flow.reset();
         let _ = s.child.kill();
     }
 }

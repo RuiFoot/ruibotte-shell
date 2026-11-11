@@ -230,7 +230,7 @@ pub(crate) struct Conn {
     route: RouteUsed,
     pub(crate) sftp: SftpSession,
     /// 터미널 채널 → 입력 큐. 셸마다 쓰기 전용 작업이 차례대로 보낸다(키 입력 순서 보장, 한 셸이 막혀도 다른 셸은 그대로)
-    shells: Mutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<ShellOp>>>,
+    shells: Mutex<HashMap<u32, ShellIo>>,
     next_shell: AtomicU32,
     /// 이 연결의 계정(sudo 암호 키)·sudo 설정 — 접속할 때의 계정 설정을 따른다
     pub(crate) account_id: Option<i64>,
@@ -243,6 +243,8 @@ pub(crate) struct Conn {
     tmux: bool,
     /// 서버에 tmux 가 있는지(0 모름·1 있음·2 없음)
     tmux_ok: std::sync::atomic::AtomicU8,
+    /// 로그인 셸 이름(bash·zsh·…) — 셸 통합을 걸지 정한다. 처음 셸을 열 때 한 번 묻는다
+    login_shell: tokio::sync::OnceCell<String>,
     /// 터미널 채널 → 붙은 tmux 세션 번호(빈 번호부터 다시 써서 다시 연결해도 같은 이름)
     tmux_used: Mutex<HashMap<u32, u32>>,
     /// 원격 포워딩 대상(처리기와 같은 것)
@@ -453,6 +455,7 @@ pub(crate) async fn connect(store: &Store, conns: &SshConns, req: ConnectReq) ->
             profile_id,
             tmux,
             tmux_ok: Default::default(),
+            login_shell: Default::default(),
             tmux_used: Default::default(),
             remote,
             route: route.clone(),
@@ -946,6 +949,7 @@ pub async fn ssh_shell_open(
     let c = conns.get(conn)?;
     // tmux 로 열기: 서버에 tmux 가 있으면 rbs-<빈 번호> 세션에 붙는다(없으면 만든다)
     let use_tmux = c.tmux && tmux_available(&c).await;
+    let kind = if use_tmux { String::new() } else { login_shell(&c).await };
     let ch = c.handle.channel_open_session().await.map_err(map_russh)?;
     ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(map_russh)?;
     ch.request_shell(true).await.map_err(map_russh)?;
@@ -954,30 +958,120 @@ pub async fn ssh_shell_open(
     if use_tmux {
         let n = c.tmux_alloc(shell);
         let _ = write.data(tmux_line(n, cwd.as_deref()).as_bytes()).await;
-        c.shells.lock().unwrap().insert(shell, spawn_shell_writer(write));
-        spawn_shell_reader(app, c.clone(), conn, shell, read, on_data);
+        let flow = Arc::new(crate::flow::Flow::default());
+        c.shells.lock().unwrap().insert(shell, ShellIo { tx: spawn_shell_writer(write), flow: flow.clone() });
+        spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, None);
         return Ok(shell);
     }
-    // 셸 통합(bash) — 서버 파일은 바꾸지 않고 이 셸에만 PROMPT_COMMAND 를 얹는다. 프롬프트마다:
-    //   OSC 133;D;종료코드(앞 명령 끝) · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작)
-    //   (exit $__rb_s) 로 $? 를 되돌려 원래 PROMPT_COMMAND·PS1 이 같은 값을 본다. 끝맺음은 모두 BEL.
-    // 앞 공백 = 셸 기록에 남지 않게(HISTCONTROL=ignorespace). 끝에 clear 로 이 줄을 화면에서 지운다.
-    let mut line = String::from(
-        r#" [ -n "$BASH_VERSION" ] && PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#,
-    );
-    if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
-        line.push_str(&format!("; cd '{}'", dir.replace('\'', "'\\''")));
-    }
-    line.push_str("; clear");
+    // 셸 통합 — 서버 파일은 바꾸지 않고 이 셸에만 프롬프트 훅을 얹는다(로그인 셸이 bash·zsh 일 때만, 그 밖은 아무것도 치지 않는다). 프롬프트마다:
+    //   OSC 133;D;종료코드(앞 명령 끝) · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작). 끝맺음은 모두 BEL.
+    // 앞 공백 = 셸 기록에 남지 않게. 이 줄의 에코는 화면에서 지우지 않고(clear 하지 않음 — MOTD·마지막 로그인 안내가 남는다)
+    // 끝에 찍는 준비 표식(OSC 6975)까지 리더가 걸러 낸다(InitFilter).
+    let hook = match kind.as_str() {
+        "bash" => Some((
+            r#" PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#,
+            " PROMPT_COMMAND='__rb_s",
+        )),
+        "zsh" => Some((
+            r#" __rb_precmd() { local s=$?; printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007' "$s" "$HOST" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#,
+            " __rb_precmd()",
+        )),
+        _ => None,
+    };
+    let cd = cwd.filter(|d| !d.is_empty()).map(|dir| format!("cd '{}'", dir.replace('\'', "'\\''")));
     // tmux 로 열라고 했는데 서버에 없으면 이 연결에서 한 번만 알린다
-    if c.tmux && c.tmux_ok.compare_exchange(2, 3, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        line.push_str(r"; printf '\r\n[RuiBotte] 서버에 tmux 가 없어 일반 셸로 열었습니다. 끊기면 이어지지 않습니다(설치 예: sudo apt install tmux).\r\n'");
+    let notice = (c.tmux && c.tmux_ok.compare_exchange(2, 3, Ordering::Relaxed, Ordering::Relaxed).is_ok())
+        .then_some(r"printf '\r\n[RuiBotte] 서버에 tmux 가 없어 일반 셸로 열었습니다. 끊기면 이어지지 않습니다(설치 예: sudo apt install tmux).\r\n'");
+    let mut filter = None;
+    let mut line = String::new();
+    if let Some((h, prefix)) = hook {
+        line.push_str(h);
+        if let Some(cd) = &cd {
+            line.push_str("; ");
+            line.push_str(cd);
+        }
+        line.push_str(r"; printf '\033]6975;rb\007'");
+        filter = Some(InitFilter::new(prefix.as_bytes().to_vec()));
+    } else if let Some(cd) = &cd {
+        // 셸 통합이 없는 셸 — 시작 폴더만(이 줄은 보인다)
+        line.push(' ');
+        line.push_str(cd);
     }
-    line.push('\n');
-    let _ = write.data(line.as_bytes()).await;
-    c.shells.lock().unwrap().insert(shell, spawn_shell_writer(write));
-    spawn_shell_reader(app, c.clone(), conn, shell, read, on_data);
+    if let Some(n) = notice {
+        line.push_str(if line.is_empty() { " " } else { "; " });
+        line.push_str(n);
+    }
+    if !line.is_empty() {
+        line.push('\n');
+        let _ = write.data(line.as_bytes()).await;
+    }
+    let flow = Arc::new(crate::flow::Flow::default());
+    c.shells.lock().unwrap().insert(shell, ShellIo { tx: spawn_shell_writer(write), flow: flow.clone() });
+    spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, filter);
     Ok(shell)
+}
+
+/// 이 연결의 로그인 셸 이름(bash·zsh·sh·…) — 한 번만 묻는다. 모르면 빈 글자(셸 통합을 걸지 않음)
+async fn login_shell(c: &Conn) -> String {
+    c.login_shell
+        .get_or_init(|| async {
+            let out = exec_out(c, r#"printf '%s' "${SHELL##*/}""#, Duration::from_secs(4)).await.unwrap_or_default();
+            out.trim().to_string()
+        })
+        .await
+        .clone()
+}
+
+/// 셸 통합을 걸려고 친 줄의 에코를 화면에서 걸러 낸다 — 그 줄이 시작한 줄 머리(그 앞 프롬프트 포함)부터 준비 표식(OSC 6975)까지.
+/// MOTD 등 그 앞 출력은 그대로 둔다. 표식이 4초 안에 안 오면(셸이 다르거나 느림) 모은 것을 그대로 내보낸다
+pub(crate) struct InitFilter {
+    prefix: Vec<u8>,
+    buf: Vec<u8>,
+    until: tokio::time::Instant,
+}
+
+const READY_MARK: &[u8] = b"\x1b]6975;rb\x07";
+
+impl InitFilter {
+    fn new(prefix: Vec<u8>) -> Self {
+        Self { prefix, buf: Vec::new(), until: tokio::time::Instant::now() + Duration::from_secs(4) }
+    }
+    /// 받은 것을 넣는다 — 다 걸렀으면 true(이후는 바로 보낸다)
+    fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> bool {
+        self.buf.extend_from_slice(data);
+        if let Some(mi) = find_bytes(&self.buf, READY_MARK) {
+            let end = mi + READY_MARK.len();
+            let cut = match find_bytes(&self.buf[..mi], &self.prefix) {
+                Some(p) => self.buf[..p].iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0),
+                None => mi,
+            };
+            out.extend_from_slice(&self.buf[..cut]);
+            out.extend_from_slice(&self.buf[end..]);
+            self.buf.clear();
+            return true;
+        }
+        if self.buf.len() > 256 * 1024 {
+            self.flush(out);
+            return true;
+        }
+        false
+    }
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        out.append(&mut self.buf);
+    }
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 터미널 채널 하나 — 입력 큐와 출력 흐름 제어
+pub(crate) struct ShellIo {
+    tx: tokio::sync::mpsc::UnboundedSender<ShellOp>,
+    flow: Arc<crate::flow::Flow>,
 }
 
 /// 터미널 채널에 할 일 — 입력·크기·닫기를 한 줄로 세워 차례대로
@@ -1033,28 +1127,87 @@ impl Conn {
     /// 이 셸의 입력 큐에 넣기 — 셸이 닫혔으면 CLOSED
     fn shell_send(&self, shell: u32, op: ShellOp) -> R<()> {
         let shells = self.shells.lock().unwrap();
-        let tx = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
-        tx.send(op).map_err(|_| err("CLOSED", "터미널이 닫혔습니다"))
+        let io = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
+        io.tx.send(op).map_err(|_| err("CLOSED", "터미널이 닫혔습니다"))
     }
 }
 
 /// 셸 출력을 화면으로 — 끝나면 채널·tmux 번호를 정리하고 알린다
-fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut read: russh::ChannelReadHalf, on_data: Channel<InvokeResponseBody>) {
+///
+/// 흐름 제어: 화면(xterm)이 그린 만큼 알려 오면(ack) 그만큼 더 보낸다 — 화면에 쌓인 양을 [`crate::flow::WINDOW`] 안으로.
+/// SSH 채널 읽기는 멈추지 않는다(russh 는 한 채널이 안 읽히면 연결 전체가 멈춘다) — 그동안 온 것은 여기 모아 두고,
+/// 모은 것이 [`crate::flow::MAX_BUF`] 를 넘을 때만 읽기를 쉰다. 바로 보낼 수 있으면 지연 없이 보낸다(타이핑 에코).
+#[allow(clippy::too_many_arguments)]
+fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut read: russh::ChannelReadHalf, on_data: Channel<InvokeResponseBody>, flow: Arc<crate::flow::Flow>, mut init: Option<InitFilter>) {
+    use crate::flow::{MAX_BUF, SEND_CHUNK};
+    use futures_util::FutureExt;
     tauri::async_runtime::spawn(async move {
         let mut code = None;
-        while let Some(msg) = read.wait().await {
-            match msg {
-                ChannelMsg::Data { data } => {
-                    if on_data.send(InvokeResponseBody::Raw(data.to_vec())).is_err() {
-                        break;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut open = true;
+        'outer: loop {
+            // 보낼 수 있는 만큼 보낸다
+            while !pending.is_empty() && flow.can_send() {
+                let n = pending.len().min(SEND_CHUNK);
+                let chunk: Vec<u8> = pending.drain(..n).collect();
+                flow.sent(n);
+                if on_data.send(InvokeResponseBody::Raw(chunk)).is_err() {
+                    break 'outer;
+                }
+            }
+            if !open {
+                if pending.is_empty() {
+                    break;
+                }
+                // 닫힌 뒤 남은 것 — ack 를 기다려 마저(화면이 사라졌으면 잠시 뒤 그냥 버린다)
+                if tokio::time::timeout(Duration::from_secs(2), flow.acked()).await.is_err() {
+                    flow.reset();
+                }
+                continue;
+            }
+            let room = pending.len() < MAX_BUF;
+            tokio::select! {
+                msg = read.wait(), if room => {
+                    let mut msg = msg;
+                    // 이미 와 있는 것은 한 번에 모은다(eval 횟수 줄이기)
+                    loop {
+                        match msg {
+                            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => match init.as_mut() {
+                                Some(f) => {
+                                    if f.feed(&data, &mut pending) {
+                                        init = None;
+                                    }
+                                }
+                                None => pending.extend_from_slice(&data),
+                            },
+                            Some(ChannelMsg::ExitStatus { exit_status }) => code = Some(exit_status),
+                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                                if let Some(mut f) = init.take() {
+                                    f.flush(&mut pending);
+                                }
+                                open = false;
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                        if pending.len() >= SEND_CHUNK {
+                            break;
+                        }
+                        match read.wait().now_or_never() {
+                            Some(m) => msg = m,
+                            None => break,
+                        }
                     }
                 }
-                ChannelMsg::ExtendedData { data, .. } => {
-                    let _ = on_data.send(InvokeResponseBody::Raw(data.to_vec()));
+                _ = flow.acked(), if !pending.is_empty() => {}
+                // 셸 통합 표식이 끝내 안 오면 모은 것을 그대로
+                _ = tokio::time::sleep_until(init.as_ref().map(|f| f.until).unwrap_or_else(tokio::time::Instant::now)), if init.is_some() => {
+                    if let Some(mut f) = init.take() {
+                        f.flush(&mut pending);
+                    }
                 }
-                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-                ChannelMsg::Eof | ChannelMsg::Close => break,
-                _ => {}
+                // 화면이 ack 를 못 보내는 상태(닫힘·멈춤)여도 영영 막히지 않게
+                _ = tokio::time::sleep(Duration::from_secs(3)), if !pending.is_empty() && !flow.can_send() => flow.reset(),
             }
         }
         c.shells.lock().unwrap().remove(&shell);
@@ -1177,6 +1330,16 @@ pub async fn ssh_tmux_kill(conns: State<'_, SshConns>, conn: u32, name: String) 
     Ok(())
 }
 
+/// 화면이 그린 바이트 수 — 흐름 제어(그만큼 더 보낸다)
+#[tauri::command]
+pub fn ssh_shell_ack(conns: State<'_, SshConns>, conn: u32, shell: u32, n: usize) -> R<()> {
+    let c = conns.get(conn)?;
+    if let Some(io) = c.shells.lock().unwrap().get(&shell) {
+        io.flow.ack(n);
+    }
+    Ok(())
+}
+
 /// 키 입력 — 동기 명령으로 둔다: 큐에 넣기만 해서 바로 끝나고, 메인 스레드가 받은 차례대로 넣으니 순서가 지켜진다
 /// (async 명령은 호출마다 따로 작업이 돼 빠른 타이핑에서 순서가 섞일 수 있었다)
 #[tauri::command]
@@ -1215,9 +1378,10 @@ pub fn ssh_shell_resize(conns: State<'_, SshConns>, conn: u32, shell: u32, cols:
 #[tauri::command]
 pub async fn ssh_shell_close(conns: State<'_, SshConns>, conn: u32, shell: u32) -> R<()> {
     if let Ok(c) = conns.get(conn) {
-        let tx = c.shells.lock().unwrap().remove(&shell);
-        if let Some(tx) = tx {
-            let _ = tx.send(ShellOp::Close);
+        let io = c.shells.lock().unwrap().remove(&shell);
+        if let Some(io) = io {
+            let _ = io.tx.send(ShellOp::Close);
+            io.flow.reset();
         }
     }
     Ok(())

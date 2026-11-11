@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Activity } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { api } from "../lib/ipc";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 
@@ -24,6 +24,116 @@ const SLOW_MS = 800;
 
 const LABEL: Record<Every, string> = { off: "끔", auto: "자동(망 상태 따라)", "5000": "5초마다", "15000": "15초마다", "60000": "1분마다" };
 
+type Snap = { cpu: number[]; mem: number[]; disk: { pct: number; mount: string } | null; info: string; err: boolean; gap: number };
+const EMPTY: Snap = { cpu: [], mem: [], disk: null, info: "", err: false, gap: AUTO_MIN };
+
+// ── 간격(모든 서버 공용 설정) ──
+let everyNow: Every = "auto";
+let everyLoaded = false;
+const everySubs = new Set<() => void>();
+function loadEvery() {
+	if (everyLoaded) return;
+	everyLoaded = true;
+	void api
+		.settingGet(KEY)
+		.then((v) => {
+			if (v && v in LABEL) setEveryGlobal(v as Every, false);
+		})
+		.catch(() => undefined);
+}
+function setEveryGlobal(v: Every, save = true) {
+	if (v === everyNow) return;
+	everyNow = v;
+	if (save) void api.settingSet(KEY, v).catch(() => undefined);
+	for (const f of everySubs) f();
+	for (const p of pollers.values()) p.restart();
+}
+function subEvery(f: () => void) {
+	everySubs.add(f);
+	return () => everySubs.delete(f);
+}
+
+/**
+ * 연결 하나에 읽기 하나 — 터미널을 여러 개(나누기·탭) 열어도 서버에는 한 번만 묻고 모든 표시가 같은 값을 본다.
+ * 보는 표시가 없어지면 멈춘다.
+ */
+class Poller {
+	snap: Snap = EMPTY;
+	subs = new Set<() => void>();
+	private prev: Ticks | null = null;
+	private timer = 0;
+	private gen = 0;
+	constructor(private conn: number) {}
+	private set(p: Partial<Snap>) {
+		this.snap = { ...this.snap, ...p };
+		for (const f of this.subs) f();
+	}
+	restart() {
+		window.clearTimeout(this.timer);
+		const my = ++this.gen;
+		if (everyNow === "off" || !this.subs.size) return;
+		let next = everyNow === "auto" ? AUTO_MIN : Number(everyNow);
+		const tick = async () => {
+			if (my !== this.gen) return;
+			if (document.visibilityState === "visible") {
+				const t0 = performance.now();
+				let ok = false;
+				try {
+					const s = await invoke<Lite>("ssh_stats", { conn: this.conn });
+					if (my !== this.gen) return;
+					ok = true;
+					const t = s.cpu[0];
+					const p = this.prev;
+					this.prev = t;
+					const cpu = p && t && t.total > p.total ? [...this.snap.cpu, Math.max(0, Math.min(100, Math.round(((t.busy - p.busy) / (t.total - p.total)) * 100)))].slice(-N) : this.snap.cpu;
+					const mem = s.mem.total ? [...this.snap.mem, Math.round((1 - s.mem.available / s.mem.total) * 100)].slice(-N) : this.snap.mem;
+					const full = s.disks.filter((d) => d.sizeK > 0).sort((a, b) => b.usedK / b.sizeK - a.usedK / a.sizeK)[0];
+					this.set({
+						err: false,
+						cpu,
+						mem,
+						disk: full ? { pct: Math.round((full.usedK / full.sizeK) * 100), mount: full.mount } : null,
+						info: `부하 ${s.load.map((x) => x.toFixed(2)).join(" ")} · 코어 ${s.ncpu} · 응답 ${Math.round(performance.now() - t0)}ms`,
+					});
+				} catch {
+					if (my === this.gen) this.set({ err: true });
+				}
+				if (everyNow === "auto") {
+					const slow = !ok || performance.now() - t0 > SLOW_MS;
+					next = slow ? Math.min(AUTO_MAX, next * 2) : Math.max(AUTO_MIN, next / 2);
+					if (next !== this.snap.gap) this.set({ gap: next });
+				}
+			}
+			if (my === this.gen) this.timer = window.setTimeout(tick, next);
+		};
+		void tick();
+	}
+	stop() {
+		this.gen++;
+		window.clearTimeout(this.timer);
+	}
+}
+const pollers = new Map<number, Poller>();
+function subPoller(conn: number, f: () => void) {
+	let p = pollers.get(conn);
+	if (!p) {
+		p = new Poller(conn);
+		pollers.set(conn, p);
+	}
+	const first = p.subs.size === 0;
+	p.subs.add(f);
+	if (first) p.restart();
+	return () => {
+		const q = pollers.get(conn);
+		if (!q) return;
+		q.subs.delete(f);
+		if (!q.subs.size) {
+			q.stop();
+			pollers.delete(conn);
+		}
+	};
+}
+
 /**
  * 상태 줄에 붙는 작은 서버 자원 표시 — CPU·메모리·가장 찬 디스크를 숫자와 짧은 꺾은선으로.
  * 켜고 끄기·간격은 우클릭(또는 ⋯)으로 고르고 모든 서버에 같이 기억한다. 기본은 "자동":
@@ -31,69 +141,13 @@ const LABEL: Record<Every, string> = { off: "끔", auto: "자동(망 상태 따�
  * 창이 안 보일 때는 읽지 않는다. 80% 넘으면 주황, 90% 넘으면 빨강. 누르면 자세한 자원 칸을 연다.
  */
 export function MiniMonitor({ conn, onOpen }: { conn: number; onOpen: () => void }) {
-	const prev = useRef<Ticks | null>(null);
-	const [every, setEveryState] = useState<Every>("auto");
-	const [cpu, setCpu] = useState<number[]>([]);
-	const [mem, setMem] = useState<number[]>([]);
-	const [disk, setDisk] = useState<{ pct: number; mount: string } | null>(null);
-	const [info, setInfo] = useState("");
-	const [err, setErr] = useState(false);
-	const [gap, setGap] = useState(AUTO_MIN);
+	loadEvery();
+	const every = useSyncExternalStore(subEvery, () => everyNow);
+	const setEvery = (v: Every) => setEveryGlobal(v);
+	const sub = useCallback((f: () => void) => subPoller(conn, f), [conn]);
+	const snap = useSyncExternalStore(sub, () => pollers.get(conn)?.snap ?? EMPTY);
+	const { cpu, mem, disk, info, err, gap } = snap;
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-
-	useEffect(() => {
-		void api
-			.settingGet(KEY)
-			.then((v) => v && v in LABEL && setEveryState(v as Every))
-			.catch(() => undefined);
-	}, []);
-	const setEvery = (v: Every) => {
-		setEveryState(v);
-		void api.settingSet(KEY, v).catch(() => undefined);
-	};
-
-	useEffect(() => {
-		if (every === "off") return;
-		let alive = true;
-		let timer = 0;
-		let next = every === "auto" ? AUTO_MIN : Number(every);
-		const tick = async () => {
-			if (document.visibilityState === "visible") {
-				const t0 = performance.now();
-				let ok = false;
-				try {
-					const s = await invoke<Lite>("ssh_stats", { conn });
-					if (!alive) return;
-					ok = true;
-					setErr(false);
-					const t = s.cpu[0];
-					const p = prev.current;
-					prev.current = t;
-					if (p && t && t.total > p.total) {
-						const v = Math.round(((t.busy - p.busy) / (t.total - p.total)) * 100);
-						setCpu((h) => [...h, Math.max(0, Math.min(100, v))].slice(-N));
-					}
-					if (s.mem.total) setMem((h) => [...h, Math.round((1 - s.mem.available / s.mem.total) * 100)].slice(-N));
-					const full = s.disks.filter((d) => d.sizeK > 0).sort((a, b) => b.usedK / b.sizeK - a.usedK / a.sizeK)[0];
-					setDisk(full ? { pct: Math.round((full.usedK / full.sizeK) * 100), mount: full.mount } : null);
-					setInfo(`부하 ${s.load.map((x) => x.toFixed(2)).join(" ")} · 코어 ${s.ncpu} · 응답 ${Math.round(performance.now() - t0)}ms`);
-				} catch {
-					if (alive) setErr(true);
-				}
-				if (every === "auto") {
-					const slow = !ok || performance.now() - t0 > SLOW_MS;
-					next = slow ? Math.min(AUTO_MAX, next * 2) : Math.max(AUTO_MIN, next / 2);
-					setGap(next);
-				}
-			}
-			if (alive) timer = window.setTimeout(tick, next);
-		};
-		void tick();
-		return () => {
-			alive = false;
-			window.clearTimeout(timer);
-		};
-	}, [conn, every]);
 
 	const openMenu = (e: React.MouseEvent) => {
 		e.preventDefault();
