@@ -1292,10 +1292,25 @@ export function Workbench({
 				}
 			}
 			if (!ok) defaultLayout(e.api, terminalOnly);
-			// 다시 연결한 뒤: 끊기기 전에 열려 있던 편집기 탭을 다시 연다(초안은 편집기가 되살리기를 묻는다)
-			for (const x of openEditors.get(owner) ?? []) {
-				if (!e.api.getPanel(`edit:${x.which}:${x.path}`)) addDoc(e.api, { id: `edit:${x.which}:${x.path}`, component: "editor", title: x.name, params: x });
-			}
+			// 다시 연결한 뒤·앱을 다시 연 뒤: 열려 있던 편집기 탭을 다시 연다(초안은 편집기가 되살리기를 묻는다).
+			// 이 창에서 연 적이 없으면(앱 재시작) 저장해 둔 목록에서 — 많으면 앞 12개만
+			const reopen = (list: { which: Which; path: string; name: string }[]) => {
+				if (gone.current) return;
+				for (const x of list.slice(0, 12)) {
+					if (!e.api.getPanel(`edit:${x.which}:${x.path}`)) addDoc(e.api, { id: `edit:${x.which}:${x.path}`, component: "editor", title: x.name, params: x });
+				}
+			};
+			const mem = openEditors.get(owner);
+			if (mem) reopen(mem);
+			else
+				void api.settingGet(`${savedKey}.editors`).then((v) => {
+					try {
+						const list = v ? (JSON.parse(v) as { which: Which; path: string; name: string }[]) : [];
+						if (Array.isArray(list)) reopen(list.filter((x) => x && typeof x.path === "string" && (x.which === "remote" || x.which === "local")));
+					} catch {
+						/* 깨진 저장본은 무시 */
+					}
+				});
 		});
 		e.api.onDidActivePanelChange((ev) => setActivePanel(ev.panel?.id ?? null));
 		e.api.onDidLayoutChange(() => {
@@ -1306,10 +1321,10 @@ export function Workbench({
 				const d = dock.current;
 				if (!d || gone.current) return;
 				void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
-				openEditors.set(
-					owner,
-					d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string }),
-				);
+				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown });
+				openEditors.set(owner, eds);
+				// 다른 서버 칸에서 연 파일은 그 연결이 있어야 하니 앱을 다시 열 때는 빼고 남긴다
+				void api.settingSet(`${savedKey}.editors`, JSON.stringify(eds.filter((x) => !x.peer).map(({ which, path, name }) => ({ which, path, name }))));
 			}, 600);
 		});
 	};

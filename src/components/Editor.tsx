@@ -4,10 +4,14 @@ import { diff as textDiff, MergeView } from "@codemirror/merge";
 import { gotoLine, highlightSelectionMatches, openSearchPanel, search, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, highlightActiveLineGutter, highlightWhitespace, keymap, lineNumbers } from "@codemirror/view";
-import { Braces, Eye, GitCompare, Save, Table2 } from "lucide-react";
+import { jsonParseLinter } from "@codemirror/lang-json";
+import { linter, lintGutter } from "@codemirror/lint";
+import { showMinimap } from "@replit/codemirror-minimap";
+import { Braces, Eye, GitCompare, Map as MapIcon, Save, Table2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { editingExtensions } from "../lib/cmEditing";
 import { codeHighlight } from "../lib/cmTheme";
+import { AUTO_SAVE_DEFAULT, type AutoSave, autoSaveWhenLabel, loadAutoSave, onAutoSave, setAutoSave as storeAutoSave } from "../lib/autoSave";
 import { api, asSshError, type FileText, type FsBackend, type TextMeta } from "../lib/ipc";
 import { detectLang, LANGS, loadLang } from "../lib/languages";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -30,6 +34,19 @@ const theme = EditorView.theme({
 });
 
 type Status = { text: string; tone?: "ok" | "err" | "warn"; conflict?: boolean };
+
+const MINIMAP_EVENT = "rb-minimap";
+/** 미니맵 — 글자 대신 덩어리로 그려 가볍게, 보이는 곳 표시는 늘 */
+const MINIMAP = {
+	create: () => ({ dom: document.createElement("div") }),
+	displayText: "blocks" as const,
+	showOverlay: "always" as const,
+};
+/** 미니맵 켜고 끄기 — 열린 편집기 모두에 */
+function setMinimapPref(on: boolean) {
+	void api.settingSet("editor.minimap", on ? "1" : "0");
+	window.dispatchEvent(new CustomEvent<boolean>(MINIMAP_EVENT, { detail: on }));
+}
 
 const normalize = (t: string) => t.replace(/\r\n?/g, "\n");
 
@@ -83,16 +100,20 @@ export function EditorView_({
 	const lang = useRef(new Compartment());
 	const ro = useRef(new Compartment());
 	const ws = useRef(new Compartment());
+	const mini = useRef(new Compartment());
+	const lint = useRef(new Compartment());
+	const [minimap, setMinimap] = useState(true);
 	const [file, setFile] = useState<FileText | null>(null);
 	/** 저장할 때 쓸 형식(인코딩·줄 끝·BOM) — 바꾸면 고친 것으로 친다 */
 	const [saveMeta, setSaveMeta] = useState<TextMeta | null>(null);
 	const [dirty, setDirty] = useState(false);
 	const [status, setStatus] = useState<Status>({ text: "여는 중…" });
 	const [encoding, setEncoding] = useState<string | undefined>(undefined);
-	const saveRef = useRef<(force?: boolean) => void>(() => {});
+	const saveRef = useRef<(force?: boolean, quiet?: boolean) => void>(() => {});
 	const [alt, setAlt] = useState(false);
 	const [altText, setAltText] = useState("");
-	const [autoSave, setAutoSave] = useState(false);
+	const [auto, setAuto] = useState<AutoSave>(AUTO_SAVE_DEFAULT);
+	const [autoState, setAutoState] = useState<{ s: "saving" | "saved" | "failed"; at?: string; msg?: string } | null>(null);
 	const autoTimer = useRef<number | undefined>(undefined);
 	const [langId, setLangId] = useState<string | null>(null);
 	const [autoLang, setAutoLang] = useState<string | null>(null);
@@ -107,7 +128,8 @@ export function EditorView_({
 	const draftTimer = useRef<number | undefined>(undefined);
 	const altKind = altView(path);
 	useEffect(() => {
-		void api.settingGet("editor.autosave").then((v) => setAutoSave(v === "1"));
+		void loadAutoSave().then(setAuto);
+		return onAutoSave(setAuto);
 	}, []);
 
 	const readOnly = !file || file.binary || file.tooLarge || file.meta.guessed;
@@ -206,6 +228,8 @@ export function EditorView_({
 					lang.current.of([]),
 					ro.current.of(EditorState.readOnly.of(true)),
 					ws.current.of([]),
+					mini.current.of([]),
+					lint.current.of([]),
 					theme,
 					EditorView.updateListener.of((u) => {
 						if (u.docChanged && u.transactions.some((t) => t.isUserEvent("input") || t.isUserEvent("delete") || t.isUserEvent("undo") || t.isUserEvent("redo") || t.isUserEvent("move"))) {
@@ -227,6 +251,28 @@ export function EditorView_({
 		};
 	}, []);
 
+	useEffect(() => {
+		void api.settingGet("editor.minimap").then((v) => setMinimap(v !== "0"));
+		const on = (e: Event) => setMinimap((e as CustomEvent<boolean>).detail);
+		window.addEventListener(MINIMAP_EVENT, on);
+		return () => window.removeEventListener(MINIMAP_EVENT, on);
+	}, []);
+	// 미니맵(오른쪽 개요 막대 — Orbit Monaco 와 같이 기본 켬). 아주 긴 파일(5만 줄 넘음)은 그리는 값이 커서 뺀다
+	const loadedLen = file?.text?.length ?? 0;
+	useEffect(() => {
+		const v = view.current;
+		if (!v) return;
+		const on = minimap && !alt && loadedLen > 0 && v.state.doc.lines <= 50_000;
+		v.dispatch({ effects: mini.current.reconfigure(on ? showMinimap.of(MINIMAP) : []) });
+	}, [minimap, alt, loadedLen]);
+	// JSON 은 문법 오류에 밑줄·줄 표시(올리면 이유)
+	useEffect(() => {
+		const v = view.current;
+		if (!v) return;
+		const json = langId === "json" || /\.json$/i.test(path);
+		v.dispatch({ effects: lint.current.reconfigure(json ? [linter(jsonParseLinter(), { delay: 400 }), lintGutter()] : []) });
+	}, [langId, path]);
+
 	useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
 	useEffect(() => {
 		if (active) requestAnimationFrame(() => view.current?.focus());
@@ -247,36 +293,70 @@ export function EditorView_({
 		return () => window.clearTimeout(draftTimer.current);
 	});
 
+	const saving = useRef(false);
 	const save = useCallback(
-		async (force = false) => {
+		async (force = false, quiet = false) => {
 			const v = view.current;
-			if (!v || !file || !saveMeta || readOnly) return;
-			setStatus({ text: "저장 중…" });
+			if (!v || !file || !saveMeta || readOnly || saving.current) return;
+			saving.current = true;
+			// 자동 저장은 조용히 — 상태 줄 글은 그대로 두고 스위치에만 "저장 중…·자동 저장됨 시각"
+			if (quiet) setAutoState({ s: "saving" });
+			else setStatus({ text: "저장 중…" });
 			const text = v.state.doc.toString();
 			try {
 				const saved = await fs.write(path, text, saveMeta, force ? null : file.mtime);
 				setFile({ ...file, size: saved.size, mtime: saved.mtime, meta: saveMeta });
 				original.current = text;
-				setDirty(false);
-				setChanged(0);
-				void api.settingSet(draftKey, "");
-				setStatus({ text: `저장함 · ${new Date().toLocaleTimeString()}`, tone: "ok" });
+				// 저장하는 사이 더 고쳤으면 고친 상태로 남긴다(다음 자동 저장이 이어서)
+				const now = view.current?.state.doc.toString() ?? text;
+				setDirty(now !== text);
+				setChanged(now !== text ? changedLines(text, now) : 0);
+				void api.settingSet(draftKey, now === text ? "" : now);
+				const at = new Date().toLocaleTimeString("ko-KR", { hour12: false });
+				if (quiet) {
+					setAutoState({ s: "saved", at });
+					setStatus((st) => (st.tone === "err" || st.tone === "ok" ? { text: "" } : st));
+				} else {
+					setAutoState(null);
+					setStatus({ text: `저장함 · ${at}`, tone: "ok" });
+				}
 			} catch (e) {
 				const x = asSshError(e);
 				const conflict = x.code === "CONFLICT" || /바뀌었습니다/.test(x.message);
-				setStatus({ text: x.message, tone: "err", conflict });
+				if (quiet) setAutoState({ s: "failed", msg: conflict ? "그사이 서버 파일이 바뀌어 자동 저장을 멈췄습니다 — 비교한 뒤 저장하세요" : x.message });
+				setStatus({ text: conflict && quiet ? `자동 저장 멈춤 — ${x.message}` : x.message, tone: "err", conflict });
+			} finally {
+				saving.current = false;
 			}
 		},
 		[fs, path, file, saveMeta, readOnly, draftKey],
 	);
-	saveRef.current = (force?: boolean) => void save(force);
+	saveRef.current = (force?: boolean, quiet?: boolean) => void save(force, quiet);
 
-	// 자동 저장 — 고친 뒤 1.5초 멈추면(읽기 전용·충돌이면 하지 않음)
+	// 자동 저장 ① 멈추면 — 고치다 멈추고 delayMs 뒤(읽기 전용·충돌이면 하지 않음, 실패하면 다음에 고칠 때 다시)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 고칠 때마다(렌더마다) 타이머를 다시 건다
 	useEffect(() => {
 		window.clearTimeout(autoTimer.current);
-		if (autoSave && dirty && !readOnly && !status.conflict) autoTimer.current = window.setTimeout(() => saveRef.current(), 1500);
+		if (auto.on && auto.when !== "blur" && dirty && !readOnly && !status.conflict)
+			autoTimer.current = window.setTimeout(() => saveRef.current(false, true), auto.delayMs);
 		return () => window.clearTimeout(autoTimer.current);
-	}, [autoSave, dirty, readOnly, status.conflict]);
+	});
+	// 자동 저장 ② 포커스가 떠날 때 — 이 편집기에서 다른 곳으로, 또는 앱 창이 뒤로 갈 때
+	const blurSave = useRef(() => {});
+	blurSave.current = () => {
+		if (auto.on && auto.when !== "delay" && dirty && !readOnly && !status.conflict) saveRef.current(false, true);
+	};
+	useEffect(() => {
+		const onWin = () => blurSave.current();
+		const onVis = () => document.visibilityState === "hidden" && blurSave.current();
+		window.addEventListener("blur", onWin);
+		document.addEventListener("visibilitychange", onVis);
+		return () => {
+			window.removeEventListener("blur", onWin);
+			document.removeEventListener("visibilitychange", onVis);
+		};
+	}, []);
+
 
 	const tidy = () => {
 		const v = view.current;
@@ -426,6 +506,10 @@ export function EditorView_({
 				className="cm-host"
 				ref={host}
 				hidden={alt}
+				onBlur={(e) => {
+					// 편집기 안(찾기 칸 등)으로 옮겨 가는 것은 떠난 게 아니다
+					if (!e.currentTarget.contains(e.relatedTarget as Node | null)) blurSave.current();
+				}}
 				onContextMenu={(e) => {
 					e.preventDefault();
 					setMenu({ x: e.clientX, y: e.clientY });
@@ -514,7 +598,18 @@ export function EditorView_({
 						</button>
 						{metaChanged && <span className="warn">형식 바꿈 — 저장하면 적용</span>}
 						{readOnly ? <span>읽기 전용</span> : null}
-						{autoSave && !readOnly ? <span title="설정 › 편집기에서 끔">자동 저장</span> : null}
+						<AutoSaveSwitch
+							auto={auto}
+							blocked={readOnly ? "읽기 전용 파일" : null}
+							state={autoState}
+							dirty={dirty}
+							onChange={(next) => {
+								storeAutoSave(next);
+								setAuto(next);
+								if (!next.on) setAutoState(null);
+							}}
+							onRetry={() => saveRef.current(false, true)}
+						/>
 						{altKind && (
 							<button
 								type="button"
@@ -539,6 +634,16 @@ export function EditorView_({
 								<Braces size={12} /> 정리
 							</button>
 						)}
+						<button
+							type="button"
+							className={`btn ghost${minimap ? " on" : ""}`}
+							style={{ height: 20 }}
+							aria-pressed={minimap}
+							title={minimap ? "미니맵 숨기기" : "미니맵 보이기"}
+							onClick={() => setMinimapPref(!minimap)}
+						>
+							<MapIcon size={12} />
+						</button>
 						<button type="button" className="btn ghost" style={{ height: 20 }} disabled={!dirty || readOnly} onClick={() => saveRef.current()} title="저장 (Ctrl+S)">
 							<Save size={12} /> 저장
 						</button>
@@ -548,6 +653,70 @@ export function EditorView_({
 			{menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems()} onClose={() => setMenu(null)} />}
 			{diffOf && <DiffSheet {...diffOf} onClose={() => setDiffOf(null)} />}
 		</>
+	);
+}
+
+/** 상태 줄 자동 저장 스위치 — 누르면 켜고 끄기, 켜져 있으면 시점(멈추면·포커스 떠날 때·둘 다)을 고른다 */
+function AutoSaveSwitch({
+	auto,
+	blocked,
+	state,
+	dirty,
+	onChange,
+	onRetry,
+}: {
+	auto: AutoSave;
+	blocked: string | null;
+	state: { s: "saving" | "saved" | "failed"; at?: string; msg?: string } | null;
+	dirty: boolean;
+	onChange: (next: AutoSave) => void;
+	onRetry: () => void;
+}) {
+	const label = !auto.on
+		? "자동 저장 꺼짐"
+		: blocked
+			? "자동 저장 — 이 파일 제외"
+			: state?.s === "saving"
+				? "저장 중…"
+				: state?.s === "failed"
+					? "자동 저장 실패 · 다시"
+					: dirty
+						? "● 저장 안 됨"
+						: state?.at
+							? `자동 저장됨 · ${state.at}`
+							: "✓ 자동 저장";
+	const title = blocked
+		? `자동 저장을 쓸 수 없음 — ${blocked}`
+		: auto.on && state?.s === "failed"
+			? `${state.msg ?? "자동 저장 실패"} — 눌러서 다시 시도`
+			: `자동 저장 ${auto.on ? "켜짐" : "꺼짐"} (${autoSaveWhenLabel(auto)}) — 눌러서 ${auto.on ? "끄기" : "켜기"}. 확인 창 없이 저장하고, 그사이 서버 파일이 바뀌었으면 멈춥니다`;
+	return (
+		<span className="autosave">
+			<button
+				type="button"
+				role="switch"
+				aria-checked={auto.on}
+				className={`btn ghost${auto.on && !blocked ? " on" : ""}${auto.on && state?.s === "failed" ? " danger" : ""}`}
+				style={{ height: 20 }}
+				title={title}
+				onClick={() => (auto.on && state?.s === "failed" ? onRetry() : onChange({ ...auto, on: !auto.on }))}
+			>
+				{label}
+			</button>
+			{auto.on && !blocked && (
+				<Select
+					size="sm"
+					value={auto.when}
+					onChange={(v) => onChange({ ...auto, when: v as AutoSave["when"] })}
+					title="자동 저장 시점"
+					options={[
+						{ value: "delay", label: `멈추고 ${auto.delayMs / 1000}초` },
+						{ value: "blur", label: "포커스 떠날 때" },
+						{ value: "both", label: "둘 다" },
+					]}
+				/>
+			)}
+		</span>
 	);
 }
 

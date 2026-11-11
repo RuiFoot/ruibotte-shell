@@ -1,4 +1,4 @@
-import { autocompletion, closeBrackets, closeBracketsKeymap, completeAnyWord, completionKeymap } from "@codemirror/autocomplete";
+import { autocompletion, type CompletionContext, closeBrackets, closeBracketsKeymap, completeAnyWord, completionKeymap } from "@codemirror/autocomplete";
 import { gotoLine } from "@codemirror/search";
 import { EditorState, type Extension } from "@codemirror/state";
 import { crosshairCursor, EditorView, keymap, rectangularSelection } from "@codemirror/view";
@@ -10,10 +10,20 @@ import { crosshairCursor, EditorView, keymap, rectangularSelection } from "@code
  * - 여러 커서: Alt+누르기로 커서 더하기, Alt+끌기로 사각 선택, Ctrl+D 로 같은 낱말 다음 것 더하기(search 키맵)
  * - 줄로 가기: Ctrl+G
  */
+/** 문서 안 낱말 완성 — 직접 연 것(Ctrl+Space)이 아니면 두 글자 이상 쳤을 때만 */
+const wordsFrom2 = (ctx: CompletionContext) => {
+	if (!ctx.explicit) {
+		const w = ctx.matchBefore(/\w+$/);
+		if (!w || w.to - w.from < 2) return null;
+	}
+	return completeAnyWord(ctx);
+};
+
 export function editingExtensions(): Extension[] {
 	return [
-		autocompletion({ activateOnTyping: true, maxRenderedOptions: 80, icons: true }),
-		EditorState.languageData.of(() => [{ autocomplete: completeAnyWord }]),
+		// 치는 동안 낱말마다 목록이 깜박이지 않게 — 잠깐 멈추면(200ms) 열고, 문서 안 낱말은 두 글자부터
+		autocompletion({ activateOnTyping: true, activateOnTypingDelay: 200, maxRenderedOptions: 80, icons: true }),
+		EditorState.languageData.of(() => [{ autocomplete: wordsFrom2 }]),
 		closeBrackets(),
 		EditorState.allowMultipleSelections.of(true),
 		rectangularSelection({ eventFilter: (e) => e.altKey }),

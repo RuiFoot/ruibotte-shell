@@ -383,14 +383,14 @@ export const FileTree = memo(function FileTree({
 		if (e) {
 			items.push({ sep: true });
 			if (e.kind !== "dir") items.push({ label: "열기", run: () => onOpen(e) });
-			if (e.kind !== "dir" && onTail) items.push({ label: "실시간 보기(tail -F)", run: () => onTail(e) });
+			if (e.kind !== "dir" && onTail) items.push({ label: "실시간 보기(tail -F)  L", run: () => onTail(e) });
 			if (e.kind !== "dir" && onCompare) items.push({ label: compareLabel?.(e) ?? "비교 대상으로 고르기", run: () => onCompare(e) });
 			if (e.kind === "dir" && onArchive) items.push({ label: "폴더째 받기(.tar.gz)…", run: () => onArchive(e) });
 			if (onRelay) items.push({ label: "다른 서버로 보내기…", run: () => onRelay(e) });
 			if (onSend) items.push({ label: sendLabel ?? "보내기", run: () => onSend(e) });
 			if (onDownloadTo) items.push({ label: "다른 곳에 받기…", run: () => onDownloadTo(e) });
 			if (e.kind === "dir" && onCd) items.push({ label: "터미널에서 이 폴더로", run: () => onCd(e.path) });
-			if (onNewTerminal) items.push({ label: "여기서 새 터미널", run: () => onNewTerminal(e.kind === "dir" ? e.path : parentDir(e.path)) });
+			if (onNewTerminal) items.push({ label: "여기서 새 터미널  T", run: () => onNewTerminal(e.kind === "dir" ? e.path : parentDir(e.path)) });
 			if (e.kind === "dir") items.push({ label: "여기를 맨 위로", run: () => onRoot(e.path) });
 			items.push(
 				{ sep: true },
@@ -642,6 +642,10 @@ export const FileTree = memo(function FileTree({
 						else onOpen(at);
 					} else if (k === "F2" && at) renameEntry(at);
 					else if (k === "Delete" && at) removeEntry(at);
+					// T = 여기서 새 터미널(파일이면 그 폴더), L = 실시간 보기(tail -F) — Orbit 트리와 같은 키
+					else if ((k === "t" || k === "T") && !ev.ctrlKey && !ev.altKey && !ev.metaKey && onNewTerminal)
+						onNewTerminal(at ? (at.kind === "dir" ? at.path : parentDir(at.path)) : root);
+					else if ((k === "l" || k === "L") && !ev.ctrlKey && !ev.altKey && !ev.metaKey && at && at.kind !== "dir" && onTail) onTail(at);
 					else return;
 					ev.preventDefault();
 					ev.stopPropagation();

@@ -963,20 +963,23 @@ pub async fn ssh_shell_open(
         spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, None);
         return Ok(shell);
     }
-    // 셸 통합 — 서버 파일은 바꾸지 않고 이 셸에만 프롬프트 훅을 얹는다(로그인 셸이 bash·zsh 일 때만, 그 밖은 아무것도 치지 않는다). 프롬프트마다:
+    // 셸 통합 — 서버 파일은 바꾸지 않고 이 셸에만 프롬프트 훅을 얹는다(zsh 는 precmd, 그 밖은 bash 일 때만 걸리는 PROMPT_COMMAND, fish·csh 등은 치지 않는다). 프롬프트마다:
     //   OSC 133;D;종료코드(앞 명령 끝) · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작). 끝맺음은 모두 BEL.
     // 앞 공백 = 셸 기록에 남지 않게. 이 줄의 에코는 화면에서 지우지 않고(clear 하지 않음 — MOTD·마지막 로그인 안내가 남는다)
     // 끝에 찍는 준비 표식(OSC 6975)까지 리더가 걸러 낸다(InitFilter).
     let hook = match kind.as_str() {
-        "bash" => Some((
-            r#" PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#,
-            " PROMPT_COMMAND='__rb_s",
-        )),
         "zsh" => Some((
             r#" __rb_precmd() { local s=$?; printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007' "$s" "$HOST" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#,
             " __rb_precmd()",
         )),
-        _ => None,
+        // 프롬프트 훅 문법이 다른 셸 — 아무것도 치지 않는다
+        "fish" | "csh" | "tcsh" | "nu" | "elvish" | "xonsh" | "pwsh" | "powershell" => None,
+        // bash·sh·dash·ksh, 또는 알아내지 못함(exec 채널 거부·느림) — bash 일 때만 걸리게 감싸서 보낸다(sh·dash 에서는 오류 없이 지나간다).
+        // 알아내지 못했다고 빼면 그 연결은 프롬프트 표식이 없어 자동완성·명령 표시가 통째로 꺼진다(0.12.0 회귀)
+        _ => Some((
+            r#" [ -n "$BASH_VERSION" ] && PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#,
+            r#" [ -n "$BASH_VERSION" ]"#,
+        )),
     };
     let cd = cwd.filter(|d| !d.is_empty()).map(|dir| format!("cd '{}'", dir.replace('\'', "'\\''")));
     // tmux 로 열라고 했는데 서버에 없으면 이 연결에서 한 번만 알린다

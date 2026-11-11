@@ -4,6 +4,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef, useState } from "react";
 import iconUrl from "../../assets/icon.svg?url";
 import { askText } from "../lib/ask";
+import { AUTO_SAVE_DEFAULT, type AutoSave, loadAutoSave, onAutoSave, setAutoSave as storeAutoSave } from "../lib/autoSave";
 import { SETTINGS_GOTO_EVENT, type SettingsSection, takeSettingsSection } from "../lib/commands";
 import { type AppInfo, api, localShells, type ShellInfo } from "../lib/ipc";
 import { defaultLogDir, revealLogDir } from "../lib/sessionLog";
@@ -317,7 +318,7 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 	const [hiWords, setHiWords] = useTermSetting(PREF_KEYS.hiWords, "[]");
 	const [zmOn, setZmOn] = useTermSetting(PREF_KEYS.zmOn, "1");
 	const [zmDir, setZmDir] = useTermSetting(PREF_KEYS.zmDir, "");
-	const [tabList, setTabList] = useTermSetting(PREF_KEYS.tabList, "0");
+	const [tabList, setTabList] = useTermSetting(PREF_KEYS.tabList, "1");
 	const [sigHint, setSigHint] = useTermSetting(PREF_KEYS.sigHint, "0");
 	const [ctrlVSend, setCtrlVSend] = useTermSetting(PREF_KEYS.ctrlVSend, "0");
 	const [logBase, setLogBase] = useState("");
@@ -332,7 +333,7 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 	}, []);
 	const [autostart, setAutostart] = useState<boolean | null>(null);
 	const [msg, setMsg] = useState("");
-	const [autoSave, setAutoSave] = useState(false);
+	const [autoSave, setAutoSave] = useState<AutoSave>(AUTO_SAVE_DEFAULT);
 	// 명령 팔레트에서 "설정 › 화면" 등으로 바로 — 그 묶음 제목으로 스크롤하고 잠깐 강조
 	const root = useRef<HTMLDivElement>(null);
 	const [flash, setFlash] = useState<SettingsSection | null>(null);
@@ -354,8 +355,13 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 		</h4>
 	);
 	useEffect(() => {
-		void api.settingGet("editor.autosave").then((v) => setAutoSave(v === "1"));
+		void loadAutoSave().then(setAutoSave);
+		return onAutoSave(setAutoSave);
 	}, []);
+	const changeAutoSave = (next: AutoSave) => {
+		setAutoSave(next);
+		storeAutoSave(next);
+	};
 
 	useEffect(() => {
 		autostartIsOn()
@@ -446,14 +452,33 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 
 			{h4("editor", "편집기")}
 			<div className="set-group">
-				<Row label="자동 저장" sub="고친 뒤 1.5초 멈추면 저장(읽기 전용·충돌은 제외). 새로 여는 파일부터 적용됩니다">
-					<Toggle
-						on={autoSave}
-						label="자동 저장"
-						onChange={(v) => {
-							setAutoSave(v);
-							void api.settingSet("editor.autosave", v ? "1" : "0");
-						}}
+				<Row label="자동 저장" sub="확인 창 없이 저장합니다. 열고 나서 서버 파일이 바뀌었으면 저장하지 않고 멈춥니다(비교·덮어쓰기는 직접). 편집기 상태 줄에서도 켜고 끌 수 있습니다">
+					<Toggle on={autoSave.on} label="자동 저장" onChange={(v) => changeAutoSave({ ...autoSave, on: v })} />
+				</Row>
+				<Row label="자동 저장 시점" sub="멈추면: 고치다 손을 멈추고 잠시 뒤 · 포커스가 떠날 때: 다른 칸·다른 앱으로 옮길 때">
+					<Select
+						size="sm"
+						value={autoSave.when}
+						onChange={(v) => changeAutoSave({ ...autoSave, when: v as AutoSave["when"] })}
+						options={[
+							{ value: "delay", label: "멈추면", hint: "기본" },
+							{ value: "blur", label: "포커스가 떠날 때" },
+							{ value: "both", label: "둘 다" },
+						]}
+					/>
+				</Row>
+				<Row label="멈춘 뒤 기다릴 시간" sub="자동 저장 시점이 멈추면·둘 다일 때">
+					<Select
+						size="sm"
+						value={String(autoSave.delayMs)}
+						onChange={(v) => changeAutoSave({ ...autoSave, delayMs: Number(v) })}
+						options={[
+							{ value: "800", label: "0.8초" },
+							{ value: "1500", label: "1.5초", hint: "기본" },
+							{ value: "3000", label: "3초" },
+							{ value: "5000", label: "5초" },
+							{ value: "10000", label: "10초" },
+						]}
 					/>
 				</Row>
 			</div>
@@ -481,14 +506,14 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 						]}
 					/>
 				</Row>
-				<Row label="Tab 키" sub="셸 완성: Tab 은 서버 셸(bash)이 완성하고 앱 목록은 Ctrl+Space 로 엽니다. 앱 목록: Tab 으로 앱 목록(명령·옵션 설명·경로)을 엽니다 — 원격에서는 경로마다 서버 목록을 받아 와 느릴 수 있습니다">
+				<Row label="Tab 키" sub="앱 목록: Tab 으로 명령·옵션 설명·경로 목록을 엽니다(후보가 하나면 바로 채우고, 없으면 셸 완성으로). 셸 완성: Tab 은 서버 셸(bash)에 맡기고 앱 목록은 Ctrl+Space 로 엽니다">
 					<Select
 						size="sm"
-						value={tabList === "1" ? "1" : "0"}
+						value={tabList === "0" ? "0" : "1"}
 						onChange={setTabList}
 						options={[
-							{ value: "0", label: "셸 완성", hint: "기본" },
-							{ value: "1", label: "앱 목록" },
+							{ value: "1", label: "앱 목록", hint: "기본" },
+							{ value: "0", label: "셸 완성" },
 						]}
 					/>
 				</Row>

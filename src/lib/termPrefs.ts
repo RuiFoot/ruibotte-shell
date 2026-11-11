@@ -16,7 +16,7 @@ export type TermPrefs = {
 	zmOn: boolean;
 	/** rz/sz 기본 받기 폴더(비우면 그때그때 고르기) */
 	zmDir: string;
-	/** Tab 으로 앱 자동완성 목록(끄면 Tab 은 셸 완성 — 기본) */
+	/** Tab 으로 앱 자동완성 목록(기본 — 끄면 Tab 은 셸 완성) */
 	tabList: boolean;
 	/** 입력 줄 위 명령 서명 줄(기본 끔) */
 	sigHint: boolean;
@@ -85,7 +85,7 @@ export async function loadTermPrefs(): Promise<TermPrefs> {
 		hiWords: parseWords(hw),
 		zmOn: zo !== "0",
 		zmDir: zd ?? "",
-		tabList: tl === "1",
+		tabList: tl !== "0",
 		sigHint: sh === "1",
 		ctrlVSend: cv === "1",
 	};

@@ -341,6 +341,10 @@ export function installMock() {
 					if (String(args.path).endsWith(".csv"))
 						return { path: args.path, size: 200, mtime: now, text: "이름;부서;연봉\n김철수;개발;5,200\n이영희;영업;4,800\n박민수;개발;6,100\n", meta: { encoding: "UTF-8", bom: false, eol: "LF", guessed: false }, binary: false, tooLarge: false };
 					return { path: args.path, size: 320, mtime: now, text: "server:\n  port: 8080\n  name: \"앱\"\n# 설정\n", meta: { encoding: "UTF-8", bom: false, eol: "LF", guessed: false }, binary: false, tooLarge: false };
+				case "sftp_write_text":
+				case "local_write_text":
+				case "sudo_write_text":
+					return { size: String(args.text ?? "").length, mtime: Date.now() };
 				case "snippets_list":
 				case "history_list":
 				case "import_candidates":

@@ -1,7 +1,8 @@
 /**
  * 터미널에 자동완성을 얹는다 — 흐린 제안(→ 받기, Ctrl+→ 한 낱말)과 목록(Ctrl+Space).
- * Tab 은 기본으로 셸 몫(bash 완성 그대로) — 앱 목록은 Ctrl+Space 로 연다. 설정 "Tab 키 = 앱 목록"이면 예전 규칙:
- * 후보 하나면 바로 넣기, 여럿이면 공통 앞부분까지 채우고 목록, 폴더를 넣으면 그 안을 다시 보인다(연타로 파고들기).
+ * Tab(기본, 설정 "Tab 키 = 셸 완성"이면 Ctrl+Space 만): 후보 하나면 바로 넣기, 여럿이면 공통 앞부분까지 채우고 목록,
+ * 폴더를 넣으면 그 안을 다시 보인다(연타로 파고들기 — 계산 중 온 Tab 은 쌓았다가 차례로). 치는 동안에는 목록을 띄우지 않고 흐린 제안(지난 명령)만.
+ * "치다 멈추면 목록" 방식에서 저절로 뜬 목록은 ↑↓ 로 고른 뒤에만 Enter 가 넣기다(아니면 Enter 는 명령 실행).
  * 목록이 떠 있으면 Tab·Enter 는 넣기, ↑↓ 고르기, Esc 닫기. 방식(설정): 흐린 제안+목록 / 치다 멈추면 목록 / 목록만 / 끔.
  * 키 입력 경로를 막지 않도록 React 상태 없이 DOM 을 직접 그린다. 프롬프트(OSC 133 A) 뒤 입력에서만 켜진다.
  * 목록이 비면 Tab 은 원래대로 셸(bash 완성)에 넘긴다. 지난 명령은 서버별로 앱 DB 에 500개까지.
@@ -10,6 +11,9 @@ import type { Terminal } from "@xterm/xterm";
 import { type Candidate, complete, ghost } from "./complete";
 import { loadDict } from "./dict";
 import { api, type FsEntry } from "./ipc";
+
+/** 목록을 저절로 띄우지 않는 짧은 인자 — . .. ../.. ~ ~/ - -- */
+const SHORT_ARG = /^(\.{1,2}(\/\.{1,2})*\/?|~\/?|-{1,2})$/;
 
 export type CompletionSource = {
 	/** 서버별 기록 열쇠(예: ssh:호스트:계정) */
@@ -86,9 +90,13 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	let replace = 0;
 	let timer: number | undefined;
 	let held = false;
-	let tabList = false;
-	/** Tab 계산 중(겹쳐 돌지 않게) */
+	let tabList = true;
+	/** Tab 계산 중(겹쳐 돌지 않게) — 그동안 온 Tab 은 버리지 않고 세어 두었다가 차례로 처리한다(연타로 파고들기) */
 	let tabBusy = false;
+	let tabQueued = 0;
+	/** 입력이 멈춰 저절로 뜬 목록 — ↑↓ 로 고른 뒤에만 Enter 가 넣기(아니면 Enter 는 셸로, 명령 실행) */
+	let autoOpen = false;
+	let moved = false;
 
 	const ghostEl = document.createElement("div");
 	ghostEl.className = "term-ghost";
@@ -137,6 +145,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		const was = !pop.hidden;
 		pop.hidden = true;
 		items = [];
+		autoOpen = false;
+		moved = false;
 		if (was) onPop?.(false);
 	};
 
@@ -153,6 +163,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const renderGhost = () => {
 		const line = currentInput();
 		if (held || line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
+		// 치는 동안에는 목록을 띄우지 않는다 — 흐린 제안은 지난 명령에서만(서버에 묻지 않음), 목록은 Tab
 		const g = ghost(line, history);
 		ghostEl.textContent = g;
 		if (g) placeAtCursor(ghostEl, false);
@@ -228,9 +239,28 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const drill = () => {
 		drilling = true;
 		window.setTimeout(() => {
-			drilling = false;
-			void compute(true);
+			void compute(true).finally(() => {
+				drilling = false;
+				runQueuedTab();
+			});
 		}, 140);
+	};
+	/** 계산 중에 쌓인 Tab 하나를 처리 — 목록이 떠 있으면 넣기, 아니면 다시 Tab */
+	const runQueuedTab = () => {
+		if (!tabQueued || drilling || tabBusy) return;
+		tabQueued--;
+		if (!promptOn || held) {
+			tabQueued = 0;
+			return;
+		}
+		if (!pop.hidden) {
+			accept();
+			if (!drilling) runQueuedTab();
+		} else if (tabList) void tabOpen();
+		else {
+			send("\t");
+			runQueuedTab();
+		}
 	};
 	/** Tab(목록 닫힘): 하나면 바로, 여럿이면 공통 앞부분 채우고 목록 */
 	const tabOpen = async () => {
@@ -242,6 +272,13 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		} finally {
 			tabBusy = false;
 		}
+		try {
+			tabShow(has);
+		} finally {
+			runQueuedTab();
+		}
+	};
+	const tabShow = (has: boolean) => {
 		if (!has) {
 			send("\t"); // 후보가 없으면 셸 완성으로
 			return;
@@ -267,6 +304,28 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const compute = async (open: boolean, quiet = false): Promise<boolean> => {
 		const line = currentInput();
 		if (line === null) return false;
+		ensureLists(line);
+		let r = complete(line, ctx());
+		if (r.pending) {
+			try {
+				const list = await src.listDir(r.pending);
+				dirCache.set(r.pending, { at: Date.now(), list });
+			} catch {
+				dirCache.set(r.pending, { at: Date.now(), list: [] });
+			}
+			r = complete(line, ctx());
+		}
+		if (!open && !quiet && pop.hidden) return false;
+		items = r.items;
+		replace = r.replace;
+		query = line.slice(line.length - r.replace);
+		sel = 0;
+		moved = false;
+		if (!quiet) renderPop();
+		return items.length > 0;
+	};
+	/** 명령·유닛·컨테이너 이름은 처음 쓸 때 한 번 받아 둔다 */
+	const ensureLists = (line: string) => {
 		const first = line.trimStart().split(/\s+/)[0] ?? "";
 		if (!unitsAsked && src.units && /^(systemctl|journalctl|service)$/.test(first)) {
 			unitsAsked = true;
@@ -289,23 +348,6 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 				})
 				.catch(() => {});
 		}
-		let r = complete(line, ctx());
-		if (r.pending) {
-			try {
-				const list = await src.listDir(r.pending);
-				dirCache.set(r.pending, { at: Date.now(), list });
-			} catch {
-				dirCache.set(r.pending, { at: Date.now(), list: [] });
-			}
-			r = complete(line, ctx());
-		}
-		if (!open && !quiet && pop.hidden) return false;
-		items = r.items;
-		replace = r.replace;
-		query = line.slice(line.length - r.replace);
-		sel = 0;
-		if (!quiet) renderPop();
-		return items.length > 0;
 	};
 
 	const schedule = () => {
@@ -318,7 +360,12 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			window.clearTimeout(autoTimer);
 			autoTimer = window.setTimeout(() => {
 				const l = currentInput();
-				if (l && l.trim() && pop.hidden && atLineEnd()) void compute(true);
+				// 공백 뒤·3글자 미만 낱말에는 띄우지 않는다(치는 중에 목록이 깜박이지 않게)
+				const token = l?.split(/\s+/).pop() ?? "";
+				if (!l || !l.trim() || /\s$/.test(l) || token.length < 3 || SHORT_ARG.test(token) ||!pop.hidden || !atLineEnd() || held) return;
+				void compute(true).then((has) => {
+					if (has) autoOpen = true;
+				});
 			}, 350);
 		}
 	};
@@ -345,6 +392,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		prompt: () => {
 			promptOn = true;
 			inputStart = null;
+			tabQueued = 0;
 			lastLine = "";
 			closePop();
 			hideGhost();
@@ -353,6 +401,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			const l = currentInput();
 			if (l) remember(l);
 			promptOn = false;
+			tabQueued = 0;
 			inputStart = null;
 			closePop();
 			hideGhost();
@@ -369,18 +418,30 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		},
 		key: (e) => {
 			if (e.type !== "keydown" || !promptOn || mode === "off" || held) return true;
-			if (drilling && e.key === "Tab") return false; // 파고드는 중에 온 Tab 은 삼킨다
+			const plainTab = e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+			// 파고드는 중·계산 중에 온 Tab 은 세어 두었다가 끝나면 차례로(버리지 않는다)
+			if ((drilling || tabBusy) && plainTab) {
+				tabQueued++;
+				return false;
+			}
 			if (!pop.hidden) {
 				const n = Math.min(items.length, MAX_POP);
 				if (e.key === "ArrowDown" || e.key === "ArrowUp") {
 					sel = (sel + (e.key === "ArrowUp" ? -1 : 1) + n) % n;
+					moved = true;
 					renderPop();
 					return false;
 				}
 				if (e.key === "Tab" && e.shiftKey) {
 					sel = (sel - 1 + n) % n;
+					moved = true;
 					renderPop();
 					return false;
+				}
+				if (e.key === "Enter" && autoOpen && !moved) {
+					// 저절로 뜬 목록에서 고르지 않고 Enter — 목록만 닫고 명령은 그대로 실행
+					closePop();
+					return true;
 				}
 				if (e.key === "Tab" || e.key === "Enter") {
 					accept();

@@ -2830,10 +2830,10 @@ input[type="radio"] {
 
 /* ── 편집기 자동완성·도움말 팝업(CodeMirror) ── */
 .cm-editor .cm-tooltip {
-	border: 0;
+	border: 0.5px solid var(--hairline);
 	border-radius: var(--r-md);
-	background: var(--elevated);
-	backdrop-filter: blur(24px) saturate(180%);
+	/* 불투명 — 글자 위 흐림(backdrop-filter)은 치는 동안 매번 다시 칠해 팝업이 떨리고 무겁다 */
+	background: var(--elevated-solid);
 	box-shadow: var(--shadow-pop);
 	color: var(--text);
 	overflow: hidden;
@@ -4553,4 +4553,22 @@ p.keys-empty.muted {
 .pc-legacy {
 	margin-right: 6px;
 	vertical-align: 1px;
+}
+
+/* ── 편집기 미니맵(오른쪽 개요 막대) ── */
+.cm-editor .cm-minimap-gutter {
+	border-left: 0.5px solid var(--hairline);
+	background: var(--surface);
+}
+.cm-editor .cm-minimap-overlay {
+	background: var(--text-3);
+	border-radius: 2px;
+}
+
+/* ── 편집기 위 마우스 포인터 — 앱 전체는 화살표(body cursor: default)지만 글 위에서는 I자(글자 커서). 없으면 글자 위에서 화살표가 떠 어색하다 ── */
+.cm-editor .cm-content {
+	cursor: text;
+}
+.cm-editor .cm-gutters {
+	cursor: default;
 }
