@@ -13,7 +13,7 @@ use crate::secrets;
 use crate::ssh::{err, Conn, SshConns, R};
 use crate::textcodec::{self, TextMeta};
 
-const MAX_TEXT: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_TEXT: usize = 8 * 1024 * 1024;
 
 pub(crate) struct Out {
     pub(crate) code: Option<u32>,
@@ -119,14 +119,14 @@ fn check(o: Out) -> R<Out> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsEntry {
-    name: String,
-    path: String,
-    kind: &'static str,
-    size: u64,
-    mtime: Option<u32>,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) kind: &'static str,
+    pub(crate) size: u64,
+    pub(crate) mtime: Option<u32>,
 }
 
-fn join(dir: &str, name: &str) -> String {
+pub(crate) fn join(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         format!("{dir}{name}")
     } else {
@@ -181,13 +181,13 @@ pub async fn sudo_list(conns: State<'_, SshConns>, conn: u32, path: String) -> R
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileText {
-    path: String,
-    size: u64,
-    mtime: Option<u32>,
-    text: Option<String>,
-    meta: TextMeta,
-    binary: bool,
-    too_large: bool,
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) mtime: Option<u32>,
+    pub(crate) text: Option<String>,
+    pub(crate) meta: TextMeta,
+    pub(crate) binary: bool,
+    pub(crate) too_large: bool,
 }
 
 #[tauri::command]
@@ -212,8 +212,8 @@ pub async fn sudo_read_text(conns: State<'_, SshConns>, conn: u32, path: String,
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Saved {
-    size: u64,
-    mtime: Option<u32>,
+    pub(crate) size: u64,
+    pub(crate) mtime: Option<u32>,
 }
 
 /// 저장 = `sudo tee` — 같은 파일(inode)에 써서 소유자·권한을 지킨다

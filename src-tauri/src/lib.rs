@@ -1,6 +1,7 @@
 // 명령 오류(SshError)는 화면에 그대로 넘기는 드문 경로라 크기를 줄이지 않는다
 #![allow(clippy::result_large_err)]
 
+mod container;
 mod db;
 mod diag;
 mod direct;
@@ -232,6 +233,12 @@ pub fn run() {
             transfer::transfer_cancel,
             transfer::relay_start,
             direct::direct_start,
+            container::ctr_list,
+            container::ctr_where,
+            container::ctr_read_text,
+            container::ctr_write_text,
+            container::ctr_op,
+            ssh::ssh_shell_inject_ctx,
             sync::sync_plan,
             sync::sync_run,
             sync::sync_rsync_command,

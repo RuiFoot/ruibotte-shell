@@ -11,7 +11,7 @@ import {
 import { CLOSE_DOC_EVENT, confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Route, Rows2, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
+import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Route, Rows2, Container, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -32,6 +32,7 @@ import {
 	type ShellInfo,
 	transferArgs,
 	directArgs,
+	containerFs,
 } from "../lib/ipc";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { DiffView } from "./DiffView";
@@ -54,6 +55,7 @@ import { type DragEntry, FileTree } from "./FileTree";
 import { sshFs } from "../lib/ipc";
 import { TerminalView } from "./Terminal";
 import { askText } from "../lib/ask";
+import { ctxContainer } from "../lib/shellCtx";
 import type { SudoCtx } from "./panels/common";
 import { ContentSearch } from "./panels/ContentSearch";
 import { DockerPanel } from "./panels/DockerPanel";
@@ -80,7 +82,11 @@ type Ctx = {
 	term: TermBackend;
 	label: string;
 	startPath?: string;
-	openFile: (which: Which, e: FsEntry, line?: number, peer?: Peer) => void;
+	openFile: (which: Which, e: FsEntry, line?: number, peer?: Peer, ctr?: string) => void;
+	/** 컨테이너 안 파일(docker exec) — 이름별로 하나 */
+	ctrFs: (name: string) => FsBackend;
+	/** 트리를 서버로 되돌리기(다음 프롬프트까지) */
+	leaveCtr: () => void;
 	activePanel: string | null;
 	/** 끌어 놓기 — destConn: 받는 트리의 연결(다른 서버 칸이면 그 서버). 서버가 다르면 중계 */
 	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string, destConn?: number) => void;
@@ -104,7 +110,7 @@ type Ctx = {
 	localShells?: ShellInfo[];
 	defaultShell?: string;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
-	onCwd: (path: string) => void;
+	onCwd: (path: string, ctx?: string, focus?: boolean) => void;
 	completion: CompletionSource;
 	openTail: (which: Which, e: FsEntry) => void;
 	compare: (which: Which, e: FsEntry) => void;
@@ -175,9 +181,25 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 		window.addEventListener(`rb-cwd-${ctx.treeKey}`, on);
 		return () => window.removeEventListener(`rb-cwd-${ctx.treeKey}`, on);
 	}, [ctx.treeKey, ctx.local, props.params.which]);
+	// 터미널이 docker exec 로 들어간 컨테이너 — 트리가 컨테이너 파일을 본다(SFTP 전송·실시간 보기 등은 서버 파일 전용이라 끈다)
+	const inCtr = fs.container;
+	const hostOnly = <T,>(f: T) => (inCtr ? undefined : f);
 	return (
 		<div className="panel-fill">
+			{inCtr && (
+				<div className="tree-ctx" role="status">
+					<Container size={13} aria-hidden />
+					<span>
+						컨테이너 <b>{inCtr}</b>
+					</span>
+					<small>터미널에서 exit 하면 서버 트리로</small>
+					<button type="button" className="btn ghost" onClick={ctx.leaveCtr} title="지금 트리만 서버 파일로 되돌립니다 — 터미널이 컨테이너에서 다음 프롬프트를 그리면 다시 따라갑니다">
+						서버 트리
+					</button>
+				</div>
+			)}
 			<FileTree
+				key={inCtr ?? "host"}
 				fs={fs}
 				root={root}
 				onRoot={setRoot}
@@ -186,19 +208,19 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 				sync={follows ? (ctx.follow ? "together" : "apart") : undefined}
 				onSyncChange={follows ? (m) => ctx.setFollow(m === "together") : undefined}
 				note={note}
-				onOpen={(e) => ctx.openFile(props.params.which, e)}
-				onDrop={(src, dir) => ctx.drop(src, fs.side, dir)}
-				onSend={ctx.local ? (e) => ctx.sendTo(props.params.which, e) : undefined}
+				onOpen={(e) => ctx.openFile(props.params.which, e, undefined, undefined, inCtr)}
+				onDrop={hostOnly((src: DragEntry, dir: string) => ctx.drop(src, fs.side, dir))}
+				onSend={ctx.local && !inCtr ? (e) => ctx.sendTo(props.params.which, e) : undefined}
 				sendLabel={props.params.which === "local" ? "서버로 올리기" : "내 PC로 받기"}
 				onCd={props.params.which === "remote" || !ctx.local ? ctx.cd : undefined}
-				onTail={(e) => ctx.openTail(props.params.which, e)}
-				onCompare={(e) => ctx.compare(props.params.which, e)}
+				onTail={hostOnly((e: FsEntry) => ctx.openTail(props.params.which, e))}
+				onCompare={hostOnly((e: FsEntry) => ctx.compare(props.params.which, e))}
 				compareLabel={(e) => ctx.compareLabel(props.params.which, e)}
-				onArchive={props.params.which === "remote" && fs.side === "remote" ? ctx.archive : undefined}
-				onRelay={props.params.which === "remote" && ctx.hasPeers ? ctx.relay : undefined}
-				onUploadPick={props.params.which === "remote" ? ctx.uploadPick : undefined}
-				onDownloadTo={props.params.which === "remote" ? ctx.downloadTo : undefined}
-				onNewTerminal={follows ? ctx.newTerminal : undefined}
+				onArchive={props.params.which === "remote" && fs.side === "remote" && !inCtr ? ctx.archive : undefined}
+				onRelay={props.params.which === "remote" && ctx.hasPeers && !inCtr ? ctx.relay : undefined}
+				onUploadPick={props.params.which === "remote" && !inCtr ? ctx.uploadPick : undefined}
+				onDownloadTo={props.params.which === "remote" && !inCtr ? ctx.downloadTo : undefined}
+				onNewTerminal={follows && !inCtr ? ctx.newTerminal : undefined}
 			/>
 		</div>
 	);
@@ -231,15 +253,23 @@ function PeerTreePanel(props: IDockviewPanelProps<{ peer: Peer }>) {
 	);
 }
 
-function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string; line?: { n: number; seq: number }; peer?: Peer }>) {
+function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string; line?: { n: number; seq: number }; peer?: Peer; ctr?: string }>) {
 	const ctx = useWb();
-	const fs = props.params.peer ? ctx.peerFs(props.params.peer) : props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+	const fs = props.params.peer
+		? ctx.peerFs(props.params.peer)
+		: props.params.ctr
+			? ctx.ctrFs(props.params.ctr)
+			: props.params.which === "local"
+				? (ctx.local ?? ctx.fs)
+				: ctx.fs;
 	const onDirty = useCallback(
 		(dirty: boolean) => {
 			setDirty(ctx.owner, props.api.id, props.params.name, dirty);
-			props.api.setTitle(`${dirty ? "● " : ""}${props.params.name}`);
+			// 다른 서버·컨테이너 파일은 어디 것인지 탭에 남긴다(같은 이름의 서버 파일과 헷갈리지 않게)
+			const where = props.params.ctr ? ` · ${props.params.ctr}` : props.params.peer ? ` · ${props.params.peer.label}` : "";
+			props.api.setTitle(`${dirty ? "● " : ""}${props.params.name}${where}`);
 		},
-		[props.api, props.params.name, ctx.owner],
+		[props.api, props.params.name, props.params.ctr, props.params.peer, ctx.owner],
 	);
 	useEffect(() => () => setDirty(ctx.owner, props.api.id, "", false), [ctx.owner, props.api.id]);
 	const kind = previewKind(props.params.path);
@@ -254,7 +284,7 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 					active={ctx.activePanel === props.api.id}
 					onDirtyChange={onDirty}
 					line={props.params.line}
-					onTail={() => ctx.openTail(props.params.which, { name: props.params.name, path: props.params.path, kind: "file", size: 0 })}
+					onTail={props.params.ctr ? undefined : () => ctx.openTail(props.params.which, { name: props.params.name, path: props.params.path, kind: "file", size: 0 })}
 				/>
 			)}
 		</div>
@@ -303,7 +333,7 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 					if (label) props.api.setTitle(label);
 				}}
 				defaultEncoding={ctx.termEncoding}
-				onOpenPath={(p) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 })}
+				onOpenPath={(p, c) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 }, undefined, undefined, ctxContainer(c) ?? undefined)}
 				onSplit={(dir) => ctx.splitTerminal(props.api.id, dir)}
 				statusExtra={
 					visible && ctx.fs.side === "remote" && ctx.fs.conn != null ? (
@@ -782,6 +812,8 @@ export function Workbench({
 	const [sudoOn, setSudoOn] = useState(false);
 	const [sudoPlace, setSudoPlace] = useState<"together" | "apart">("together");
 	const [follow, setFollow] = useState(true);
+	/** 터미널이 지금 들어가 있는 컨테이너(트리·편집기가 볼 곳) — 셸 훅이 프롬프트마다 알려 준다 */
+	const [ctr, setCtr] = useState<string | null>(null);
 	const [broadcastOn, setBroadcastOn] = useState(false);
 	const broadcastRef = useRef(false);
 	broadcastRef.current = broadcastOn;
@@ -838,13 +870,29 @@ export function Workbench({
 		() => (fs.side === "remote" && fs.conn != null && sudoMode !== "off" ? sshSudoFs(fs.conn, fs.label, fs.home, sudoUser || "root") : null),
 		[fs, sudoMode, sudoUser],
 	);
-	const fsNow = sudoOn && sudoFs ? sudoFs : fs;
+	const ctrCache = useRef(new Map<string, FsBackend>());
+	const ctrFs = useCallback(
+		(name: string) => {
+			if (fs.conn == null) return fs;
+			const k = `${fs.conn}:${name}`;
+			let f = ctrCache.current.get(k);
+			if (!f) {
+				f = containerFs(fs.conn, name);
+				ctrCache.current.set(k, f);
+			}
+			return f;
+		},
+		[fs],
+	);
+	const ctrRef = useRef(ctr);
+	ctrRef.current = ctr;
+	const fsNow = ctr && fs.side === "remote" && fs.conn != null ? ctrFs(ctr) : sudoOn && sudoFs ? sudoFs : fs;
 	// 자동완성 출처 — 원격은 SFTP 목록·compgen, 내 PC 는 파일 목록·사전
 	const completion = useMemo<CompletionSource>(
 		() => ({
 			key: fs.side === "remote" ? `ssh:${label}` : "local",
 			home: fs.home,
-			listDir: (dir) => fs.list(dir),
+			listDir: (dir) => (ctrRef.current && fs.conn != null ? ctrFs(ctrRef.current) : fs).list(dir),
 			commands: async () => {
 				if (fs.side !== "remote" || fs.conn == null) return [];
 				const out = await invoke<string>("ssh_exec", { conn: fs.conn, cmd: "bash -lc 'compgen -c' 2>/dev/null | sort -u | head -5000" });
@@ -914,11 +962,11 @@ export function Workbench({
 	const rememberRef = useRef(rememberFile);
 	rememberRef.current = rememberFile;
 
-	const openFile = useCallback((which: Which, e: FsEntry, lineNo?: number, peer?: Peer) => {
+	const openFile = useCallback((which: Which, e: FsEntry, lineNo?: number, peer?: Peer, ctr?: string) => {
 		const d = dock.current;
 		if (!d) return;
-		if (!peer) rememberRef.current(which, e);
-		const id = peer ? `edit:peer${peer.conn}:${e.path}` : `edit:${which}:${e.path}`;
+		if (!peer && !ctr) rememberRef.current(which, e);
+		const id = peer ? `edit:peer${peer.conn}:${e.path}` : ctr ? `edit:ctr:${ctr}:${e.path}` : `edit:${which}:${e.path}`;
 		const line = lineNo ? { n: lineNo, seq: Date.now() } : undefined;
 		const existing = d.getPanel(id);
 		if (existing) {
@@ -926,7 +974,7 @@ export function Workbench({
 			existing.api.setActive();
 			return;
 		}
-		addDoc(d, { id, component: "editor", title: peer ? `${e.name} · ${peer.label}` : e.name, params: { which, path: e.path, name: e.name, line, peer } });
+		addDoc(d, { id, component: "editor", title: peer ? `${e.name} · ${peer.label}` : ctr ? `${e.name} · ${ctr}` : e.name, params: { which, path: e.path, name: e.name, line, peer, ctr } });
 	}, []);
 
 	// 동시 입력: 받는 터미널 탭에 ⇉ 표시
@@ -957,11 +1005,16 @@ export function Workbench({
 	}, []);
 
 	const onCwd = useCallback(
-		(path: string) => {
+		(path: string, c?: string, focus?: boolean) => {
+			// 터미널로 초점만 옮긴 것 — 이미 그 셸 쪽·그 폴더면 트리를 건드리지 않는다
+			if (focus && path === lastCwd.current && ctxContainer(c) === ctrRef.current) return;
 			lastCwd.current = path;
-			if (follow) window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: path }));
+			if (!follow) return;
+			// 그 프롬프트를 그린 셸 쪽으로 — docker exec 로 들어가면 컨테이너, exit 하면 서버(셸 훅이 없는 셸이면 그대로)
+			if (c !== undefined) setCtr(fs.side === "remote" ? ctxContainer(c) : null);
+			window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: path }));
 		},
-		[follow],
+		[follow, fs.side],
 	);
 
 	/** sudo 켜기: 되는지 보고(암호가 필요하면 묻고), 같이 모드면 보이는 터미널도 root 셸로 */
@@ -1404,7 +1457,7 @@ export function Workbench({
 				if (gone.current) return;
 				for (const x of list.slice(0, 12)) {
 					// 다른 서버 칸에서 연 파일은 그 칸(연결)이 다시 있어야 하니 되살리지 않는다(같은 경로가 이 서버 탭으로 열리지 않게)
-					if ((x as { peer?: unknown }).peer) continue;
+					if ((x as { peer?: unknown }).peer || (x as { ctr?: unknown }).ctr) continue;
 					if (!e.api.getPanel(`edit:${x.which}:${x.path}`)) addDoc(e.api, { id: `edit:${x.which}:${x.path}`, component: "editor", title: x.name, params: x });
 				}
 			};
@@ -1429,10 +1482,10 @@ export function Workbench({
 				const d = dock.current;
 				if (!d || gone.current) return;
 				void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
-				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown });
+				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown; ctr?: unknown });
 				openEditors.set(owner, eds);
 				// 다른 서버 칸에서 연 파일은 그 연결이 있어야 하니 앱을 다시 열 때는 빼고 남긴다
-				void api.settingSet(editorsKey, JSON.stringify(eds.filter((x) => !x.peer).map(({ which, path, name }) => ({ which, path, name }))));
+				void api.settingSet(editorsKey, JSON.stringify(eds.filter((x) => !x.peer && !x.ctr).map(({ which, path, name }) => ({ which, path, name }))));
 			}, 600);
 		});
 	};
@@ -1460,6 +1513,8 @@ export function Workbench({
 			defaultShell,
 			registerShell,
 			onCwd,
+			ctrFs,
+			leaveCtr: () => setCtr(null),
 			broadcast,
 			completion,
 			openTail,
@@ -1486,7 +1541,7 @@ export function Workbench({
 			profileId: server?.profileId,
 			rootShell: fs.side === "remote" && sudoMode !== "off" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, peerFs, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server, sudo],
+		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, ctrFs, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, peerFs, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server, sudo],
 	);
 
 	useEffect(() => {

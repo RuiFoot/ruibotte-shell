@@ -61,6 +61,16 @@ function sendChannel(ch: unknown, text: string) {
 
 /** 셸 흉내(화면 점검용) — 줄 편집 하나: 글자 넣기·백스페이스·←/→·Enter. 명령 입력 보조(빈칸 Tab 이동)를 눈으로 보려고 */
 const shellLine = { buf: [] as string[], at: 0, ch: null as unknown, seq: 1 };
+/** 흉내 셸 상태 — 들어간 컨테이너(훅을 넣었는지), 멈춘 작업, 앞에서 도는 가짜 편집기 */
+const msh = { ctr: null as string | null, hooked: false, jobs: [] as string[], fg: null as string | null };
+function mshMarks() {
+	const j = msh.jobs.map((c, i) => `[${i + 1}]${i === msh.jobs.length - 1 ? "+" : "-"}  Stopped                 ${c}`).join("␤");
+	if (msh.ctr) return msh.hooked ? `\x1b]133;D;0\x07\x1b]6976;docker:${msh.ctr}\x07\x1b]6977;${j}\x07\x1b]7;file://ctr/app\x07` : "";
+	return `\x1b]133;D;0\x07\x1b]6976;host\x07\x1b]6977;${j}\x07\x1b]7;file://dev/home/deploy\x07`;
+}
+function mshPrompt() {
+	return msh.ctr ? `${msh.hooked ? "\x1b]133;A\x07" : ""}\x1b[1;36mroot@${msh.ctr}\x1b[0m:/app# ` : prompt;
+}
 function quickSend(ch: unknown, text: string) {
 	const id = typeof ch === "object" && ch ? (ch as { id: number }).id : Number(String(ch).replace("__CHANNEL__:", ""));
 	const internals = (window as unknown as { __TAURI_INTERNALS__: { runCallback: (id: number, data: unknown) => void } }).__TAURI_INTERNALS__;
@@ -86,12 +96,36 @@ function shellWrite(data: string) {
 				out += `${"\b".repeat(cellW(gone))}${rest}${" ".repeat(cellW(gone))}${"\b".repeat(cellW(rest) + cellW(gone))}`;
 			}
 			i++;
+		} else if (data[i] === "\x1a" && msh.fg) {
+			msh.jobs.push(msh.fg);
+			out += `\r\n[${msh.jobs.length}]+  Stopped                 ${msh.fg}\r\n${mshMarks()}${mshPrompt()}`;
+			msh.fg = null;
+			i++;
 		} else if (data[i] === "\r") {
-			const line = L.buf.join("");
+			const line = L.buf.join("").trim();
 			L.buf = [];
 			L.at = 0;
-			out += `\r\n${line.trim() ? `(가짜 셸) ${line}\r\n` : ""}\x1b]133;D;0\x07${prompt}`;
 			i++;
+			const dx = /docker\s+exec\s+-it\s+(\S+)\s+(bash|sh)/.exec(line);
+			const fg = /^fg(?:\s+%(\d+))?$/.exec(line);
+			if (dx) {
+				msh.ctr = dx[1];
+				msh.hooked = false;
+				out += `\r\n${mshPrompt()}`;
+			} else if (line === "exit" && msh.ctr) {
+				msh.ctr = null;
+				msh.hooked = false;
+				out += `\r\nexit\r\n${mshMarks()}${mshPrompt()}`;
+			} else if (/^(vim?|nano)\s+\S+$/.test(line)) {
+				msh.fg = line;
+				out += `\r\n(가짜 편집기 ${line} — Ctrl+Z 로 멈추기)`;
+			} else if (fg && msh.jobs.length) {
+				const k = fg[1] ? Number(fg[1]) - 1 : msh.jobs.length - 1;
+				msh.fg = msh.jobs.splice(k, 1)[0] ?? null;
+				out += `\r\n${msh.fg}\r\n(가짜 편집기 — Ctrl+Z 로 멈추기)`;
+			} else {
+				out += `\r\n${line ? `(가짜 셸) ${line}\r\n` : ""}${mshMarks()}${mshPrompt()}`;
+			}
 		} else if (data.charCodeAt(i) < 0x20) i++;
 		else {
 			const cp = String.fromCodePoint(data.codePointAt(i) ?? 32);
@@ -105,7 +139,7 @@ function shellWrite(data: string) {
 }
 
 const prompt = "\x1b]133;A\x07\x1b[1;32mdeploy@dev\x1b[0m:\x1b[1;34m~\x1b[0m$ ";
-const banner = `Last login: Thu Nov  5 09:12:44 2026 from 10.0.0.2\r\n\x1b]7;file://dev/home/deploy\x07${prompt}`;
+const banner = `Last login: Thu Nov  5 09:12:44 2026 from 10.0.0.2\r\n\x1b]6976;host\x07\x1b]7;file://dev/home/deploy\x07${prompt}`;
 
 let tick = 0;
 function stats() {
@@ -243,6 +277,26 @@ export function installMock() {
 					shellLine.seq = 1;
 					sendChannel(args.onData, banner);
 					return 1;
+				case "ssh_shell_inject_ctx":
+					// 넣은 줄의 에코는 앱(Rust)이 거른다 — 훅이 걸린 뒤 프롬프트만
+					msh.hooked = true;
+					if (shellLine.ch) quickSend(shellLine.ch, `\r\x1b[2K${mshMarks()}${mshPrompt()}`);
+					return null;
+				case "ctr_where":
+					return ["/app", "/root"];
+				case "ctr_list": {
+					const cp = String(args.path ?? "/").replace(/\/$/, "") || "";
+					const mk = (n: string, d: boolean, i = 0) => ({ name: n, path: `${cp}/${n}`, kind: d ? "dir" : "file", size: d ? 4096 : 900 + i * 700, mtime: now - i * 600 });
+					if (cp === "") return ["app", "bin", "etc", "root", "usr", "var"].map((n) => mk(n, true));
+					if (cp === "/app") return [mk("static", true), mk("templates", true), ...["main.py", "config.yaml", "requirements.txt", "Dockerfile"].map((n, i) => mk(n, false, i + 1))];
+					return ["a.conf", "b.conf"].map((n, i) => mk(n, false, i));
+				}
+				case "ctr_read_text":
+					return { path: args.path, size: 120, mtime: now, text: `# 컨테이너 ${args.ctr} 안 파일\napp:\n  debug: false\n`, meta: { encoding: "UTF-8", bom: false, eol: "LF", guessed: false }, binary: false, tooLarge: false };
+				case "ctr_write_text":
+					return { size: String(args.text ?? "").length, mtime: Math.floor(Date.now() / 1000) };
+				case "ctr_op":
+					return null;
 				case "ssh_shell_write":
 				case "pty_write":
 					shellWrite(String(args.data ?? ""));

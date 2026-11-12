@@ -918,6 +918,7 @@ pub async fn ssh_test(store: State<'_, Store>, conns: State<'_, SshConns>, req: 
 #[tauri::command]
 pub async fn ssh_disconnect(conns: State<'_, SshConns>, conn: u32) -> R<()> {
     crate::tunnel::stop_conn(conn).await;
+    crate::container::forget(conn);
     let c = conns.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
         let _ = c.sftp.close().await;
@@ -959,17 +960,19 @@ pub async fn ssh_shell_open(
         let n = c.tmux_alloc(shell);
         let _ = write.data(tmux_line(n, cwd.as_deref()).as_bytes()).await;
         let flow = Arc::new(crate::flow::Flow::default());
-        c.shells.lock().unwrap().insert(shell, ShellIo { tx: spawn_shell_writer(write), flow: flow.clone() });
-        spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, None);
+        let inject = Arc::new(Mutex::new(None));
+        c.shells.lock().unwrap().insert(shell, ShellIo { tx: spawn_shell_writer(write), flow: flow.clone(), inject: inject.clone() });
+        spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, None, inject);
         return Ok(shell);
     }
     // 셸 통합 — 서버 파일은 바꾸지 않고 이 셸에만 프롬프트 훅을 얹는다(zsh 는 precmd, 그 밖은 bash 일 때만 걸리는 PROMPT_COMMAND, fish·csh 등은 치지 않는다). 프롬프트마다:
-    //   OSC 133;D;종료코드(앞 명령 끝) · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작). 끝맺음은 모두 BEL.
+    //   OSC 133;D;종료코드(앞 명령 끝) · OSC 6976 어느 셸인지(host · docker:이름 — 트리·편집기가 볼 곳) · OSC 6977 작업 목록(jobs, 줄은 ␤)
+    //   · OSC 7 지금 폴더(트리 따라가기) · OSC 6974 uid(root 표시) · OSC 133;A(프롬프트 시작). 끝맺음은 모두 BEL.
     // 앞 공백 = 셸 기록에 남지 않게. 이 줄의 에코는 화면에서 지우지 않고(clear 하지 않음 — MOTD·마지막 로그인 안내가 남는다)
     // 끝에 찍는 준비 표식(OSC 6975)까지 리더가 걸러 낸다(InitFilter).
     let hook = match kind.as_str() {
         "zsh" => Some((
-            r#" __rb_precmd() { local s=$?; printf '\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007' "$s" "$HOST" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#,
+            ZSH_HOOK_HOST,
             " __rb_precmd()",
         )),
         // 프롬프트 훅 문법이 다른 셸 — 아무것도 치지 않는다
@@ -977,7 +980,7 @@ pub async fn ssh_shell_open(
         // bash·sh·dash·ksh, 또는 알아내지 못함(exec 채널 거부·느림) — bash 일 때만 걸리게 감싸서 보낸다(sh·dash 에서는 오류 없이 지나간다).
         // 알아내지 못했다고 빼면 그 연결은 프롬프트 표식이 없어 자동완성·명령 표시가 통째로 꺼진다(0.12.0 회귀)
         _ => Some((
-            r#" [ -n "$BASH_VERSION" ] && PROMPT_COMMAND='__rb_s=$?; printf "\033]133;D;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#,
+            BASH_HOOK_HOST,
             r#" [ -n "$BASH_VERSION" ]"#,
         )),
     };
@@ -1009,9 +1012,47 @@ pub async fn ssh_shell_open(
         let _ = write.data(line.as_bytes()).await;
     }
     let flow = Arc::new(crate::flow::Flow::default());
-    c.shells.lock().unwrap().insert(shell, ShellIo { tx: spawn_shell_writer(write), flow: flow.clone() });
-    spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, filter);
+    let inject = Arc::new(Mutex::new(None));
+    c.shells.lock().unwrap().insert(shell, ShellIo { tx: spawn_shell_writer(write), flow: flow.clone(), inject: inject.clone() });
+    spawn_shell_reader(app, c.clone(), conn, shell, read, on_data, flow, filter, inject);
     Ok(shell)
+}
+
+/// zsh 프롬프트 훅 — 작업 목록은 $jobstates·$jobtexts 로(포크 없음)
+const ZSH_HOOK_HOST: &str = r#" __rb_precmd() { local s=$? j= k; for k in ${(k)jobtexts}; do j+="[$k] ${${jobstates[$k]}%%:*} ${jobtexts[$k]}␤"; done; printf '\033]133;D;%s\007\033]6976;host\007\033]6977;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007' "$s" "$j" "$HOST" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#;
+/// bash 프롬프트 훅 — bash 일 때만 걸린다(sh·dash 에서는 오류 없이 지나간다). 작업 목록은 $(jobs) 의 줄바꿈을 ␤ 로
+const BASH_HOOK_HOST: &str = r#" [ -n "$BASH_VERSION" ] && __rb_nl=$'\n' && PROMPT_COMMAND='__rb_s=$?; __rb_j=$(jobs); printf "\033]133;D;%s\007\033]6976;host\007\033]6977;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${__rb_j//$__rb_nl/␤}" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#;
+
+/// 컨테이너 셸에 넣는 줄의 머리 — 에코를 거를 때 이 글귀로 줄을 찾는다
+const INJECT_PREFIX: &str = " __rb_inj=1";
+
+/// docker exec 로 들어간 컨테이너 셸에 같은 훅을 건다 — bash 는 PROMPT_COMMAND, zsh 는 precmd(eval 로 — 다른 셸이 문법 오류를 내지 않게),
+/// 그 밖(sh·ash·dash)은 PS1 앞에 표식을 붙인다($PWD 는 프롬프트마다 풀린다). 끝에 준비 표식(OSC 6975) — 리더가 그때까지 에코를 거른다
+fn ctr_hook_line(ctr: &str) -> String {
+    let tag = format!("docker:{ctr}");
+    let bash_pc = r#"__rb_s=$?; __rb_j=$(jobs); printf "\033]133;D;%s\007\033]6976;TAG\007\033]6977;%s\007\033]7;file://ctr%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${__rb_j//$__rb_nl/␤}" "$PWD" "$EUID"; (exit $__rb_s)"#.replace("TAG", &tag);
+    let zsh_def = r#"__rb_precmd() { local s=$? j= k; for k in ${(k)jobtexts}; do j+="[$k] ${${jobstates[$k]}%%:*} ${jobtexts[$k]}␤"; done; printf '\033]133;D;%s\007\033]6976;TAG\007\033]6977;%s\007\033]7;file://ctr%s\007\033]6974;%s\007\033]133;A\007' "$s" "$j" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#.replace("TAG", &tag);
+    let sh_ps1 = format!(r#"PS1="$(printf '\033]6976;{tag}\007\033]7;file://ctr')"'$PWD'"$(printf '\007\033]133;A\007')$PS1""#);
+    format!(
+        "{INJECT_PREFIX}; if [ -n \"$BASH_VERSION\" ]; then __rb_nl=$'\\n'; PROMPT_COMMAND={}; elif [ -n \"$ZSH_VERSION\" ]; then eval {}; else {sh_ps1}; fi; printf '\\033]6975;rb\\007'\n",
+        crate::sudo::q(&bash_pc),
+        crate::sudo::q(&zsh_def),
+    )
+}
+
+/// 터미널이 docker exec 로 컨테이너 셸에 들어간 뒤 — 그 셸에 훅을 건다(넣은 줄의 에코는 화면에 안 보이게 거른다)
+#[tauri::command]
+pub async fn ssh_shell_inject_ctx(conns: State<'_, SshConns>, conn: u32, shell: u32, ctr: String) -> R<()> {
+    if !crate::container::valid_name(&ctr) {
+        return Err(err("OTHER", "컨테이너 이름이 올바르지 않습니다"));
+    }
+    let c = conns.get(conn)?;
+    {
+        let shells = c.shells.lock().unwrap();
+        let io = shells.get(&shell).ok_or_else(|| err("CLOSED", "터미널이 닫혔습니다"))?;
+        *io.inject.lock().unwrap() = Some(InitFilter::new(INJECT_PREFIX.as_bytes().to_vec()));
+    }
+    c.shell_send(shell, ShellOp::Data(ctr_hook_line(&ctr).into_bytes()))
 }
 
 /// 이 연결의 로그인 셸 이름(bash·zsh·sh·…) — 한 번만 묻는다. 모르면 빈 글자(셸 통합을 걸지 않음)
@@ -1075,6 +1116,8 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 pub(crate) struct ShellIo {
     tx: tokio::sync::mpsc::UnboundedSender<ShellOp>,
     flow: Arc<crate::flow::Flow>,
+    /// 셸 안에서 다른 셸(컨테이너)에 훅을 넣을 때 — 리더가 다음 출력부터 그 에코를 거른다
+    inject: Arc<Mutex<Option<InitFilter>>>,
 }
 
 /// 터미널 채널에 할 일 — 입력·크기·닫기를 한 줄로 세워 차례대로
@@ -1141,7 +1184,7 @@ impl Conn {
 /// SSH 채널 읽기는 멈추지 않는다(russh 는 한 채널이 안 읽히면 연결 전체가 멈춘다) — 그동안 온 것은 여기 모아 두고,
 /// 모은 것이 [`crate::flow::MAX_BUF`] 를 넘을 때만 읽기를 쉰다. 바로 보낼 수 있으면 지연 없이 보낸다(타이핑 에코).
 #[allow(clippy::too_many_arguments)]
-fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut read: russh::ChannelReadHalf, on_data: Channel<InvokeResponseBody>, flow: Arc<crate::flow::Flow>, mut init: Option<InitFilter>) {
+fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut read: russh::ChannelReadHalf, on_data: Channel<InvokeResponseBody>, flow: Arc<crate::flow::Flow>, mut init: Option<InitFilter>, inject: Arc<Mutex<Option<InitFilter>>>) {
     use crate::flow::{MAX_BUF, SEND_CHUNK};
     use futures_util::FutureExt;
     tauri::async_runtime::spawn(async move {
@@ -1175,14 +1218,19 @@ fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut r
                     // 이미 와 있는 것은 한 번에 모은다(eval 횟수 줄이기)
                     loop {
                         match msg {
-                            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => match init.as_mut() {
-                                Some(f) => {
-                                    if f.feed(&data, &mut pending) {
-                                        init = None;
-                                    }
+                            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                if init.is_none() {
+                                    init = inject.lock().unwrap().take();
                                 }
-                                None => pending.extend_from_slice(&data),
-                            },
+                                match init.as_mut() {
+                                    Some(f) => {
+                                        if f.feed(&data, &mut pending) {
+                                            init = None;
+                                        }
+                                    }
+                                    None => pending.extend_from_slice(&data),
+                                }
+                            }
                             Some(ChannelMsg::ExitStatus { exit_status }) => code = Some(exit_status),
                             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                                 if let Some(mut f) = init.take() {

@@ -10,7 +10,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type IMarker, Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ChevronDown, ChevronUp, Gauge, RotateCcw, X, Check, TriangleAlert } from "lucide-react";
+import { ChevronDown, ChevronUp, Container, Gauge, Layers, RotateCcw, X, Check, TriangleAlert } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ipc";
 import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
@@ -26,6 +26,7 @@ import { Select } from "./Select";
 import { AssistFormSheet, ExplainCard } from "./CmdAssist";
 import { candidatesFor, cmdDesc, ensureDict, type ExplainPart, explainLine, fillTemplate, hasTemplateFields, optLookup, requestMan, subDesc } from "../lib/cmdAssist";
 import { attachAssist, type TermAssist } from "../lib/termAssist";
+import { ctxContainer, type Job, jobFile, parseDockerExec, parseJobs } from "../lib/shellCtx";
 
 type Stat = { label: string; ok?: boolean };
 type Pending = { marker: IMarker; start: number; text: string };
@@ -66,6 +67,9 @@ const FIND_OPTS = {
 	decorations: { matchOverviewRuler: "#ff9f0a", activeMatchColorOverviewRuler: "#0a84ff", matchBackground: "#ff9f0a55", activeMatchBackground: "#0a84ff88" },
 };
 
+/** 줄 바꾸지 않기의 열 수 — docker ps·ps aux 같은 긴 줄이 한 줄에 들어가게 */
+const WIDE_COLS = 320;
+
 export function TerminalView({
 	backend,
 	active,
@@ -99,13 +103,14 @@ export function TerminalView({
 	/** 바깥(트리 "터미널에서 이 폴더로" 등)에서 셸에 글을 넣을 수 있게 */
 	onShell?: (h: ShellHandle | null) => void;
 	/** 셸이 알려 준 지금 폴더(OSC 7) */
-	onCwd?: (path: string) => void;
+	/** ctx: 그 프롬프트를 그린 셸(host · docker:이름) — 셸 훅이 알려 주지 않는 셸(내 PC 등)이면 undefined */
+	onCwd?: (path: string, ctx?: string, focus?: boolean) => void;
 	/** 사람이 친 입력(동시 입력용) */
 	onInput?: (data: string) => void;
 	/** 자동완성(흐린 제안·Ctrl+Space 목록) 출처 */
 	completion?: CompletionSource;
 	/** 출력의 경로를 Ctrl+누르면 편집기로 */
-	onOpenPath?: (path: string) => void;
+	onOpenPath?: (path: string, ctx?: string) => void;
 	/** 처음 인코딩(서버 로캘이 EUC-KR 이면) */
 	defaultEncoding?: string;
 	/** 내 PC 셸 id(없으면 기본) */
@@ -133,6 +138,10 @@ export function TerminalView({
 	const completionRef = useRef(completion);
 	completionRef.current = completion;
 	const host = useRef<HTMLDivElement>(null);
+	/** 줄 바꾸지 않기(가로 스크롤) — 긴 줄(docker ps 등)을 접지 않고 옆으로 밀어 본다. Alt+Z */
+	const [wide, setWide] = useState(false);
+	const wideRef = useRef(false);
+	const refitRef = useRef<() => void>(() => {});
 	const termRef = useRef<XTerm | null>(null);
 	const fitRef = useRef<FitAddon | null>(null);
 	const searchRef = useRef<SearchAddon | null>(null);
@@ -164,6 +173,19 @@ export function TerminalView({
 		clipTimer.current = window.setTimeout(() => setClipNote(null), ok ? 1500 : 5000);
 	};
 	useEffect(() => () => window.clearTimeout(clipTimer.current), []);
+	const toggleWide = () => {
+		const next = !wideRef.current;
+		wideRef.current = next;
+		setWide(next);
+		noteClip(next ? "줄 바꾸지 않음 — Shift+휠로 옆으로 · Alt+Z 로 되돌리기" : "줄 바꿈으로 되돌림", true);
+	};
+	const toggleWideRef = useRef(toggleWide);
+	toggleWideRef.current = toggleWide;
+	// 클래스(nowrap)가 붙은 뒤 다시 맞춘다 — 끄면 왼쪽 끝으로
+	useEffect(() => {
+		refitRef.current();
+		if (!wide && host.current) host.current.scrollLeft = 0;
+	}, [wide]);
 	/** 클립보드에 쓰기 — 실패를 삼키지 않는다(웹뷰 클립보드 API 가 막히면 execCommand 로 한 번 더) */
 	const copyText = async (text: string, what = "복사됨") => {
 		if (!text) return false;
@@ -211,6 +233,15 @@ export function TerminalView({
 	const cmds = useRef<{ start: IMarker; end?: IMarker; text: string; code?: number }[]>([]);
 	const [findCount, setFindCount] = useState<{ i: number; n: number } | null>(null);
 	const [here, setHere] = useState<string | null>(null);
+	/** 지금 프롬프트를 그린 컨테이너(서버 셸이면 null) */
+	const [inCtr, setInCtr] = useState<string | null>(null);
+	/** 이 셸의 멈춘·뒤에서 도는 작업 */
+	const [jobs, setJobs] = useState<Job[]>([]);
+	const [jobMenu, setJobMenu] = useState<{ x: number; y: number } | null>(null);
+	/** 작업을 앞으로(fg) — 프롬프트에서 아무것도 안 쳤을 때만 */
+	const fgRef = useRef<(n: number) => boolean>(() => false);
+	const ctxRef = useRef<string | undefined>(undefined);
+	const pathRef = useRef<string | null>(null);
 	const exited = useRef(false);
 	const reopenAt = useRef<string | undefined>(undefined);
 	const onOpenPathRef = useRef(onOpenPath);
@@ -367,7 +398,7 @@ export function TerminalView({
 						text: p,
 						decorations: { pointerCursor: true, underline: true },
 						activate: (ev) => {
-							if (ev.ctrlKey || ev.metaKey) onOpenPathRef.current?.(p.replace(/\\/g, "/"));
+							if (ev.ctrlKey || ev.metaKey) onOpenPathRef.current?.(p.replace(/\\/g, "/"), ctxRef.current);
 						},
 					});
 				}
@@ -406,10 +437,23 @@ export function TerminalView({
 			if (n >= 8 && n <= 32) {
 				term.options.fontSize = n;
 				setFontPx(n);
-				fit.fit();
+				refit();
 			}
 		});
-		fit.fit();
+		// 칸에 맞추기 — 줄 바꾸지 않기면 열 수를 넉넉히(WIDE_COLS) 두고 가로로 밀어 본다(줄 수는 가로 막대 자리만큼 하나 덜)
+		const refit = () => {
+			if (!wideRef.current) {
+				fit.fit();
+				return;
+			}
+			const d = fit.proposeDimensions();
+			if (!d || !Number.isFinite(d.cols) || !Number.isFinite(d.rows)) return;
+			const cols = Math.max(d.cols, WIDE_COLS);
+			const rows = Math.max(2, d.rows - 1);
+			if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
+		};
+		refitRef.current = refit;
+		refit();
 		termRef.current = term;
 		fitRef.current = fit;
 		searchRef.current = search;
@@ -504,6 +548,7 @@ export function TerminalView({
 			setLag({ p50: at(0.5), p95: at(0.95), n: sorted.length });
 		}, 1000);
 		const ch = bytesChannel((b) => {
+			if (inj) injectSoon();
 			if (lagAt) {
 				const ms = performance.now() - lagAt;
 				lagAt = 0;
@@ -565,6 +610,19 @@ export function TerminalView({
 		axRef.current = ax;
 
 		// ── 셸 통합 ──
+		/** docker exec 로 컨테이너 셸에 들어가는 중 — 그 셸의 출력이 멎으면(프롬프트) 훅을 넣는다. 그 사이 무엇이든 치면 그만둔다 */
+		let inj: { ctr: string; until: number } | null = null;
+		let injTimer: number | undefined;
+		const injectSoon = () => {
+			if (!inj) return;
+			window.clearTimeout(injTimer);
+			injTimer = window.setTimeout(() => {
+				const it = inj;
+				inj = null;
+				if (!it || disposed || Date.now() > it.until || idRef.current == null || !backend.injectCtx) return;
+				void backend.injectCtx(idRef.current, it.ctr).catch(() => undefined);
+			}, 300);
+		};
 		let atPrompt = false;
 		let promptSeen = false;
 		let typedAtPrompt = false;
@@ -572,6 +630,7 @@ export function TerminalView({
 		const osc133 = term.parser.registerOscHandler(133, (data) => {
 			const [kind, arg] = data.split(";");
 			if (kind === "A") {
+				inj = null;
 				atPrompt = true;
 				promptSeen = true;
 				typedAtPrompt = false;
@@ -603,7 +662,27 @@ export function TerminalView({
 			}
 			return true;
 		});
+		// 어느 셸이 그린 프롬프트인지 — 한 번이라도 받은 셸이면 그 뒤의 OSC 7 은 이 표식 바로 뒤에 온 것만 믿는다
+		// (컨테이너·다른 서버의 셸이 제 나름으로 보내는 OSC 7 경로를 이 서버 트리에 열지 않게)
+		let ctxFresh = false;
+		const osc6976 = term.parser.registerOscHandler(6976, (data) => {
+			const v = data.trim();
+			if (v === "host" || /^docker:[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(v)) {
+				ctxRef.current = v;
+				ctxFresh = true;
+				setInCtr(ctxContainer(v));
+				inj = null;
+			}
+			return true;
+		});
+		const osc6977 = term.parser.registerOscHandler(6977, (data) => {
+			const next = parseJobs(data);
+			setJobs((cur) => (cur.length === next.length && cur.every((j, i) => j.n === next[i].n && j.state === next[i].state && j.cmd === next[i].cmd) ? cur : next));
+			return true;
+		});
 		const osc7 = term.parser.registerOscHandler(7, (data) => {
+			if (ctxRef.current !== undefined && !ctxFresh) return true;
+			ctxFresh = false;
 			const m = /^file:\/\/[^/]*(\/.*)$/.exec(data);
 			if (m) {
 				let p = m[1];
@@ -615,10 +694,13 @@ export function TerminalView({
 				// Windows: file://localhost/C:/Users → C:/Users (cmd 는 역슬래시로 준다)
 				p = p.replace(/\\/g, "/");
 				if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
+				const c = ctxRef.current;
+				pathRef.current = p;
 				completer?.cwd(p);
-				onCwdRef.current?.(p);
+				onCwdRef.current?.(p, c);
 				setHere(p);
-				reopenAt.current = p;
+				// 셸을 다시 열 때의 폴더는 서버 셸의 것만(컨테이너 경로로 서버 셸을 열지 않게)
+				if (!ctxContainer(c)) reopenAt.current = p;
 			}
 			return true;
 		});
@@ -677,6 +759,8 @@ export function TerminalView({
 				}
 			}
 			if (atPrompt && d !== "\r") typedAtPrompt = true;
+			// 컨테이너 셸이 뜨기 전에 무엇을 치면 훅을 넣지 않는다(친 글과 섞이지 않게)
+			if (inj) inj = null;
 			// 빈칸 템플릿 입력(D25 ①) — 셸로 보내기까지 끝
 			if (ax?.data(d)) return;
 			if (d === "\r") completer?.submitted();
@@ -684,9 +768,20 @@ export function TerminalView({
 			else if (d >= " " && d !== "\x7f") completer?.typed();
 			if (atPrompt && d.includes("\r")) {
 				const buf = term.buffer.active;
-				const line = buf.getLine(buf.cursorY + buf.baseY)?.translateToString(true) ?? "";
+				// 화면 폭을 넘어 접힌 명령은 앞 줄들까지 이어 붙인다(접힌 줄만 읽으면 명령 끝 조각만 남는다)
+				let y = buf.cursorY + buf.baseY;
+				const lastY = y;
+				while (y > 0 && buf.getLine(y)?.isWrapped) y--;
+				let line = "";
+				for (let k = y; k <= lastY; k++) line += buf.getLine(k)?.translateToString(k === lastY) ?? "";
 				const marker = term.registerMarker(0);
 				if (marker) pending = { marker, start: Date.now(), text: line.trim() };
+				const ctr = backend.injectCtx ? parseDockerExec(line) : null;
+				if (ctr) {
+					window.setTimeout(() => {
+						inj = { ctr, until: Date.now() + 8000 };
+					}, 0);
+				}
 				atPrompt = false;
 			}
 			if (!lagAt) lagAt = performance.now();
@@ -694,6 +789,12 @@ export function TerminalView({
 			onInputRef.current?.(d);
 			if (d.includes("\r")) ax?.reset();
 		});
+		fgRef.current = (n) => {
+			if (!atPrompt || typedAtPrompt) return false;
+			write(` fg %${n}\r`);
+			atPrompt = false;
+			return true;
+		};
 		const onResize = term.onResize(({ cols, rows }) => {
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
@@ -768,8 +869,12 @@ export function TerminalView({
 				const next = e.key === "0" ? getAppearance().termSize : Math.min(32, Math.max(8, cur + (e.key === "-" ? -1 : 1)));
 				term.options.fontSize = next;
 				setFontPx(next);
-				fit.fit();
+				refit();
 				void api.settingSet("term.fontSize", String(next));
+				return false;
+			}
+			if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === "KeyZ") {
+				if (e.type === "keydown") toggleWideRef.current();
 				return false;
 			}
 			if (e.altKey && e.code === "KeyP") {
@@ -781,12 +886,15 @@ export function TerminalView({
 		// 여러 줄 붙여넣기 확인 — xterm 이 받기 전에 가로챈다
 		const ta = term.textarea;
 		// 사전에서 "터미널에 넣기" 할 대상 — 마지막으로 포커스를 받은 터미널
-		const onFocusIn = () =>
+		const onFocusIn = () => {
+			// 이 터미널로 옮겨 오면 트리·편집기도 이 셸 쪽(서버·컨테이너)으로 — 셸 훅이 있는 셸만
+			if (pathRef.current && ctxRef.current !== undefined) onCwdRef.current?.(pathRef.current, ctxRef.current, true);
 			setActiveTerminal({
 				write: (s) => write(s),
 				label,
 				...(ax ? { template: (s: string) => insertRef.current(s), candidates: (src: Parameters<typeof candidatesFor>[0]) => candRef.current(src) } : {}),
 			});
+		};
 		ta?.addEventListener("focus", onFocusIn);
 		const onPaste = (ev: ClipboardEvent) => {
 			const text = ev.clipboardData?.getData("text/plain") ?? "";
@@ -800,11 +908,35 @@ export function TerminalView({
 		ta?.addEventListener("paste", onPaste, true);
 
 		// 칸 경계를 끄는 동안 프레임마다 다시 맞추면 스크롤백을 매번 다시 흘리고 서버에 크기 변경을 연달아 보낸다 — 멈추면(80ms) 한 번
+		// 줄 바꾸지 않기: Shift+휠·옆 휠은 가로로. 치는 동안에는 커서가 보이게 따라간다(출력이 흐를 때는 보던 자리를 지킨다)
+		const onWheelX = (ev: WheelEvent) => {
+			if (!wideRef.current) return;
+			const dx = ev.shiftKey ? ev.deltaY || ev.deltaX : Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : 0;
+			if (!dx) return;
+			el.scrollLeft += dx;
+			ev.preventDefault();
+			ev.stopPropagation();
+		};
+		el.addEventListener("wheel", onWheelX, { capture: true, passive: false });
+		let keyAt = 0;
+		const onKeyAt = term.onData(() => {
+			keyAt = performance.now();
+		});
+		const onCur = term.onCursorMove(() => {
+			if (!wideRef.current || performance.now() - keyAt > 600) return;
+			const screen = el.querySelector(".xterm-screen") as HTMLElement | null;
+			if (!screen || !term.cols) return;
+			const cw = screen.offsetWidth / term.cols;
+			const x = term.buffer.active.cursorX * cw;
+			const pad = cw * 4;
+			if (x < el.scrollLeft + pad) el.scrollLeft = Math.max(0, x - pad);
+			else if (x > el.scrollLeft + el.clientWidth - pad) el.scrollLeft = x - el.clientWidth + pad;
+		});
 		let fitTimer: number | undefined;
 		const ro = new ResizeObserver(() => {
 			window.clearTimeout(fitTimer);
 			fitTimer = window.setTimeout(() => {
-				if (!disposed && el.offsetWidth > 0 && el.offsetHeight > 0) fit.fit();
+				if (!disposed && el.offsetWidth > 0 && el.offsetHeight > 0) refit();
 			}, 80);
 		});
 		ro.observe(el);
@@ -829,7 +961,7 @@ export function TerminalView({
 				term.options.fontSize = a.termSize;
 				setFontPx(a.termSize);
 			}
-			if (el.offsetWidth > 0) fit.fit();
+			if (el.offsetWidth > 0) refit();
 		});
 
 		return () => {
@@ -851,6 +983,9 @@ export function TerminalView({
 			ta?.removeEventListener("focus", onFocusIn);
 			osc133.dispose();
 			osc7.dispose();
+			osc6976.dispose();
+			osc6977.dispose();
+			window.clearTimeout(injTimer);
 			osc6974.dispose();
 			pathLinks.dispose();
 			onSel.dispose();
@@ -862,6 +997,9 @@ export function TerminalView({
 			unLook();
 			void unlisten.then((f) => f());
 			ro.disconnect();
+			el.removeEventListener("wheel", onWheelX, { capture: true });
+			onKeyAt.dispose();
+			onCur.dispose();
 			onData.dispose();
 			onResize.dispose();
 			if (idRef.current != null) void backend.close(idRef.current);
@@ -952,6 +1090,31 @@ export function TerminalView({
 		return out.join("\n");
 	};
 	const hitCmd = cmdAt(menuLine.current);
+	/** 작업 메뉴 — 앞으로 가져오기(fg), 편집 프로그램이면 앱 편집기로 열기(터미널 쪽은 멈춘 채로 둔다) */
+	const jobItems: MenuItem[] = jobs.flatMap((j): MenuItem[] => {
+		const file = jobFile(j.cmd);
+		const abs = file && here ? (file.startsWith("/") ? file : `${here.replace(/\/$/, "")}/${file.replace(/^\.\//, "")}`) : null;
+		return [
+			{
+				label: `${j.state === "stopped" ? "멈춤" : "실행 중"} [${j.n}] ${j.cmd.length > 48 ? `${j.cmd.slice(0, 47)}…` : j.cmd} — 앞으로(fg)`,
+				run: () => {
+					if (!fgRef.current(j.n)) noteClip("프롬프트에서 아무것도 치지 않았을 때만 fg 할 수 있습니다", false);
+					termRef.current?.focus();
+				},
+			},
+			...(abs && onOpenPath
+				? [
+						{
+							label: `   ${abs.split("/").pop()} 를 앱 편집기로 열기`,
+							run: () => {
+								onOpenPath(abs, ctxRef.current);
+								noteClip(`[${j.n}] 은 멈춘 채로 둡니다 — 같은 파일을 양쪽에서 고치지 마세요`, true);
+							},
+						},
+					]
+				: []),
+		];
+	});
 	const menuItems: MenuItem[] = [
 		...(hitCmd
 			? ([
@@ -974,6 +1137,7 @@ export function TerminalView({
 				] as MenuItem[])
 			: []),
 		{ label: "화면 지우기", run: () => termRef.current?.clear() },
+		{ label: wide ? "줄 바꾸기로 되돌리기  Alt+Z" : "줄 바꾸지 않기(가로 스크롤)  Alt+Z", run: toggleWide },
 		{ label: "스크롤백 저장…", run: () => void exportScrollback() },
 		recording ? { label: "이 터미널 기록 멈추기", run: () => void stopRec() } : { label: "이 터미널 기록 시작", run: () => void startRec() },
 		{
@@ -1053,7 +1217,7 @@ export function TerminalView({
 				</div>
 			)}
 			<div
-				className="term-host"
+				className={`term-host${wide ? " nowrap" : ""}`}
 				ref={host}
 				onClick={() => termRef.current?.focus()}
 				onContextMenu={(e) => {
@@ -1102,6 +1266,25 @@ export function TerminalView({
 					</span>
 				)}
 				{root && <span className="badge warn">root</span>}
+				{inCtr && (
+					<span className="badge ctr" title={`이 터미널은 지금 컨테이너 ${inCtr} 안입니다 — 트리·편집기가 컨테이너 파일을 봅니다. exit 하면 서버로 돌아갑니다`}>
+						<Container size={11} aria-hidden /> {inCtr}
+					</span>
+				)}
+				{jobs.length > 0 && (
+					<button
+						type="button"
+						className="env-chip jobs-chip"
+						title={`이 셸의 작업 — ${jobs.map((j) => `[${j.n}] ${j.state === "stopped" ? "멈춤" : "실행 중"} ${j.cmd}`).join("\n")}\n눌러서 앞으로 가져오기(fg)·앱 편집기로 열기`}
+						onClick={(e) => {
+							const r = e.currentTarget.getBoundingClientRect();
+							setJobMenu({ x: r.left, y: r.top - 4 });
+						}}
+					>
+						<Layers size={11} aria-hidden />
+						{jobs.some((j) => j.state === "stopped") ? `멈춘 작업 ${jobs.filter((j) => j.state === "stopped").length}` : `뒤 작업 ${jobs.length}`}
+					</button>
+				)}
 				{lag && lag.n >= 5 && (
 					<span className={lag.p95 > 150 ? "err" : undefined} title={`입력 지연 — 키를 보낸 뒤 첫 출력(에코)이 올 때까지, 최근 ${lag.n}번\n중앙값 ${lag.p50} ms · 느린 쪽 5% ${lag.p95} ms`}>
 						입력 {lag.p50}/{lag.p95}ms
@@ -1135,6 +1318,7 @@ export function TerminalView({
 				)}
 			</div>
 			{menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />}
+			{jobMenu && <ContextMenu x={jobMenu.x} y={jobMenu.y} items={jobItems} onClose={() => setJobMenu(null)} />}
 			{formOpen && (
 				<AssistFormSheet
 					initial={formOpen.id}

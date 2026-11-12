@@ -419,7 +419,7 @@ export const FileTree = memo(function FileTree({
 
 	const dropProps = (dir: string) => ({
 		onDragOver: (ev: React.DragEvent) => {
-			const osFiles = ev.dataTransfer.types.includes("Files") && fs.side === "remote" && fs.conn != null;
+			const osFiles = ev.dataTransfer.types.includes("Files") && fs.side === "remote" && fs.conn != null && !fs.container;
 			if (osFiles) {
 				ev.preventDefault();
 				ev.stopPropagation();
@@ -437,7 +437,7 @@ export const FileTree = memo(function FileTree({
 		onDrop: (ev: React.DragEvent) => {
 			const raw = ev.dataTransfer.getData(DRAG_MIME);
 			setDropOn(null);
-			if (!raw && ev.dataTransfer.files.length && fs.side === "remote") {
+			if (!raw && ev.dataTransfer.files.length && fs.side === "remote" && !fs.container) {
 				ev.preventDefault();
 				ev.stopPropagation();
 				void uploadDropped(ev.dataTransfer.items, dir);
@@ -493,7 +493,7 @@ export const FileTree = memo(function FileTree({
 					data-path={e.path}
 					style={{ paddingLeft: 6 + depth * 14 }}
 					title={`${e.path}${e.target ? ` → ${e.target}` : ""}${e.kind === "file" ? ` · ${fmtSize(e.size)}` : ""}`}
-					draggable
+					draggable={!fs.container}
 					onDragStart={(ev) => {
 						const d: DragEntry = { side: fs.side, conn: fs.conn, path: e.path, name: e.name, kind: e.kind };
 						ev.dataTransfer.setData(DRAG_MIME, JSON.stringify(d));

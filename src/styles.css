@@ -3128,6 +3128,52 @@ input[type="radio"] {
 	background: var(--accent);
 	color: #fff;
 }
+/* 트리가 컨테이너 파일을 볼 때 — 어디를 보는지 늘 보이게(서버 파일과 헷갈리지 않게) */
+.tree-ctx {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: 4px 6px 0;
+	padding: 3px 4px 3px 8px;
+	border-radius: 7px;
+	background: color-mix(in srgb, #0a84ff 13%, transparent);
+	color: var(--text);
+	font-size: 12px;
+	flex: none;
+	min-width: 0;
+}
+.tree-ctx > span {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	min-width: 0;
+}
+.tree-ctx small {
+	color: var(--text-3);
+	font-size: 11px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	min-width: 0;
+	flex: 1;
+}
+.tree-ctx .btn {
+	height: 22px;
+	padding: 0 8px;
+	font-size: 11.5px;
+	flex: none;
+}
+.badge.ctr {
+	height: 18px;
+	background: color-mix(in srgb, #0a84ff 16%, transparent);
+	color: var(--accent);
+}
+.env-chip.jobs-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--text);
+}
 .tree-note {
 	margin: 4px 8px 0;
 	padding: 4px 8px;

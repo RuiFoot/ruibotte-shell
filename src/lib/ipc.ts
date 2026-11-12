@@ -334,6 +334,8 @@ export type FsBackend = {
 	remove(path: string): Promise<unknown>;
 	/** 같은 쪽 안에서 복사(폴더는 안까지, 같은 이름이면 거절) */
 	copy?(from: string, to: string): Promise<unknown>;
+	/** 컨테이너 안 파일(docker exec) — 이름. SFTP 전송·끌어 놓기·실시간 보기 대상이 아니다 */
+	container?: string;
 };
 
 export type TransferProgress = {
@@ -404,6 +406,8 @@ export type TermBackend = {
 	sudoPw?(id: number): Promise<boolean>;
 	/** 흐름 제어 — 화면이 그린 바이트 수(그만큼 더 보낸다) */
 	ack?(id: number, n: number): Promise<void>;
+	/** 원격: docker exec 로 들어간 컨테이너 셸에 프롬프트 훅을 건다(트리·편집기가 컨테이너를 따라가게) */
+	injectCtx?(id: number, ctr: string): Promise<void>;
 };
 
 export function localFs(home: string): FsBackend {
@@ -478,6 +482,26 @@ export function sshSudoFs(conn: number, label: string, home: string, sudoUser = 
 	};
 }
 
+/** 컨테이너 안 파일 — 서버에서 docker(podman) exec 로. 트리·편집기가 컨테이너를 따라갈 때 */
+export function containerFs(conn: number, ctr: string, home = "/"): FsBackend {
+	const op = (op: string, path: string, to?: string) => invoke<void>("ctr_op", { conn, ctr, op, path, to });
+	return {
+		side: "remote",
+		conn,
+		container: ctr,
+		label: `컨테이너 ${ctr}`,
+		home,
+		sep: "/",
+		list: (path) => invoke("ctr_list", { conn, ctr, path }),
+		read: (path, encoding) => invoke("ctr_read_text", { conn, ctr, path, encoding }),
+		write: (path, text, meta, expectMtime) => invoke("ctr_write_text", { conn, ctr, path, text, meta, expectMtime }),
+		mkdir: (path) => op("mkdir", path),
+		touch: (path) => op("touch", path),
+		rename: (from, to) => op("rename", from, to),
+		remove: (path) => op("remove", path),
+	};
+}
+
 export const sudoApi = {
 	/** 되는지 보기 — 넣은 암호는 이 연결 동안 기억, save 면 계정의 sudo 암호로 저장 */
 	check: (conn: number, password: string | null, save: boolean) => invoke<boolean>("sudo_check", { conn, password, save }),
@@ -503,6 +527,7 @@ export function sshTerm(conn: number): TermBackend {
 		close: (shell) => invoke("ssh_shell_close", { conn, shell }),
 		sudoPw: (shell) => invoke<boolean>("ssh_shell_sudo_pw", { conn, shell }),
 		ack: (shell, n) => invoke("ssh_shell_ack", { conn, shell, n }),
+		injectCtx: (shell, ctr) => invoke("ssh_shell_inject_ctx", { conn, shell, ctr }),
 		exitEvent: "ssh-shell-exit",
 		isMine: (p, id) => {
 			const x = p as { conn: number; shell: number };
