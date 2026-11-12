@@ -510,6 +510,8 @@ export const sudoApi = {
 /** 바깥에서 셸을 다루는 손잡이 — 글 넣기, 출력에서 글귀 기다리기 */
 export type ShellHandle = {
 	send: (s: string) => void;
+	/** 앱이 연 컨테이너 셸(Docker 칸 "컨테이너 안 셸") — 그 셸이 뜨면 프롬프트 훅을 건다 */
+	armCtr?: (ctr: string) => void;
 	expect: (re: RegExp, ms: number) => Promise<boolean>;
 	/** 프롬프트에서 아무것도 치지 않고 기다리는 중인지(셸 통합이 없으면 늘 true) */
 	idle?: () => boolean;

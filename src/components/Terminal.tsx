@@ -10,7 +10,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type IMarker, Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { ChevronDown, ChevronUp, Container, Gauge, Layers, RotateCcw, X, Check, TriangleAlert } from "lucide-react";
+import { ChevronDown, ChevronUp, Container, Gauge, Layers, RotateCcw, X, Check, TriangleAlert, Info } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { api, bytesChannel, type ShellHandle, type TermBackend } from "../lib/ipc";
 import { attachCompletion, type Completer, type CompletionSource } from "../lib/termComplete";
@@ -26,7 +26,7 @@ import { Select } from "./Select";
 import { AssistFormSheet, ExplainCard } from "./CmdAssist";
 import { candidatesFor, cmdDesc, ensureDict, type ExplainPart, explainLine, fillTemplate, hasTemplateFields, optLookup, requestMan, subDesc } from "../lib/cmdAssist";
 import { attachAssist, type TermAssist } from "../lib/termAssist";
-import { ctxContainer, type Job, jobFile, parseDockerExec, parseJobs } from "../lib/shellCtx";
+import { contextCommand, contextNotice, ctxContainer, type ForeignCtx, type Job, jobFile, looksLikePrompt, parseDockerExec, parseJobs, STOPPED_EXIT } from "../lib/shellCtx";
 
 type Stat = { label: string; ok?: boolean };
 type Pending = { marker: IMarker; start: number; text: string };
@@ -82,6 +82,7 @@ export function TerminalView({
 	onInput,
 	completion,
 	onOpenPath,
+	onManualCtr,
 	defaultEncoding,
 	shell,
 	shellOptions,
@@ -111,6 +112,8 @@ export function TerminalView({
 	completion?: CompletionSource;
 	/** 출력의 경로를 Ctrl+누르면 편집기로 */
 	onOpenPath?: (path: string, ctx?: string) => void;
+	/** 손으로 친 docker exec 에 훅을 넣지 못했을 때 — "컨테이너로 트리 열기" (그 셸이 다음 프롬프트를 그리면 그 맥락을 따른다) */
+	onManualCtr?: (ctr: string) => void;
 	/** 처음 인코딩(서버 로캘이 EUC-KR 이면) */
 	defaultEncoding?: string;
 	/** 내 PC 셸 id(없으면 기본) */
@@ -173,6 +176,8 @@ export function TerminalView({
 		clipTimer.current = window.setTimeout(() => setClipNote(null), ok ? 1500 : 5000);
 	};
 	useEffect(() => () => window.clearTimeout(clipTimer.current), []);
+	const noteClipRef = useRef(noteClip);
+	noteClipRef.current = noteClip;
 	const toggleWide = () => {
 		const next = !wideRef.current;
 		wideRef.current = next;
@@ -242,6 +247,10 @@ export function TerminalView({
 	const fgRef = useRef<(n: number) => boolean>(() => false);
 	const ctxRef = useRef<string | undefined>(undefined);
 	const pathRef = useRef<string | null>(null);
+	/** 셸 훅이 닿지 않는 다른 맥락(ssh·su·tmux·컨테이너 등)에 들어간 명령 — 다음 프롬프트까지 띠로 알린다 */
+	const [foreign, setForeign] = useState<ForeignCtx | null>(null);
+	/** 줄마다 그 줄이 찍힐 때의 맥락 — 경로 링크를 누르면 그때의 맥락으로 연다(컨테이너에서 찍힌 경로를 나온 뒤 눌러도) */
+	const ctxMarks = useRef<{ m: IMarker; ctx?: string; foreign?: string }[]>([]);
 	const exited = useRef(false);
 	const reopenAt = useRef<string | undefined>(undefined);
 	const onOpenPathRef = useRef(onOpenPath);
@@ -398,7 +407,11 @@ export function TerminalView({
 						text: p,
 						decorations: { pointerCursor: true, underline: true },
 						activate: (ev) => {
-							if (ev.ctrlKey || ev.metaKey) onOpenPathRef.current?.(p.replace(/\\/g, "/"), ctxRef.current);
+							if (!(ev.ctrlKey || ev.metaKey)) return;
+							const at = ctxMarks.current.filter((k) => !k.m.isDisposed && k.m.line <= y - 1).pop();
+							const path = p.replace(/\\/g, "/");
+							if (at?.foreign && !confirm(`이 경로는 다른 맥락(${at.foreign})에서 찍혔습니다.\n이 서버(또는 그때의 컨테이너)의 ${path} 를 열까요?`)) return;
+							onOpenPathRef.current?.(path, at ? at.ctx : ctxRef.current);
 						},
 					});
 				}
@@ -620,17 +633,31 @@ export function TerminalView({
 				const it = inj;
 				inj = null;
 				if (!it || disposed || Date.now() > it.until || idRef.current == null || !backend.injectCtx) return;
+				// 암호 프롬프트(sudo docker exec)·확인 질문·전체 화면 프로그램에 훅 줄을 넣지 않는다 — 셸 프롬프트 모양일 때만
+				const b = term.buffer.active;
+				const before = b.getLine(b.cursorY + b.baseY)?.translateToString(false, 0, b.cursorX) ?? "";
+				if (b.type !== "normal" || !looksLikePrompt(before)) {
+					// 암호 입력 뒤 컨테이너 프롬프트가 뜨면 그때 다시 본다(같은 시한 안에서)
+					if (/pass(word|phrase)|암호/i.test(before)) inj = it;
+					return;
+				}
 				void backend.injectCtx(idRef.current, it.ctr).catch(() => undefined);
 			}, 300);
 		};
 		let atPrompt = false;
 		let promptSeen = false;
 		let typedAtPrompt = false;
+		/** 프롬프트 뒤에 친 글(키로 모음) — 화살표·Tab·Ctrl 키처럼 셸이 줄을 바꾸는 키를 쓰면 믿지 않는다(keyDirty) */
+		let keyLine = "";
+		let keyDirty = false;
 		let pending: Pending | null = null;
 		const osc133 = term.parser.registerOscHandler(133, (data) => {
 			const [kind, arg] = data.split(";");
 			if (kind === "A") {
+				keyLine = "";
+				keyDirty = false;
 				inj = null;
+				setForeign(null);
 				atPrompt = true;
 				promptSeen = true;
 				typedAtPrompt = false;
@@ -646,17 +673,19 @@ export function TerminalView({
 				const end = term.registerMarker(0);
 				cmds.current.push({ start: p.marker, end: end ?? undefined, text: p.text, code });
 				if (cmds.current.length > 2000) cmds.current.shift();
-				term.registerDecoration({ marker: p.marker, overviewRulerOptions: { color: code === 0 ? "#30d158" : "#ff453a", position: "right" } });
-				const text = `${code === 0 ? "✓" : `✗ ${code}`} ${ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`}`;
+				// Ctrl+Z 로 멈춘 명령(종료 코드 148 등)은 실패가 아니다 — 작업(jobs)으로 남았다(fg 로 되살린다)
+				const stopped = STOPPED_EXIT.has(code);
+				term.registerDecoration({ marker: p.marker, overviewRulerOptions: { color: code === 0 ? "#30d158" : stopped ? "#ff9f0a" : "#ff453a", position: "right" } });
+				const text = `${code === 0 ? "✓" : stopped ? "⏸ 정지" : `✗ ${code}`} ${ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`}`;
 				const deco = term.registerDecoration({ marker: p.marker, anchor: "right", x: 0, width: text.length + 1, layer: "top" });
 				deco?.onRender((d) => {
 					// 렌더마다 불린다 — 처음 한 번만 쓴다(에코마다 DOM 을 다시 쓰지 않게)
 					if (d.textContent === text) return;
 					d.textContent = text;
-					d.className = `cmd-mark ${code === 0 ? "ok" : "bad"}`;
-					d.title = `${p.text}\n종료 코드 ${code} · ${ms} ms`;
+					d.className = `cmd-mark ${code === 0 ? "ok" : stopped ? "stop" : "bad"}`;
+					d.title = `${p.text}\n${stopped ? "정지 — 작업으로 남음(fg 로 되살림)" : `종료 코드 ${code}`} · ${ms} ms`;
 				});
-				if (ms > 10_000 && !document.hasFocus()) {
+				if (ms > 10_000 && !document.hasFocus() && !stopped) {
 					sendNotification({ title: code === 0 ? "명령이 끝났습니다" : `명령이 실패했습니다(${code})`, body: `${p.text.slice(0, 80)} · ${(ms / 1000).toFixed(0)}초` });
 				}
 			}
@@ -668,6 +697,10 @@ export function TerminalView({
 		const osc6976 = term.parser.registerOscHandler(6976, (data) => {
 			const v = data.trim();
 			if (v === "host" || /^docker:[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(v)) {
+				if (ctxRef.current !== v || !ctxMarks.current.length) {
+					const m = term.registerMarker(0);
+					if (m) ctxMarks.current.push({ m, ctx: v });
+				}
 				ctxRef.current = v;
 				ctxFresh = true;
 				setInCtr(ctxContainer(v));
@@ -727,6 +760,9 @@ export function TerminalView({
 							}
 						: undefined,
 					send: (s) => write(s),
+					armCtr: (ctr: string) => {
+						if (backend.injectCtx) inj = { ctr, until: Date.now() + 15000 };
+					},
 					sudoPw: backend.sudoPw ? () => backend.sudoPw?.(id) ?? Promise.resolve(false) : undefined,
 					expect: (re, ms) =>
 						new Promise<boolean>((res) => {
@@ -759,8 +795,13 @@ export function TerminalView({
 				}
 			}
 			if (atPrompt && d !== "\r") typedAtPrompt = true;
+			if (atPrompt && d !== "\r") {
+				if (d === "\x7f") keyLine = keyLine.slice(0, -1);
+				else if (/^[^\x00-\x1f\x7f]+$/.test(d)) keyLine += d;
+				else keyDirty = true;
+			}
 			// 컨테이너 셸이 뜨기 전에 무엇을 치면 훅을 넣지 않는다(친 글과 섞이지 않게)
-			if (inj) inj = null;
+			if (inj && !(atPrompt && d.includes("\r"))) inj = null;
 			// 빈칸 템플릿 입력(D25 ①) — 셸로 보내기까지 끝
 			if (ax?.data(d)) return;
 			if (d === "\r") completer?.submitted();
@@ -774,14 +815,26 @@ export function TerminalView({
 				while (y > 0 && buf.getLine(y)?.isWrapped) y--;
 				let line = "";
 				for (let k = y; k <= lastY; k++) line += buf.getLine(k)?.translateToString(k === lastY) ?? "";
+				// 친 명령만(프롬프트 뒤) — 입력 시작 칸을 알면 거기서부터, 모르면 프롬프트 끝 글자 뒤
+				const st = completer?.inputStart();
+				let typed = "";
+				if (st && st.y <= lastY && lastY - st.y < 50) {
+					for (let k = st.y; k <= lastY; k++) typed += buf.getLine(k)?.translateToString(k === lastY, k === st.y ? st.x : 0) ?? "";
+				} else typed = line.replace(/^.*?[$#%>❯]\s/, "");
+				typed = typed.trim();
+				// 에코가 아직 화면에 안 온 채 Enter 를 누를 수 있다(빠른 입력·느린 서버) — 친 키로 모은 줄이 더 길면 그것을
+				if (!keyDirty && keyLine.trim().length > typed.length) typed = keyLine.trim();
 				const marker = term.registerMarker(0);
-				if (marker) pending = { marker, start: Date.now(), text: line.trim() };
-				const ctr = backend.injectCtx ? parseDockerExec(line) : null;
-				if (ctr) {
-					window.setTimeout(() => {
-						inj = { ctr, until: Date.now() + 8000 };
-					}, 0);
+				if (marker) pending = { marker, start: Date.now(), text: typed || line.trim() };
+				const away = typed ? contextCommand(typed) : null;
+				if (away) {
+					setForeign(away);
+					const m = term.registerMarker(0);
+					if (m) ctxMarks.current.push({ m, ctx: ctxRef.current, foreign: away.label });
+					if (ctxMarks.current.length > 600) ctxMarks.current = ctxMarks.current.filter((k) => !k.m.isDisposed).slice(-400);
 				}
+				const ctr = backend.injectCtx && typed ? parseDockerExec(typed) : null;
+				if (ctr) inj = { ctr, until: Date.now() + 15000 };
 				atPrompt = false;
 			}
 			if (!lagAt) lagAt = performance.now();
@@ -889,10 +942,19 @@ export function TerminalView({
 		const onFocusIn = () => {
 			// 이 터미널로 옮겨 오면 트리·편집기도 이 셸 쪽(서버·컨테이너)으로 — 셸 훅이 있는 셸만
 			if (pathRef.current && ctxRef.current !== undefined) onCwdRef.current?.(pathRef.current, ctxRef.current, true);
+			const canInsert = () => {
+				if (term.buffer.active.type !== "normal" || (promptSeen && !atPrompt)) {
+					noteClipRef.current("명령이 실행 중이라 넣지 않았습니다 — 프롬프트에서 다시", false);
+					return false;
+				}
+				return true;
+			};
 			setActiveTerminal({
-				write: (s) => write(s),
+				write: (s) => {
+					if (canInsert()) write(s);
+				},
 				label,
-				...(ax ? { template: (s: string) => insertRef.current(s), candidates: (src: Parameters<typeof candidatesFor>[0]) => candRef.current(src) } : {}),
+				...(ax ? { template: (s: string) => (canInsert() ? insertRef.current(s) : undefined), candidates: (src: Parameters<typeof candidatesFor>[0]) => candRef.current(src) } : {}),
 			});
 		};
 		ta?.addEventListener("focus", onFocusIn);
@@ -1216,6 +1278,33 @@ export function TerminalView({
 					</button>
 				</div>
 			)}
+			{foreign && (
+				<div className="term-band" role="status">
+					<Info size={13} aria-hidden />
+					<span>{contextNotice(foreign)}</span>
+					{foreign.kind === "container" && foreign.name && onManualCtr && (
+						<button
+							type="button"
+							className="btn ghost"
+							title="트리·편집기·경로 링크를 이 컨테이너 안으로 — 서버 셸 프롬프트로 돌아오면 다시 서버로"
+							onClick={() => {
+								const name = foreign.name as string;
+								ctxRef.current = `docker:${name}`;
+								const m = termRef.current?.registerMarker(0);
+								if (m) ctxMarks.current.push({ m, ctx: ctxRef.current });
+								setInCtr(name);
+								setForeign(null);
+								onManualCtr(name);
+							}}
+						>
+							컨테이너로 트리 열기
+						</button>
+					)}
+					<button type="button" className="btn ghost icon" title="닫기" onClick={() => setForeign(null)}>
+						<X size={12} />
+					</button>
+				</div>
+			)}
 			<div
 				className={`term-host${wide ? " nowrap" : ""}`}
 				ref={host}
@@ -1261,8 +1350,8 @@ export function TerminalView({
 					</span>
 				)}
 				{last && (
-					<span className={last.code === 0 ? "ok" : "err"}>
-						{last.code === 0 ? "✓" : `✗ ${last.code}`} {last.ms < 1000 ? `${last.ms}ms` : `${(last.ms / 1000).toFixed(1)}초`}
+					<span className={last.code === 0 ? "ok" : STOPPED_EXIT.has(last.code) ? undefined : "err"}>
+						{last.code === 0 ? "✓" : STOPPED_EXIT.has(last.code) ? "⏸ 정지" : `✗ ${last.code}`} {last.ms < 1000 ? `${last.ms}ms` : `${(last.ms / 1000).toFixed(1)}초`}
 					</span>
 				)}
 				{root && <span className="badge warn">root</span>}

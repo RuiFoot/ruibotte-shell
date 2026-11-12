@@ -11,7 +11,7 @@ import {
 import { CLOSE_DOC_EVENT, confirmDiscard, forgetOwner, isDirty, setDirty } from "../lib/dirty";
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
-import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Route, Rows2, Container, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
+import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Route, Rows2, Container, SquareTerminal, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
 	api,
@@ -110,7 +110,11 @@ type Ctx = {
 	localShells?: ShellInfo[];
 	defaultShell?: string;
 	registerShell: (panelId: string, h: ShellHandle | null) => void;
-	onCwd: (path: string, ctx?: string, focus?: boolean) => void;
+	onCwd: (path: string, ctx?: string, focus?: boolean, panelId?: string) => void;
+	/** 손으로 친 docker exec — 그 터미널 맥락을 컨테이너로 두고 트리를 연다 */
+	openCtrTree: (name: string, panelId: string) => void;
+	/** 보이는 터미널이 트리와 다른 곳(서버·컨테이너)에 있다 — 트리 → 터미널 cd 를 보내지 않는다 */
+	termOtherSide: () => boolean;
 	completion: CompletionSource;
 	openTail: (which: Which, e: FsEntry) => void;
 	compare: (which: Which, e: FsEntry) => void;
@@ -145,7 +149,7 @@ type Ctx = {
 	/** 연결한 계정의 sudo 설정(서비스·Docker 칸) */
 	sudo?: SudoCtx;
 	/** 새 터미널을 열고 명령 실행(컨테이너 셸·journal 등) */
-	openTerminalCmd: (cmd: string, title: string) => void;
+	openTerminalCmd: (cmd: string, title: string, ctr?: string) => void;
 	/** 지금 터미널 폴더 */
 	cwdNow: () => string | null;
 	/** 원격: 포트 포워딩 관리 창 열기(상태 줄 표시를 누르면) */
@@ -169,7 +173,7 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 	const onSelectDir = (dir: string) => {
 		if (!ctx.follow || !follows) return;
 		if (!ctx.cd(dir, true)) {
-			setNote("터미널이 명령을 실행 중이라 cd 하지 않았습니다");
+			setNote(ctx.termOtherSide() ? "터미널이 트리와 다른 곳(서버·컨테이너)에 있어 cd 하지 않았습니다" : "터미널이 명령을 실행 중이라 cd 하지 않았습니다");
 			window.setTimeout(() => setNote(null), 3000);
 		}
 	};
@@ -306,7 +310,17 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 	}, [props.api]);
 	const info = ctx.localShells?.find((s) => s.id === shell);
 	const kind = info ? (info.kind === "pwsh" ? "pwsh" : info.kind === "cmd" ? "cmd" : "linux") : "linux";
-	const completion = useMemo(() => ({ ...ctx.completion, key: `${ctx.completion.key}:${kind}`, shellKind: kind as "linux" | "pwsh" | "cmd" }), [ctx.completion, kind]);
+	// 이 터미널이 지금 들어가 있는 컨테이너 — 경로 자동완성 목록을 그 쪽 파일로
+	const myCtr = useRef<string | null>(null);
+	const completion = useMemo(
+		() => ({
+			...ctx.completion,
+			key: `${ctx.completion.key}:${kind}`,
+			shellKind: kind as "linux" | "pwsh" | "cmd",
+			listDir: (dir: string) => (myCtr.current ? ctx.ctrFs(myCtr.current).list(dir) : ctx.completion.listDir(dir)),
+		}),
+		[ctx.completion, ctx.ctrFs, kind],
+	);
 	// 명령 입력 보조(D25) — 원격 SSH 와 내 PC 의 bash·zsh·Git Bash·WSL 만(PowerShell·cmd·그 밖은 끔)
 	const assist = !ctx.localShells || (!!info && (info.kind === "bash" || info.kind === "zsh" || info.kind === "wsl"));
 	// 터미널이 셸 정보(목록)를 받기 전에는 열지 않는다(기본 셸로 한 번 열렸다 다시 열리지 않게)
@@ -320,7 +334,14 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 				label={ctx.label}
 				toolbar={false}
 				onShell={(h) => ctx.registerShell(props.api.id, h)}
-				onCwd={ctx.onCwd}
+				onCwd={(p, c, f) => {
+					if (c !== undefined) myCtr.current = ctxContainer(c);
+					ctx.onCwd(p, c, f, props.api.id);
+				}}
+				onManualCtr={(name) => {
+					myCtr.current = name;
+					ctx.openCtrTree(name, props.api.id);
+				}}
 				onInput={(d) => ctx.broadcast(props.api.id, d)}
 				completion={ctx.localShells ? completion : ctx.completion}
 				assist={assist}
@@ -687,6 +708,7 @@ function addDoc(d: DockviewApi, opts: { id: string; component: string; title: st
 		return;
 	}
 	const term = d.panels.find((p) => p.id.startsWith("term-"));
+	unhide(term);
 	const p = d.addPanel({
 		...opts,
 		renderer: "always",
@@ -701,6 +723,7 @@ function addDoc(d: DockviewApi, opts: { id: string; component: string; title: st
 /** 아래 칸(전송·동기화) — VS Code 의 아래 패널처럼 터미널 칸의 탭으로 */
 function addBottom(d: DockviewApi, opts: { id: string; component: string; title: string }, focus: boolean) {
 	const term = d.panels.find((p) => p.id.startsWith("term-"));
+	unhide(term);
 	d.addPanel({
 		...opts,
 		renderer: "always",
@@ -734,6 +757,48 @@ function defaultLayout(d: DockviewApi, terminalOnly = false) {
 	term.api.setActive();
 }
 
+/**
+ * 되살린 배치 바로잡기 — 서버 작업대가 "트리만 덩그러니" 보이지 않게.
+ * ① Ctrl+` 로 숨긴 칸은 다시 보이게(옛 저장본에 숨김이 남아 있을 수 있다)
+ * ② 편집기를 빼고 저장해 비어 버린 칸은 지운다
+ * ③ 터미널이 없으면(마지막 터미널을 닫은 채 저장) 트리 오른쪽에 하나
+ * ④ sizes: 트리 밖 칸이 최소 폭(100)에 붙어 있으면 편다 — 숨은 터미널 칸 "위"에 편집기가 열리며 100px 띠로 굳은 배치.
+ *    작업대가 실제로 보일 때(폭이 있을 때)만, 되살릴 때 한 번
+ */
+function repairLayout(d: DockviewApi, needTerm: boolean, nextTerm: () => number, sizes: boolean) {
+	for (const g of d.groups) if (!g.api.isVisible) g.api.setVisible(true);
+	for (const g of [...d.groups]) if (g.panels.length === 0 && d.groups.length > 1) d.removeGroup(g);
+	const sized = d.width >= 480 && d.height >= 240;
+	if (needTerm && !d.panels.some((p) => p.id.startsWith("term-"))) {
+		const n = nextTerm();
+		const tree = d.getPanel("tree");
+		d.addPanel({
+			id: `term-${n}`,
+			component: "terminal",
+			title: n === 1 ? "터미널" : `터미널 ${n}`,
+			params: { n },
+			renderer: "always",
+			position: tree ? { referencePanel: "tree", direction: "right" } : undefined,
+		});
+		if (tree && sized) tree.api.setSize({ width: 250 });
+	}
+	if (!sizes || !sized) return;
+	const MIN = 104; // dockview 의 칸 최소 크기는 100
+	const tree = d.getPanel("tree")?.group;
+	const others = d.groups.filter((g) => g !== tree);
+	// 트리 밖 칸이 모두 최소 폭이면(트리가 화면을 다 차지) 트리를 기본 폭으로
+	if (tree && others.length && others.every((g) => g.width <= MIN)) tree.api.setSize({ width: 250 });
+	for (const g of others) {
+		if (g.width <= MIN) g.api.setSize({ width: Math.round(d.width * 0.5) });
+		if (g.height <= MIN && d.height > 400) g.api.setSize({ height: Math.round(d.height * 0.4) });
+	}
+}
+
+/** 칸이 숨겨져 있으면(Ctrl+`) 보이게 — 숨은 칸을 기준으로 새 칸을 붙이면 크기 0 옆에 끼어 안 보인다 */
+function unhide(p: { group: { api: { isVisible: boolean; setVisible(v: boolean): void } } } | undefined) {
+	if (p && !p.group.api.isVisible) p.group.api.setVisible(true);
+}
+
 /** 저장용 배치 — 편집기 탭은 빼고 고정 칸만 */
 function stripEditors(json: ReturnType<DockviewApi["toJSON"]>) {
 	const j = structuredClone(json) as unknown as {
@@ -742,14 +807,15 @@ function stripEditors(json: ReturnType<DockviewApi["toJSON"]>) {
 		activeGroup?: string;
 	};
 	for (const id of Object.keys(j.panels)) if (!FIXED.test(id)) delete j.panels[id];
-	const walk = (node: { type: string; data: unknown }): boolean => {
+	const walk = (node: { type: string; data: unknown; visible?: boolean }): boolean => {
+		delete node.visible;
 		if (node.type === "leaf") {
 			const g = node.data as { views: string[]; activeView?: string };
 			g.views = g.views.filter((v) => FIXED.test(v));
 			if (g.activeView && !FIXED.test(g.activeView)) g.activeView = g.views[0];
 			return true;
 		}
-		const kids = node.data as { type: string; data: unknown }[];
+		const kids = node.data as { type: string; data: unknown; visible?: boolean }[];
 		for (const k of kids) walk(k);
 		return true;
 	};
@@ -886,13 +952,16 @@ export function Workbench({
 	);
 	const ctrRef = useRef(ctr);
 	ctrRef.current = ctr;
+	/** 터미널 칸마다 마지막 프롬프트의 맥락(host · docker:이름) — 트리는 지금 쓰는(마지막으로 초점을 받은) 터미널을 따른다 */
+	const termCtx = useRef(new Map<string, string | undefined>());
+	const lastTerm = useRef<string | null>(null);
 	const fsNow = ctr && fs.side === "remote" && fs.conn != null ? ctrFs(ctr) : sudoOn && sudoFs ? sudoFs : fs;
 	// 자동완성 출처 — 원격은 SFTP 목록·compgen, 내 PC 는 파일 목록·사전
 	const completion = useMemo<CompletionSource>(
 		() => ({
 			key: fs.side === "remote" ? `ssh:${label}` : "local",
 			home: fs.home,
-			listDir: (dir) => (ctrRef.current && fs.conn != null ? ctrFs(ctrRef.current) : fs).list(dir),
+			listDir: (dir) => fs.list(dir),
 			commands: async () => {
 				if (fs.side !== "remote" || fs.conn == null) return [];
 				const out = await invoke<string>("ssh_exec", { conn: fs.conn, cmd: "bash -lc 'compgen -c' 2>/dev/null | sort -u | head -5000" });
@@ -937,6 +1006,10 @@ export function Workbench({
 	}, [active, owner]);
 	const [activePanel, setActivePanel] = useState<string | null>(null);
 	const termSeq = useRef(1);
+	/** 되살릴 때 작업대가 가려져 있어 크기 바로잡기를 미뤘다 */
+	const repairPending = useRef(false);
+	const activeRef = useRef(active);
+	activeRef.current = active;
 	const saveTimer = useRef<number | undefined>(undefined);
 
 	// 최근 연 파일(작업대 종류·서버별로 앱 설정에) — 명령 팔레트의 "최근 파일"
@@ -1005,7 +1078,13 @@ export function Workbench({
 	}, []);
 
 	const onCwd = useCallback(
-		(path: string, c?: string, focus?: boolean) => {
+		(path: string, c?: string, focus?: boolean, panelId?: string) => {
+			if (panelId) {
+				if (c !== undefined) termCtx.current.set(panelId, c);
+				if (focus || !lastTerm.current || !dock.current?.getPanel(lastTerm.current)) lastTerm.current = panelId;
+				// 뒤에 있는 다른 터미널의 프롬프트는 트리를 옮기지 않는다
+				else if (lastTerm.current !== panelId) return;
+			}
 			// 터미널로 초점만 옮긴 것 — 이미 그 셸 쪽·그 폴더면 트리를 건드리지 않는다
 			if (focus && path === lastCwd.current && ctxContainer(c) === ctrRef.current) return;
 			lastCwd.current = path;
@@ -1051,6 +1130,8 @@ export function Workbench({
 			const termId = s?.id;
 			const send = s?.h?.send;
 			if (!send) return false;
+			// 터미널이 트리와 다른 곳(서버·컨테이너)에 있으면 경로가 맞지 않는다
+			if (termId && termCtx.current.has(termId) && ctxContainer(termCtx.current.get(termId)) !== ctrRef.current) return false;
 			// 명령 실행 중·입력 중(vim 등)이면 보내지 않는다
 			if (s?.h?.idle && !s.h.idle()) return false;
 			// 원격은 POSIX 셸(작은따옴표), 내 PC 는 PowerShell/zsh 모두 받는 큰따옴표
@@ -1272,24 +1353,58 @@ export function Workbench({
 		addDoc(d, { id, component: id, title });
 	};
 	/** 새 터미널을 열고, 셸이 준비되면 명령을 보낸다 */
-	const openTerminalCmdRef = useRef<(cmd: string, title: string) => void>(() => {});
-	openTerminalCmdRef.current = (cmd: string, title: string) => {
+	const openTerminalCmdRef = useRef<(cmd: string, title: string, ctr?: string) => void>(() => {});
+	openTerminalCmdRef.current = (cmd: string, title: string, ctr?: string) => {
 		const d = dock.current;
 		if (!d) return;
 		termSeq.current += 1;
 		const n = termSeq.current;
 		const id = `term-${n}`;
 		const ref = d.panels.find((p) => p.id.startsWith("term-"));
+		unhide(ref);
 		d.addPanel({ id, component: "terminal", title, params: { n }, renderer: "always", position: ref ? { referencePanel: ref.id, direction: "within" } : undefined });
 		let tries = 0;
 		const send = () => {
 			const h = shells.current.get(id);
-			if (h && (!h.idle || h.idle())) return void h.send(`${cmd}\r`);
+			if (h && (!h.idle || h.idle())) {
+				h.send(`${cmd}\r`);
+				if (ctr) h.armCtr?.(ctr);
+				return;
+			}
 			if (++tries < 60) window.setTimeout(send, 150);
 		};
 		window.setTimeout(send, 300);
 	};
 
+	// 앱 탭이 보이게 되면(크기가 생기면) 찌그러진 칸을 편다 — 처음 열 때 가려져 있었던 작업대
+	useEffect(() => {
+		if (!active) return;
+		const id = requestAnimationFrame(() => {
+			const d = dock.current;
+			if (!d || d.width === 0) return;
+			if (repairPending.current) {
+				repairPending.current = false;
+				repairLayout(d, false, () => ++termSeq.current, true);
+			}
+			// 가려진 동안 칸이 열리고 닫히면 칸 내용이 0 크기로 잡힌 채 남는다 — 한 번 다시 그린다
+			d.layout(d.width, d.height, true);
+		});
+		return () => cancelAnimationFrame(id);
+	}, [active]);
+	/** 터미널 단추 — 있으면 그 터미널로, 없으면(닫았으면) 트리 오른쪽에 새로 */
+	const showTerminal = () => {
+		const d = dock.current;
+		if (!d) return;
+		const t = d.panels.find((p) => p.id.startsWith("term-") && p.api.isVisible) ?? d.panels.find((p) => p.id.startsWith("term-"));
+		if (t) {
+			unhide(t);
+			t.api.setActive();
+			if (t.group.width <= 104 || t.group.height <= 104) repairLayout(d, false, () => ++termSeq.current, true);
+			return;
+		}
+		if (blockedByLock()) return;
+		repairLayout(d, true, () => ++termSeq.current, true);
+	};
 	const addTerminalRef = useRef<(cwd?: string, shell?: string, near?: string) => void>(() => {});
 	const addTerminal = (cwd?: string, shell?: string, near?: string) => {
 		const d = dock.current;
@@ -1297,6 +1412,7 @@ export function Workbench({
 		termSeq.current += 1;
 		const n = termSeq.current;
 		const ref = (near ? d.getPanel(near) : undefined) ?? d.panels.find((p) => p.id.startsWith("term-"));
+		unhide(ref);
 		d.addPanel({
 			id: `term-${n}`,
 			component: "terminal",
@@ -1316,6 +1432,7 @@ export function Workbench({
 		const n = termSeq.current;
 		const cwd = lastCwd.current ?? undefined;
 		const ref = d.getPanel(panelId);
+		unhide(ref);
 		d.addPanel({
 			id: `term-${n}`,
 			component: "terminal",
@@ -1422,7 +1539,7 @@ export function Workbench({
 			// 원격 트리는 왼쪽 끝, 내 PC 트리는 오른쪽 끝(주고받을 때만 여는 칸)
 			position: { direction: id === "tree" ? "left" : "right" },
 		});
-		if (id === "localtree") d.getPanel(id)?.api.setSize({ width: 300 });
+		d.getPanel(id)?.api.setSize({ width: id === "localtree" ? 300 : 250 });
 	};
 
 	// 기본 배치가 바뀌면 옛 저장 배치는 쓰지 않는다(v3: 터미널 우선 — 빈 문서 자리 없음, 내 PC 셸은 터미널만)
@@ -1451,6 +1568,11 @@ export function Workbench({
 				}
 			}
 			if (!ok) defaultLayout(e.api, terminalOnly);
+			else {
+				const sized = e.api.width >= 480;
+				repairLayout(e.api, true, () => ++termSeq.current, sized);
+				repairPending.current = !sized;
+			}
 			// 다시 연결한 뒤·앱을 다시 연 뒤: 열려 있던 편집기 탭을 다시 연다(초안은 편집기가 되살리기를 묻는다).
 			// 이 창에서 연 적이 없으면(앱 재시작) 저장해 둔 목록에서 — 많으면 앞 12개만
 			const reopen = (list: { which: Which; path: string; name: string }[]) => {
@@ -1473,7 +1595,10 @@ export function Workbench({
 					}
 				});
 		});
-		e.api.onDidActivePanelChange((ev) => setActivePanel(ev.panel?.id ?? null));
+		e.api.onDidActivePanelChange((ev) => {
+			setActivePanel(ev.panel?.id ?? null);
+			if (ev.panel?.id.startsWith("term-")) lastTerm.current = ev.panel.id;
+		});
 		e.api.onDidLayoutChange(() => {
 			if (gone.current) return;
 			setShownIds(e.api.panels.map((p) => p.id).join("|"));
@@ -1481,6 +1606,8 @@ export function Workbench({
 			saveTimer.current = window.setTimeout(() => {
 				const d = dock.current;
 				if (!d || gone.current) return;
+				// 가려진 앱 탭에서는 작업대 크기가 0 으로 다시 그려진다 — 그 배치를 저장하면 다음에 칸이 찌그러져 열린다
+				if (!activeRef.current || d.width < 240 || d.height < 160) return;
 				void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
 				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown; ctr?: unknown });
 				openEditors.set(owner, eds);
@@ -1514,6 +1641,22 @@ export function Workbench({
 			registerShell,
 			onCwd,
 			ctrFs,
+			openCtrTree: (name: string, panelId: string) => {
+				termCtx.current.set(panelId, `docker:${name}`);
+				lastTerm.current = panelId;
+				if (fs.conn == null) return;
+				setCtr(name);
+				void invoke<[string, string]>("ctr_where", { conn: fs.conn, ctr: name })
+					.then(([cwd]) => {
+						lastCwd.current = cwd;
+						window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: cwd }));
+					})
+					.catch((e) => alert(asSshError(e).message));
+			},
+			termOtherSide: () => {
+				const id = visibleShell()?.id;
+				return !!id && termCtx.current.has(id) && ctxContainer(termCtx.current.get(id)) !== ctrRef.current;
+			},
 			leaveCtr: () => setCtr(null),
 			broadcast,
 			completion,
@@ -1535,7 +1678,7 @@ export function Workbench({
 			addTerminalNear: (id?: string) => addTerminalRef.current(undefined, undefined, id),
 			openMonitor: () => openMonitorRef.current(),
 			sudo: sudo ? { mode: sudo.mode, user: sudo.user || "root" } : undefined,
-			openTerminalCmd: (cmd: string, title: string) => openTerminalCmdRef.current(cmd, title),
+			openTerminalCmd: (cmd: string, title: string, ctr?: string) => openTerminalCmdRef.current(cmd, title, ctr),
 			cwdNow: () => lastCwd.current,
 			openForwards: server ? () => setFwdOpen(true) : undefined,
 			profileId: server?.profileId,
@@ -1713,6 +1856,9 @@ export function Workbench({
 						<span className="wb-group-label">칸</span>
 						<button type="button" className={`btn ghost${has("tree") ? " on" : ""}`} onClick={() => toggle("tree")} title={`파일 칸 — ${fs.side === "remote" ? "서버" : "내 PC"} 파일 트리 ${has("tree") ? "닫기" : "열기"}`} aria-pressed={has("tree")}>
 							<FolderTree size={14} /> <span className="lbl">파일</span>
+						</button>
+						<button type="button" className={`btn ghost${shownIds.includes("term-") ? " on" : ""}`} onClick={showTerminal} title={shownIds.includes("term-") ? "터미널로" : "터미널 열기 — 닫혀 있으면 트리 오른쪽에 새로"} aria-pressed={shownIds.includes("term-")}>
+							<SquareTerminal size={14} /> <span className="lbl">터미널</span>
 						</button>
 						{local && (
 							<button type="button" className={`btn ghost${has("localtree") ? " on" : ""}`} onClick={() => toggle("localtree")} title={`내 PC 칸 — 내 PC 파일 트리 ${has("localtree") ? "닫기" : "열기"}(서버 트리와 끌어 놓아 주고받기)`} aria-pressed={has("localtree")}>

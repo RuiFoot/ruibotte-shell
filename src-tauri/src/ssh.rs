@@ -1018,10 +1018,11 @@ pub async fn ssh_shell_open(
     Ok(shell)
 }
 
-/// zsh 프롬프트 훅 — 작업 목록은 $jobstates·$jobtexts 로(포크 없음)
-const ZSH_HOOK_HOST: &str = r#" __rb_precmd() { local s=$? j= k; for k in ${(k)jobtexts}; do j+="[$k] ${${jobstates[$k]}%%:*} ${jobtexts[$k]}␤"; done; printf '\033]133;D;%s\007\033]6976;host\007\033]6977;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007' "$s" "$j" "$HOST" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#;
-/// bash 프롬프트 훅 — bash 일 때만 걸린다(sh·dash 에서는 오류 없이 지나간다). 작업 목록은 $(jobs) 의 줄바꿈을 ␤ 로
-const BASH_HOOK_HOST: &str = r#" [ -n "$BASH_VERSION" ] && __rb_nl=$'\n' && PROMPT_COMMAND='__rb_s=$?; __rb_j=$(jobs); printf "\033]133;D;%s\007\033]6976;host\007\033]6977;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${__rb_j//$__rb_nl/␤}" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#;
+/// zsh 프롬프트 훅 — 작업 목록은 $jobstates·$jobtexts 로(포크 없음). 정지 @@R@@ 실행 중, 줄 사이 @@J@@(ASCII — EUC-KR 터미널에서도 안 깨진다)
+const ZSH_HOOK_HOST: &str = r#" __rb_precmd() { local s=$? j= r= k; for k in ${(k)jobstates}; do if [[ ${jobstates[$k]} == suspended* ]]; then j+="[$k]  z  ${jobtexts[$k]}@@J@@"; elif [[ ${jobstates[$k]} == running* ]]; then r+="[$k]  z  ${jobtexts[$k]}@@J@@"; fi; done; printf '\033]133;D;%s\007\033]6976;host\007\033]6977;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007' "$s" "$j@@R@@$r" "$HOST" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#;
+/// bash 프롬프트 훅 — bash 일 때만 걸린다(sh·dash 에서는 오류 없이 지나간다). 작업 목록은 jobs -s(정지) @@R@@ jobs -r(실행 중) —
+/// 상태 글자(로캘마다 다름)는 앱이 읽지 않는다. 줄 사이 @@J@@
+const BASH_HOOK_HOST: &str = r#" [ -n "$BASH_VERSION" ] && __rb_nl=$'\n' && PROMPT_COMMAND='__rb_s=$?; __rb_j=$(jobs -s; printf "@@R@@"; jobs -r); printf "\033]133;D;%s\007\033]6976;host\007\033]6977;%s\007\033]7;file://%s%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${__rb_j//$__rb_nl/@@J@@}" "${HOSTNAME:-}" "$PWD" "$EUID"; (exit $__rb_s)'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}""#;
 
 /// 컨테이너 셸에 넣는 줄의 머리 — 에코를 거를 때 이 글귀로 줄을 찾는다
 const INJECT_PREFIX: &str = " __rb_inj=1";
@@ -1030,11 +1031,11 @@ const INJECT_PREFIX: &str = " __rb_inj=1";
 /// 그 밖(sh·ash·dash)은 PS1 앞에 표식을 붙인다($PWD 는 프롬프트마다 풀린다). 끝에 준비 표식(OSC 6975) — 리더가 그때까지 에코를 거른다
 fn ctr_hook_line(ctr: &str) -> String {
     let tag = format!("docker:{ctr}");
-    let bash_pc = r#"__rb_s=$?; __rb_j=$(jobs); printf "\033]133;D;%s\007\033]6976;TAG\007\033]6977;%s\007\033]7;file://ctr%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${__rb_j//$__rb_nl/␤}" "$PWD" "$EUID"; (exit $__rb_s)"#.replace("TAG", &tag);
-    let zsh_def = r#"__rb_precmd() { local s=$? j= k; for k in ${(k)jobtexts}; do j+="[$k] ${${jobstates[$k]}%%:*} ${jobtexts[$k]}␤"; done; printf '\033]133;D;%s\007\033]6976;TAG\007\033]6977;%s\007\033]7;file://ctr%s\007\033]6974;%s\007\033]133;A\007' "$s" "$j" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#.replace("TAG", &tag);
+    let bash_pc = r#"__rb_s=$?; __rb_j=$(jobs -s; printf "@@R@@"; jobs -r); printf "\033]133;D;%s\007\033]6976;TAG\007\033]6977;%s\007\033]7;file://ctr%s\007\033]6974;%s\007\033]133;A\007" "$__rb_s" "${__rb_j//$__rb_nl/@@J@@}" "$PWD" "$EUID"; (exit $__rb_s)"#.replace("TAG", &tag);
+    let zsh_def = r#"__rb_precmd() { local s=$? j= r= k; for k in ${(k)jobstates}; do if [[ ${jobstates[$k]} == suspended* ]]; then j+="[$k]  z  ${jobtexts[$k]}@@J@@"; elif [[ ${jobstates[$k]} == running* ]]; then r+="[$k]  z  ${jobtexts[$k]}@@J@@"; fi; done; printf '\033]133;D;%s\007\033]6976;TAG\007\033]6977;%s\007\033]7;file://ctr%s\007\033]6974;%s\007\033]133;A\007' "$s" "$j@@R@@$r" "$PWD" "$EUID"; }; precmd_functions+=(__rb_precmd)"#.replace("TAG", &tag);
     let sh_ps1 = format!(r#"PS1="$(printf '\033]6976;{tag}\007\033]7;file://ctr')"'$PWD'"$(printf '\007\033]133;A\007')$PS1""#);
     format!(
-        "{INJECT_PREFIX}; if [ -n \"$BASH_VERSION\" ]; then __rb_nl=$'\\n'; PROMPT_COMMAND={}; elif [ -n \"$ZSH_VERSION\" ]; then eval {}; else {sh_ps1}; fi; printf '\\033]6975;rb\\007'\n",
+        "{INJECT_PREFIX}; if [ -n \"$BASH_VERSION\" ]; then __rb_nl=$'\\n'; PROMPT_COMMAND={}\"${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\"; elif [ -n \"$ZSH_VERSION\" ]; then eval {}; else {sh_ps1}; fi; printf '\\033]6975;rb\\007'\n",
         crate::sudo::q(&bash_pc),
         crate::sudo::q(&zsh_def),
     )

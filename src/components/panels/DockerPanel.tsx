@@ -14,7 +14,8 @@ export type DockerPanelProps = {
 	sudo?: SudoCtx;
 	visible?: boolean;
 	/** 터미널 새 탭에서 명령 돌리기 — 컨테이너 셸 */
-	onOpenTerminal?: (cmd: string, title: string) => void;
+	/** ctr: 컨테이너 셸이면 그 이름 — 터미널이 그 셸에 프롬프트 훅을 걸어 트리·편집기가 따라간다 */
+	onOpenTerminal?: (cmd: string, title: string, ctr?: string) => void;
 };
 
 export type Container = { id: string; name: string; image: string; state: string; status: string; ports: string; created: string; project: string; service: string };
@@ -223,7 +224,7 @@ export function DockerPanel({ conn, sudo, visible = true, onOpenTerminal }: Dock
 
 	const shell = (c: Container) => {
 		if (!onOpenTerminal) return;
-		onOpenTerminal(`${env.sudo ? "sudo " : ""}${D} exec -it ${sq(c.id)} sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'`, `셸 · ${c.name}`);
+		onOpenTerminal(`${env.sudo ? "sudo " : ""}${D} exec -it ${sq(c.id)} sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'`, `셸 · ${c.name}`, /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(c.name) ? c.name : c.id);
 	};
 
 	const shown = useMemo(() => {

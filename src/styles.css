@@ -1515,6 +1515,38 @@ html[data-os="macos"] .sidebar {
 .cmd-mark.bad {
 	color: var(--danger);
 }
+.cmd-mark.stop {
+	color: #ff9f0a;
+}
+/* 셸 훅이 닿지 않는 다른 맥락(ssh·su·tmux·컨테이너) — 다음 프롬프트까지 터미널 위에 */
+.term-band {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 6px 4px 12px;
+	background: color-mix(in srgb, #ff9f0a 14%, var(--term-bg));
+	color: var(--text);
+	font-size: 12px;
+	flex: none;
+	min-width: 0;
+}
+.term-band > span {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.term-band .btn {
+	height: 22px;
+	padding: 0 8px;
+	font-size: 11.5px;
+	flex: none;
+}
+.term-band .btn.icon {
+	width: 22px;
+	padding: 0;
+}
 .term-find {
 	position: absolute;
 	right: 18px;

@@ -143,7 +143,8 @@ pub async fn ctr_read_text(conns: State<'_, SshConns>, conn: u32, ctr: String, p
     Ok(FileText { path, size, mtime, text: d.text, meta: d.meta, binary: d.binary, too_large: false })
 }
 
-/// 저장 = `cat > 파일` — 같은 파일(inode)에 써서 소유자·권한·바인드 마운트를 지킨다
+/// 저장 — 컨테이너 안 임시 파일에 다 받은 뒤 `cat 임시 > 파일` 로 같은 파일(inode)에 쓴다(소유자·권한·바인드 마운트를 지키고,
+/// 받는 도중 끊겨도 원래 파일이 잘리지 않는다)
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn ctr_write_text(
@@ -163,7 +164,7 @@ pub async fn ctr_write_text(
         }
     }
     let bytes = textcodec::encode(&text, &meta).map_err(|e| err("ENCODING", e))?;
-    run(&c, conn, &ctr, r#"cat > "$1""#, &[&path], Some(&bytes)).await?;
+    run(&c, conn, &ctr, r#"t="$1.rbsave.$$"; cat > "$t" || { rm -f "$t"; exit 1; }; cat "$t" > "$1"; e=$?; rm -f "$t"; exit $e"#, &[&path], Some(&bytes)).await?;
     let (size, mtime) = size_mtime(&run(&c, conn, &ctr, r#"stat -c '%s %Y' -- "$1""#, &[&path], None).await?);
     Ok(Saved { size, mtime })
 }
