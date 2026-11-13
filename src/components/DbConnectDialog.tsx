@@ -42,6 +42,14 @@ export function DbConnectDialog({
 	const [sshSave, setSshSave] = useState(true);
 	const sshTrust = useRef<string | null>(null);
 	const roKey = `db.readonly.${profile.id}`;
+	// 창이 닫힌 뒤(취소·Esc·탭 닫기) 끝난 접속은 버린다 — 붙은 연결은 끊어 아무 탭에도 안 붙은 연결이 남지 않게(ConnectDialog 와 같은 규칙)
+	const alive = useRef(true);
+	useEffect(() => {
+		alive.current = true;
+		return () => {
+			alive.current = false;
+		};
+	}, []);
 
 	const run = useCallback(
 		async (password: string | null, ro: boolean) => {
@@ -65,9 +73,14 @@ export function DbConnectDialog({
 						...tunnelReq(profile, { sshSecret: sshPw || null, sshTrustFingerprint: sshTrust.current, sshSaveSecret: sshSave }),
 					},
 				});
+				if (!alive.current) {
+					void invoke("db_disconnect", { conn: ok.connId }).catch(() => {});
+					return;
+				}
 				void api.settingSet(roKey, ro ? "1" : "0");
 				onConnected(ok, ro);
 			} catch (e) {
+				if (!alive.current) return;
 				const x = e as DbError;
 				if (x.code === "NEED_JAVA") {
 					setStep("java");
