@@ -1,7 +1,7 @@
 import { Background, ControlButton, Controls, type Edge, Handle, type Node, type NodeProps, Position, ReactFlow, type ReactFlowInstance } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "../styles/querymap.css";
-import { AlertTriangle, ArrowDownWideNarrow, ArrowRightLeft, Combine, CopyMinus, Funnel, GitMerge, Info, ListTree, Maximize, RefreshCw, Sheet, Sigma, SquareFunction, Stethoscope, Table2 } from "lucide-react";
+import { AlertTriangle, ArrowDownWideNarrow, ArrowRightLeft, ChevronDown, Combine, CopyMinus, Funnel, GitMerge, Info, ListTree, Maximize, RefreshCw, Sheet, Sigma, SquareFunction, Stethoscope, Table2 } from "lucide-react";
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ColMeta } from "../lib/edits";
 import { type AnalyzeDeps, type Snapshot, useAnalysis } from "../lib/queryAnalysis";
@@ -82,7 +82,7 @@ type Flow = {
 const TW = 200;
 const SW = 214;
 const OW = 196;
-const RW = 276;
+const RW = 300;
 const ROWH = 18;
 const RROWH = 22;
 const MAX_TROWS = 8;
@@ -91,7 +91,7 @@ const MAX_RROWS = 14;
 const tableH = (rows: number, sub: boolean) => 34 + (sub ? 16 : 0) + Math.max(1, Math.min(rows, MAX_TROWS)) * ROWH + (rows > MAX_TROWS ? 16 : 0) + 8;
 const stageH = (code: boolean, sub: boolean) => 36 + (code ? 34 : 0) + (sub ? 18 : 0) + 4;
 const outH = (rows: number) => 34 + Math.max(1, Math.min(rows, MAX_OROWS)) * ROWH + (rows > MAX_OROWS ? 16 : 0) + 8;
-const resultH = (rows: number, code: boolean) => 50 + (code ? 40 : Math.max(1, Math.min(rows, MAX_RROWS)) * RROWH + (rows > MAX_RROWS ? 18 : 0)) + 10;
+const resultH = (rows: number, code: boolean) => 64 + (code ? 40 : Math.max(1, Math.min(rows, MAX_RROWS)) * RROWH + (rows > MAX_RROWS ? 18 : 0)) + 10;
 
 const ROLE_ORDER = "SWJGHOUI";
 const ROLE_OF: Record<string, string> = { select: "S", where: "W", on: "J", group: "G", having: "H", order: "O", set: "U", insert: "I" };
@@ -168,10 +168,11 @@ function buildFlow(snap: Snapshot, findings: Finding[]): Flow {
 	for (const l of rows.values()) for (const r of l) r.roles = [...r.roles].sort((a, b) => ROLE_ORDER.indexOf(a) - ROLE_ORDER.indexOf(b)).join("");
 
 	const outRow = (o: MapOut, k: number): OutRow => {
-		let expr = snip(text, o.pos, 90);
+		let expr = snip(text, o.expr ?? o.pos, 90);
 		const star = o.star !== undefined;
 		const label = o.name ?? (star ? (o.star ? `${o.star}.*` : "*") : expr);
-		if (o.name) expr = expr.replace(new RegExp(`\\s+(as\\s+)?["\`[]?${esc(o.name)}["\`\\]]?$`, "i"), "");
+		// 예전 파서 결과(식 위치 없음) — 원문 끝의 별칭을 떼어 낸다
+		if (o.name && !o.expr) expr = expr.replace(new RegExp(`\\s+(as\\s+)?["\`[]?${esc(o.name)}["\`\\]]?$`, "i"), "");
 		let hint: string | null = null;
 		if (star) hint = "모든 열";
 		else if (o.name && expr.toLowerCase() !== o.name.toLowerCase()) {
@@ -335,7 +336,7 @@ function buildFlow(snap: Snapshot, findings: Finding[]): Flow {
 		// 출력 — 바깥 문장은 결과(가운데 주인공), 안쪽 묶음은 작은 출력
 		const rowsOut = outsOf(sid).map((o, k) => outRow(o, k));
 		if (main) {
-			let title = "결과";
+			let title = "SELECT 결과";
 			let code: string | null = null;
 			let ranges: Pos[] = [];
 			let list = rowsOut;
@@ -345,16 +346,23 @@ function buildFlow(snap: Snapshot, findings: Finding[]): Flow {
 			} else if (map.kind === "insert") {
 				title = snip(text, target, 40) || "INSERT";
 				ranges = [target];
-				list = map.cols.filter((c) => c.scope === sid && c.role === "insert").map((c, k) => ({ k, label: c.name, hint: null, agg: false, win: false, sub: false, star: false, pos: c.pos }));
+				// 넣는 열 ← 넣을 행(SELECT)의 같은 자리 식
+				const sel = map.scopes.find((x) => x.parent === sid && x.kind === "subquery" && x.name === "SELECT");
+				const from = sel ? outsOf(sel.id) : [];
+				list = map.cols.filter((c) => c.scope === sid && c.role === "insert").map((c, k) => ({ k, label: c.name, hint: from[k] ? clip(snip(text, from[k].expr ?? from[k].pos, 90), 64) : null, agg: false, win: false, sub: false, star: false, pos: c.pos }));
 				if (!list.length) code = "모든 열에 넣는다";
 			} else {
 				title = snip(text, target, 40) || map.kind.toUpperCase();
 				const set = one(sid, "set");
 				ranges = [target, set];
-				code = map.kind === "update" ? snip(text, set, 160) : "조건에 맞는 행을 지운다";
-				list = [];
+				// UPDATE — SET 한 항목씩(바뀌는 열 ← 값), 예전 파서 결과면 SET 원문
+				if (map.kind === "update" && rowsOut.length) list = rowsOut;
+				else {
+					code = map.kind === "update" ? snip(text, set, 160) : map.kind === "delete" ? (one(sid, "where") ? "조건에 맞는 행을 지운다" : "모든 행을 지운다") : null;
+					list = [];
+				}
 			}
-			add({ id: outId, kind: "result", scope: sid, title, code, sub: list.length ? `열 ${list.length}개` : null, badge: null, ranges: ranges.filter(isR), inputs: prev ? [prev] : [], w: RW, h: resultH(list.length, !!code), rows: list.slice(0, MAX_RROWS), rowsMore: Math.max(0, list.length - MAX_RROWS) });
+			add({ id: outId, kind: "result", scope: sid, title, code, sub: null, badge: null, ranges: ranges.filter(isR), inputs: prev ? [prev] : [], w: RW, h: resultH(list.length, !!code), rows: list.slice(0, MAX_RROWS), rowsMore: Math.max(0, list.length - MAX_RROWS) });
 		} else {
 			const title = sc.kind === "derived" ? (sc.name ?? "(서브쿼리)") : sc.kind === "cte" ? (sc.name ?? "CTE") : sc.kind === "union" ? "출력" : sc.name === "SELECT" ? "넣을 행" : sc.name?.includes("EXISTS") ? "있는지 / 없는지" : sc.name?.includes("IN") ? "값 목록" : "값 하나";
 			add({
@@ -426,6 +434,162 @@ function buildFlow(snap: Snapshot, findings: Finding[]): Flow {
 	const parent = new Map<string, string>();
 	for (const n of nodes.values()) for (const k of n.inputs) if (!parent.has(k)) parent.set(k, n.id);
 	return { nodes, roots, cross, scopeOut, tableNode, parent, badEdges };
+}
+
+// ── 최종 결과 요약: 이 문장이 끝내 무엇을 내놓나(지도 위 띠 · 결과 노드 머리) ──
+
+/** 띠의 열 칩 하나 — scope·k: 계보를 따라갈 출력 열(INSERT 는 넣을 행 SELECT 의 열) */
+type FinalChip = { k: number; name: string; src: string; kind: "col" | "agg" | "win" | "sub" | "case" | "lit" | "expr" | "star" | "cond"; type?: string; pos: Pos; scope: number; trace: boolean };
+type FinalPart = { text: string; tone?: "warn" | "key"; tip?: string };
+type Final = { verb: string; parts: FinalPart[]; chips: FinalChip[]; ranges: R[]; short: string };
+
+const PLAIN_COL = /^[^\s(),'+\-*/|<>=!]+$/;
+const LITERAL = /^(N?'(?:[^']|'')*'|-?\d+(?:\.\d+)?|null|true|false)$/i;
+const CHIP_KIND_TIP: Record<FinalChip["kind"], string> = { col: "열 그대로", agg: "집계", win: "창 함수", sub: "스칼라 서브쿼리", case: "CASE 식", lit: "상수", expr: "식", star: "모든 열", cond: "조건" };
+
+function summarize(snap: Snapshot): Final {
+	const { map, resolved } = snap;
+	const text = snap.stmt.text;
+	const meta = resolved?.meta ?? map.tables.map(() => undefined);
+	const colTable = resolved?.colTable ?? map.cols.map((c) => c.table);
+	const clauses = map.clauses ?? [];
+	const outs = map.outs ?? [];
+	const main = map.scopes.find((s) => s.kind === "main");
+	const empty: Final = { verb: map.kind.toUpperCase(), parts: [], chips: [], ranges: [], short: "" };
+	if (!main) return empty;
+	const sid = main.id;
+	const one = (s: number, k: string) => clauses.find((c) => c.scope === s && c.kind === k && c.pos)?.pos ?? null;
+	const branchesOf = (s: number) => map.scopes.filter((x) => x.parent === s && x.kind === "union");
+	const outsOf = (s: number): MapOut[] => {
+		const own = outs.filter((o) => o.scope === s);
+		if (own.length) return own;
+		const b = branchesOf(s)[0];
+		return b ? outsOf(b.id) : [];
+	};
+	const exprOf = (o: MapOut) => {
+		let e = snip(text, o.expr ?? o.pos, 400);
+		if (o.name && !o.expr) e = e.replace(new RegExp(`\\s+(as\\s+)?["\`[]?${esc(o.name)}["\`\\]]?$`, "i"), "");
+		return e;
+	};
+	const colType = (tid: number | null | undefined, name: string) => (tid === null || tid === undefined ? undefined : meta[tid]?.cols?.find((x) => x.name.toLowerCase() === name.toLowerCase())?.dataType);
+	/** 열 그대로 내놓는 항목의 형식 — 서브쿼리·CTE 를 거슬러 원본 표까지 */
+	const typeOf = (o: MapOut, depth = 0): string | undefined => {
+		if (depth > 6 || o.star !== undefined || o.agg || o.win || o.subs?.length || !PLAIN_COL.test(exprOf(o))) return undefined;
+		const own: number[] = [];
+		for (let c = o.cols[0]; c < o.cols[1]; c++) if (map.cols[c]?.scope === o.scope) own.push(c);
+		if (own.length !== 1) return undefined;
+		const c = map.cols[own[0]];
+		const tid = colTable[c.id];
+		if (tid === null || tid === undefined) return undefined;
+		const m = meta[tid];
+		if (m?.cols) return colType(tid, c.name);
+		const t = map.tables[tid];
+		const inner = t.derived ?? t.cte;
+		if (inner === null || inner === undefined) return undefined;
+		const io = outsOf(inner).find((x) => x.name?.toLowerCase() === c.name.toLowerCase());
+		return io ? typeOf(io, depth + 1) : undefined;
+	};
+	/** 칩 하나 — 이름(별칭)·출처·형식 */
+	const chipOf = (o: MapOut, k: number, scope: number, name?: string): FinalChip => {
+		const e = exprOf(o);
+		const star = o.star !== undefined;
+		let kind: FinalChip["kind"] = "expr";
+		let src = clip(e, 34);
+		if (star) {
+			kind = "star";
+			src = "모든 열";
+		} else if (o.subs?.length && e.startsWith("(")) {
+			kind = "sub";
+			src = "서브쿼리";
+		} else if (/^case\b/i.test(e)) {
+			kind = "case";
+			src = "CASE…";
+		} else if (o.win) {
+			kind = "win";
+			src = clip(e.replace(/\s+over\s*\(.*$/is, " OVER…"), 34);
+		} else if (o.agg) kind = "agg";
+		else if (LITERAL.test(e)) {
+			kind = "lit";
+			src = `상수 ${clip(e, 24)}`;
+		} else if (PLAIN_COL.test(e)) {
+			kind = "col";
+			// 한정 없이 쓴 열은 어느 표인지 붙여 준다
+			if (!e.includes(".")) {
+				const c = map.cols.slice(o.cols[0], o.cols[1]).find((x) => x.scope === o.scope);
+				const tid = c ? colTable[c.id] : null;
+				const t = tid !== null && tid !== undefined ? map.tables[tid] : null;
+				if (t) src = `${t.alias ?? t.name}.${e}`;
+			}
+		}
+		const label = name ?? o.name ?? (star ? (o.star ? `${o.star}.*` : "*") : clip(e, 28));
+		// 이름이 곧 출처면(별칭 없는 식) 출처 칸은 비운다
+		if (!o.name && !name && !star && kind !== "col") src = "";
+		return { k, name: label, src, kind, type: typeOf(o), pos: o.pos, scope, trace: true };
+	};
+	const target = map.tables.find((t) => t.target && t.scope === sid);
+	const targetName = target ? `${target.schema ? `${target.schema}.` : ""}${target.name}` : "";
+	const where = one(sid, "where");
+
+	if (map.kind === "select") {
+		const list = outsOf(sid);
+		const chips = list.map((o, k) => chipOf(o, k, sid));
+		const parts: FinalPart[] = [{ text: `열 ${list.length}개`, tone: "key" }];
+		const branches = branchesOf(sid);
+		const group = one(sid, "group");
+		const having = one(sid, "having");
+		const dis = one(sid, "distinct");
+		const own = outs.filter((o) => o.scope === sid);
+		if (branches.length) {
+			const ops = clauses.filter((c) => c.scope === sid && c.kind === "setop" && c.pos).map((c) => snip(text, c.pos, 30).toUpperCase());
+			const dedupe = ops.some((n) => !/\bALL\b/.test(n));
+			const op = [...new Set(ops)].join("·") || "UNION";
+			parts.push({ text: `갈래 ${branches.length}개를 ${dedupe ? "합쳐 같은 행은 하나로" : "그대로 이어 붙임"}`, tip: op });
+		} else if (group) parts.push({ text: `묶음마다 1행 · ${clip(snip(text, group).replace(/^group\s+by\s+/i, ""), 40)}`, tip: snip(text, group, 400) });
+		else if (own.some((o) => o.agg && !o.win)) parts.push({ text: having ? "0~1행(전체 집계 · HAVING)" : "1행(전체 집계)" });
+		else if (!dis) {
+			const tabs = map.tables.filter((t) => t.scope === sid);
+			parts.push({ text: !tabs.length ? "1행" : map.joins.some((j) => j.scope === sid && j.kind !== "where") ? "조인한 행마다 1행" : `${tabs[0].name} 행마다 1행` });
+		}
+		if (dis) {
+			const d = snip(text, dis);
+			const on = /\bon\b/i.test(d) ? d.replace(/^distinct\s+on\s*/i, "").replace(/^\(|\)$/g, "") : null;
+			parts.push({ text: on ? `${clip(on, 30)} 마다 1행(DISTINCT ON)` : "같은 행은 하나만(DISTINCT)" });
+		}
+		const order = one(sid, "order");
+		if (order) parts.push({ text: `정렬 ${clip(snip(text, order).replace(/^order\s+by\s+/i, ""), 30)}`, tip: snip(text, order, 400) });
+		const limit = one(sid, "limit");
+		if (main.limit !== undefined) parts.push({ text: `최대 ${main.limit.toLocaleString()}행`, tone: "key", tip: snip(text, limit) });
+		else if (limit) parts.push({ text: clip(snip(text, limit), 28) });
+		if (main.offset !== undefined && main.offset > 0) parts.push({ text: `앞 ${main.offset.toLocaleString()}행 건너뜀` });
+		const ranges = (branches.length ? branches.map((b) => one(b.id, "select")) : [one(sid, "select")]).filter(isR);
+		const short = parts.map((p) => p.text).join(" · ");
+		return { verb: "SELECT", parts, chips, ranges, short };
+	}
+	if (map.kind === "update") {
+		const sets = outs.filter((o) => o.scope === sid);
+		const chips = sets.map((o, k) => ({ ...chipOf(o, k, sid, o.name), type: colType(target?.id, o.name ?? "") }));
+		const nSet = sets.length || map.cols.filter((c) => c.scope === sid && c.role === "set").length;
+		const parts: FinalPart[] = [{ text: `대상 표 ${targetName || "?"}`, tone: "key" }, { text: `바꾸는 열 ${nSet}개` }, where ? { text: "WHERE 조건에 맞는 행만" } : { text: "WHERE 없음 — 모든 행을 바꾼다", tone: "warn" }];
+		return { verb: "UPDATE", parts, chips, ranges: [one(sid, "target"), one(sid, "set")].filter(isR), short: parts.map((p) => p.text).join(" · ") };
+	}
+	if (map.kind === "delete") {
+		const parts: FinalPart[] = [{ text: `대상 표 ${targetName || "?"}`, tone: "key" }, { text: "행을 지운다" }, where ? { text: "WHERE 조건에 맞는 행만" } : { text: "WHERE 없음 — 모든 행을 지운다", tone: "warn" }];
+		const chips: FinalChip[] = where ? [{ k: 0, name: "WHERE", src: clip(snip(text, where, 200).replace(/^where\s+/i, ""), 60), kind: "cond", pos: where, scope: sid, trace: false }] : [];
+		return { verb: "DELETE", parts, chips, ranges: [one(sid, "target"), where].filter(isR), short: parts.map((p) => p.text).join(" · ") };
+	}
+	if (map.kind === "insert") {
+		const sel = map.scopes.find((s) => s.parent === sid && s.kind === "subquery" && s.name === "SELECT");
+		const src = sel ? outsOf(sel.id) : [];
+		const cols = map.cols.filter((c) => c.scope === sid && c.role === "insert");
+		const chips: FinalChip[] = cols.map((c, k) => {
+			const o = src[k];
+			const from = o ? chipOf(o, k, sel?.id ?? sid) : null;
+			return { k, name: c.name, src: from ? from.src || from.name : "", kind: from?.kind ?? "col", type: colType(target?.id, c.name) ?? from?.type, pos: c.pos, scope: sel?.id ?? sid, trace: !!from };
+		});
+		const parts: FinalPart[] = [{ text: `대상 표 ${targetName || "?"}`, tone: "key" }, { text: cols.length ? `넣는 열 ${cols.length}개` : "모든 열에 넣는다" }, { text: sel ? "SELECT 결과 행마다 1행" : "VALUES 의 행" }];
+		return { verb: "INSERT", parts, chips, ranges: [one(sid, "target")].filter(isR), short: parts.map((p) => p.text).join(" · ") };
+	}
+	return { ...empty, parts: [{ text: "이 문장은 구조를 그리지 않습니다" }] };
 }
 
 // ── 배치: 결과를 뿌리로 한 물고기뼈 — 본줄기는 한 줄, 곁가지는 위·아래(또는 좌·우)로 번갈아 ──
@@ -796,11 +960,12 @@ const ResultNode = memo(function ResultNode({ data }: NodeProps<Node<ND>>) {
 			<Ports />
 			<div className="qf-rhead">
 				<span className="qf-ico big">
-					<Sheet size={15} />
+					<Sheet size={17} />
 				</span>
 				<div>
+					<span className="qf-final-tag">최종 결과</span>
 					<b title={n.title}>{n.title}</b>
-					<small>{n.sub ?? "이 문장이 내놓는 것"}</small>
+					<small title={n.sub ?? undefined}>{n.sub ?? "이 문장이 내놓는 것"}</small>
 				</div>
 				<Warns list={n.warns} />
 			</div>
@@ -828,10 +993,13 @@ const TYPE_OF: Record<Kind, keyof typeof nodeTypes> = { table: "qtable", join: "
 type Drawn = { flow: Flow; nodes: Node[]; edges: Edge[]; bounds: Laid["bounds"]; result: { x: number; y: number; w: number; h: number } | null; key: string };
 
 /** 그래프와 두 방향 배치 — 방향은 칸 모양에 더 크게 들어가는 쪽을 고른다 */
-type Prepared = { flow: Flow; map: QueryMap; h: Laid; v: Laid };
+type Prepared = { flow: Flow; map: QueryMap; h: Laid; v: Laid; final: Final };
 function prepare(snap: Snapshot, findings: Finding[]): Prepared {
 	const flow = buildFlow(snap, findings);
-	return { flow, map: snap.map, h: layout(flow, true), v: layout(flow, false) };
+	const final = summarize(snap);
+	const r = flow.nodes.get("result");
+	if (r) r.sub = final.short || null;
+	return { flow, map: snap.map, h: layout(flow, true), v: layout(flow, false), final };
 }
 const fitZoom = (b: Laid["bounds"], w: number, h: number) => Math.min((w - 56) / Math.max(1, b.w), (h - 56) / Math.max(1, b.h));
 
@@ -868,6 +1036,113 @@ function draw(prep: Prepared, horizontal: boolean): Drawn {
 }
 
 const mapWarnsOf = (snap: Snapshot) => snap.findings.filter((f) => f.layer === "map");
+
+/** 접었을 때 보이는 칩 줄 수 */
+const BAND_ROWS = 2;
+
+/** 지도 위 고정 띠 — 확대·이동과 상관없이 "이 문장이 끝내 무엇을 내놓나" */
+const ResultBand = memo(function ResultBand({
+	final,
+	lit,
+	pinned,
+	onTitle,
+	onHover,
+	onPick,
+}: {
+	final: Final;
+	lit: Lit | null;
+	pinned: { scope: number; k: number } | null;
+	onTitle: () => void;
+	onHover: (c: FinalChip | null) => void;
+	onPick: (c: FinalChip) => void;
+}) {
+	const [open, setOpen] = useState(false);
+	const [hidden, setHidden] = useState(0);
+	const list = useRef<HTMLDivElement>(null);
+	// 접은 상태에서 몇 개가 넘치나 — 칩 위치로 센다(칸 폭이 바뀌면 다시)
+	useLayoutEffect(() => {
+		const el = list.current;
+		if (!el) return;
+		const count = () => {
+			if (open) return;
+			// 접힌 목록은 늘 처음부터(가려진 칩으로 초점이 가며 밀린 스크롤을 되돌린다)
+			el.scrollTop = 0;
+			const kids = el.querySelectorAll<HTMLElement>(".qm-chip");
+			if (!kids.length) return setHidden(0);
+			const top = kids[0].offsetTop;
+			const row = kids[0].offsetHeight + 4;
+			let n = 0;
+			for (const k of kids) if (k.offsetTop - top >= row * BAND_ROWS - 2) n++;
+			setHidden(n);
+		};
+		count();
+		const ro = new ResizeObserver(count);
+		ro.observe(el);
+		return () => ro.disconnect();
+	}, [final, open]);
+	const warn = final.parts.some((p) => p.tone === "warn");
+	return (
+		<div className={`qm-final${warn ? " warn" : ""}`}>
+			<div className="qm-final-line">
+				<button type="button" className="qm-final-title" onClick={onTitle} title="결과 노드로 가서 편집기의 출력 목록을 강조">
+					<Sheet size={13} />
+					<b>최종 결과</b>
+					{final.verb !== "SELECT" && <span className="qm-final-verb">{final.verb}</span>}
+				</button>
+				<span className="qm-final-parts" title={final.short}>
+					{final.parts.map((p) => (
+						<span key={p.text} className={`qm-fp${p.tone ? ` ${p.tone}` : ""}`} title={p.tip}>
+							{p.tone === "warn" && <AlertTriangle size={11} />}
+							{p.text}
+						</span>
+					))}
+				</span>
+				{(open || hidden > 0) && (
+					<button type="button" className="qm-final-more" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+						{open ? "접기" : `열 ${hidden}개 더`}
+						<ChevronDown size={11} style={open ? { transform: "rotate(180deg)" } : undefined} />
+					</button>
+				)}
+			</div>
+			{final.chips.length > 0 && (
+				<div
+					className={`qm-chips${open ? " open" : ""}`}
+					ref={list}
+					// 접힌 동안은 밀리지 않게(가려진 칩은 "열 N개 더" 로 연다)
+					onScroll={(e) => {
+						if (!open) e.currentTarget.scrollTop = 0;
+					}}
+					onFocus={(e) => {
+						// 키보드로 가려진 칩에 오면 펼친다
+						const t = e.target as HTMLElement;
+						const first = list.current?.firstElementChild as HTMLElement | null;
+						if (!open && first && t.offsetTop - first.offsetTop >= (first.offsetHeight + 4) * BAND_ROWS - 2) setOpen(true);
+					}}
+				>
+					{final.chips.map((c) => {
+						const on = pinned?.scope === c.scope && pinned.k === c.k;
+						const hot = c.trace && lit?.cols.has(`row:${c.scope}:${c.k}`);
+						return (
+							<button
+								type="button"
+								key={`${c.scope}:${c.k}`}
+								className={`qm-chip k-${c.kind}${on ? " on" : ""}${hot ? " lit" : ""}`}
+								onMouseEnter={() => c.trace && onHover(c)}
+								onMouseLeave={() => c.trace && onHover(null)}
+								onClick={() => onPick(c)}
+								title={`${c.name}${c.src ? ` ← ${c.src}` : ""}${c.type ? ` · ${c.type}` : ""} (${CHIP_KIND_TIP[c.kind]})${c.trace ? " — 올리면 어디서 왔는지, 누르면 고정하고 편집기에서 그 항목" : " — 누르면 편집기에서"}`}
+							>
+								<b>{c.name}</b>
+								{c.src && <span className="qm-chip-src">{c.src}</span>}
+								{c.type && <i>{c.type}</i>}
+							</button>
+						);
+					})}
+				</div>
+			)}
+		</div>
+	);
+});
 
 /** 쿼리 지도 — 결과(출력 열)를 가운데 주인공으로, 그 결과를 만드는 단계를 흐름으로 그린다. 서버에는 묻지 않는다 */
 export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; visible: boolean; onTuning: () => void }) {
@@ -932,10 +1207,12 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 		}
 		const r = d.result;
 		const hz = d.key.startsWith("h");
+		// 결과 노드는 반드시 통째로 — 칸이 아주 작으면 그만큼 더 줄인다
+		const zr = Math.max(0.12, Math.min(MINZ, (W - pad * 2) / Math.max(1, r.w), (H - pad * 2) / Math.max(1, r.h)));
 		// 가로 흐름이면 결과를 오른쪽 끝 안쪽에, 세로면 아래쪽 안쪽에 — 다른 축은 결과 가운데
-		const x = hz ? W - pad - (r.x + r.w) * MINZ : W / 2 - (r.x + r.w / 2) * MINZ;
-		const y = hz ? H / 2 - (r.y + r.h / 2) * MINZ : H - pad - (r.y + r.h) * MINZ;
-		void inst.setViewport({ zoom: MINZ, x, y });
+		const x = hz ? W - pad - (r.x + r.w) * zr : W / 2 - (r.x + r.w / 2) * zr;
+		const y = hz ? H / 2 - (r.y + r.h / 2) * zr : H - pad - (r.y + r.h) * zr;
+		void inst.setViewport({ zoom: zr, x, y });
 	}, []);
 
 	// 크기 — 숨었다 보이면(0 → N) 다시 맞춘다, 가로·세로 흐름도 여기서 고른다
@@ -963,7 +1240,8 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 			cancelAnimationFrame(refit);
 		};
 	}, [fit]);
-	const fitKey = drawn?.key ?? "";
+	// 다른 문장으로 옮겨 가도(같은 모양이어도) 다시 맞춘다
+	const fitKey = drawn ? `${drawn.key}|${snap?.stmt.from ?? 0}` : "";
 	useEffect(() => {
 		if (!fitKey) return;
 		moved.current = false;
@@ -1060,6 +1338,33 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 		[lit, cursor, picked, horizontal, pick],
 	);
 
+	// 띠 — 칩에 올리면 계보, 누르면 고정 + 편집기에서 그 항목, 제목은 결과 노드로
+	const bandHover = useCallback((c: FinalChip | null) => setHover(c ? { scope: c.scope, k: c.k } : null), []);
+	const bandPick = useCallback(
+		(c: FinalChip) => {
+			if (c.trace) setPinned((p) => (p && p.scope === c.scope && p.k === c.k ? null : { scope: c.scope, k: c.k }));
+			pick(`final#${c.scope}:${c.k}`, c.pos ? [c.pos] : []);
+		},
+		[pick],
+	);
+	const bandTitle = useCallback(() => {
+		const d = drawnRef.current;
+		const inst = rf.current;
+		const final = prep?.final;
+		if (d?.result && inst) {
+			const r = d.result;
+			const el = host.current;
+			// 지금 배율이 너무 작거나 크면 결과가 칸에 들어가게
+			const fitZ = el ? Math.min((el.clientWidth - 40) / r.w, (el.clientHeight - 40) / r.h) : 1;
+			const zoom = Math.max(0.12, Math.min(fitZ, Math.max(inst.getZoom(), 0.85), 1.2));
+			void inst.setCenter(r.x + r.w / 2, r.y + r.h / 2, { zoom, duration: 260 });
+		}
+		if (final?.ranges.length) {
+			setPicked("result");
+			markIn(conn, snapRef.current, final.ranges);
+		}
+	}, [prep, conn]);
+
 	const edges = useMemo(() => {
 		if (!drawn) return [];
 		if (!lit) return drawn.edges;
@@ -1069,6 +1374,7 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	const others = (snap?.findings ?? []).filter((f) => f.layer !== "map").length;
 	return (
 		<div className="panel-fill qmap-panel">
+			{snap && prep && drawn && drawn.nodes.length > 0 && <ResultBand final={prep.final} lit={lit} pinned={pinned} onTitle={bandTitle} onHover={bandHover} onPick={bandPick} />}
 			<div className={`qm-host${snap?.stale ? " stale" : ""}`} ref={host}>
 				{snap && drawn && drawn.nodes.length > 0 ? (
 					<UiCtx.Provider value={ui}>
