@@ -99,10 +99,11 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 	const stmtRef = useRef(stmt);
 	stmtRef.current = stmt;
 	const applyCleanup = useCallback(
-		(text: string) => {
+		(text: string, original: string) => {
 			const v = currentView(deps.conn);
 			const s = stmtRef.current;
-			if (!v || !s || v.state.sliceDoc(s.from, s.to) !== s.text) return;
+			// 넣기 직전 한 번 더 — 편집기의 그 범위 글이 다듬기가 받은 원문 그대로일 때만(그사이 고쳤거나 커서가 다른 문장이면 덮지 않는다)
+			if (!v || !s || s.text !== original || v.state.sliceDoc(s.from, s.to) !== original) return;
 			v.dispatch({ changes: { from: s.from, to: s.to, insert: text }, userEvent: "input.cleanup", scrollIntoView: true });
 			v.focus();
 		},
@@ -115,7 +116,12 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 		},
 		[deps.conn],
 	);
-	const getMeta = useCallback((schema: string | null, table: string) => tableMetaFor(deps, schema, table), [deps]);
+	// 메타 조회는 같은 연결·epoch·엔진이면 같은 함수 — 실행·트랜잭션 상태는 부를 때 ref 로 읽는다(바뀔 때마다 다듬기가 처음부터 다시 하지 않게)
+	const depsRef = useRef(deps);
+	depsRef.current = deps;
+	const { conn, epoch, engine, defaultSchema } = deps;
+	// biome 없음 — conn·epoch·engine·defaultSchema 가 바뀔 때만 새 함수(running·inTx 는 depsRef 로)
+	const getMeta = useCallback((schema: string | null, table: string) => tableMetaFor(depsRef.current, schema, table), [conn, epoch, engine, defaultSchema]);
 
 	const dbLabel = database || (meta?.schemas.length === 1 ? meta.schemas[0] : meta?.schemas.length ? `${meta.schemas[0]} 외 ${meta.schemas.length - 1}` : "");
 	const metaText = [dbLabel || null, meta ? `표 ${meta.tables}` : null, meta?.indexes != null ? `인덱스 ${meta.indexes}` : null].filter(Boolean).join(" · ");
@@ -163,7 +169,14 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 				{mounted.cleanup && (
 					<div className={`qa-layer qa-cleanup${tab === "cleanup" ? " on" : ""}`} aria-hidden={tab !== "cleanup"}>
 						{stmt ? (
-							<QueryCleanup sql={stmt.text} engine={deps.engine} conn={deps.conn} getMeta={getMeta} onApply={applyCleanup} onHighlight={highlightCleanup} />
+							<QueryCleanup
+								sql={stmt.text}
+								engine={deps.engine}
+								conn={deps.conn}
+								getMeta={getMeta}
+								onApply={applyCleanup}
+								onHighlight={highlightCleanup}
+							/>
 						) : (
 							<div className="qa-empty">SQL 편집기에서 다듬을 문장에 커서를 두세요.</div>
 						)}

@@ -59,8 +59,11 @@ export type QueryCleanupProps = {
 	conn: number;
 	/** 표 메타데이터 조회 — 열 한정·안 쓰는 LEFT JOIN 지우기에 쓴다(없으면 그 변환만 건너뛴다) */
 	getMeta?: (schema: string | null, table: string) => Promise<CleanTableMeta>;
-	/** 편집기의 그 문장을 정리본으로 바꾼다 — 붙이는 쪽이 CodeMirror 트랜잭션 하나로(Ctrl+Z 로 되돌림) */
-	onApply: (newSql: string) => void;
+	/**
+	 * 편집기의 그 문장을 정리본으로 바꾼다 — 붙이는 쪽이 CodeMirror 트랜잭션 하나로(Ctrl+Z 로 되돌림).
+	 * original 은 다듬기가 받은 원문 — 붙이는 쪽은 편집기의 그 범위 글이 이것과 같을 때만 바꾼다(다른 문장을 덮지 않게)
+	 */
+	onApply: (newSql: string, original: string) => void;
 	/** 원문 범위 강조(UTF-16, 문장 안 위치) — null 이면 지우기 */
 	onHighlight?: (range: [number, number] | null) => void;
 	/** 서버 버전 문자열(EXCEPT 지원 판별 — MySQL 8.0.31·MariaDB 10.3 이상) */
@@ -112,51 +115,57 @@ type Verify =
 
 type Plans = { state: "busy" } | { state: "error"; note: string } | { state: "done"; a: ExplainOk; b: ExplainOk };
 
+/** 다듬은 결과 — src 는 그때 받은 원문(지금 sql 과 다르면 낡은 결과) */
+type Res = CleanResult & { src: string };
+
 const fmtNum = (n?: number) => (n === undefined ? "—" : n >= 100 ? Math.round(n).toLocaleString() : n.toLocaleString(undefined, { maximumFractionDigits: 2 }));
 
 export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight, serverVersion, keywordCase = "upper", explain, queryFirstRow, timeoutMs = 15000 }: QueryCleanupProps) {
-	const [res, setRes] = useState<CleanResult | null>(null);
+	const [res, setRes] = useState<Res | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [off, setOff] = useState<string[]>([]);
 	const [fmtOn, setFmtOn] = useState(true);
 	/** 왼쪽을 정렬해서 비교(구조 차이만 보이게) · 원문 그대로 */
 	const [leftFmt, setLeftFmt] = useState(true);
-	const [texts, setTexts] = useState<{ left: string; right: string } | null>(null);
+	const [texts, setTexts] = useState<{ left: string; right: string; src: string } | null>(null);
 	const [active, setActive] = useState<string | null>(null);
 	const [verify, setVerify] = useState<Verify | null>(null);
 	const [plans, setPlans] = useState<Plans | null>(null);
 	const [copied, setCopied] = useState(false);
 	const metaRef = useRef<{ sql: string; meta: CleanMeta | null } | null>(null);
 	const seq = useRef(0);
+	// 메타 조회 함수가 새로 와도(붙이는 쪽 다시 그리기) 처음부터 다시 하지 않는다 — 다시 하는 것은 문장·엔진이 바뀔 때만
+	const getMetaRef = useRef(getMeta);
+	getMetaRef.current = getMeta;
 
 	const run = useCallback(
-		async (offIds: string[], withMeta: CleanMeta | null) => invoke<CleanResult>("sql_cleanup", { sql, engine, meta: withMeta, off: offIds }),
-		[sql, engine],
+		async (src: string, offIds: string[], withMeta: CleanMeta | null): Promise<Res> => ({ ...(await invoke<CleanResult>("sql_cleanup", { sql: src, engine, meta: withMeta, off: offIds })), src }),
+		[engine],
 	);
 
-	// 문장이 바뀌면 처음부터 — 먼저 메타데이터 없이 읽고, 표 목록으로 메타데이터를 채워 한 번 더
+	// 문장이 바뀌면 처음부터 — 지난 결과·비교·확인을 바로 비우고(다른 문장의 정리본을 넣지 않게), 먼저 메타데이터 없이 읽고 표 목록으로 메타데이터를 채워 한 번 더
 	useEffect(() => {
 		const my = ++seq.current;
 		setOff([]);
 		setVerify(null);
 		setPlans(null);
 		setActive(null);
-		if (!sql.trim()) {
-			setRes(null);
-			return;
-		}
+		setRes(null);
+		setTexts(null);
+		if (!sql.trim()) return;
 		setBusy(true);
 		const t = window.setTimeout(async () => {
 			try {
-				const first = await run([], null);
+				const first = await run(sql, [], null);
 				if (my !== seq.current) return;
 				setRes(first);
 				let meta: CleanMeta | null = null;
-				if (first.ok && getMeta && first.tables.length) {
+				const gm = getMetaRef.current;
+				if (first.ok && gm && first.tables.length) {
 					const got = await Promise.all(
 						first.tables.slice(0, 40).map(async (t) => {
 							try {
-								const m = await getMeta(t.schema, t.name);
+								const m = await gm(t.schema, t.name);
 								if (!m?.cols?.length) return null;
 								const unique = (m.indexes ?? []).filter((i) => (i.unique || i.primary) && !i.partial && i.cols.every((c) => c !== null)).map((i) => i.cols as string[]);
 								return { schema: t.schema, name: t.name, cols: m.cols.map((c) => ({ name: c.name, pk: c.pk })), unique };
@@ -168,20 +177,21 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 					const tables = got.filter((x): x is NonNullable<typeof x> => !!x);
 					if (tables.length) meta = { tables };
 				}
+				if (my !== seq.current) return;
 				metaRef.current = { sql, meta };
 				if (meta) {
-					const second = await run([], meta);
+					const second = await run(sql, [], meta);
 					if (my !== seq.current) return;
 					setRes(second);
 				}
 			} catch (e) {
-				if (my === seq.current) setRes({ ok: false, error: String((e as { message?: string }).message ?? e), kind: "other", dialect: engine, text: sql, changed: false, changes: [], comments: { total: 0, kept: 0, moved: 0 }, tables: [], notes: [] });
+				if (my === seq.current) setRes({ ok: false, error: String((e as { message?: string }).message ?? e), kind: "other", dialect: engine, text: sql, changed: false, changes: [], comments: { total: 0, kept: 0, moved: 0 }, tables: [], notes: [], src: sql });
 			} finally {
 				if (my === seq.current) setBusy(false);
 			}
 		}, 200);
 		return () => window.clearTimeout(t);
-	}, [sql, engine, getMeta, run]);
+	}, [sql, engine, run]);
 
 	const toggle = async (id: string) => {
 		if (id === FORMAT_ID) {
@@ -195,7 +205,7 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 		const my = ++seq.current;
 		setBusy(true);
 		try {
-			const r = await run(next, metaRef.current?.sql === sql ? metaRef.current.meta : null);
+			const r = await run(sql, next, metaRef.current?.sql === sql ? metaRef.current.meta : null);
 			if (my === seq.current) setRes(r);
 		} finally {
 			if (my === seq.current) setBusy(false);
@@ -209,8 +219,9 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 			return;
 		}
 		let gone = false;
+		const src = res.src;
 		void (async () => {
-			const base = res.changed ? res.text : sql;
+			const base = res.changed ? res.text : src;
 			let right = base;
 			if (fmtOn) {
 				const f = await formatSqlText(base, engine, keywordCase);
@@ -219,14 +230,14 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 					if (chk.ok) right = f;
 				}
 			}
-			let left = sql;
-			if (leftFmt) left = (await formatSqlText(sql, engine, keywordCase)) ?? sql;
-			if (!gone) setTexts({ left: left.replace(/\r\n?/g, "\n"), right: right.replace(/\r\n?/g, "\n") });
+			let left = src;
+			if (leftFmt) left = (await formatSqlText(src, engine, keywordCase)) ?? src;
+			if (!gone) setTexts({ left: left.replace(/\r\n?/g, "\n"), right: right.replace(/\r\n?/g, "\n"), src });
 		})();
 		return () => {
 			gone = true;
 		};
-	}, [res, fmtOn, leftFmt, sql, engine, keywordCase]);
+	}, [res, fmtOn, leftFmt, engine, keywordCase]);
 
 	const changes = useMemo<CleanChange[]>(() => {
 		const list = res?.changes ?? [];
@@ -237,8 +248,10 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 	const onCount = changes.filter((c) => c.on).length;
 	const safeCount = changes.filter((c) => c.on && c.safety === "safe").length;
 	const checkCount = changes.filter((c) => c.on && c.safety === "check").length;
-	const output = texts?.right ?? "";
-	const dirty = !!res?.ok && output.trim() !== "" && output !== sql;
+	// 결과가 지금 문장의 것일 때만(문장이 바뀐 직후의 낡은 정리본으로 넣기·비교하지 않게)
+	const fresh = !!texts && texts.src === sql && res?.src === sql;
+	const output = fresh ? (texts?.right ?? "") : "";
+	const dirty = fresh && !!res?.ok && output.trim() !== "" && output !== sql;
 	const isSelect = res?.kind === "select";
 
 	// 비교 화면
@@ -290,9 +303,10 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 
 	const runVerify = async () => {
 		if (!isSelect || !output) return;
+		const src = sql;
 		setVerify({ state: "busy", note: "비교 SQL 만드는 중…" });
 		try {
-			const c = await invoke<CompareSql>("sql_compare_sql", { a: sql, b: output, engine, version: serverVersion ?? null });
+			const c = await invoke<CompareSql>("sql_compare_sql", { a: src, b: output, engine, version: serverVersion ?? null });
 			if (!c.ok) return setVerify({ state: "error", note: c.reason ?? "비교할 수 없는 문장입니다" });
 			const got: Record<string, (string | null)[] | null> = {};
 			for (const s of c.steps) {
@@ -508,7 +522,7 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 				<button type="button" className="btn ghost qc-btn" disabled={!output} onClick={copy}>
 					<Copy size={12} /> {copied ? "복사함" : "복사"}
 				</button>
-				<button type="button" className="btn primary qc-btn" disabled={!dirty} onClick={() => onApply(output)} title="편집기의 이 문장을 정리본으로 바꿉니다(Ctrl+Z 로 되돌림)">
+				<button type="button" className="btn primary qc-btn" disabled={!dirty} onClick={() => texts && onApply(output, texts.src)} title="편집기의 이 문장을 정리본으로 바꿉니다(Ctrl+Z 로 되돌림)">
 					<CornerDownLeft size={12} /> 편집기에 넣기
 				</button>
 			</div>
