@@ -187,6 +187,14 @@ function completionOf(conn: number, engine: string, epoch: () => number): SqlSou
 	return s;
 }
 
+/** 앞 주석을 뺀 첫 낱말이 DDL(CREATE·ALTER·DROP·RENAME·TRUNCATE)인지 — 성공하면 그 연결의 완성 이름 기억을 새로 */
+const isDdl = (sql: string) => /^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(?:CREATE|ALTER|DROP|RENAME|TRUNCATE)\b/i.test(sql);
+/** 연결의 완성 이름·외래 키 기억 비우기(다음 완성 때 다시 읽는다) */
+function forgetCompletion(conn: number) {
+	completions.delete(conn);
+	for (const k of fkCache.keys()) if (k.startsWith(`${conn}:`)) fkCache.delete(k);
+}
+
 /** 외래 키 기억 — 연결·epoch·스키마마다. 뒤 조회 줄로 읽고, 못 읽었으면(BUSY 등) 기억하지 않는다(다음에 다시) */
 const fkCache = new Map<string, Promise<Fk[]>>();
 function fksLoad(conn: number, epoch: number, engine: string, schema: string): Promise<Fk[]> {
@@ -2222,6 +2230,8 @@ export function DbWorkbench({
 								? `${ok.affected.toLocaleString()}행 반영`
 								: "완료";
 					addMsg({ at: Date.now(), sql: stmts[i], ok: !ok.stopped || ok.stopped === "memory", ms: ok.ms, text });
+					// 표·열을 만들거나 바꿨으면 완성 이름 기억을 새로(열린 편집기는 다음 완성 때 다시 읽는다)
+					if (!ok.stopped && isDdl(stmts[i])) forgetCompletion(conn);
 					if (!tool) void invoke("history_add", { scope: historyScope, item: { sql: stmts[i], ms: ok.ms, rows: ok.rowCount, ok: true } }).then(() => window.dispatchEvent(new Event("rb-history")));
 					if (ok.stopped === "memory") showNotice(`결과가 너무 커서(메모리 어림 512MB) ${rows}에서 멈췄습니다 — 조건이나 LIMIT 으로 줄여 보세요`, true);
 					// 취소·시간 상한이면 남은 문장은 실행하지 않는다(받은 행은 이 탭에 남는다)

@@ -159,6 +159,15 @@ export const ROWS: Record<string, RowMeta> = {
 	"db.confirmWrites": { cat: "db", group: "실행", label: "쓰기 확인", desc: "INSERT·UPDATE·DELETE·DDL·GRANT 를 실행 전에 모두 묻습니다", kw: "confirm 확인 안전 update delete" },
 	"db.pageSize": { cat: "db", group: "결과", label: "표 한 쪽 행 수", desc: "표 보기에서 서버에서 쪽 단위로 읽는 행 수", kw: "page size 페이지" },
 	"db.thousands": { cat: "db", group: "결과", label: "숫자 천 단위 구분", desc: "결과 표의 숫자를 1,000 처럼 보입니다", kw: "thousands 쉼표 콤마" },
+	"db.completeAlias": { cat: "db", group: "자동완성", label: "표를 고르면 별칭 붙이기", desc: "FROM·JOIN 뒤에서 표를 고르면 짧은 별칭(o, c …)을 함께 넣습니다", kw: "complete alias 자동완성 별칭" },
+	"db.completeQualify": {
+		cat: "db",
+		group: "자동완성",
+		label: "열 앞에 별칭 붙이기",
+		desc: "별칭이 있거나 표가 여럿이면 열을 a.열 로 넣습니다 — 여러 표에 겹치는 이름은 꺼도 붙입니다",
+		kw: "complete qualify 자동완성 한정",
+	},
+	"db.completeWords": { cat: "db", group: "자동완성", label: "문서 낱말 제안", desc: "편집기에 이미 쓴 낱말을 목록 맨 뒤에 함께 냅니다", kw: "complete words 자동완성 낱말" },
 	"db.fmtCase": { cat: "db", group: "SQL 정렬", label: "정렬 키워드", desc: "SQL 정렬(Shift+Alt+F)이 SELECT·FROM 같은 키워드를 쓰는 꼴", kw: "format 대문자 소문자 포맷" },
 
 	// SSH·보안

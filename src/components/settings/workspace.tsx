@@ -98,6 +98,10 @@ export function DbPage(_: PageProps) {
 	const [pageSize, setPageSize] = useSetting("db.pageSize", "1000");
 	const [thousands, setThousands] = useSetting("db.thousands", "0");
 	const [fmtCase, setFmtCase] = useSetting("db.fmtCase", "upper");
+	// 자동완성 — 값 "0" 이면 끔(없으면 켬), 열린 SQL 편집기가 바로 따라간다(sqlComplete 의 SQL_COMPLETE_KEYS·onSettingLive)
+	const [cAlias, setCAlias] = useSetting("db.completeAlias", "1");
+	const [cQualify, setCQualify] = useSetting("db.completeQualify", "1");
+	const [cWords, setCWords] = useSetting("db.completeWords", "1");
 	// 작업대와 같은 읽기 — 목록에 없는 값이면 그 값을 그대로 보인다
 	const tVal = String(Number(timeout) || 0);
 	const pVal = String(Number(pageSize) || 1000);
@@ -132,6 +136,17 @@ export function DbPage(_: PageProps) {
 				</Row>
 				<Row id="db.thousands">
 					<Toggle on={thousands === "1"} label="숫자 천 단위 구분" onChange={(v) => setThousands(v ? "1" : "0")} />
+				</Row>
+			</Group>
+			<Group title="자동완성" foot="열린 SQL 편집기에 바로 적용됩니다. 이름이 여러 표에 겹치는 열은 열 앞 별칭 붙이기를 꺼도 늘 별칭을 붙입니다.">
+				<Row id="db.completeAlias">
+					<Toggle on={cAlias !== "0"} label="표를 고르면 별칭 붙이기" onChange={(v) => setCAlias(v ? "1" : "0")} />
+				</Row>
+				<Row id="db.completeQualify">
+					<Toggle on={cQualify !== "0"} label="열 앞에 별칭 붙이기" onChange={(v) => setCQualify(v ? "1" : "0")} />
+				</Row>
+				<Row id="db.completeWords">
+					<Toggle on={cWords !== "0"} label="문서 낱말 제안" onChange={(v) => setCWords(v ? "1" : "0")} />
 				</Row>
 			</Group>
 			<Group title="SQL 정렬">
