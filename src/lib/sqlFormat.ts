@@ -29,3 +29,16 @@ export async function formatSqlIn(view: EditorView, engine: string, keywordCase:
 		return false;
 	}
 }
+
+/**
+ * 글 하나를 정렬해 돌려준다(편집기 없이 — 다듬기 화면). 정렬 규칙은 Shift+Alt+F 와 같다. 못 읽으면 null.
+ */
+export async function formatSqlText(text: string, engine: string, keywordCase: "upper" | "lower" | "preserve" = "upper"): Promise<string | null> {
+	if (!text.trim()) return text;
+	const { format } = await import("sql-formatter");
+	try {
+		return format(text, { language: dialect(engine) as never, keywordCase, tabWidth: 4, linesBetweenQueries: 1 });
+	} catch {
+		return null;
+	}
+}
