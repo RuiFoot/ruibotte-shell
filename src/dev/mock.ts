@@ -264,6 +264,9 @@ export function installMock() {
 				case "direct_start":
 					return 900 + connSeq;
 				case "ssh_connect": {
+					// 화면 점검: window.__rbConnFail = "NETWORK" 처럼 두면 그 오류로 실패(조용한 다시 연결·접속 창 대기열 확인용)
+					const fail = (window as unknown as { __rbConnFail?: string }).__rbConnFail;
+					if (fail) throw { code: fail, message: `가짜 오류 ${fail}` };
 					const req = (args as { req: Record<string, any> }).req;
 					const a = accounts.find((x) => x.id === req.accountId);
 					if (a) a.lastUsedAt = Date.now();
