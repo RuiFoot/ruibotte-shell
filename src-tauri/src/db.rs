@@ -1399,6 +1399,13 @@ async fn set_server_timeout(c: &DbConn, ms: u64) -> bool {
     ok
 }
 
+/// 앞 호출(쿼리 지도의 뒤 조회 등)이 세션에 남긴 문장 시간 상한을 푼다 — 계획·반영·트랜잭션·트리는 상한 없이 돈다
+async fn clear_server_timeout(c: &DbConn) {
+    if c.timeout_set.load(Ordering::Relaxed) != 0 {
+        set_server_timeout(c, 0).await;
+    }
+}
+
 /// 실행 중인 문장 취소 — 앱 쪽 멈춤 표시(받는 루프가 본다) + 엔진별 서버 취소
 async fn cancel_conn(c: &DbConn) -> R<()> {
     c.stop_req.store(true, Ordering::Relaxed);
@@ -1509,9 +1516,7 @@ pub(crate) async fn query_opts(dbs: &DbConns, conn: u32, sql: String, max_rows: 
     let server_side = match limit {
         Some(ms) => set_server_timeout(&c, ms).await && !(matches!(c.engine, Engine::My { mariadb: false, .. }) && cl.keyword != "SELECT"),
         None => {
-            if c.timeout_set.load(Ordering::Relaxed) != 0 {
-                set_server_timeout(&c, 0).await;
-            }
+            clear_server_timeout(&c).await;
             true
         }
     };
@@ -2068,6 +2073,7 @@ pub async fn db_explain(dbs: State<'_, DbConns>, conn: u32, sql: String, analyze
     let Ok(_busy) = c.busy.try_lock() else {
         return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
     };
+    clear_server_timeout(&c).await;
     let started = Instant::now();
     let body = sql.trim().trim_end_matches(';').to_string();
     let wrap = analyze && inner.writes;
@@ -2258,6 +2264,7 @@ pub async fn db_tree(dbs: State<'_, DbConns>, conn: u32, path: Vec<String>) -> R
 
 pub(crate) async fn tree(dbs: &DbConns, conn: u32, path: Vec<String>) -> R<Vec<DbNode>> {
     let c = dbs.get(conn)?;
+    clear_server_timeout(&c).await;
     if let Engine::Jdbc { side } = &c.engine {
         let v = side.call(json!({"op": "tree", "path": path})).await.map_err(|m| e("CLOSED", m))?;
         if v["type"] == "error" {
@@ -2401,6 +2408,7 @@ fn truthy(v: &Option<String>) -> bool {
 #[tauri::command]
 pub async fn db_table_meta(dbs: State<'_, DbConns>, conn: u32, schema: Option<String>, table: String) -> R<Vec<ColMeta>> {
     let c = dbs.get(conn)?;
+    clear_server_timeout(&c).await;
     if let Engine::Jdbc { side } = &c.engine {
         let v = side.call(json!({"op": "meta", "schema": schema, "table": table})).await.map_err(|m| e("CLOSED", m))?;
         if v["type"] == "error" {
@@ -2501,6 +2509,7 @@ pub async fn db_apply(dbs: State<'_, DbConns>, conn: u32, stmts: Vec<EditStmt>) 
 
 pub(crate) async fn apply(dbs: &DbConns, conn: u32, stmts: Vec<EditStmt>) -> R<ApplyOk> {
     let c = dbs.get(conn)?;
+    clear_server_timeout(&c).await;
     if c.read_only {
         return Err(e("READ_ONLY", "읽기 전용 연결이라 고칠 수 없습니다"));
     }
@@ -2658,6 +2667,7 @@ async fn tx_state_op(dbs: &DbConns, conn: u32, op: String) -> R<TxState> {
     let Ok(_busy) = c.busy.try_lock() else {
         return Err(e("BUSY", "앞 문장이 아직 실행 중입니다"));
     };
+    clear_server_timeout(&c).await;
     tx_raw(&c, &op).await?;
     Ok(c.tx_state())
 }

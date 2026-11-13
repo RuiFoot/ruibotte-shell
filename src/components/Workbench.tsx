@@ -651,17 +651,23 @@ async function askServerToServer(name: string, from: string, to: string, t: Targ
 	return v;
 }
 
+/** 작업대(owner)별 옆에 연 다른 서버 칸(peer) 연결 — 전송 칸이 peer ↔ 내 PC 전송을 제 것으로 알아보는 데 쓴다 */
+const peerConnsOf = new Map<string, Set<number>>();
+
 function TransfersPanel() {
 	const ctx = useWb();
 	const [list, setList] = useState<TransferProgress[]>([]);
 	// 앱 탭마다 이 칸이 있다 — 다른 탭(다른 서버)에서 시작한 전송이 섞여 보이지 않게 출발 연결(conn)이 내 것이 아니면 무시한다
 	const myConn = useRef(ctx.fs.conn);
 	myConn.current = ctx.fs.conn;
+	const ownerRef = useRef(ctx.owner);
+	ownerRef.current = ctx.owner;
 	useEffect(() => {
 		const un = listen<TransferProgress>("transfer", (e) => {
 			const p = e.payload;
-			// 내 작업대가 시작한 전송은 출발 연결이 다른 서버(peer)여도 도착 연결(destConn)이 내 것이다 — 둘 다 아니면 다른 탭의 전송
-			if (p.conn != null && p.conn !== myConn.current && p.destConn !== myConn.current) return;
+			// 내 작업대가 시작한 전송: 출발·도착 연결이 내 것이거나, 옆에 연 다른 서버 칸(peer) ↔ 내 PC 전송(conn = peer, destConn 없음)
+			const mine = (c: number | null | undefined) => c != null && (c === myConn.current || (peerConnsOf.get(ownerRef.current)?.has(c) ?? false));
+			if (p.conn != null && !mine(p.conn) && !mine(p.destConn)) return;
 			setList((l) => {
 				const i = l.findIndex((x) => x.id === p.id);
 				if (i < 0) return [p, ...l].slice(0, 50);
@@ -1638,6 +1644,11 @@ useEffect(() => activeStore.set(activeStore.panel, active), [active, activeStore
 		for (const p of [...d.panels]) if (p.id.startsWith("peer:") && !alive.has(p.id)) d.removePanel(p);
 		for (const [c] of peerFsMap.current) if (!peers.some((x) => x.conn === c)) peerFsMap.current.delete(c);
 	}, [peers]);
+	// 전송 칸이 다른 서버 칸(peer) ↔ 내 PC 전송도 이 작업대 것으로 보게 — ctx 에 넣지 않아 다시 그리기 없음
+	useEffect(() => {
+		peerConnsOf.set(owner, new Set(peers.map((x) => x.conn)));
+		return () => void peerConnsOf.delete(owner);
+	}, [peers, owner]);
 
 	const toggle = (id: "tree" | "localtree") => {
 		const d = dock.current;
