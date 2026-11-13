@@ -85,12 +85,13 @@
 - [x] 오류 상자: 코드·복사·편집기로
 - [x] 쓰기 문장 실행 전 확인(도구 막대)
 - [x] 문장 시간 상한
-- [ ] 커서·스크롤 위치 복원, 기록 단축키(Alt+H)
+- [x] 기록 단축키(Alt+H)
+- [ ] 커서·스크롤 위치 복원
 
 ### DB — 결과 표
 - [x] 머리 눌러 정렬, 받은 행에서 거르기, 값 보기(JSON 정리·NULL 구분), 열 너비 맞춤·끌기
 - [x] 엑셀 붙여넣기(여러 칸), 글자 치면 바로 편집
-- [ ] 외래 키 → 참조 행 열기 / 이 행을 가리키는 행
+- [x] 외래 키 → 참조 행 열기 / 이 행을 가리키는 행
 - [x] 숫자 천 단위 토글, 빈 문자열 표시
 - [x] Delete 행 지우기 표시 · Ctrl+Delete·Ctrl+Shift+N NULL, 머리 PK 표시·형식 안내
 - [x] 표 보기 WHERE 칸
@@ -217,7 +218,7 @@
 ## 명령 팔레트·테마(사용자 지정 2026-11-06)
 - [x] 명령 팔레트 Ctrl+Shift+P(맥 ⌘⇧P, 제목 줄 ⌘ 단추) — 한 칸에서 찾아 실행, 묶음: 지금 작업대·DB 작업대·서버·DB 연결(서버 카드/기본 계정으로 접속/"서버명 › 계정"/서버 설정)·열린 탭·최근 파일·앱(화면 이동·설정 각 묶음·새 연결·가져오기·테마·터미널 색·업데이트 확인), 띄어 쓴 낱말 모두 맞기·초성(사전과 같은 코드, src/lib/hangul.ts), 단축키 표시, ↑↓ PgUp/PgDn Enter Esc, 최근 실행 위로(palette.recent). 터미널·편집기보다 먼저 잡아 셸에 ^P 가 가지 않음. Ctrl+K(홈에서 연결 찾기)는 그대로 — 겹치지 않음
 - [x] 등록 구조 src/lib/commands.ts — registerCommands(scope, 목록|함수)·useCommands(scope, 켜짐, 함수)·openPalette, 작업대는 앞에 보일 때만 자기 명령(파일 빠른 열기·새 터미널·나누기·동시 입력·칸 옮기기·잠금·기본 배치·칸 열기·자원·전송·동기화·포워딩·tmux·sudo·root 셸·관리자 셸·도움말)과 최근 파일(서버별 15개, recent.files.*)
-- [ ] DB 작업대 명령 등록(DbWorkbench 에서 useCommands("db", active, …) — 다른 작업과 겹쳐 이번엔 API 만)
+- [x] DB 작업대 명령 등록(DbWorkbench 에서 useCommands("db", active, …))
 - [x] F1 단축키 도움말에 앱 단축키(팔레트·Ctrl+T·W·K·B)
 - [x] 설정 › 화면: 앱 테마(시스템 따라·밝게·어둡게, html[data-theme] — CSS 는 :root + 다크 미디어(:not([data-theme=light])) + [data-theme=dark] 짝, OS 창 바탕도 setTheme), 첫 화면 번쩍임 막기(웹 저장소에 마지막 값)
 - [x] 터미널 색 구성 8개(기본=앱 테마 따라, Solarized Dark·Light, One Dark, Dracula, Nord, Gruvbox Dark, GitHub Light) 미리보기 카드, 열린 터미널·tail 에 바로(options.theme·바탕)
