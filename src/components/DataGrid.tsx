@@ -564,7 +564,7 @@ export function DataGrid({
 								>
 									{st === "added" ? "+" : r + 1}
 								</div>
-								{(virtCols && editing && editing.r === r && !visCols.includes(editing.c) ? [...visCols, editing.c] : visCols).map((ci) => {
+								{(virtCols && editing && editing.r === r && !visCols.includes(editing.c) ? [...visCols, editing.c].sort((a, b) => a - b) : visCols).map((ci) => {
 									const c = columns[ci];
 									const val = cellAt(r, ci);
 									const isSel = sel?.r === r && sel?.c === ci;

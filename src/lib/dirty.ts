@@ -55,8 +55,9 @@ export function flushDrafts() {
  * 항목은 편집기 파일(저장 안 함)과 DB 표 편집(반영 안 함) 둘 다다. 파일은 초안으로 남지만 표 편집은 사라진다.
  */
 export function confirmDiscard(titles: string[], what: string): boolean {
-	if (!titles.length) return true;
+	// 묻지 않고 끝나는 경우(앱 끄기에 다른 항목이 없을 때)에도 대기 중인 초안은 쓴다
 	flushDrafts();
+	if (!titles.length) return true;
 	const list = titles.slice(0, 8).join("\n· ");
 	return confirm(
 		`저장·반영하지 않은 항목이 ${titles.length}개 있습니다.\n· ${list}${titles.length > 8 ? "\n…" : ""}\n\n${what} 계속할까요?\n(편집기 글은 초안으로 남아 다음에 열 때 되살릴 수 있지만, DB 표 편집은 반영하지 않으면 사라집니다.)`,

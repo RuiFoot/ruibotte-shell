@@ -849,7 +849,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					sort={gridSort}
 					onSort={onSort}
 					overlay={overlay}
-					editable={() => canEdit}
+					editable={() => canEdit && !busy}
 					onCellNull={(r, c) => metaOf(c)?.nullable !== false && void setCell(r, c, null)}
 					onDeleteRows={(rs) => toggleDelete(rs)}
 					onCopyRows={async (rs) => {
@@ -2272,7 +2272,7 @@ export function DbWorkbench({
 						<button type="button" className="btn ghost" onClick={addSql} title="SQL 편집기 하나 더">
 							<FilePlus size={14} /> SQL +
 						</button>
-						<button type="button" className="btn ghost" title={locked ? "배치가 잠겨 있습니다(풀어야 초기화)" : "배치 초기화"} disabled={locked} onClick={() => dock.current && !locked && defaultLayout(dock.current)}>
+						<button type="button" className="btn ghost" title={locked ? "배치가 잠겨 있습니다(풀어야 초기화)" : "배치 초기화"} disabled={locked} onClick={() => dock.current && !locked && okToDiscardEdits(dirtyTitles(dbOwner(conn)), "기본 배치로 되돌리면 결과 칸이 닫혀") && defaultLayout(dock.current)}>
 							<LayoutTemplate size={14} /> 기본 배치
 						</button>
 						<LayoutLockButton locked={locked} onChange={setLocked} />
