@@ -442,6 +442,7 @@ export function TerminalView({
 		// WebGL 렌더러 — 문맥을 잃으면(GPU 재설정·절전 복귀) DOM 렌더러로 두었다가 터미널이 다시 앞에 오면 한 번 더 붙여 본다. 3번 잃으면 포기
 		let webgl: WebglAddon | null = null;
 		let webglFails = 0;
+		let webglFirst = true;
 		const attachWebgl = () => {
 			if (webgl || webglFails >= 3) return;
 			try {
@@ -454,9 +455,10 @@ export function TerminalView({
 				term.loadAddon(w);
 				webgl = w;
 			} catch {
-				// WebGL 이 안 되는 GPU 는 xterm 기본 렌더러로
-				webglFails = 3;
+				// WebGL 이 안 되는 GPU 는 xterm 기본 렌더러로(처음부터 안 되면 포기, 다시 붙이다 실패하면 횟수만 센다)
+				webglFails = webglFirst ? 3 : webglFails + 1;
 			}
+			webglFirst = false;
 		};
 		attachWebgl();
 		webglRetryRef.current = attachWebgl;

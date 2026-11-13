@@ -141,6 +141,8 @@ export function EditorView_({
 	/** 저장을 시작한 뒤 쌓은 변경(저장하는 사이 더 고친 것) */
 	const sinceSave = useRef<ChangeSet | null>(null);
 	const lastDraftDoc = useRef<Text | null>(null);
+	/** 파일을 (다시) 읽은 횟수 — 저장하는 사이 다시 읽었으면 저장 완료가 기준 문서를 되돌리지 않게 */
+	const loadGen = useRef(0);
 	// sudo 를 켜고 끄면 fs 가 바뀐다(이름에 "(sudo)") — 초안 열쇠와 다시 읽기는 그와 상관없이 같은 파일로 본다
 	const draftKey = `draft.${fs.side}:${fs.label.replace(/ \(sudo[^)]*\)$/, "")}:${path}`;
 	const fsRef = useRef(fs);
@@ -184,6 +186,7 @@ export function EditorView_({
 					});
 					loadedRef.current = true;
 					origDoc.current = v.state.doc;
+					loadGen.current++;
 					accum.current = null;
 					sinceSave.current = null;
 					lastDraftDoc.current = null;
@@ -271,7 +274,7 @@ export function EditorView_({
 						if (u.docChanged) docRef.current = u.state.doc;
 						if (u.docChanged && !u.transactions.some((t) => t.annotation(LOADED))) {
 							accum.current = accum.current ? accum.current.compose(u.changes) : u.changes;
-							sinceSave.current = sinceSave.current ? sinceSave.current.compose(u.changes) : u.changes;
+							if (saving.current) sinceSave.current = sinceSave.current ? sinceSave.current.compose(u.changes) : u.changes;
 							scheduleDraft.current();
 							setDirty(true);
 							// 자동 저장이 실패해 멈춰 있었으면 사람이 다시 고친 지금부터 다시 시도한다
@@ -349,10 +352,15 @@ export function EditorView_({
 			if (!cur) return;
 			const doc = cur.state.doc;
 			const same = sameDoc(doc, origDoc.current);
-			setChanged(same ? 0 : changedLines(origDoc.current, doc, accum.current));
+			// 초안 쓰기가 먼저 — 바뀐 줄 수 계산이 어긋나도(기준 문서가 달라진 드문 경우) 초안은 남는다
 			if (doc !== lastDraftDoc.current) {
 				lastDraftDoc.current = doc;
 				void api.settingSet(draftKeyRef.current, same ? "" : doc.toString());
+			}
+			try {
+				setChanged(same ? 0 : changedLines(origDoc.current, doc, accum.current));
+			} catch {
+				setChanged(same ? 0 : 1);
 			}
 			// 되돌리기로 연 때와 똑같아졌으면 고친 것이 아니다(형식만 바꾼 것은 남긴다)
 			if (same && !metaChangedRef.current) setDirty(false);
@@ -379,13 +387,17 @@ export function EditorView_({
 			const docAt = v.state.doc;
 			const text = docAt.toString();
 			sinceSave.current = null;
+			const gen = loadGen.current;
 			try {
 				// 연 때의 수정 시각·크기를 같이 넘긴다 — 서버가 그사이 바뀌었거나 쓴 뒤 크기가 다르면 거절·알림
 				const saved = await fsRef.current.write(path, text, saveMeta, force ? null : file.mtime, force ? null : file.size);
 				setFile({ ...file, size: saved.size, mtime: saved.mtime, meta: saveMeta });
-				original.current = text;
-				origDoc.current = docAt;
-				accum.current = sinceSave.current;
+				// 저장하는 사이 다시 읽었으면(인코딩 바꿔 열기) 기준 문서는 다시 읽은 쪽 그대로
+				if (gen === loadGen.current) {
+					original.current = text;
+					origDoc.current = docAt;
+					accum.current = sinceSave.current;
+				}
 				// 저장하는 사이 더 고쳤으면 고친 상태로 남긴다(다음 자동 저장이 이어서)
 				const nowDoc = view.current?.state.doc ?? docAt;
 				const edited = !sameDoc(nowDoc, docAt);
@@ -588,6 +600,9 @@ export function EditorView_({
 						onClick={() => {
 							void api.settingSet(draftKey, "");
 							setDraft(null);
+							// 지금 고친 내용의 초안은 다시 쓴다(건너뛰기 때문에 같은 문서면 안 써진다)
+							lastDraftDoc.current = null;
+							if (dirty) scheduleDraft.current();
 						}}
 					>
 						버리기

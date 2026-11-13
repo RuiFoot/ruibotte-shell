@@ -660,7 +660,8 @@ function TransfersPanel() {
 	useEffect(() => {
 		const un = listen<TransferProgress>("transfer", (e) => {
 			const p = e.payload;
-			if (p.conn != null && p.conn !== myConn.current) return;
+			// 내 작업대가 시작한 전송은 출발 연결이 다른 서버(peer)여도 도착 연결(destConn)이 내 것이다 — 둘 다 아니면 다른 탭의 전송
+			if (p.conn != null && p.conn !== myConn.current && p.destConn !== myConn.current) return;
 			setList((l) => {
 				const i = l.findIndex((x) => x.id === p.id);
 				if (i < 0) return [p, ...l].slice(0, 50);
@@ -1723,8 +1724,9 @@ useEffect(() => activeStore.set(activeStore.panel, active), [active, activeStore
 				const d = dock.current;
 				if (!d || gone.current) return;
 				// 가려진 앱 탭에서는 작업대 크기가 0 으로 다시 그려진다 — 그 배치를 저장하면 다음에 칸이 찌그러져 열린다
-				if (!activeRef.current || d.width < 240 || d.height < 160 || d.hasMaximizedGroup()) return;
-				void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
+				if (!activeRef.current || d.width < 240 || d.height < 160) return;
+				// 최대화 중에는 배치(숨은 칸이 있는 상태)를 저장하지 않는다 — 열린 편집기 목록은 그래도 저장
+				if (!d.hasMaximizedGroup()) void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
 				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown; ctr?: unknown });
 				openEditors.set(owner, eds);
 				// 다른 서버 칸에서 연 파일은 그 연결이 있어야 하니 앱을 다시 열 때는 빼고 남긴다
