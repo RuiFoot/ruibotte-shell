@@ -3,13 +3,30 @@
  * 모든 화면을 Rust 없이 띄워 보고 고치기 위한 것이다. 값은 그럴듯한 예시일 뿐이다.
  */
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+import { QUERY_MAP_SAMPLES } from "./querymapSamples";
 
 type Args = Record<string, unknown>;
 const now = Math.floor(Date.now() / 1000);
 
-/** sql_map 예시(쿼리 지도 화면 점검) — 이 문장을 SQL 편집기에 붙여 넣으면 지도가 뜬다 */
-const MOCK_SQL_SAMPLE = `WITH recent AS (SELECT customer_id, count(*) n FROM orders WHERE created_at > now() - interval '30 days' GROUP BY customer_id) SELECT c.name, o.id, i.qty, r.n FROM orders o JOIN customer c ON c.id = o.customer_id LEFT JOIN order_item i ON i.order_id = o.id JOIN recent r ON r.customer_id = c.id WHERE o.status = 'paid' AND YEAR(o.created_at) = 2024 AND o.id NOT IN (SELECT order_id FROM order_item WHERE qty = 0) ORDER BY o.created_at DESC LIMIT 50`;
-const MOCK_SQL_MAP = {"ok": true, "error": null, "kind": "select", "dialect": "postgres", "scopes": [{"id": 0, "kind": "main", "name": null, "parent": null, "pos": [0, 448]}, {"id": 1, "kind": "cte", "name": "recent", "parent": 0, "pos": [5, 126]}, {"id": 2, "kind": "subquery", "name": "NOT IN", "parent": 0, "pos": [366, 411]}], "tables": [{"id": 0, "scope": 1, "schema": null, "name": "orders", "alias": null, "cte": null, "derived": null, "virt": false, "target": false, "qualText": "orders", "pos": [52, 58]}, {"id": 1, "scope": 0, "schema": null, "name": "orders", "alias": "o", "cte": null, "derived": null, "virt": false, "target": false, "qualText": "o", "pos": [164, 170]}, {"id": 2, "scope": 0, "schema": null, "name": "customer", "alias": "c", "cte": null, "derived": null, "virt": false, "target": false, "qualText": "c", "pos": [178, 186]}, {"id": 3, "scope": 0, "schema": null, "name": "order_item", "alias": "i", "cte": null, "derived": null, "virt": false, "target": false, "qualText": "i", "pos": [223, 233]}, {"id": 4, "scope": 0, "schema": null, "name": "recent", "alias": "r", "cte": 1, "derived": null, "virt": false, "target": false, "qualText": "r", "pos": [262, 268]}, {"id": 5, "scope": 2, "schema": null, "name": "order_item", "alias": null, "cte": null, "derived": null, "virt": false, "target": false, "qualText": "order_item", "pos": [387, 397]}], "joins": [{"scope": 0, "left": 1, "right": 2, "kind": "inner", "on": [{"a": 3, "b": 4, "op": "="}], "hasOn": true, "using": [], "natural": false, "pos": [192, 212]}, {"scope": 0, "left": 1, "right": 3, "kind": "left", "on": [{"a": 5, "b": 6, "op": "="}], "hasOn": true, "using": [], "natural": false, "pos": [239, 256]}, {"scope": 0, "left": 2, "right": 4, "kind": "inner", "on": [{"a": 7, "b": 8, "op": "="}], "hasOn": true, "using": [], "natural": false, "pos": [274, 294]}], "cols": [{"id": 0, "scope": 1, "table": 0, "qual": null, "name": "customer_id", "role": "select", "pred": null, "wrapped": null, "pos": [23, 34]}, {"id": 1, "scope": 1, "table": 0, "qual": null, "name": "created_at", "role": "where", "pred": "range", "wrapped": null, "pos": [65, 75]}, {"id": 2, "scope": 1, "table": 0, "qual": null, "name": "customer_id", "role": "group", "pred": null, "wrapped": null, "pos": [114, 125]}, {"id": 3, "scope": 0, "table": 2, "qual": "c", "name": "id", "role": "on", "pred": "eq", "wrapped": null, "pos": [192, 196]}, {"id": 4, "scope": 0, "table": 1, "qual": "o", "name": "customer_id", "role": "on", "pred": "eq", "wrapped": null, "pos": [199, 212]}, {"id": 5, "scope": 0, "table": 3, "qual": "i", "name": "order_id", "role": "on", "pred": "eq", "wrapped": null, "pos": [239, 249]}, {"id": 6, "scope": 0, "table": 1, "qual": "o", "name": "id", "role": "on", "pred": "eq", "wrapped": null, "pos": [252, 256]}, {"id": 7, "scope": 0, "table": 4, "qual": "r", "name": "customer_id", "role": "on", "pred": "eq", "wrapped": null, "pos": [274, 287]}, {"id": 8, "scope": 0, "table": 2, "qual": "c", "name": "id", "role": "on", "pred": "eq", "wrapped": null, "pos": [290, 294]}, {"id": 9, "scope": 0, "table": 2, "qual": "c", "name": "name", "role": "select", "pred": null, "wrapped": null, "pos": [134, 140]}, {"id": 10, "scope": 0, "table": 1, "qual": "o", "name": "id", "role": "select", "pred": null, "wrapped": null, "pos": [142, 146]}, {"id": 11, "scope": 0, "table": 3, "qual": "i", "name": "qty", "role": "select", "pred": null, "wrapped": null, "pos": [148, 153]}, {"id": 12, "scope": 0, "table": 4, "qual": "r", "name": "n", "role": "select", "pred": null, "wrapped": null, "pos": [155, 158]}, {"id": 13, "scope": 0, "table": 1, "qual": "o", "name": "status", "role": "where", "pred": "eq", "wrapped": null, "pos": [301, 309]}, {"id": 14, "scope": 0, "table": 1, "qual": "o", "name": "created_at", "role": "where", "pred": "eq", "wrapped": "YEAR", "pos": [328, 340]}, {"id": 15, "scope": 0, "table": 1, "qual": "o", "name": "id", "role": "where", "pred": "other", "wrapped": null, "pos": [353, 357]}, {"id": 16, "scope": 2, "table": null, "qual": null, "name": "order_id", "role": "select", "pred": null, "wrapped": null, "pos": [373, 381]}, {"id": 17, "scope": 2, "table": null, "qual": null, "name": "qty", "role": "where", "pred": "eq", "wrapped": null, "pos": [404, 407]}, {"id": 18, "scope": 0, "table": 1, "qual": "o", "name": "created_at", "role": "order", "pred": null, "wrapped": null, "pos": [422, 434]}], "facts": [{"kind": "cmp", "scope": 0, "pos": [192, 212], "col": 3, "col2": 4, "sub": null, "table": null, "text": null, "num": null, "op": "=", "lit": null, "value": null}, {"kind": "cmp", "scope": 0, "pos": [239, 256], "col": 5, "col2": 6, "sub": null, "table": null, "text": null, "num": null, "op": "=", "lit": null, "value": null}, {"kind": "cmp", "scope": 0, "pos": [274, 294], "col": 7, "col2": 8, "sub": null, "table": null, "text": null, "num": null, "op": "=", "lit": null, "value": null}, {"kind": "cmp", "scope": 0, "pos": [301, 318], "col": 13, "col2": null, "sub": null, "table": null, "text": null, "num": null, "op": "=", "lit": "str", "value": "paid"}, {"kind": "cmp", "scope": 0, "pos": [323, 348], "col": 14, "col2": null, "sub": null, "table": null, "text": null, "num": null, "op": "=", "lit": "num", "value": "2024"}, {"kind": "fnOnCol", "scope": 0, "pos": [323, 341], "col": 14, "col2": null, "sub": null, "table": null, "text": "YEAR", "num": null, "op": null, "lit": null, "value": null}, {"kind": "cmp", "scope": 2, "pos": [404, 411], "col": 17, "col2": null, "sub": null, "table": null, "text": null, "num": null, "op": "=", "lit": "num", "value": "0"}, {"kind": "notInSubquery", "scope": 0, "pos": [353, 412], "col": 15, "col2": null, "sub": 2, "table": null, "text": null, "num": null, "op": null, "lit": null, "value": null}]};
+/** sql_map 예시(쿼리 지도 화면 점검) — SQL 편집기 첫 탭 초안에 이 문장들이 들어 있다. 커서를 문장에 두면 지도가 뜬다 */
+const MOCK_SQL_DRAFT = QUERY_MAP_SAMPLES.map((x) => `${x.sql};`).join("\n\n");
+const normSql = (x: string) => x.replace(/\s+/g, " ").replace(/;\s*$/, "").trim();
+const MOCK_SQL_MAPS = new Map(QUERY_MAP_SAMPLES.map((x) => [normSql(x.sql), x.map]));
+type SampleMap = { tables: { name: string; virt: boolean; cte: number | null; derived: number | null }[]; cols: { name: string; table: number | null }[] };
+/** 예시가 쓰는 표 → 열(목업 메타데이터 — 없는 열 경고가 뜨지 않게) */
+const MOCK_TABLE_COLS = (() => {
+	const m = new Map<string, string[]>();
+	for (const x of QUERY_MAP_SAMPLES) {
+		const map = x.map as SampleMap;
+		for (const t of map.tables ?? []) if (!t.virt && t.cte === null && t.derived === null && !m.has(t.name.toLowerCase())) m.set(t.name.toLowerCase(), []);
+		for (const c of map.cols ?? []) {
+			const t = c.table !== null ? map.tables[c.table] : null;
+			const list = t && !t.virt && t.cte === null && t.derived === null ? m.get(t.name.toLowerCase()) : undefined;
+			if (list && !list.some((n) => n.toLowerCase() === c.name.toLowerCase())) list.push(c.name);
+		}
+	}
+	return m;
+})();
 
 const settings = new Map<string, string>();
 const profiles: Record<string, any>[] = [
@@ -251,8 +268,12 @@ export function installMock() {
 					if (i >= 0) profiles.splice(i, 1);
 					return null;
 				}
-				case "setting_get":
-					return settings.get((args as { key: string }).key) ?? null;
+				case "setting_get": {
+					const key = (args as { key: string }).key;
+					// SQL 편집기 첫 탭 — 쿼리 지도 예시 문장들
+					if (/^sql\.draft\..*\.1$/.test(key) && !settings.has(key)) return MOCK_SQL_DRAFT;
+					return settings.get(key) ?? null;
+				}
 				case "setting_set":
 					settings.set((args as { key: string; value: string }).key, (args as { key: string; value: string }).value);
 					return null;
@@ -420,7 +441,10 @@ export function installMock() {
 				case "db_tree": {
 					const p = (args.path as string[]) ?? [];
 					if (p.length === 0) return ["public", "audit"].map((n) => ({ name: n, kind: "schema" }));
-					if (p.length === 1) return ["customer", "orders", "order_item", "product", "v_sales"].map((n, i) => ({ name: n, kind: i === 4 ? "view" : "table", detail: i === 4 ? null : `${(i + 1) * 1200}행` }));
+					if (p.length === 1) {
+						const names = [...new Set(["customer", "orders", "order_item", "product", "v_sales", ...MOCK_TABLE_COLS.keys()])];
+						return names.map((n, i) => ({ name: n, kind: n === "v_sales" ? "view" : "table", detail: n === "v_sales" ? null : `${(i + 1) * 1200}행` }));
+					}
 					return ["id", "name", "created_at", "status"].map((n, i) => ({ name: n, kind: "column", detail: ["bigint PK", "varchar(200)", "timestamptz", "text"][i] }));
 				}
 				case "db_query":
@@ -436,17 +460,23 @@ export function installMock() {
 					return args.filter ? 37 : 240;
 				case "sql_map": {
 					// 목업에는 SQL 파서가 없다 — 이 예시 문장만 Rust 가 낸 결과 그대로(쿼리 지도·튜닝 화면 점검용)
-					const norm = (x: string) => x.replace(/\s+/g, " ").trim();
-					if (norm(String(args.sql)) === norm(MOCK_SQL_SAMPLE)) return MOCK_SQL_MAP;
-					return { ok: false, error: `목업에는 SQL 파서가 없습니다 — 예시 문장을 붙여 넣으세요: ${MOCK_SQL_SAMPLE.slice(0, 60)}…`, kind: "other", dialect: "postgres", scopes: [], tables: [], joins: [], cols: [], facts: [] };
+					const hit = MOCK_SQL_MAPS.get(normSql(String(args.sql)));
+					if (hit) return hit;
+					return { ok: false, error: "목업에는 SQL 파서가 없습니다 — 첫 탭의 예시 문장에 커서를 두세요", kind: "other", dialect: "postgres", scopes: [], tables: [], joins: [], cols: [], facts: [], clauses: [], outs: [] };
 				}
-				case "db_table_meta":
+				case "db_table_meta": {
+					const cols = MOCK_TABLE_COLS.get(String(args.table).toLowerCase());
+					if (cols?.length) {
+						const pk = cols.find((c) => /(^|_)id$/i.test(c)) ?? cols[0];
+						return cols.map((c) => ({ name: c, dataType: /(^|_)(id|sn|hit|qty|n)$/i.test(c) ? "bigint" : /_at$|date/i.test(c) ? "timestamp" : "varchar(200)", nullable: c !== pk, pk: c === pk }));
+					}
 					return [
 						{ name: "id", dataType: "bigint", nullable: false, pk: true },
 						{ name: "name", dataType: "varchar(200)", nullable: false, pk: false },
 						{ name: "created_at", dataType: "timestamptz", nullable: true, pk: false },
 						{ name: "status", dataType: "text", nullable: true, pk: false },
 					];
+				}
 				case "jdbc_status":
 					return { java: false, drivers: [] };
 				// 경로·진단(화면 점검용)

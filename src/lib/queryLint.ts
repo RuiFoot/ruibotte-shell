@@ -8,10 +8,19 @@ import type { ColMeta } from "./edits";
 import { quoteIdentFor } from "./engines";
 
 export type Pos = [number, number] | null;
-export type MapScope = { id: number; kind: "main" | "cte" | "derived" | "subquery" | "union"; name: string | null; parent: number | null; pos: Pos };
-export type MapTable = { id: number; scope: number; schema: string | null; name: string; alias: string | null; cte: number | null; derived: number | null; virt: boolean; target: boolean; qualText: string; pos: Pos };
+/** 단계의 입력 — 표 하나 또는 앞 조인 */
+export type MapIn = { t: number } | { j: number };
+/** range: 편집기 강조 범위(서브쿼리는 괄호까지, CTE 는 WITH 이름 AS (…)) · src: FROM 을 다 읽은 결과 */
+export type MapScope = { id: number; kind: "main" | "cte" | "derived" | "subquery" | "union"; name: string | null; parent: number | null; pos: Pos; range?: Pos; src?: MapIn };
+/** span: 이름 + 별칭 */
+export type MapTable = { id: number; scope: number; schema: string | null; name: string; alias: string | null; cte: number | null; derived: number | null; virt: boolean; target: boolean; qualText: string; pos: Pos; span?: Pos };
 export type MapPair = { a: number; b: number; op: string };
-export type MapJoin = { scope: number; left: number | null; right: number | null; kind: string; on: MapPair[]; hasOn: boolean; using: string[]; natural: boolean; pos: Pos };
+/** clause: `LEFT JOIN 표 ON …` 전체 · ia/ib: 두 입력 */
+export type MapJoin = { scope: number; left: number | null; right: number | null; kind: string; on: MapPair[]; hasOn: boolean; using: string[]; natural: boolean; pos: Pos; clause?: Pos; ia?: MapIn; ib?: MapIn };
+/** 묶음의 절 — select · distinct · from · where · group · having · window · order · limit · setop · target · set */
+export type MapClause = { scope: number; kind: string; pos: Pos };
+/** SELECT 목록 한 항목 — cols: 쓴 열 id [시작, 끝)(scope 로 거른다) · star: * 이면 "", t.* 이면 "t" */
+export type MapOut = { scope: number; name?: string; pos: Pos; cols: [number, number]; subs?: number[]; agg?: boolean; win?: boolean; star?: string };
 export type MapCol = { id: number; scope: number; table: number | null; qual: string | null; name: string; role: string; pred: string | null; wrapped: string | null; pos: Pos };
 export type MapFact = {
 	kind: string;
@@ -27,7 +36,7 @@ export type MapFact = {
 	lit: string | null;
 	value: string | null;
 };
-export type QueryMap = { ok: boolean; error: string | null; kind: string; dialect: string; scopes: MapScope[]; tables: MapTable[]; joins: MapJoin[]; cols: MapCol[]; facts: MapFact[] };
+export type QueryMap = { ok: boolean; error: string | null; kind: string; dialect: string; scopes: MapScope[]; tables: MapTable[]; joins: MapJoin[]; cols: MapCol[]; facts: MapFact[]; clauses: MapClause[]; outs: MapOut[] };
 
 /** 표 하나의 메타데이터 — cols/indexes 가 null 이면 못 읽음(또는 아직) */
 export type TableMeta = { schema: string | null; name: string; kind: "table" | "view"; cols: ColMeta[] | null; indexes: IndexInfo[] | null };

@@ -33,6 +33,18 @@ pub struct QueryMap {
     pub joins: Vec<JoinEdge>,
     pub cols: Vec<ColUse>,
     pub facts: Vec<Fact>,
+    /// 묶음마다 절(FROM·WHERE·GROUP BY …)의 자리 — 단계 그래프와 편집기 강조용
+    pub clauses: Vec<Clause>,
+    /// 묶음마다 내놓는 열(SELECT 목록 한 항목씩)
+    pub outs: Vec<OutCol>,
+}
+
+/// 단계의 입력 — 표 하나({"t":id}) 또는 앞 조인({"j":조인 번호})
+#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum In {
+    T(u32),
+    J(u32),
 }
 
 #[derive(Serialize, Debug)]
@@ -44,6 +56,44 @@ pub struct Scope {
     pub name: Option<String>,
     pub parent: Option<u32>,
     pub pos: Pos,
+    /// 편집기에서 강조할 범위 — 서브쿼리는 괄호까지, CTE 는 `WITH 이름 AS (…)`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Pos,
+    /// FROM 을 다 읽은 결과(마지막 조인 또는 표 하나)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src: Option<In>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Clause {
+    pub scope: u32,
+    /// select · distinct · from · where · group · having · window · order · limit · setop · target · set
+    pub kind: &'static str,
+    pub pos: Pos,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OutCol {
+    pub scope: u32,
+    /// 별칭 또는 그냥 열의 이름(식이면 없음 — 화면이 원문으로 보여 준다)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 항목 전체(식 + 별칭)
+    pub pos: Pos,
+    /// 이 항목이 쓴 열 id [시작, 끝) — 그 안의 서브쿼리 열도 섞여 있으니 scope 로 거른다
+    pub cols: [u32; 2],
+    /// 이 항목 안의 스칼라 서브쿼리 묶음
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subs: Vec<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub agg: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub win: bool,
+    /// * 이면 "", t.* 이면 "t"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub star: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -65,6 +115,9 @@ pub struct TableRef {
     /// 열을 한정할 때 쓰는 원문 표기(별칭 또는 표 이름, 따옴표 그대로) — 바꿔 쓰기용
     pub qual_text: String,
     pub pos: Pos,
+    /// 이름 + 별칭(FROM·JOIN 의 그 표 참조 전체)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Pos,
 }
 
 #[derive(Serialize, Debug)]
@@ -75,7 +128,7 @@ pub struct ColPair {
     pub op: &'static str,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinEdge {
     pub scope: u32,
@@ -90,6 +143,14 @@ pub struct JoinEdge {
     pub using: Vec<String>,
     pub natural: bool,
     pub pos: Pos,
+    /// `LEFT JOIN 표 별칭 ON …` 전체
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clause: Pos,
+    /// 조인의 두 입력(where 로 이은 것은 없음)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ia: Option<In>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ib: Option<In>,
 }
 
 #[derive(Serialize, Debug)]
@@ -228,7 +289,24 @@ pub fn build(sql: &str, engine: &str) -> QueryMap {
     if b.cols.len() > MAX_COLS {
         return QueryMap { error: Some("열이 너무 많아 지도를 그리지 않습니다".into()), kind: "other", dialect: used, ..Default::default() };
     }
-    QueryMap { ok: true, error: None, kind: b.kind, dialect: used, scopes: b.scopes, tables: b.tables, joins: b.joins, cols: b.cols, facts: b.facts }
+    QueryMap { ok: true, error: None, kind: b.kind, dialect: used, scopes: b.scopes, tables: b.tables, joins: b.joins, cols: b.cols, facts: b.facts, clauses: b.clauses, outs: b.outs }
+}
+
+/// 두 범위를 덮는 범위
+fn upos(a: Pos, b: Pos) -> Pos {
+    match (a, b) {
+        (Some([a0, a1]), Some([b0, b1])) => Some([a0.min(b0), a1.max(b1)]),
+        (x, None) | (None, x) => x,
+    }
+}
+
+const JOIN_WORDS: &[&str] = &["join", "inner", "left", "right", "full", "outer", "cross", "natural", "straight_join", "semi", "anti", "asof", "global", "lateral", "apply"];
+
+fn is_ws(c: u16) -> bool {
+    matches!(c, 9 | 10 | 13 | 32)
+}
+fn is_word(c: u16) -> bool {
+    c < 128 && ((c as u8).is_ascii_alphanumeric() || c == u16::from(b'_'))
 }
 
 /// 줄·열(문자 단위, 1부터) → UTF-16 위치
@@ -305,6 +383,173 @@ impl PosMap {
             i as u32
         }
     }
+
+    // ── 절 범위 넓히기(키워드·괄호) — 모두 UTF-16 위치, ASCII 키워드만 본다 ──
+
+    fn word(&self, a: usize, b: usize) -> String {
+        self.units[a..b].iter().map(|&c| (c as u8 as char).to_ascii_lowercase()).collect()
+    }
+    /// 공백·주석(/* */, -- 줄) 건너뛰기(앞으로)
+    fn skip_fwd(&self, mut i: usize) -> usize {
+        let u = &self.units;
+        let (slash, star, dash, nl) = (u16::from(b'/'), u16::from(b'*'), u16::from(b'-'), u16::from(b'\n'));
+        loop {
+            while i < u.len() && is_ws(u[i]) {
+                i += 1;
+            }
+            if i + 1 < u.len() && u[i] == slash && u[i + 1] == star {
+                let mut j = i + 2;
+                while j + 1 < u.len() && !(u[j] == star && u[j + 1] == slash) {
+                    j += 1;
+                }
+                i = (j + 2).min(u.len());
+            } else if i + 1 < u.len() && u[i] == dash && u[i + 1] == dash {
+                while i < u.len() && u[i] != nl {
+                    i += 1;
+                }
+            } else {
+                return i;
+            }
+        }
+    }
+    /// 공백·/* */ 주석 건너뛰기(뒤로)
+    fn skip_back(&self, mut i: usize) -> usize {
+        let u = &self.units;
+        let (slash, star) = (u16::from(b'/'), u16::from(b'*'));
+        loop {
+            while i > 0 && is_ws(u[i - 1]) {
+                i -= 1;
+            }
+            if i >= 2 && u[i - 1] == slash && u[i - 2] == star {
+                let mut j = i - 2;
+                while j >= 2 && !(u[j - 2] == slash && u[j - 1] == star) {
+                    j -= 1;
+                }
+                i = j.saturating_sub(2);
+            } else {
+                return i;
+            }
+        }
+    }
+    /// a 앞의 키워드들(최대 max 개)까지 시작을 당긴다 — 사이의 여는 괄호는 건너뛴다(WHERE (a OR b))
+    fn back_kw(&self, a: u32, words: &[&str], max: usize) -> u32 {
+        let u = &self.units;
+        let mut start = (a as usize).min(u.len());
+        for _ in 0..max {
+            let mut i = self.skip_back(start);
+            while i > 0 && u[i - 1] == u16::from(b'(') {
+                i = self.skip_back(i - 1);
+            }
+            let end = i;
+            while i > 0 && is_word(u[i - 1]) {
+                i -= 1;
+            }
+            if i == end || !words.contains(&self.word(i, end).as_str()) {
+                break;
+            }
+            start = i;
+        }
+        start as u32
+    }
+    /// b 뒤의 키워드들까지 끝을 늘린다
+    fn fwd_kw(&self, b: u32, words: &[&str], max: usize) -> u32 {
+        let u = &self.units;
+        let mut end = (b as usize).min(u.len());
+        for _ in 0..max {
+            let i = self.skip_fwd(end);
+            let mut j = i;
+            while j < u.len() && is_word(u[j]) {
+                j += 1;
+            }
+            if i == j || !words.contains(&self.word(i, j).as_str()) {
+                break;
+            }
+            end = j;
+        }
+        end as u32
+    }
+    /// i 의 ( 짝인 ) 뒤 — 작은따옴표 안은 건너뜀
+    fn match_paren(&self, i: usize) -> Option<usize> {
+        let u = &self.units;
+        let (mut depth, mut quoted) = (0i32, false);
+        for (k, &c) in u.iter().enumerate().skip(i) {
+            if c == u16::from(b'\'') {
+                quoted = !quoted;
+            } else if !quoted && c == u16::from(b'(') {
+                depth += 1;
+            } else if !quoted && c == u16::from(b')') {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k + 1);
+                }
+            }
+        }
+        None
+    }
+    /// b 뒤에 (…) 가 바로 오면 그 끝까지(함수 인자)
+    fn call_end(&self, b: u32) -> u32 {
+        let i = self.skip_fwd(b as usize);
+        if self.units.get(i) == Some(&u16::from(b'(')) {
+            if let Some(e) = self.match_paren(i) {
+                return e as u32;
+            }
+        }
+        b
+    }
+    /// 창 함수 끝 — b 뒤의 OVER (…) 또는 OVER 이름까지
+    fn over_end(&self, b: u32) -> u32 {
+        let u = &self.units;
+        let i = self.skip_fwd(b as usize);
+        let mut j = i;
+        while j < u.len() && is_word(u[j]) {
+            j += 1;
+        }
+        if self.word(i, j) != "over" {
+            return b;
+        }
+        let k = self.skip_fwd(j);
+        if u.get(k) == Some(&u16::from(b'(')) {
+            return self.match_paren(k).map(|e| e as u32).unwrap_or(b);
+        }
+        let mut e = k;
+        while e < u.len() && is_word(u[e]) {
+            e += 1;
+        }
+        e as u32
+    }
+    /// 괄호로 바로 감싸였으면 괄호까지
+    fn wrap_paren(&self, p: Pos) -> Pos {
+        let [a, b] = p?;
+        let u = &self.units;
+        let i = self.skip_back(a as usize);
+        if i == 0 || u[i - 1] != u16::from(b'(') {
+            return p;
+        }
+        let j = self.skip_fwd(b as usize);
+        if u.get(j) != Some(&u16::from(b')')) {
+            return p;
+        }
+        Some([(i - 1) as u32, (j + 1) as u32])
+    }
+    /// 두 위치 사이를 공백·괄호를 뺀 범위로(UNION ALL 같은 연산자 글자)
+    fn between(&self, a: u32, b: u32) -> Pos {
+        let u = &self.units;
+        let (mut i, mut j) = (a as usize, (b as usize).min(u.len()));
+        let paren = |c: u16| c == u16::from(b'(') || c == u16::from(b')');
+        while i < j && (is_ws(u[i]) || paren(u[i])) {
+            i += 1;
+        }
+        while j > i && (is_ws(u[j - 1]) || paren(u[j - 1])) {
+            j -= 1;
+        }
+        (i < j).then_some([i as u32, j as u32])
+    }
+    /// 식 범위를 앞 키워드까지 넓히고 괄호 짝을 맞춘다(WHERE …, GROUP BY …)
+    fn kw(&self, s: Span, words: &[&str], max: usize) -> Pos {
+        let [a, b] = self.span(s)?;
+        let a = self.back_kw(a, words, max);
+        Some([a, self.balance(a, b)])
+    }
 }
 
 #[derive(Default)]
@@ -316,6 +561,8 @@ struct Builder {
     joins: Vec<JoinEdge>,
     cols: Vec<ColUse>,
     facts: Vec<Fact>,
+    clauses: Vec<Clause>,
+    outs: Vec<OutCol>,
     /// (소문자 이름, CTE 묶음, 그 이름이 보이는 묶음)
     ctes: Vec<(String, u32, u32)>,
     /// WHERE 의 열 = 열 (묶음, a, b) — 끝에 표를 알아낸 뒤 조인 선으로
@@ -429,6 +676,44 @@ fn lit_kind(e: &Expr) -> Option<(&'static str, String)> {
     }
 }
 
+/// 집계 함수(창 없이 쓰면 묶음 전체를 접는다)
+fn is_agg(name: &str) -> bool {
+    matches!(
+        name,
+        "count" | "sum" | "avg" | "min" | "max" | "group_concat" | "string_agg" | "array_agg" | "listagg" | "json_agg" | "jsonb_agg" | "json_arrayagg" | "json_objectagg" | "bool_and" | "bool_or" | "every"
+            | "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop" | "var_samp" | "bit_and" | "bit_or" | "bit_xor" | "median" | "percentile_cont" | "percentile_disc" | "approx_count_distinct"
+            | "any_value" | "xmlagg" | "mode" | "count_big" | "checksum_agg"
+    )
+}
+
+/// 식 안의 함수(바로 아래 서브쿼리 속은 빼고) — (소문자 이름, 이름 위치, OVER 가 있나)
+#[derive(Default)]
+struct Funcs {
+    depth: usize,
+    list: Vec<(String, Span, bool)>,
+}
+
+impl Visitor for Funcs {
+    type Break = ();
+    fn pre_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+    fn post_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if self.depth == 0 {
+            if let Expr::Function(f) = e {
+                let name = name_parts(&f.name).last().map(|i| i.value.to_lowercase()).unwrap_or_default();
+                self.list.push((name, f.name.span(), f.over.is_some()));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// 식 안의 열과 (바로 아래) 서브쿼리 — 서브쿼리 속 열은 그 묶음이 따로 모은다
 #[derive(Default)]
 struct Scan {
@@ -467,8 +752,22 @@ impl Visitor for Scan {
 impl Builder {
     fn scope(&mut self, kind: &'static str, name: Option<String>, parent: Option<u32>, pos: Pos) -> u32 {
         let id = self.scopes.len() as u32;
-        self.scopes.push(Scope { id, kind, name, parent, pos });
+        self.scopes.push(Scope { id, kind, name, parent, pos, range: None, src: None });
         id
+    }
+
+    /// 괄호로 감싼 서브쿼리 묶음 — 강조 범위는 괄호까지
+    fn sub_scope(&mut self, kind: &'static str, name: Option<String>, parent: u32, sp: Span) -> u32 {
+        let pos = self.pos.span(sp);
+        let id = self.scope(kind, name, Some(parent), pos);
+        self.scopes[id as usize].range = self.pos.wrap_paren(pos);
+        id
+    }
+
+    fn clause(&mut self, scope: u32, kind: &'static str, pos: Pos) {
+        if pos.is_some() {
+            self.clauses.push(Clause { scope, kind, pos });
+        }
     }
 
     fn fact(&mut self, f: Fact) {
@@ -497,14 +796,19 @@ impl Builder {
                 let s = self.scope("main", None, None, None);
                 if let TableObject::TableName(n) = &ins.table {
                     let t = self.table_ref(n, None, s, true);
+                    let mut p = self.pos.kw(n.span(), &["into", "insert"], 2);
                     for c in &ins.columns {
                         if let Some(i) = name_parts(c).last() {
                             self.push_col(s, Some(t), None, ident_name(i), "insert", None, None, i.span);
+                            p = upos(p, self.pos.span(c.span()));
                         }
                     }
+                    // 열 목록의 닫는 괄호까지
+                    let p = p.map(|[a, b]| [a, self.pos.balance(a, b)]);
+                    self.clause(s, "target", p);
                 }
                 if let Some(src) = &ins.source {
-                    let sub = self.scope("subquery", Some("SELECT".into()), Some(s), self.pos.span(src.span()));
+                    let sub = self.sub_scope("subquery", Some("SELECT".into()), s, src.span());
                     self.query(src, sub, false);
                 }
             }
@@ -512,14 +816,21 @@ impl Builder {
                 self.kind = "update";
                 let s = self.scope("main", None, None, None);
                 let first = self.tables.len();
-                self.table_item(&u.table, s);
+                let (_, h) = self.table_item(&u.table, s);
+                self.scopes[s as usize].src = h;
                 if let Some(t) = self.tables.get_mut(first) {
                     t.target = true;
                 }
+                let tp = self.pos.kw(u.table.span(), &["update"], 1);
+                self.clause(s, "target", tp);
                 if let Some(UpdateTableFromKind::BeforeSet(v) | UpdateTableFromKind::AfterSet(v)) = &u.from {
                     for x in v {
                         self.table_item(x, s);
                     }
+                }
+                if let (Some(a), Some(b)) = (u.assignments.first(), u.assignments.last()) {
+                    let p = self.pos.kw(a.span().union(&b.span()), &["set"], 1);
+                    self.clause(s, "set", p);
                 }
                 for a in &u.assignments {
                     let names: Vec<&ObjectName> = match &a.target {
@@ -536,7 +847,11 @@ impl Builder {
                     self.collect(&a.value, s, "set", None, None);
                 }
                 match &u.selection {
-                    Some(w) => self.cond(w, s, "where", None),
+                    Some(w) => {
+                        let p = self.pos.kw(w.span(), &["where"], 1);
+                        self.clause(s, "where", p);
+                        self.cond(w, s, "where", None)
+                    }
                     None => self.fact(Fact { kind: "noWhere", scope: s, text: Some("UPDATE".into()), ..Default::default() }),
                 }
             }
@@ -547,8 +862,13 @@ impl Builder {
                     FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
                 };
                 let first = self.tables.len();
-                for x in list {
-                    self.table_item(x, s);
+                for (i, x) in list.iter().enumerate() {
+                    let (_, h) = self.table_item(x, s);
+                    if i == 0 {
+                        self.scopes[s as usize].src = h;
+                        let p = self.pos.kw(x.span(), &["from", "delete"], 2);
+                        self.clause(s, "target", p);
+                    }
                 }
                 if let Some(t) = self.tables.get_mut(first) {
                     t.target = true;
@@ -559,7 +879,11 @@ impl Builder {
                     }
                 }
                 match &d.selection {
-                    Some(w) => self.cond(w, s, "where", None),
+                    Some(w) => {
+                        let p = self.pos.kw(w.span(), &["where"], 1);
+                        self.clause(s, "where", p);
+                        self.cond(w, s, "where", None)
+                    }
                     None => self.fact(Fact { kind: "noWhere", scope: s, text: Some("DELETE".into()), ..Default::default() }),
                 }
             }
@@ -574,7 +898,10 @@ impl Builder {
             // WITH orders AS (SELECT … FROM orders) 의 안쪽 orders 는 실제 표다
             let mut ids = Vec::new();
             for c in &w.cte_tables {
-                let id = self.scope("cte", Some(ident_name(&c.alias.name)), Some(s), self.pos.span(c.span()));
+                let p = self.pos.span(c.span());
+                let id = self.scope("cte", Some(ident_name(&c.alias.name)), Some(s), p);
+                // 첫 CTE 는 WITH [RECURSIVE] 부터
+                self.scopes[id as usize].range = p.map(|[a, b]| [self.pos.back_kw(a, &["recursive", "with"], 2), b]);
                 if w.recursive {
                     self.ctes.push((c.alias.name.value.to_lowercase(), id, s));
                 }
@@ -593,8 +920,22 @@ impl Builder {
             if let OrderByKind::Expressions(v) = &ob.kind {
                 has_order = !v.is_empty();
                 self.order_list(v, s);
+                // 끝의 ASC·DESC·NULLS LAST 는 식 위치에 없다
+                let p = self.pos.kw(ob.span(), &["by", "order"], 2).map(|[a, b]| [a, self.pos.fwd_kw(b, &["asc", "desc", "nulls", "first", "last"], 3)]);
+                self.clause(s, "order", p);
             }
         }
+        // LIMIT·OFFSET·FETCH — 키워드까지 한 범위로
+        let lp = q.limit_clause.as_ref().and_then(|l| {
+            let [a, b] = self.pos.span(l.span())?;
+            let a = self.pos.back_kw(a, &["limit", "offset"], 1);
+            Some([a, self.pos.fwd_kw(b, &["rows", "row"], 1)])
+        });
+        let fp = q.fetch.as_ref().and_then(|f| {
+            let [a, b] = self.pos.span(f.span())?;
+            Some([self.pos.back_kw(a, &["first", "next", "fetch"], 2), self.pos.fwd_kw(b, &["percent", "rows", "row", "only", "with", "ties"], 4)])
+        });
+        self.clause(s, "limit", upos(lp, fp));
         let mut limited = q.fetch.is_some();
         match &q.limit_clause {
             Some(LimitClause::LimitOffset { limit, offset, .. }) => {
@@ -642,11 +983,16 @@ impl Builder {
             SetExpr::Select(sel) => self.select(sel, s),
             SetExpr::Query(q) => self.query(q, s, false),
             SetExpr::SetOperation { left, right, .. } => {
+                // 연산자 글자(UNION ALL …) — 왼쪽 끝과 오른쪽 시작 사이
+                if let (Some([_, le]), Some([rs, _])) = (self.pos.span(left.span()), self.pos.span(right.span())) {
+                    let p = self.pos.between(le, rs);
+                    self.clause(s, "setop", p);
+                }
                 for side in [left, right] {
                     if matches!(side.as_ref(), SetExpr::SetOperation { .. }) {
                         self.set_expr(side, s);
                     } else {
-                        let u = self.scope("union", None, Some(s), None);
+                        let u = self.sub_scope("union", None, s, side.span());
                         self.set_expr(side, u);
                     }
                 }
@@ -664,58 +1010,162 @@ impl Builder {
                 self.aliases.push((s, alias.value.to_lowercase()));
             }
         }
+        // FROM — 쉼표로 늘어놓은 덩이도 앞 결과와 잇는 단계(comma)로
+        let mut acc: Option<In> = None;
         for (i, item) in sel.from.iter().enumerate() {
             let before = self.tables.iter().filter(|t| t.scope == s).map(|t| t.id).next_back();
-            let first = self.table_item(item, s);
+            let (first, h) = self.table_item(item, s);
             if i > 0 {
-                self.joins.push(JoinEdge { scope: s, left: before, right: first, kind: "comma", on: vec![], has_on: false, using: vec![], natural: false, pos: self.pos.span(item.relation.span()) });
+                let idx = self.joins.len() as u32;
+                self.joins.push(JoinEdge { scope: s, left: before, right: first, kind: "comma", pos: self.pos.span(item.relation.span()), ia: acc, ib: h, ..Default::default() });
+                acc = Some(In::J(idx));
+            } else {
+                acc = h;
             }
         }
+        if acc.is_some() {
+            self.scopes[s as usize].src = acc;
+        }
+        if let (Some(a), Some(b)) = (sel.from.first(), sel.from.last()) {
+            let p = self.pos.kw(a.span().union(&b.span()), &["from"], 1);
+            self.clause(s, "from", p);
+        }
+        // SELECT 목록 — 항목마다 내놓는 열과 그 열이 쓴 열(계보)
+        let mut list: Pos = self.pos.span(sel.select_token.0.span);
         for item in &sel.projection {
-            match item {
+            let (c0, s0) = (self.cols.len() as u32, self.scopes.len() as u32);
+            let mut pos = self.pos.span(item.span());
+            let (mut agg, mut win) = (false, false);
+            let (name, star) = match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } | SelectItem::ExprWithAliases { expr: e, .. } => {
                     self.collect(e, s, "select", None, None);
+                    let mut f = Funcs::default();
+                    let _ = e.visit(&mut f);
+                    for (fname, sp, over) in f.list {
+                        if over {
+                            win = true;
+                            let wp = self.pos.span(sp).map(|[a, b]| [a, self.pos.over_end(self.pos.call_end(b))]);
+                            self.clause(s, "window", wp);
+                            pos = upos(pos, wp);
+                        } else if is_agg(&fname) {
+                            agg = true;
+                        }
+                    }
+                    let name = match item {
+                        SelectItem::ExprWithAlias { alias, .. } => Some(ident_name(alias)),
+                        SelectItem::ExprWithAliases { aliases, .. } => aliases.first().map(ident_name),
+                        _ => plain_col(e).and_then(|v| v.last().map(|i| ident_name(i))),
+                    };
+                    (name, None)
                 }
                 SelectItem::Wildcard(_) => {
-                    let p = self.pos.span(item.span());
-                    self.fact(Fact { kind: "selectStar", scope: s, pos: p, ..Default::default() });
+                    self.fact(Fact { kind: "selectStar", scope: s, pos, ..Default::default() });
+                    (None, Some(String::new()))
                 }
                 SelectItem::QualifiedWildcard(k, _) => {
-                    let p = self.pos.span(item.span());
                     let q = match k {
                         SelectItemQualifiedWildcardKind::ObjectName(n) => Some(n.to_string()),
                         _ => None,
                     };
-                    self.fact(Fact { kind: "selectStar", scope: s, pos: p, text: q, ..Default::default() });
+                    let qual = match k {
+                        SelectItemQualifiedWildcardKind::ObjectName(n) => name_parts(n).last().map(|i| ident_name(i)),
+                        _ => None,
+                    };
+                    self.fact(Fact { kind: "selectStar", scope: s, pos, text: q, ..Default::default() });
+                    (None, Some(qual.unwrap_or_default()))
                 }
-            }
+            };
+            // 함수 끝 ) 를 빼먹은 위치 바로잡기
+            pos = pos.map(|[a, b]| [a, self.pos.balance(a, b)]);
+            list = upos(list, pos);
+            let subs: Vec<u32> = (s0..self.scopes.len() as u32).filter(|&k| self.scopes[k as usize].parent == Some(s)).collect();
+            self.outs.push(OutCol { scope: s, name, pos, cols: [c0, self.cols.len() as u32], subs, agg, win, star });
         }
+        self.clause(s, "select", list);
+        self.mods_clause(sel, s);
         if let Some(w) = &sel.selection {
+            let p = self.pos.kw(w.span(), &["where"], 1);
+            self.clause(s, "where", p);
             self.cond(w, s, "where", None);
         }
         if let GroupByExpr::Expressions(v, _) = &sel.group_by {
             for e in v {
                 self.collect(e, s, "group", None, None);
             }
+            if !v.is_empty() {
+                let p = self.pos.kw(sel.group_by.span(), &["by", "group"], 2);
+                self.clause(s, "group", p);
+            }
         }
         if let Some(h) = &sel.having {
+            let p = self.pos.kw(h.span(), &["having"], 1);
+            self.clause(s, "having", p);
             self.cond(h, s, "having", None);
         }
         self.order_list(&sel.sort_by, s);
     }
 
-    /// FROM 한 덩이(표 + JOIN 들) — 첫 표 id
-    fn table_item(&mut self, twj: &TableWithJoins, s: u32) -> Option<u32> {
-        let first = self.factor(&twj.relation, s);
-        let mut prev = first;
-        for j in &twj.joins {
-            prev = self.join(j, prev, s).or(prev);
+    /// SELECT 바로 뒤의 DISTINCT · TOP — AST 에 위치가 없어 원문에서 찾는다
+    fn mods_clause(&mut self, sel: &Select, s: u32) {
+        if sel.distinct.is_none() && sel.top.is_none() {
+            return;
         }
-        first
+        let Some([_, mut i]) = self.pos.span(sel.select_token.0.span) else { return };
+        let u = &self.pos.units;
+        for _ in 0..4 {
+            let a = self.pos.skip_fwd(i as usize);
+            let mut b = a;
+            while b < u.len() && is_word(u[b]) {
+                b += 1;
+            }
+            if a == b {
+                return;
+            }
+            let w = self.pos.word(a, b);
+            match w.as_str() {
+                "distinct" | "distinctrow" => {
+                    // DISTINCT ON (…)
+                    let on = self.pos.fwd_kw(b as u32, &["on"], 1);
+                    let end = if on as usize > b { self.pos.call_end(on) } else { b as u32 };
+                    self.clauses.push(Clause { scope: s, kind: "distinct", pos: Some([a as u32, end]) });
+                    i = end;
+                }
+                "top" => {
+                    let k = self.pos.skip_fwd(b);
+                    let end_q = if u.get(k) == Some(&u16::from(b'(')) {
+                        self.pos.match_paren(k).unwrap_or(b)
+                    } else {
+                        let mut e = k;
+                        while e < u.len() && is_word(u[e]) {
+                            e += 1;
+                        }
+                        e
+                    };
+                    let mut end = end_q as u32;
+                    end = self.pos.fwd_kw(end, &["percent", "with", "ties"], 3);
+                    self.clauses.push(Clause { scope: s, kind: "limit", pos: Some([a as u32, end]) });
+                    i = end;
+                }
+                "all" | "sql_calc_found_rows" | "sql_no_cache" | "sql_cache" | "high_priority" | "straight_join" | "sql_small_result" | "sql_big_result" | "sql_buffer_result" => i = b as u32,
+                _ => return,
+            }
+        }
     }
 
-    fn join(&mut self, j: &Join, left: Option<u32>, s: u32) -> Option<u32> {
-        let right = self.factor(&j.relation, s);
+    /// FROM 한 덩이(표 + JOIN 들) — 첫 표 id 와 이 덩이의 결과(마지막 조인 또는 표)
+    fn table_item(&mut self, twj: &TableWithJoins, s: u32) -> (Option<u32>, Option<In>) {
+        let (first, mut h) = self.factor(&twj.relation, s);
+        let mut prev = first;
+        for j in &twj.joins {
+            let (r, jh) = self.join(j, prev, h, s);
+            prev = r.or(prev);
+            h = jh;
+        }
+        (first, h)
+    }
+
+    fn join(&mut self, j: &Join, left: Option<u32>, lh: Option<In>, s: u32) -> (Option<u32>, Option<In>) {
+        let (right, rh) = self.factor(&j.relation, s);
         let (kind, c) = match &j.join_operator {
             JoinOperator::Join(c) | JoinOperator::Inner(c) | JoinOperator::StraightJoin(c) => ("inner", Some(c)),
             JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => ("left", Some(c)),
@@ -730,18 +1180,25 @@ impl Builder {
             _ => ("inner", None),
         };
         let idx = self.joins.len();
-        self.joins.push(JoinEdge { scope: s, left, right, kind, on: vec![], has_on: false, using: vec![], natural: false, pos: self.pos.span(j.relation.span()) });
+        let rel = self.pos.span(j.relation.span());
+        // 강조 범위 — 앞의 LEFT OUTER JOIN 같은 키워드부터 ON 조건 끝까지
+        let mut clause = rel.map(|[a, b]| [self.pos.back_kw(a, JOIN_WORDS, 5), b]);
+        self.joins.push(JoinEdge { scope: s, left, right, kind, pos: rel, ia: lh, ib: rh, ..Default::default() });
         match c {
             Some(JoinConstraint::On(e)) => {
                 self.joins[idx].has_on = true;
                 if let Some(p) = self.pos.span(e.span()) {
                     self.joins[idx].pos = Some(p);
+                    clause = upos(clause, Some(p));
                 }
                 self.cond(e, s, "on", Some(idx));
             }
             Some(JoinConstraint::Using(v)) | Some(JoinConstraint::UsingAlias(v, _)) => {
                 self.joins[idx].using = v.iter().filter_map(|n| name_parts(n).last().map(|i| ident_name(i))).collect();
                 self.joins[idx].has_on = true;
+                for n in v {
+                    clause = upos(clause, self.pos.span(n.span()));
+                }
             }
             Some(JoinConstraint::Natural) => {
                 self.joins[idx].natural = true;
@@ -755,7 +1212,8 @@ impl Builder {
                 }
             }
         }
-        right
+        self.joins[idx].clause = clause.map(|[a, b]| [a, self.pos.balance(a, b)]);
+        (right, Some(In::J(idx as u32)))
     }
 
     fn table_ref(&mut self, n: &ObjectName, alias: Option<&Ident>, s: u32, target: bool) -> u32 {
@@ -772,25 +1230,33 @@ impl Builder {
         };
         let id = self.tables.len() as u32;
         let qual_text = alias.map(|a| a.to_string()).unwrap_or_else(|| n.to_string());
-        self.tables.push(TableRef { id, scope: s, schema, name, alias: alias.map(ident_name), cte, derived: None, virt: false, target, qual_text, pos: self.pos.span(n.span()) });
+        self.tables.push(TableRef { id, scope: s, schema, name, alias: alias.map(ident_name), cte, derived: None, virt: false, target, qual_text, pos: self.pos.span(n.span()), span: None });
         id
     }
 
-    fn factor(&mut self, f: &TableFactor, s: u32) -> Option<u32> {
+    /// FROM 의 한 요소 — 표 id 와 그 입력
+    fn factor(&mut self, f: &TableFactor, s: u32) -> (Option<u32>, Option<In>) {
         match f {
             TableFactor::Table { name, alias, args, .. } => {
                 let id = self.table_ref(name, alias.as_ref().map(|a| &a.name), s, false);
+                let sp = self.pos.span(f.span());
+                // 표 함수의 닫는 괄호까지
+                self.tables[id as usize].span = sp.map(|[a, b]| [a, self.pos.balance(a, b)]);
                 // jsonb_array_elements(o.items) 같은 표 함수 — 실표가 아니고, 앞 표의 열을 받으니 데카르트 곱도 아니다
                 if args.is_some() {
                     self.tables[id as usize].virt = true;
                     self.tables[id as usize].cte = None;
                     self.no_cartesian.push(id);
                 }
-                Some(id)
+                (Some(id), Some(In::T(id)))
             }
             TableFactor::Derived { subquery, alias, lateral, .. } => {
                 let nm = alias.as_ref().map(|a| ident_name(&a.name));
-                let sub = self.scope("derived", nm.clone(), Some(s), self.pos.span(subquery.span()));
+                let sub = self.sub_scope("derived", nm.clone(), s, subquery.span());
+                // 괄호 + 별칭(+ 앞의 LATERAL)
+                let fp = self.pos.span(f.span());
+                let r = upos(self.scopes[sub as usize].range, fp).map(|[a, b]| [if *lateral { self.pos.back_kw(a, &["lateral"], 1) } else { a }, b]);
+                self.scopes[sub as usize].range = r;
                 let id = self.tables.len() as u32;
                 self.tables.push(TableRef {
                     id,
@@ -803,13 +1269,14 @@ impl Builder {
                     virt: true,
                     target: false,
                     qual_text: alias.as_ref().map(|a| a.name.to_string()).unwrap_or_default(),
-                    pos: self.pos.span(f.span()),
+                    pos: fp,
+                    span: r,
                 });
                 if *lateral {
                     self.no_cartesian.push(id);
                 }
                 self.query(subquery, sub, false);
-                Some(id)
+                (Some(id), Some(In::T(id)))
             }
             TableFactor::NestedJoin { table_with_joins, .. } => self.table_item(table_with_joins, s),
             other => {
@@ -823,9 +1290,10 @@ impl Builder {
                     _ => None,
                 };
                 let (alias, qual_text) = (alias_id.map(ident_name), alias_id.map(|a| a.to_string()).unwrap_or_default());
-                self.tables.push(TableRef { id, scope: s, schema: None, name: text, alias, cte: None, derived: None, virt: true, target: false, qual_text, pos: self.pos.span(other.span()) });
+                let pos = self.pos.span(other.span());
+                self.tables.push(TableRef { id, scope: s, schema: None, name: text, alias, cte: None, derived: None, virt: true, target: false, qual_text, pos, span: pos });
                 self.no_cartesian.push(id);
-                Some(id)
+                (Some(id), Some(In::T(id)))
             }
         }
     }
@@ -856,7 +1324,7 @@ impl Builder {
             first.get_or_insert(id);
         }
         for q in sc.subs {
-            let sub = self.scope("subquery", None, Some(s), self.pos.span(q.span()));
+            let sub = self.sub_scope("subquery", None, s, q.span());
             self.query(&q, sub, false);
         }
         first
@@ -957,7 +1425,7 @@ impl Builder {
                 let (a, aw) = self.side(expr, s, role, if *negated { "other" } else { "in" });
                 match target {
                     InTarget::Subquery(q) => {
-                        let sub = self.scope("subquery", Some(if *negated { "NOT IN".into() } else { "IN".into() }), Some(s), self.pos.span(q.span()));
+                        let sub = self.sub_scope("subquery", Some(if *negated { "NOT IN".into() } else { "IN".into() }), s, q.span());
                         self.query(q, sub, false);
                         if *negated {
                             self.fact(Fact { kind: "notInSubquery", scope: s, col: a, sub: Some(sub), pos: self.pos.span(c.span()), ..Default::default() });
@@ -987,7 +1455,7 @@ impl Builder {
                 self.side(x, s, role, "null");
             }
             Expr::Exists { subquery, negated } => {
-                let sub = self.scope("subquery", Some(if *negated { "NOT EXISTS".into() } else { "EXISTS".into() }), Some(s), self.pos.span(subquery.span()));
+                let sub = self.sub_scope("subquery", Some(if *negated { "NOT EXISTS".into() } else { "EXISTS".into() }), s, subquery.span());
                 self.query(subquery, sub, false);
             }
             other => {
@@ -1071,14 +1539,14 @@ impl Builder {
                         Some(k) => self.joins[k].on.push(ColPair { a, b, op: "=" }),
                         None => {
                             let pos = self.cols[a as usize].pos;
-                            self.joins.push(JoinEdge { scope: s, left: Some(x), right: Some(y), kind: "where", on: vec![ColPair { a, b, op: "=" }], has_on: true, using: vec![], natural: false, pos });
+                            self.joins.push(JoinEdge { scope: s, left: Some(x), right: Some(y), kind: "where", on: vec![ColPair { a, b, op: "=" }], has_on: true, pos, ..Default::default() });
                         }
                     }
                 }
                 (Some(_), Some(_)) => {}
                 _ => {
                     unresolved_scopes.push(s);
-                    self.joins.push(JoinEdge { scope: s, left: ta, right: tb, kind: "where", on: vec![ColPair { a, b, op: "=" }], has_on: true, using: vec![], natural: false, pos: self.cols[a as usize].pos });
+                    self.joins.push(JoinEdge { scope: s, left: ta, right: tb, kind: "where", on: vec![ColPair { a, b, op: "=" }], has_on: true, pos: self.cols[a as usize].pos, ..Default::default() });
                 }
             }
         }
@@ -1438,6 +1906,170 @@ mod tests {
         // 열 = 열 이 아니어도 두 표를 함께 쓰는 조건이면 이어졌다
         let m = build("SELECT 1 FROM a, b WHERE a.d BETWEEN b.s AND b.e", "postgres");
         assert!(facts(&m, "cartesian").is_empty());
+    }
+
+    // ── 단계 그래프(절 범위·출력 열·조인 입력) — 시험 SQL 묶음을 일반 이름으로 ──
+
+    fn clause<'a>(m: &'a QueryMap, scope: u32, kind: &str) -> &'a Clause {
+        m.clauses.iter().find(|c| c.scope == scope && c.kind == kind).unwrap_or_else(|| panic!("절 {kind} 없음: {:?}", m.clauses))
+    }
+
+    #[test]
+    fn flow_inner_join_where() {
+        let sql = "SELECT a.post_id, a.title, b.hit AS bak_hit\nFROM article a\nJOIN article_hit_bak b ON b.post_id = a.post_id\nWHERE a.hit > 100;";
+        let m = build(sql, "mysql");
+        assert!(m.ok, "{:?}", m.error);
+        assert_eq!(text(sql, clause(&m, 0, "select").pos), "SELECT a.post_id, a.title, b.hit AS bak_hit");
+        assert_eq!(text(sql, clause(&m, 0, "from").pos), "FROM article a\nJOIN article_hit_bak b ON b.post_id = a.post_id");
+        assert_eq!(text(sql, clause(&m, 0, "where").pos), "WHERE a.hit > 100");
+        let j = &m.joins[0];
+        assert_eq!(text(sql, j.clause), "JOIN article_hit_bak b ON b.post_id = a.post_id");
+        assert_eq!((j.ia, j.ib), (Some(In::T(0)), Some(In::T(1))));
+        assert_eq!(m.scopes[0].src, Some(In::J(0)));
+        assert_eq!(text(sql, tbl(&m, "article").span), "article a");
+        let names: Vec<Option<&str>> = m.outs.iter().map(|o| o.name.as_deref()).collect();
+        assert_eq!(names, vec![Some("post_id"), Some("title"), Some("bak_hit")]);
+        // 계보 — bak_hit 은 b.hit 에서
+        let o = &m.outs[2];
+        let c: Vec<&ColUse> = (o.cols[0]..o.cols[1]).map(|i| &m.cols[i as usize]).collect();
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].name.as_str(), c[0].table), ("hit", Some(tbl(&m, "article_hit_bak").id)));
+    }
+
+    #[test]
+    fn flow_join_chain_inputs() {
+        let sql = "SELECT bf.file_id, bf.file_sn, bm.title AS movie_title, mf.c_name\nFROM board_file bf\nJOIN board_movie bm ON bm.file_id = bf.file_id\nLEFT JOIN form_file mf ON mf.file_id = bf.file_id AND mf.file_sn = bf.file_sn;";
+        let m = build(sql, "mysql");
+        assert!(m.ok, "{:?}", m.error);
+        assert_eq!(m.joins.len(), 2);
+        // 둘째 조인의 왼쪽 입력은 첫 조인 결과
+        assert_eq!((m.joins[1].ia, m.joins[1].ib), (Some(In::J(0)), Some(In::T(2))));
+        assert_eq!(text(sql, m.joins[1].clause), "LEFT JOIN form_file mf ON mf.file_id = bf.file_id AND mf.file_sn = bf.file_sn");
+        assert_eq!(m.scopes[0].src, Some(In::J(1)));
+        assert!(m.clauses.iter().all(|c| c.kind != "where"));
+    }
+
+    #[test]
+    fn flow_cte_and_window() {
+        let sql = "WITH recent AS (\n  SELECT post_id, board_id, title, created_at,\n         ROW_NUMBER() OVER (PARTITION BY board_id ORDER BY created_at DESC) AS rn\n  FROM article\n)\nSELECT r.board_id, r.title, r.created_at\nFROM recent r\nWHERE r.rn <= 3;";
+        let m = build(sql, "mysql");
+        assert!(m.ok, "{:?}", m.error);
+        let cte = m.scopes.iter().find(|s| s.kind == "cte").unwrap();
+        let r = text(sql, cte.range);
+        assert!(r.starts_with("WITH recent AS (") && r.ends_with(')'), "{r}");
+        assert_eq!(text(sql, clause(&m, cte.id, "window").pos), "ROW_NUMBER() OVER (PARTITION BY board_id ORDER BY created_at DESC)");
+        let rn = m.outs.iter().find(|o| o.name.as_deref() == Some("rn")).unwrap();
+        assert!(rn.win && !rn.agg && rn.scope == cte.id);
+        assert!(text(sql, rn.pos).ends_with("DESC) AS rn"));
+        assert!(text(sql, clause(&m, cte.id, "select").pos).ends_with("AS rn"));
+        assert_eq!(text(sql, clause(&m, 0, "where").pos), "WHERE r.rn <= 3");
+        assert_eq!(m.outs.iter().filter(|o| o.scope == 0).count(), 3);
+    }
+
+    #[test]
+    fn flow_subquery_ranges() {
+        let sql = "SELECT d.doc_id, d.file_name\nFROM docs d\nWHERE d.doc_id IN (SELECT l.doc_id FROM doc_lang l WHERE l.lang = 'ko')\n  AND EXISTS (SELECT 1 FROM doc_field tf WHERE tf.doc_id = d.doc_id);";
+        let m = build(sql, "mysql");
+        assert!(m.ok, "{:?}", m.error);
+        let subs: Vec<String> = m.scopes.iter().filter(|s| s.kind == "subquery").map(|s| text(sql, s.range)).collect();
+        assert_eq!(subs, vec!["(SELECT l.doc_id FROM doc_lang l WHERE l.lang = 'ko')", "(SELECT 1 FROM doc_field tf WHERE tf.doc_id = d.doc_id)"]);
+        let w = text(sql, clause(&m, 0, "where").pos);
+        assert!(w.starts_with("WHERE d.doc_id IN") && w.ends_with("d.doc_id)"), "{w}");
+    }
+
+    #[test]
+    fn flow_union_branches() {
+        let sql = "SELECT id AS id, title AS title, 'board' AS src FROM board\nUNION ALL\nSELECT id, title, 'qna' FROM qna;";
+        let m = build(sql, "mysql");
+        assert!(m.ok, "{:?}", m.error);
+        assert_eq!(text(sql, clause(&m, 0, "setop").pos), "UNION ALL");
+        let br: Vec<&Scope> = m.scopes.iter().filter(|s| s.kind == "union").collect();
+        assert_eq!(br.len(), 2);
+        assert_eq!(text(sql, br[1].range), "SELECT id, title, 'qna' FROM qna");
+        assert_eq!(m.outs.iter().filter(|o| o.scope == br[0].id).count(), 3);
+        assert_eq!(m.outs.iter().find(|o| o.scope == br[1].id).and_then(|o| o.name.as_deref()), Some("id"));
+        // 셋째 열은 식(이름 없음)
+        assert!(m.outs.iter().filter(|o| o.scope == br[1].id).nth(2).unwrap().name.is_none());
+        assert_eq!(m.scopes[br[0].id as usize].src, Some(In::T(0)));
+    }
+
+    #[test]
+    fn flow_comma_cartesian() {
+        let sql = "SELECT d.doc_id, t.title\nFROM docs d, theater t\nWHERE d.file_ext = 'pdf';";
+        let m = build(sql, "mysql");
+        assert!(m.ok, "{:?}", m.error);
+        let j = m.joins.iter().find(|j| j.kind == "comma").unwrap();
+        assert_eq!((j.ia, j.ib), (Some(In::T(0)), Some(In::T(1))));
+        assert_eq!(text(sql, j.pos), "theater t");
+        assert_eq!(facts(&m, "cartesian").len(), 1);
+    }
+
+    #[test]
+    fn flow_group_order_limit_distinct() {
+        let sql = "SELECT DISTINCT fm.idx, fm.c_name, COUNT(mf.file_sn) AS files\nFROM form fm\nLEFT JOIN form_file mf ON mf.idx = fm.idx\nGROUP BY fm.idx, fm.c_name\nHAVING COUNT(mf.file_sn) > 1\nORDER BY files DESC\nLIMIT 20 OFFSET 40";
+        let m = build(sql, "postgres");
+        assert!(m.ok, "{:?}", m.error);
+        assert_eq!(text(sql, clause(&m, 0, "distinct").pos), "DISTINCT");
+        assert_eq!(text(sql, clause(&m, 0, "group").pos), "GROUP BY fm.idx, fm.c_name");
+        assert_eq!(text(sql, clause(&m, 0, "having").pos), "HAVING COUNT(mf.file_sn) > 1");
+        assert_eq!(text(sql, clause(&m, 0, "order").pos), "ORDER BY files DESC");
+        assert_eq!(text(sql, clause(&m, 0, "limit").pos), "LIMIT 20 OFFSET 40");
+        assert!(m.outs[2].agg && m.outs[2].name.as_deref() == Some("files"));
+        // TOP · FETCH · DISTINCT ON
+        let sql = "SELECT TOP (10) o.id FROM orders o ORDER BY o.id";
+        let m = build(sql, "mssql");
+        assert_eq!(text(sql, clause(&m, 0, "limit").pos), "TOP (10)");
+        let sql = "SELECT o.id FROM orders o ORDER BY o.id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY";
+        let m = build(sql, "mssql");
+        assert_eq!(text(sql, clause(&m, 0, "limit").pos), "OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY");
+        let sql = "SELECT DISTINCT ON (u.team) u.team, u.name FROM users u ORDER BY u.team, u.score DESC";
+        let m = build(sql, "postgres");
+        assert_eq!(text(sql, clause(&m, 0, "distinct").pos), "DISTINCT ON (u.team)");
+    }
+
+    #[test]
+    fn flow_derived_and_dml() {
+        let sql = "SELECT t.c FROM (SELECT count(*) c FROM a GROUP BY k) t WHERE (t.c > 1 OR t.c < 0)";
+        let m = build(sql, "postgres");
+        let d = m.scopes.iter().find(|s| s.kind == "derived").unwrap();
+        assert_eq!(text(sql, d.range), "(SELECT count(*) c FROM a GROUP BY k) t");
+        assert_eq!(text(sql, clause(&m, 0, "where").pos), "WHERE (t.c > 1 OR t.c < 0)");
+        assert!(m.outs.iter().any(|o| o.scope == d.id && o.agg && o.name.as_deref() == Some("c")));
+        // * 와 t.*
+        let m = build("SELECT *, u.* FROM users u", "postgres");
+        assert_eq!(m.outs.iter().map(|o| o.star.as_deref()).collect::<Vec<_>>(), vec![Some(""), Some("u")]);
+        // UPDATE · DELETE · INSERT 의 대상·SET·WHERE
+        let sql = "UPDATE users SET name = 'x', age = age + 1 WHERE id = 3";
+        let m = build(sql, "postgres");
+        assert_eq!(text(sql, clause(&m, 0, "target").pos), "UPDATE users");
+        assert_eq!(text(sql, clause(&m, 0, "set").pos), "SET name = 'x', age = age + 1");
+        assert_eq!(text(sql, clause(&m, 0, "where").pos), "WHERE id = 3");
+        assert_eq!(m.scopes[0].src, Some(In::T(0)));
+        let sql = "DELETE FROM users WHERE id = 3";
+        let m = build(sql, "mysql");
+        assert_eq!(text(sql, clause(&m, 0, "target").pos), "DELETE FROM users");
+        let sql = "INSERT INTO archive (id, name) SELECT id, name FROM users";
+        let m = build(sql, "postgres");
+        assert_eq!(text(sql, clause(&m, 0, "target").pos), "INSERT INTO archive (id, name)");
+        // 스칼라 서브쿼리는 그 출력 열에 붙는다
+        let sql = "SELECT bd.id, (SELECT COUNT(*) FROM board_file f WHERE f.board_id = bd.id) AS files FROM board bd";
+        let m = build(sql, "mysql");
+        let o = m.outs.iter().find(|o| o.name.as_deref() == Some("files")).unwrap();
+        assert_eq!(o.subs.len(), 1);
+        assert_eq!(text(sql, m.scopes[o.subs[0] as usize].range), "(SELECT COUNT(*) FROM board_file f WHERE f.board_id = bd.id)");
+        assert!(!o.agg, "서브쿼리 속 COUNT 는 바깥 집계가 아니다");
+    }
+
+    /// 목업(src/dev/mock.ts) 예시 만들기 — `cargo test --lib dump_mock_maps -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_mock_maps() {
+        let path = std::env::var("QM_DUMP").expect("QM_DUMP=예시 SQL 파일(문장마다 빈 줄 둘)");
+        let all = std::fs::read_to_string(path).unwrap();
+        for sql in all.split("\n\n\n").map(str::trim).filter(|s| !s.is_empty()) {
+            let m = build(sql, "mariadb");
+            println!("{}", serde_json::to_string(&serde_json::json!({ "sql": sql, "map": m })).unwrap());
+        }
     }
 
     #[test]
