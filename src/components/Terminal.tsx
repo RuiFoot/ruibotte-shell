@@ -804,14 +804,19 @@ export function TerminalView({
 			return true;
 		});
 
+		const openCols = term.cols;
+		const openRows = term.rows;
 		backend
-			.open(term.cols, term.rows, ch, reopenAt.current ?? cwd, shell)
+			.open(openCols, openRows, ch, reopenAt.current ?? cwd, shell)
 			.then((id) => {
 				if (disposed) {
 					void backend.close(id);
 					return;
 				}
 				idRef.current = id;
+				// 여는 동안 크기가 바뀌었을 수 있다(줄 바꾸지 않기 설정·글꼴 크기가 늦게 도착 — 그때는 idRef 가 비어 onResize 가 건너뛴다).
+				// 지금 크기를 한 번 보내 PTY·SSH 창과 xterm 을 맞춘다(이후 refit 은 값이 같아 다시 보내지 않는다)
+				if (term.cols !== openCols || term.rows !== openRows) void backend.resize(id, term.cols, term.rows);
 				onShellRef.current?.({
 					idle: () => !promptSeen || (atPrompt && !typedAtPrompt),
 					assist: ax
