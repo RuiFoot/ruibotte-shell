@@ -26,6 +26,7 @@ import { type ExplainOk, ExplainView } from "./DbExplain";
 import { ImportCsvSheet } from "./DbImport";
 import { type AskReq, AskSheet, BigEditSheet } from "./DbSheets";
 import { setOpenTx } from "../lib/dbTx";
+import { dirtyTitleOf, dirtyTitles, forgetOwner, onDraftFlush, setDirty } from "../lib/dirty";
 import { useCommands } from "../lib/commands";
 import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
 
@@ -103,9 +104,8 @@ type Ctx = {
 	explain: () => void;
 	/** 실행 중이면 멈추기 */
 	cancel: () => void;
-	running: boolean;
-	/** 메시지(실행 기록) */
-	messages: Msg[];
+	/** 지금 실행 중인지(읽는 시점 값 — 구독하지 않는다. 구독이 필요한 칸은 LiveCtx) */
+	isRunning: () => boolean;
 	clearMessages: () => void;
 	/** 표 보기 열기(서버 쪽 쪽 나누기·정렬) */
 	openTable: (src: Source) => void;
@@ -136,9 +136,26 @@ const ranField = StateField.define<DecorationSet>({
 	provide: (f) => EditorView.decorations.from(f),
 });
 const DbCtx = createContext<Ctx | null>(null);
+/**
+ * 자주 바뀌는 값(실행 중 표시·메시지 목록) — DbCtx 에 두면 실행 메시지가 쌓일 때마다 DB 칸 전체가 다시 그려져서
+ * 쓰는 칸(메시지·활동)만 따로 구독하게 뗐다.
+ */
+type Live = { running: boolean; messages: Msg[] };
+const LiveCtx = createContext<Live>({ running: false, messages: [] });
 /** db_query 받는 중 알림 번호(앱 전체에서 하나씩 늘림) */
 let streamSeq = 0;
 const useDb = () => useContext(DbCtx) as Ctx;
+
+/** 이 연결의 DB 작업대가 dirty.ts 에 올리는 주인 이름 — 앱 끄기·탭 닫기 확인이 이 이름으로 묻는다 */
+const dbOwner = (conn: number) => `db:${conn}`;
+/** 결과 칸 하나의 표 편집 기록 이름 */
+const editKey = (panelId: string) => `db-edit-${panelId}`;
+/** 반영하지 않은 표 편집을 버려도 되는지 묻는다(없으면 true) — what 은 "다시 실행하면" 같은 말 */
+function okToDiscardEdits(titles: string[], what: string): boolean {
+	if (!titles.length) return true;
+	const list = titles.slice(0, 8).join("\n· ");
+	return confirm(`반영하지 않은 편집이 있습니다.\n· ${list}${titles.length > 8 ? "\n…" : ""}\n\n${what} 이 편집은 버려집니다. 계속할까요?`);
+}
 
 /** 연결마다 하나 — 열어 둔 SQL 편집기들이 같은 이름 목록을 함께 쓴다 */
 const completions = new Map<number, ReturnType<typeof dbCompletionSource>>();
@@ -247,6 +264,15 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 		if (!host.current) return;
 		const key = `${ctx.draftKey}.${props.params.n}`;
 		let timer: number | undefined;
+		// 초안 — 0.8초 멈추면 쓰되, 탭 닫기·앱 끄기·편집기 갈아 끼우기 전에는 대기 중인 것을 바로 쓴다
+		let pending = false;
+		let view: EditorView | null = null;
+		const flush = () => {
+			window.clearTimeout(timer);
+			if (!pending || !view) return;
+			pending = false;
+			void api.settingSet(key, view.state.doc.toString());
+		};
 		const v = new EditorView({
 			parent: host.current,
 			state: EditorState.create({
@@ -277,7 +303,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 						{
 							key: "Escape",
 							run: () => {
-								if (!ctxRef.current.running) return false;
+								if (!ctxRef.current.isRunning()) return false;
 								ctxRef.current.cancel();
 								return true;
 							},
@@ -292,12 +318,15 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					sqlTheme,
 					EditorView.updateListener.of((u) => {
 						if (!u.docChanged) return;
+						pending = true;
 						window.clearTimeout(timer);
-						timer = window.setTimeout(() => void api.settingSet(key, u.state.doc.toString()), 800);
+						timer = window.setTimeout(flush, 800);
 					}),
 				],
 			}),
 		});
+		view = v;
+		const offFlush = onDraftFlush(flush);
 		if (props.params.initial) v.dispatch({ changes: { from: 0, insert: props.params.initial } });
 		else
 			void api.settingGet(key).then((t) => {
@@ -305,7 +334,9 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 			});
 		ctx.registerEditor(props.api.id, v);
 		return () => {
-			window.clearTimeout(timer);
+			flush();
+			offFlush();
+			view = null;
 			ctx.registerEditor(props.api.id, null);
 			v.destroy();
 		};
@@ -383,6 +414,16 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 표·조건이 바뀌면 전체 행 수를 다시 센다
 	useEffect(() => setTotalRows(null), [p.source?.table, p.source?.where]);
 
+	// 반영하지 않은 편집 — 탭 닫기·앱 끄기·다시 실행 확인이 볼 수 있게 dirty.ts 에 올린다(반영·버리기·칸이 사라질 때 내린다)
+	const changeCount = [...edits.keys()].filter((r) => !deleted.has(r)).length + deleted.size + added.length;
+	const owner = dbOwner(ctx.conn);
+	const dirtyId = editKey(props.api.id);
+	const dirtyName = p.source?.table ?? "결과";
+	useEffect(() => {
+		setDirty(owner, dirtyId, `${dirtyName} 편집 ${changeCount}건`, changeCount > 0);
+	}, [owner, dirtyId, dirtyName, changeCount]);
+	useEffect(() => () => setDirty(owner, dirtyId, "", false), [owner, dirtyId]);
+
 	if (p.state === "running")
 		return (
 			<div className="dock-watermark">
@@ -433,7 +474,6 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 					: null;
 	const table = src ? qualified(ctx.engine, src.schema, src.table) : "";
 	const total = viewCount ?? ok.rowCount;
-	const changeCount = [...edits.keys()].filter((r) => !deleted.has(r)).length + deleted.size + added.length;
 	const paged = !!src && src.limit != null;
 	const offset = src?.offset ?? 0;
 	const limit = src?.limit ?? 0;
@@ -512,6 +552,11 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 			const r = await db.apply(ctx.conn, st);
 			announceTx(ctx.conn, r.tx);
 			setMsg(`${r.affected.length}문장 반영${r.inTx ? "(트랜잭션 안 — 커밋해야 남습니다)" : ""}`);
+			// 반영했으니 편집 기록을 비우고(다시 읽기가 반영 전 확인을 묻지 않게) 같은 조건으로 다시 읽는다
+			setEdits(new Map());
+			setDeleted(new Set());
+			setAdded([]);
+			setDirty(owner, dirtyId, "", false);
 			ctx.run([p.sql], src);
 		} catch (e) {
 			setMsg((e as DbError).message ?? String(e));
@@ -725,8 +770,12 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 			}
 			return;
 		}
-		const n = await db.export(rid, format, path);
-		setMsg(`${n.toLocaleString()}행을 저장했습니다`);
+		try {
+			const n = await db.export(rid, format, path);
+			setMsg(`${n.toLocaleString()}행을 저장했습니다`);
+		} catch (x) {
+			setMsg(`저장 실패: ${String((x as DbError).message ?? x)}`);
+		}
 	}
 	const num = (v: string) => (thousands ? groupDigits(v) : v);
 	const statChip = (label: string, v: string | undefined) =>
@@ -1003,11 +1052,16 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	);
 }
 
+/** 객체 트리가 한 부모 아래 한 번에 그리는 자식 수 — 표가 수천 개인 스키마에서 DOM 이 수천 줄이 되지 않게(나머지는 "더 보기") */
+const TREE_CAP = 300;
+
 function ObjectsPanel() {
 	const ctx = useDb();
 	const [kids, setKids] = useState<Record<string, Node[] | string>>({});
 	const [open, setOpen] = useState<Set<string>>(new Set());
 	const [filter, setFilter] = useState("");
+	/** 부모(스키마·표)마다 지금 보이는 자식 수 — 표가 수천 개여도 한 번에 TREE_CAP 개만 그린다 */
+	const [shown, setShown] = useState<Record<string, number>>({});
 	const openKey = `dbtree.open.${ctx.historyScope}`;
 	const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
 
@@ -1025,6 +1079,7 @@ function ObjectsPanel() {
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 연결이 바뀔 때만
 	useEffect(() => {
 		setKids({});
+		setShown({});
 		load([]);
 		void api.settingGet(openKey).then((v) => {
 			try {
@@ -1075,20 +1130,20 @@ function ObjectsPanel() {
 		try {
 			const ok = await db.query(ctx.conn, `SELECT * FROM ${qname(schema, table)}`, format === "xlsx" ? XLSX_MAX_ROWS : 1_000_000);
 			if (!ok.resultId) return;
-			if (format === "xlsx") {
-				const rid = ok.resultId;
-				try {
+			const rid = ok.resultId;
+			// 내보내기가 실패해도 백엔드에 남은 결과(최대 수백 MB)는 놓는다 — 형식 상관없이 finally 에서
+			try {
+				if (format === "xlsx") {
 					const r = await saveXlsx(path, ok.columns, ok.rowCount, (from, to) => db.rows(rid, from, to), table);
 					ctx.notice(`${r.rows.toLocaleString()}행을 엑셀로 저장했습니다${ok.truncated ? `(엑셀 한 장 상한 ${XLSX_MAX_ROWS.toLocaleString()}행에서 멈춤)` : ""}`);
-				} finally {
-					void db.closeResult(rid);
+					return;
 				}
-				return;
+				const prefix = format === "sql" ? `INSERT INTO ${qname(schema, table)} (${ok.columns.map((c) => quoteIdentFor(ctx.engine, c.name)).join(", ")}) VALUES ` : undefined;
+				const n = await db.export(rid, format, path, prefix, ctx.mysql);
+				ctx.notice(`${n.toLocaleString()}행을 저장했습니다${ok.truncated ? "(100만 행에서 멈춤)" : ""}`);
+			} finally {
+				void db.closeResult(rid);
 			}
-			const prefix = format === "sql" ? `INSERT INTO ${qname(schema, table)} (${ok.columns.map((c) => quoteIdentFor(ctx.engine, c.name)).join(", ")}) VALUES ` : undefined;
-			const n = await db.export(ok.resultId, format, path, prefix, ctx.mysql);
-			void db.closeResult(ok.resultId);
-			ctx.notice(`${n.toLocaleString()}행을 저장했습니다${ok.truncated ? "(100만 행에서 멈춤)" : ""}`);
 		} catch (x) {
 			errMsg(x);
 		}
@@ -1164,8 +1219,10 @@ function ObjectsPanel() {
 			);
 			return;
 		}
-		for (const n of v) {
-			if (fl && (n.kind === "table" || n.kind === "view") && !n.name.toLowerCase().includes(fl)) continue;
+		const pk = path.join("");
+		const list = fl ? v.filter((n) => !((n.kind === "table" || n.kind === "view") && !n.name.toLowerCase().includes(fl))) : v;
+		const cap = shown[pk] ?? TREE_CAP;
+		for (const n of cap < list.length ? list.slice(0, cap) : list) {
 			const p = [...path, n.name];
 			const k = p.join("\u0001");
 			const expandable = n.kind !== "column";
@@ -1313,13 +1370,32 @@ function ObjectsPanel() {
 			);
 			if (expandable && isOpen) walk(p, depth + 1);
 		}
+		if (list.length > cap)
+			rows.push(
+				<button key={`${path.join("/")}#more`} type="button" className="tree-row" style={{ paddingLeft: 6 + depth * 14 }} onClick={() => setShown((x) => ({ ...x, [pk]: cap + TREE_CAP }))}>
+					<span style={{ color: "var(--text-3)" }}>… 더 보기 (남은 {(list.length - cap).toLocaleString()}개)</span>
+				</button>,
+			);
 	};
 	walk([], 0);
 	return (
 		<div className="tree">
 			<label className="tree-filter">
 				<Search size={12} />
-				<input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="표·뷰 이름 거르기" spellCheck={false} onKeyDown={(e) => e.key === "Escape" && setFilter("")} />
+				<input
+					value={filter}
+					onChange={(e) => {
+						setFilter(e.target.value);
+						setShown({});
+					}}
+					placeholder="표·뷰 이름 거르기"
+					spellCheck={false}
+					onKeyDown={(e) => {
+						if (e.key !== "Escape") return;
+						setFilter("");
+						setShown({});
+					}}
+				/>
 			</label>
 			<div className="tree-body">{rows}</div>
 			{menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
@@ -1347,11 +1423,12 @@ function CompareDock(props: IDockviewPanelProps<{ a: string; b: string }>) {
 /** 메시지 — 실행한 문장마다 시각·결과·걸린 시간 */
 function MessagesPanel() {
 	const ctx = useDb();
+	const { messages } = useContext(LiveCtx);
 	return (
 		<div className="panel-fill">
 			<div className="msg-list selectable">
-				{ctx.messages.length === 0 && <div className="panel-hint">실행하면 여기에 시각·결과·걸린 시간이 쌓입니다.</div>}
-				{ctx.messages.map((m, i) => (
+				{messages.length === 0 && <div className="panel-hint">실행하면 여기에 시각·결과·걸린 시간이 쌓입니다.</div>}
+				{messages.map((m, i) => (
 					// biome-ignore lint/suspicious/noArrayIndexKey: 시간 순 기록
 					<div key={i} className={`msg-row${m.ok ? "" : " bad"}`} title={m.sql}>
 						<span className="msg-at">{new Date(m.at).toLocaleTimeString()}</span>
@@ -1365,7 +1442,7 @@ function MessagesPanel() {
 				))}
 			</div>
 			<div className="statusbar">
-				<span>{ctx.messages.length}개</span>
+				<span>{messages.length}개</span>
 				<span style={{ marginLeft: "auto" }} />
 				<button type="button" className="btn ghost" style={{ height: 20 }} onClick={ctx.clearMessages}>
 					지우기
@@ -1431,7 +1508,8 @@ function ActivityDock(props: IDockviewPanelProps) {
 		return () => d.dispose();
 	}, [props.api]);
 	const busy = useRef(false);
-	busy.current = ctx.running || ctx.inTx;
+	const { running } = useContext(LiveCtx);
+	busy.current = running || ctx.inTx;
 	const runSql = useCallback(
 		async (sql: string) => {
 			if (busy.current) throw new Error(ctx.inTx ? "이 연결에 열린 트랜잭션이 있어 잠깐 멈췄습니다 — 커밋·되돌리기 뒤에 다시 읽습니다" : "쿼리가 실행 중이라 끝난 뒤 다시 읽습니다");
@@ -1451,11 +1529,19 @@ const FIXED = /^(objects|sql-\d+)$/;
 /** 배치를 잠그면 닫기를 숨기는 구조 칸 */
 const STRUCT = /^(objects|sql-1|res-\d+|messages)$/;
 
-const LockCtx = createContext(false);
+const LockCtx = createContext({ locked: false, owner: "" });
 function LockTab(props: IDockviewPanelHeaderProps) {
-	const locked = useContext(LockCtx);
-	const fixed = locked && STRUCT.test(props.api.id);
-	return <DockviewDefaultTab {...props} hideClose={fixed} closeActionOverride={fixed ? () => undefined : undefined} />;
+	const { locked, owner } = useContext(LockCtx);
+	const id = props.api.id;
+	const fixed = locked && STRUCT.test(id);
+	// 반영하지 않은 표 편집이 있는 결과 칸은 닫기 전에 묻는다(가운데 단추·× 모두 이 함수를 거친다)
+	const guard = /^res-\d+$/.test(id)
+		? () => {
+				const t = dirtyTitleOf(owner, editKey(id));
+				if (okToDiscardEdits(t ? [t] : [], "이 탭을 닫으면")) props.api.close();
+			}
+		: undefined;
+	return <DockviewDefaultTab {...props} hideClose={fixed} closeActionOverride={fixed ? () => undefined : guard} />;
 }
 
 /** 이 시간 동안 입력이 없으면 열린 트랜잭션을 되돌린다 */
@@ -1712,6 +1798,8 @@ export function DbWorkbench({
 					if (risky.length && !confirm(`되돌리기 어려운 문장이 있습니다. 실행할까요?\n\n${risky.map((y) => `· ${y.c.reason}\n${y.x.slice(0, 200)}`).join("\n\n")}`)) return;
 				}
 			}
+			// 결과 칸(res-N)은 이번 실행이 덮어쓰거나 닫는다 — 반영하지 않은 표 편집이 있으면 먼저 묻는다
+			if (!okToDiscardEdits(dirtyTitles(dbOwner(conn)), "다시 실행하면")) return;
 			setRunning(true);
 			// 문장마다 결과 탭 하나(결과 1, 2…) — 남는 예전 탭은 닫는다
 			const existing = d.panels.filter((p) => p.id.startsWith("res-"));
@@ -1735,6 +1823,8 @@ export function DbWorkbench({
 						component: "result",
 						title: stmts.length > 1 ? `결과 ${i + 1}` : "결과",
 						params,
+						// 같은 묶음의 다른 탭(결과 2·메시지)으로 갔다 와도 표 편집·고른 칸·스크롤이 남게 — 기본(보일 때만 그림)이면 가려질 때 내려가 반영 전 편집이 사라졌다
+						renderer: "always",
 						position: ref ? { referencePanel: ref.id, direction: "within" } : sqlRef ? { referencePanel: sqlRef.id, direction: "below" } : undefined,
 					});
 					if (!ref) panel.api.setSize({ height: 300 });
@@ -1990,47 +2080,50 @@ export function DbWorkbench({
 		if (active) requestAnimationFrame(() => currentEditor()?.focus());
 	}, [active]);
 	// 단축키 — Alt+O 객체 찾기, Alt+H 기록, Alt+1/2/3 객체·편집기·결과로, Alt+M 결과 최대화, Ctrl+Alt+L 배치 잠금
+	// 처리기는 렌더마다 ref 에 최신 것을 넣고, window 에는 한 번만 단다(예전엔 deps 없는 effect 라 렌더마다 떼었다 붙였다)
+	const keyRef = useRef<(e: KeyboardEvent) => void>(() => undefined);
 	useEffect(() => {
 		if (!active) return;
-		const on = (e: KeyboardEvent) => {
-			const d = dock.current;
-			if (e.altKey && (e.ctrlKey || e.metaKey) && e.code === "KeyL") {
-				e.preventDefault();
-				setLocked(!lockedRef.current);
-				return;
-			}
-			if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-			if (e.code === "KeyO") {
-				e.preventDefault();
-				void findObjects();
-			} else if (e.code === "KeyH") {
-				e.preventDefault();
-				const h = d?.getPanel("history");
-				if (h?.api.isActive) h.api.close();
-				else openPanel("history", "history", "기록", {});
-			} else if (e.code === "Digit1") {
-				e.preventDefault();
-				d?.getPanel("objects")?.api.setActive();
-				requestAnimationFrame(() => (document.querySelector(".tree-filter input") as HTMLElement | null)?.focus());
-			} else if (e.code === "Digit2") {
-				e.preventDefault();
-				const v = currentEditor();
-				const pid = [...editors.current.entries()].find(([, x]) => x === v)?.[0];
-				if (pid) d?.getPanel(pid)?.api.setActive();
-				v?.focus();
-			} else if (e.code === "Digit3") {
-				e.preventDefault();
-				const r = d?.panels.find((p) => p.id.startsWith("res-") && p.api.isVisible) ?? d?.getPanel("res-1");
-				r?.api.setActive();
-				requestAnimationFrame(() => (document.querySelector(".dv-active-group .grid-scroll") as HTMLElement | null)?.focus());
-			} else if (e.code === "KeyM") {
-				e.preventDefault();
-				toggleMax();
-			}
-		};
-		window.addEventListener("keydown", on);
-		return () => window.removeEventListener("keydown", on);
-	});
+		const h = (e: KeyboardEvent) => keyRef.current(e);
+		window.addEventListener("keydown", h);
+		return () => window.removeEventListener("keydown", h);
+	}, [active]);
+	keyRef.current = (e: KeyboardEvent) => {
+		const d = dock.current;
+		if (e.altKey && (e.ctrlKey || e.metaKey) && e.code === "KeyL") {
+			e.preventDefault();
+			setLocked(!lockedRef.current);
+			return;
+		}
+		if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+		if (e.code === "KeyO") {
+			e.preventDefault();
+			void findObjects();
+		} else if (e.code === "KeyH") {
+			e.preventDefault();
+			const h = d?.getPanel("history");
+			if (h?.api.isActive) h.api.close();
+			else openPanel("history", "history", "기록", {});
+		} else if (e.code === "Digit1") {
+			e.preventDefault();
+			d?.getPanel("objects")?.api.setActive();
+			requestAnimationFrame(() => (document.querySelector(".tree-filter input") as HTMLElement | null)?.focus());
+		} else if (e.code === "Digit2") {
+			e.preventDefault();
+			const v = currentEditor();
+			const pid = [...editors.current.entries()].find(([, x]) => x === v)?.[0];
+			if (pid) d?.getPanel(pid)?.api.setActive();
+			v?.focus();
+		} else if (e.code === "Digit3") {
+			e.preventDefault();
+			const r = d?.panels.find((p) => p.id.startsWith("res-") && p.api.isVisible) ?? d?.getPanel("res-1");
+			r?.api.setActive();
+			requestAnimationFrame(() => (document.querySelector(".dv-active-group .grid-scroll") as HTMLElement | null)?.focus());
+		} else if (e.code === "KeyM") {
+			e.preventDefault();
+			toggleMax();
+		}
+	};
 
 	const ctx = useMemo<Ctx>(
 		() => ({
@@ -2048,8 +2141,7 @@ export function DbWorkbench({
 			draftKey: `sql.draft.${profileId ?? "adhoc"}`,
 			explain: () => void explainRef.current(false),
 			cancel: () => void db.cancel(conn),
-			running,
-			messages,
+			isRunning: () => runningRef.current,
 			clearMessages: () => setMessages([]),
 			openTable,
 			ask,
@@ -2058,14 +2150,19 @@ export function DbWorkbench({
 			importCsv: (schema, table) => setCsvTarget({ schema, table }),
 			locked,
 		}),
-		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, running, messages, openTable, ask, epoch, showNotice, locked],
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked],
 	);
+	const live = useMemo<Live>(() => ({ running, messages }), [running, messages]);
+	const lockValue = useMemo(() => ({ locked, owner: dbOwner(conn) }), [locked, conn]);
+	// 이 작업대가 사라지면 남은 편집 기록도 지운다(칸마다 지우지만 한 번 더)
+	useEffect(() => () => forgetOwner(dbOwner(conn)), [conn]);
 
 	const tick = (on: boolean) => (on ? "✓ " : "　");
 
 	return (
 		<DbCtx.Provider value={ctx}>
-			<LockCtx.Provider value={locked}>
+			<LiveCtx.Provider value={live}>
+			<LockCtx.Provider value={lockValue}>
 				<div
 					className="wb-dock-shell"
 					onKeyDownCapture={() => {
@@ -2294,6 +2391,7 @@ export function DbWorkbench({
 					/>
 				)}
 			</LockCtx.Provider>
+			</LiveCtx.Provider>
 		</DbCtx.Provider>
 	);
 }
