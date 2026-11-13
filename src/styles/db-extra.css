@@ -282,3 +282,317 @@
 .db-stopped {
 	color: color-mix(in srgb, var(--danger) 75%, var(--text));
 }
+
+/* ── DB 작업대 머리 · 편집기 도구 막대 (0.15) ─────────────────────── */
+/* 연결 머리 — 지금 데이터베이스·서버 판, 오른쪽 끝 배치 */
+.wb-bar.dbw-head {
+	height: 32px;
+	gap: 8px;
+	padding: 0 6px 0 10px;
+}
+.dbw-conn {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	color: var(--text-2);
+	font-size: 12.5px;
+}
+.dbw-conn > svg {
+	flex: none;
+	color: var(--accent);
+}
+.dbw-conn b {
+	color: var(--text);
+	font-weight: 600;
+	white-space: nowrap;
+}
+.dbw-conn .rb-select.sm {
+	color: var(--text);
+	font-weight: 600;
+	font-size: 12.5px;
+}
+.dbw-ver {
+	color: var(--text-3);
+	font-size: 11.5px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	max-width: 260px;
+}
+.dbw-running {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	color: var(--text-2);
+	font-size: 11.5px;
+}
+@container (max-width: 640px) {
+	.dbw-ver {
+		display: none;
+	}
+}
+
+/* SQL 칸 — 쿼리 탭 줄(도킹 머리) 아래 도구 막대, 그 아래 편집기 */
+.sql-panel {
+	background: var(--surface);
+}
+.dbw-tools {
+	container-type: inline-size;
+	flex: none;
+	border-bottom: 0.5px solid var(--hairline);
+	background: var(--surface);
+}
+.dbw-tools-row {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	height: 36px;
+	padding: 0 8px;
+	overflow-x: auto;
+	overflow-y: hidden;
+	scrollbar-width: none;
+}
+.dbw-tools-row::-webkit-scrollbar {
+	display: none;
+}
+.dbw-tools-row > * {
+	flex: none;
+}
+.dbw-grp {
+	display: inline-flex;
+	align-items: center;
+	gap: 1px;
+}
+.dbw-sep {
+	width: 1px;
+	height: 18px;
+	margin: 0 7px;
+	background: var(--hairline-strong);
+}
+.dbw-tools .btn {
+	height: 26px;
+	padding: 0 8px;
+	gap: 5px;
+	font-size: 12px;
+	white-space: nowrap;
+	color: var(--text-2);
+}
+.dbw-tools .btn:hover:not(:disabled) {
+	color: var(--text);
+}
+.dbw-tools .btn.on {
+	background: var(--accent-soft);
+	color: var(--accent);
+}
+/* 주 동작 — 실행만 채운 강조색 */
+.dbw-tools .btn.dbw-run {
+	padding: 0 12px 0 10px;
+	margin-right: 4px;
+	background: var(--accent);
+	color: #fff;
+	font-weight: 600;
+}
+.dbw-tools .btn.dbw-run:hover:not(:disabled) {
+	background: color-mix(in srgb, var(--accent) 88%, black);
+	color: #fff;
+}
+.dbw-tools .btn.dbw-cancel {
+	margin-left: 4px;
+	background: color-mix(in srgb, var(--danger) 14%, transparent);
+	color: var(--danger);
+	font-weight: 600;
+}
+.dbw-tools .btn.dbw-cancel:hover {
+	background: color-mix(in srgb, var(--danger) 22%, transparent);
+	color: var(--danger);
+}
+/* 오른쪽 끝 실행 설정 — 조용한 묶음 */
+.dbw-opts {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	margin-left: auto;
+	padding-left: 12px;
+	color: var(--text-3);
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+}
+.dbw-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	height: 22px;
+	padding: 0 8px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text-2);
+	font: inherit;
+	white-space: nowrap;
+	cursor: default;
+}
+.dbw-chip:hover {
+	background: var(--fill);
+	color: var(--text);
+}
+.dbw-chip.on {
+	background: var(--accent-soft);
+	color: var(--accent);
+}
+.dbw-check {
+	display: inline-block;
+	width: 9px;
+	font-size: 10px;
+	text-align: center;
+}
+.dbw-opt {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	padding-left: 4px;
+	white-space: nowrap;
+}
+.dbw-opt .rb-select.sm {
+	border-color: var(--hairline-strong);
+	background: var(--surface);
+	color: var(--text);
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+}
+.dbw-tx {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	margin-right: 6px;
+}
+.dbw-tools .btn.dbw-mini {
+	height: 22px;
+	padding: 0 6px;
+	font-size: 11.5px;
+}
+/* 쿼리 탭 줄 "+" */
+.dbw-tab-add.btn {
+	width: 26px;
+	height: 26px;
+	margin: 4px 0 0 2px;
+	color: var(--text-2);
+}
+
+/* 좁아지면 — 보조 글자 → 설정 글자 → 주 동작 글자 순으로 접고 아이콘만(이름은 title), 더 좁으면 두 줄로 */
+@container (max-width: 1080px) {
+	.dbw-grp + .dbw-sep + .dbw-grp .lbl {
+		display: none;
+	}
+	.dbw-grp + .dbw-sep + .dbw-grp .btn {
+		width: 28px;
+		padding: 0;
+	}
+}
+@container (max-width: 880px) {
+	.dbw-opts .lbl {
+		display: none;
+	}
+	.dbw-sep {
+		margin: 0 4px;
+	}
+}
+@container (max-width: 660px) {
+	.dbw-grp:first-child .lbl:not(.keep) {
+		display: none;
+	}
+	.dbw-grp:first-child .btn:not(.dbw-run):not(.dbw-cancel) {
+		width: 28px;
+		padding: 0;
+	}
+	.dbw-tx .badge {
+		display: none;
+	}
+}
+@container (max-width: 560px) {
+	.dbw-tools-row {
+		height: auto;
+		min-height: 36px;
+		flex-wrap: wrap;
+		row-gap: 2px;
+		padding: 4px 6px;
+	}
+	.dbw-opts {
+		margin-left: 0;
+		padding-left: 0;
+	}
+}
+@container (max-width: 420px) {
+	.dbw-sep {
+		display: none;
+	}
+	.dbw-grp .btn:not(.dbw-run):not(.dbw-cancel) {
+		width: 26px;
+	}
+	.dbw-tools .btn.dbw-run {
+		margin-right: 2px;
+	}
+}
+
+/* 빈 편집기 안내(CodeMirror placeholder) */
+.sql-panel .cm-placeholder {
+	display: block;
+	white-space: normal;
+}
+/* 안내가 줄 하나를 차지해 현재 줄 칠이 회색 판처럼 깔리지 않게 */
+.sql-panel .cm-activeLine:has(.cm-placeholder) {
+	background: transparent;
+}
+.sql-empty {
+	padding: 2px 0 0;
+	max-width: 640px;
+	color: var(--text-3);
+	font-family: var(--font-ui);
+	line-height: 1.6;
+	user-select: none;
+}
+.sql-empty-title {
+	margin-bottom: 10px;
+	color: var(--text-2);
+	font-size: 13px;
+}
+.sql-empty-keys {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+	gap: 6px 18px;
+	font-size: 12px;
+}
+.sql-empty-keys span {
+	white-space: nowrap;
+}
+.sql-empty kbd,
+.msg-empty kbd {
+	display: inline-block;
+	min-width: 18px;
+	margin-right: 3px;
+	padding: 0 5px;
+	border: 0.5px solid var(--hairline-strong);
+	border-radius: 4px;
+	background: var(--surface-2);
+	color: var(--text-2);
+	font: 11px/17px var(--font-mono);
+	text-align: center;
+}
+.msg-empty {
+	max-width: 440px;
+}
+.msg-empty > div + div {
+	margin-top: 6px;
+}
+.sql-empty-tip {
+	margin-top: 12px;
+	font-size: 11.5px;
+}
+
+/*
+ * 도킹 "늘 그림" 칸은 가려질 때 visibility:hidden 으로 숨는데, React Flow 의 노드는
+ * 제 크기를 잰 뒤 visibility:visible 을 직접 달아 숨긴 칸 밖으로 비쳤다(ERD·쿼리 지도가 다른 탭 위에 겹침).
+ */
+.dv-render-overlay[style*="visibility: hidden"] .react-flow * {
+	visibility: hidden !important;
+}

@@ -126,8 +126,12 @@ function Compare({ a, b, actions, onClose, onReplace }: { a: string; b: string; 
 	);
 }
 
-/** 튜닝 도우미 — 정적 검사 · 인덱스 초안 · 실행 계획 규칙을 한 목록으로 */
-export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps; visible: boolean; actions: TuningActions }) {
+/** 쿼리 분석 칸의 진단(구조·정적 검사·실행 계획 규칙) / 인덱스(인덱스 초안) 보기 */
+export type TuningView = "diag" | "index";
+const VIEW_LAYERS: Record<TuningView, Finding["layer"][]> = { diag: ["map", "static"], index: ["index"] };
+
+/** 튜닝 도우미 — 정적 검사 · 인덱스 초안 · 실행 계획 규칙(view 로 진단·인덱스를 나눠 보인다) */
+export function QueryTuningPanel({ deps, visible, actions, view = "diag" }: { deps: AnalyzeDeps; visible: boolean; actions: TuningActions; view?: TuningView }) {
 	const { state, refresh } = useAnalysis(deps, visible);
 	const snap = state.snap;
 	const snapRef = useRef(snap);
@@ -147,7 +151,8 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 	}, [conn, snap, planTick]);
 	const planList = useMemo(() => (plan ? planFindings(plan.ok) : []), [plan]);
 
-	const findings = snap?.findings ?? [];
+	const findings = useMemo(() => (snap?.findings ?? []).filter((f) => VIEW_LAYERS[view].includes(f.layer)), [snap?.findings, view]);
+	const showPlan = view === "diag";
 	const replaceInEditor = (text: string) => {
 		const v = currentView(conn);
 		if (!v || !cmp) return;
@@ -208,10 +213,10 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 	return (
 		<div className="panel-fill tuning-panel">
 			<div className="tn-body selectable">
-				{!snap && <div className="panel-hint">{state.off ?? "SQL 편집기에서 쿼리를 치면 튜닝 지적이 여기에 모입니다"}</div>}
+				{!snap && <div className="panel-hint">{state.off ?? (showPlan ? "SQL 편집기에서 쿼리를 치면 진단(구조·정적 검사·실행 계획 규칙)이 여기에 모입니다" : "SQL 편집기에서 쿼리를 치면 WHERE·JOIN·ORDER 열에 맞춘 인덱스 초안이 여기에 모입니다")}</div>}
 				{snap?.stale && <div className="tn-stale">치는 중 — 마지막으로 읽은 문장의 지적입니다</div>}
 				{snap &&
-					LAYERS.map((l) => {
+					LAYERS.filter((l) => VIEW_LAYERS[view].includes(l.key)).map((l) => {
 						const list = findings.filter((f) => f.layer === l.key);
 						if (!list.length) return null;
 						return (
@@ -223,7 +228,7 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 							</section>
 						);
 					})}
-				{snap && (
+				{snap && showPlan && (
 					<section>
 						<h4>
 							실행 계획 <small>{plan ? planList.length : ""}</small>
@@ -252,10 +257,10 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 						)}
 					</section>
 				)}
-				{snap && !findings.length && !state.busy && <div className="panel-hint">지적할 것이 없습니다.</div>}
+				{snap && !findings.length && !state.busy && <div className="panel-hint">{showPlan ? "지적할 것이 없습니다." : "제안할 인덱스가 없습니다 — 조건·조인 열에 맞는 인덱스가 이미 있거나, 이 엔진은 인덱스 목록을 읽지 못합니다."}</div>}
 			</div>
 			<div className="statusbar">
-				<span>{snap ? `지적 ${findings.length + planList.length}개` : ""}</span>
+				<span>{snap ? (showPlan ? `지적 ${findings.length + planList.length}개` : `초안 ${findings.length}개`) : ""}</span>
 				{snap?.note && <span title={snap.note}>{snap.note}</span>}
 				{state.busy && <span>맞추는 중…</span>}
 				<span style={{ marginLeft: "auto" }} title="SQL·스키마를 밖으로 보내지 않습니다 — 검사는 이 PC 에서, 메타데이터는 표마다 한 번만 읽어 둡니다">

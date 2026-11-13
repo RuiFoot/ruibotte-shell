@@ -237,6 +237,9 @@ class Analyzer {
 	}
 
 	attach(id: symbol, visible: boolean, cb: (s: State) => void) {
+		// 모든 칸이 잠깐 떨어졌다 다시 붙으면(칸 다시 그리기·StrictMode) 지도에서 빠진 채 남아,
+		// 뒤에 붙는 칸이 새 분석기를 만들어 서로 다른 문장을 보였다 — 다시 붙을 때 자리를 되찾는다
+		if (!analyzers.has(this.deps.conn)) analyzers.set(this.deps.conn, this);
 		this.consumers.set(id, { visible, cb });
 		this.wire();
 		cb(this.state);
