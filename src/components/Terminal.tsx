@@ -88,6 +88,7 @@ export function TerminalView({
 	shellOptions,
 	onShellChange,
 	onSplit,
+	onMaximize,
 	onRootShell,
 	statusExtra,
 	onRecording,
@@ -123,6 +124,8 @@ export function TerminalView({
 	onShellChange?: (id: string) => void;
 	/** 우클릭 › 오른쪽·아래로 나누기(작업대가 옆에 새 터미널 칸) */
 	onSplit?: (dir: "right" | "below") => void;
+	/** 우클릭 › 이 칸 최대화·되돌리기(Alt+M) */
+	onMaximize?: () => void;
 	/** 원격: 우클릭 › root 셸로(sudo -i)·나오기 */
 	onRootShell?: (on: boolean) => void;
 	/** 상태 줄 오른쪽에 덧붙일 것(원격: 작은 자원 표시) */
@@ -145,6 +148,8 @@ export function TerminalView({
 	const [wide, setWide] = useState(false);
 	const wideRef = useRef(false);
 	const refitRef = useRef<() => void>(() => {});
+	/** WebGL 렌더러 다시 붙이기(문맥을 잃은 터미널이 다시 앞에 올 때) */
+	const webglRetryRef = useRef<() => void>(() => {});
 	const termRef = useRef<XTerm | null>(null);
 	const fitRef = useRef<FitAddon | null>(null);
 	const searchRef = useRef<SearchAddon | null>(null);
@@ -434,13 +439,27 @@ export function TerminalView({
 			if (copyOnSelect && term.hasSelection()) void copyRef.current(term.getSelection());
 		};
 		el.addEventListener("mouseup", onSelUp);
-		try {
-			const webgl = new WebglAddon();
-			webgl.onContextLoss(() => webgl.dispose());
-			term.loadAddon(webgl);
-		} catch {
-			// WebGL 이 안 되는 GPU 는 xterm 기본 렌더러로
-		}
+		// WebGL 렌더러 — 문맥을 잃으면(GPU 재설정·절전 복귀) DOM 렌더러로 두었다가 터미널이 다시 앞에 오면 한 번 더 붙여 본다. 3번 잃으면 포기
+		let webgl: WebglAddon | null = null;
+		let webglFails = 0;
+		const attachWebgl = () => {
+			if (webgl || webglFails >= 3) return;
+			try {
+				const w = new WebglAddon();
+				w.onContextLoss(() => {
+					w.dispose();
+					if (webgl === w) webgl = null;
+					webglFails++;
+				});
+				term.loadAddon(w);
+				webgl = w;
+			} catch {
+				// WebGL 이 안 되는 GPU 는 xterm 기본 렌더러로
+				webglFails = 3;
+			}
+		};
+		attachWebgl();
+		webglRetryRef.current = attachWebgl;
 		void api.settingGet("term.scrollback").then((v) => {
 			const n = Number(v);
 			if (n >= 1000 && n <= 200000) term.options.scrollback = n;
@@ -849,6 +868,10 @@ export function TerminalView({
 			return true;
 		};
 		const onResize = term.onResize(({ cols, rows }) => {
+			// 열 수가 바뀌면 칸 너비 캐시(줄 바꾸지 않기 모드의 커서 따라가기)를 DOM 이 갱신된 뒤 다시 잰다
+			requestAnimationFrame(() => {
+				cwKey = "";
+			});
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
 		term.attachCustomKeyEventHandler((e) => {
@@ -981,14 +1004,22 @@ export function TerminalView({
 		};
 		el.addEventListener("wheel", onWheelX, { capture: true, passive: false });
 		let keyAt = 0;
+		let cwKey = "";
+		let cwPx = 0;
 		const onKeyAt = term.onData(() => {
 			keyAt = performance.now();
 		});
 		const onCur = term.onCursorMove(() => {
 			if (!wideRef.current || performance.now() - keyAt > 600) return;
-			const screen = el.querySelector(".xterm-screen") as HTMLElement | null;
-			if (!screen || !term.cols) return;
-			const cw = screen.offsetWidth / term.cols;
+			// 칸 너비는 캐시 — 커서가 움직일 때마다 offsetWidth 를 읽으면 강제 레이아웃이 걸린다(칸 크기·열 수·글자 크기가 바뀌면 다시 잰다)
+			const key = `${term.cols}|${term.options.fontSize}|${term.options.fontFamily}|${term.options.letterSpacing}`;
+			if (cwKey !== key) {
+				const screen = el.querySelector(".xterm-screen") as HTMLElement | null;
+				if (!screen || !term.cols) return;
+				cwKey = key;
+				cwPx = screen.offsetWidth / term.cols;
+			}
+			const cw = cwPx;
 			const x = term.buffer.active.cursorX * cw;
 			const pad = cw * 4;
 			if (x < el.scrollLeft + pad) el.scrollLeft = Math.max(0, x - pad);
@@ -998,6 +1029,7 @@ export function TerminalView({
 		const ro = new ResizeObserver(() => {
 			window.clearTimeout(fitTimer);
 			fitTimer = window.setTimeout(() => {
+				cwKey = "";
 				if (!disposed && el.offsetWidth > 0 && el.offsetHeight > 0) refit();
 			}, 80);
 		});
@@ -1059,6 +1091,7 @@ export function TerminalView({
 			unLook();
 			void unlisten.then((f) => f());
 			ro.disconnect();
+			webglRetryRef.current = () => {};
 			el.removeEventListener("wheel", onWheelX, { capture: true });
 			onKeyAt.dispose();
 			onCur.dispose();
@@ -1074,7 +1107,9 @@ export function TerminalView({
 	useEffect(() => {
 		if (active) {
 			requestAnimationFrame(() => {
-				fitRef.current?.fit();
+				// 줄 바꾸지 않기(wide)면 열 수를 넉넉히 두는 분기가 있는 refit — fit() 으로 부르면 Alt+Z 가 풀린다
+				refitRef.current();
+				webglRetryRef.current();
 				termRef.current?.focus();
 			});
 		}
@@ -1212,13 +1247,14 @@ export function TerminalView({
 		{ sep: true },
 		{ label: encoding === "UTF-8" ? "인코딩: EUC-KR 로" : "인코딩: UTF-8 로", run: () => changeEncoding(encoding === "UTF-8" ? "EUC-KR" : "UTF-8") },
 		{ label: "셸 다시 열기", run: () => setGen((g) => g + 1) },
-		...(onSplit || onRootShell ? ([{ sep: true }] as MenuItem[]) : []),
+		...(onSplit || onMaximize || onRootShell ? ([{ sep: true }] as MenuItem[]) : []),
 		...(onSplit
 			? ([
-					{ label: "오른쪽으로 나누기", run: () => onSplit("right") },
-					{ label: "아래로 나누기", run: () => onSplit("below") },
+					{ label: "오른쪽으로 나누기  Alt+Shift+=", run: () => onSplit("right") },
+					{ label: "아래로 나누기  Alt+Shift+-", run: () => onSplit("below") },
 				] as MenuItem[])
 			: []),
+		...(onMaximize ? ([{ label: "이 칸 최대화·되돌리기  Alt+M", run: onMaximize }] as MenuItem[]) : []),
 		...(onRootShell ? [root ? { label: "root 셸에서 나오기", run: () => onRootShell(false) } : { label: "root 셸로(sudo -i)", danger: true, run: () => onRootShell(true) }] : []),
 	];
 
