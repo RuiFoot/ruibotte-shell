@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::comments::{Comment, CommentWithSpan};
 use sqlparser::ast::{
-    BinaryOperator, CastKind, Cte, Distinct, Expr, Function, GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderBy, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias, TableFactor, TableWithJoins, UnaryOperator,
+    BinaryOperator, CastKind, Cte, Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, OrderBy, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias, TableFactor, TableWithJoins, UnaryOperator,
     Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::{Dialect, GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect};
@@ -384,6 +384,43 @@ fn fn_name(f: &Function) -> String {
     f.name.0.last().and_then(ObjectNamePart::as_ident).map(|i| lc(&i.value)).unwrap_or_default()
 }
 
+/// 첫 인자가 날짜 단위 낱말인 함수 — DATEADD(day, …)·TIMESTAMPDIFF(MONTH, …) 의 그 낱말은 열이 아니다(별칭을 붙이면 안 된다).
+/// EXTRACT(YEAR FROM …)·INTERVAL 1 DAY 는 파서가 단위를 따로 읽어 식(열)으로 오지 않는다
+const DATE_UNIT_FNS: &[&str] = &["dateadd", "datediff", "datediff_big", "datepart", "datename", "datetrunc", "date_bucket", "timestampadd", "timestampdiff"];
+
+/// 날짜 단위 함수의 첫 인자(한정 안 된 낱말)
+fn unit_arg(e: &Expr) -> Option<&Expr> {
+    let Expr::Function(f) = e else { return None };
+    if !DATE_UNIT_FNS.contains(&fn_name(f).as_str()) {
+        return None;
+    }
+    let FunctionArguments::List(l) = &f.args else { return None };
+    match l.args.first()? {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(a)) if matches!(a, Expr::Identifier(_)) => Some(a),
+        _ => None,
+    }
+}
+
+/// 날짜 단위 함수의 첫 인자 자리(고치기용)
+fn unit_slot(e: &mut Expr) -> Option<&mut Expr> {
+    let Expr::Function(f) = e else { return None };
+    if !DATE_UNIT_FNS.contains(&fn_name(f).as_str()) {
+        return None;
+    }
+    let FunctionArguments::List(l) = &mut f.args else { return None };
+    match l.args.first_mut()? {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(a)) => Some(a),
+        _ => None,
+    }
+}
+
+/// 식을 고치며 걷는 동안 단위 낱말을 잠시 맡겨 두는 자리표(고치기 함수가 열로 보지 않게)
+const UNIT_HOLD: &str = "__rb_unit_hold__";
+
+fn is_unit_hold(e: &Expr) -> bool {
+    matches!(e, Expr::Value(v) if matches!(&v.value, Value::Placeholder(p) if p == UNIT_HOLD))
+}
+
 const AGGS: &[&str] = &[
     "count", "sum", "avg", "min", "max", "group_concat", "string_agg", "array_agg", "listagg", "stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp", "bit_and", "bit_or",
     "bit_xor", "bool_and", "bool_or", "every", "json_agg", "jsonb_agg", "json_arrayagg", "json_objectagg", "median", "percentile_cont", "percentile_disc", "mode", "any_value", "count_big",
@@ -421,6 +458,8 @@ struct Scan {
     window: bool,
     impure: bool,
     outer_join: bool,
+    /// 날짜 단위 낱말 자리(열 참조로 세지 않는다)
+    units: Vec<*const Expr>,
 }
 
 impl Visitor for Scan {
@@ -435,7 +474,11 @@ impl Visitor for Scan {
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Some(a) = unit_arg(e) {
+            self.units.push(a as *const Expr);
+        }
         match e {
+            Expr::Identifier(_) if self.units.iter().any(|p| std::ptr::eq(*p, e)) => {}
             Expr::Identifier(i) => self.refs.push(CRef { parts: vec![i.clone()], depth: self.depth, marked: self.outer > 0 }),
             Expr::CompoundIdentifier(v) => self.refs.push(CRef { parts: v.clone(), depth: self.depth, marked: self.outer > 0 }),
             Expr::OuterJoin(_) => {
@@ -475,6 +518,8 @@ fn scan<V: Visit>(v: &V) -> Scan {
 struct ExprMut<F: FnMut(&mut Expr, usize)> {
     depth: usize,
     f: F,
+    /// 맡겨 둔 날짜 단위 낱말
+    held: Vec<Ident>,
 }
 
 impl<F: FnMut(&mut Expr, usize)> VisitorMut for ExprMut<F> {
@@ -489,12 +534,30 @@ impl<F: FnMut(&mut Expr, usize)> VisitorMut for ExprMut<F> {
     }
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
         (self.f)(e, self.depth);
+        // 날짜 단위 낱말은 고치기 함수에 보이지 않게 맡겨 두었다가 함수를 다 걸은 뒤 되돌린다
+        if let Some(a) = unit_slot(e) {
+            if matches!(a, Expr::Identifier(_)) {
+                if let Expr::Identifier(i) = std::mem::replace(a, Expr::Value(Value::Placeholder(UNIT_HOLD.into()).with_empty_span())) {
+                    self.held.push(i);
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+    fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if let Some(a) = unit_slot(e) {
+            if is_unit_hold(a) {
+                if let Some(i) = self.held.pop() {
+                    *a = Expr::Identifier(i);
+                }
+            }
+        }
         ControlFlow::Continue(())
     }
 }
 
 fn each_expr_mut<V: VisitMut, F: FnMut(&mut Expr, usize)>(v: &mut V, f: F) {
-    let mut w = ExprMut { depth: 0, f };
+    let mut w = ExprMut { depth: 0, f, held: vec![] };
     let _ = v.visit(&mut w);
 }
 

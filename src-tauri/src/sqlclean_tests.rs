@@ -336,6 +336,23 @@ fn qualify_columns_with_meta() {
 }
 
 #[test]
+fn qualify_leaves_date_unit_words() {
+    // 단위 낱말(day·MONTH)과 같은 이름의 열이 있어도 단위 자리는 한정하지 않는다
+    let m = meta(&[("orders", &["id", "day", "reg_dt", "cust_id"], &["id"]), ("customer", &["id", "name", "joined"], &["id"])]);
+    let r = run_meta("SELECT name, DATEADD(day, 1, reg_dt) AS due FROM orders o JOIN customer c ON o.cust_id = c.id", "mssql", &m);
+    same(&r, "mssql", "SELECT c.name, DATEADD(day, 1, o.reg_dt) AS due FROM orders o JOIN customer c ON o.cust_id = c.id");
+    let m = meta(&[("orders", &["id", "month", "reg_dt", "cust_id"], &["id"]), ("customer", &["id", "name", "joined"], &["id"])]);
+    let r = run_meta("SELECT name, TIMESTAMPDIFF(MONTH, joined, reg_dt) AS m FROM orders o JOIN customer c ON o.cust_id = c.id", "mysql", &m);
+    same(&r, "mysql", "SELECT c.name, TIMESTAMPDIFF(MONTH, c.joined, o.reg_dt) AS m FROM orders o JOIN customer c ON o.cust_id = c.id");
+    let r = run_meta(
+        "SELECT name, EXTRACT(YEAR FROM joined) AS y FROM orders o JOIN customer c ON o.cust_id = c.id WHERE reg_dt > joined + INTERVAL 1 DAY",
+        "mysql",
+        &m,
+    );
+    same(&r, "mysql", "SELECT c.name, EXTRACT(YEAR FROM c.joined) AS y FROM orders o JOIN customer c ON o.cust_id = c.id WHERE o.reg_dt > c.joined + INTERVAL 1 DAY");
+}
+
+#[test]
 fn qualify_then_comma_join_moves_more() {
     let m = meta(&[("article", &["post_id", "board_id", "title"], &["post_id"]), ("board_master", &["board_id", "board_nm"], &["board_id"])]);
     let r = run_meta("SELECT title, board_nm FROM article a, board_master m WHERE a.board_id = m.board_id AND title LIKE '%공지%'", "mysql", &m);
