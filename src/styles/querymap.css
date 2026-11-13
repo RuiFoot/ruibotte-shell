@@ -516,6 +516,38 @@
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+/* 상태 막대 — 좁으면 도움말부터 줄이고, 방향 스위치는 아이콘만 */
+.qmap-panel > .statusbar {
+	container-type: inline-size;
+}
+.qmap-panel > .statusbar > .qf-hint {
+	flex: 0 1 auto;
+	min-width: 0;
+}
+.qm-dir {
+	flex: none;
+}
+.qm-dir button {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	height: 18px;
+	padding: 0 8px;
+	line-height: 1;
+}
+@container (max-width: 640px) {
+	.qm-dir .qm-dir-l {
+		display: none;
+	}
+	.qm-dir button {
+		padding: 0 6px;
+	}
+}
+@container (max-width: 480px) {
+	.qmap-panel > .statusbar > .qf-hint {
+		display: none;
+	}
+}
 .qm-warns {
 	display: flex;
 	flex-wrap: wrap;

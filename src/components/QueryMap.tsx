@@ -1,9 +1,10 @@
 import { Background, ControlButton, Controls, type Edge, Handle, MarkerType, type Node, type NodeProps, Position, ReactFlow, type ReactFlowInstance } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "../styles/querymap.css";
-import { AlertTriangle, ArrowDownWideNarrow, ArrowRightLeft, ChevronDown, Combine, CopyMinus, Funnel, GitMerge, Info, ListTree, Maximize, RefreshCw, Sheet, Sigma, SquareFunction, Stethoscope, Table2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowDownWideNarrow, ArrowRight, ChevronDown, Combine, CopyMinus, Funnel, GitMerge, Info, ListTree, Maximize, RefreshCw, Sheet, Sigma, SquareFunction, Stethoscope, Table2, WandSparkles } from "lucide-react";
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ColMeta } from "../lib/edits";
+import { api } from "../lib/ipc";
 import { type AnalyzeDeps, type Snapshot, useAnalysis } from "../lib/queryAnalysis";
 import type { Finding, MapIn, MapOut, Pos, QueryMap } from "../lib/queryLint";
 import { currentView, markEditor, subscribeEditor } from "../lib/queryWatch";
@@ -1259,6 +1260,15 @@ function draw(prep: Prepared, horizontal: boolean): Drawn {
 }
 
 const mapWarnsOf = (snap: Snapshot) => snap.findings.filter((f) => f.layer === "map");
+/** 흐름 방향 — 자동은 칸 모양에 더 크게 들어가는 쪽 */
+type Dir = "auto" | "h" | "v";
+const DIR_KEY = "querymap.dir";
+const DIRS: [Dir, typeof Table2, string, string][] = [
+	["auto", WandSparkles, "자동", "흐름 방향 자동(칸 모양 따라)"],
+	["v", ArrowDown, "위→아래", "흐름 방향 위 → 아래(결과가 아래)"],
+	["h", ArrowRight, "왼→오른", "흐름 방향 왼쪽 → 오른쪽(결과가 오른쪽)"],
+];
+
 /** 강조한 선 끝의 화살표 — 색은 칸의 --qf-lit(역방향 주황 · 정방향 파랑)를 따른다 */
 const LIT_ARROW = { type: MarkerType.ArrowClosed, color: "var(--qf-lit)", width: 11, height: 11 } as const;
 
@@ -1379,7 +1389,20 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	const host = useRef<HTMLDivElement>(null);
 	const conn = deps.conn;
 	const [size, setSize] = useState({ w: 0, h: 0 });
-	const [dirPref, setDirPref] = useState<"auto" | "h" | "v">("auto");
+	const [dirPref, setDirPref] = useState<Dir>("auto");
+	// 고른 방향은 기억한다(기본 자동)
+	useEffect(() => {
+		let live = true;
+		void api
+			.settingGet(DIR_KEY)
+			.then((v) => {
+				if (live && (v === "auto" || v === "h" || v === "v")) setDirPref(v);
+			})
+			.catch(() => {});
+		return () => {
+			live = false;
+		};
+	}, []);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 구조·글이 바뀔 때만 다시 만든다
 	const prep = useMemo(() => (snap ? prepare(snap, mapWarnsOf(snap)) : null), [snap?.shape, snap?.stmt.text, snap?.findings.length]);
 	// 자동 — 칸에 더 크게 들어가는 방향(비슷하면 가로)
@@ -1442,6 +1465,17 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 		const y = hz ? H / 2 - (r.y + r.h / 2) * zr : H - pad - (r.y + r.h) * zr;
 		void inst.setViewport({ zoom: zr, x, y });
 	}, []);
+
+	/** 방향 고르기 — 기억하고, 같은 방향으로 풀려도 화면은 다시 맞춘다 */
+	const chooseDir = useCallback(
+		(d: Dir) => {
+			setDirPref(d);
+			void api.settingSet(DIR_KEY, d).catch(() => {});
+			moved.current = false;
+			requestAnimationFrame(() => requestAnimationFrame(fit));
+		},
+		[fit],
+	);
 
 	// 크기 — 숨었다 보이면(0 → N) 다시 맞춘다, 가로·세로 흐름도 여기서 고른다
 	useLayoutEffect(() => {
@@ -1693,16 +1727,14 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 				{state.busy && <span>맞추는 중…</span>}
 				<span style={{ marginLeft: "auto" }} />
 				{snap && snap.map.dialect === "generic" && deps.engine !== "cubrid" && deps.engine !== "altibase" && <span title="엔진 방언이 못 읽어 일반 방언으로 읽었습니다">일반 방언</span>}
-				<button
-					type="button"
-					className="btn ghost"
-					style={{ height: 20 }}
-					onClick={() => setDirPref((d) => (d === "auto" ? (horizontal ? "v" : "h") : d === "h" ? "v" : "auto"))}
-					title={`흐름 방향 — ${dirPref === "auto" ? "칸 모양 따라" : dirPref === "h" ? "왼쪽 → 오른쪽" : "위 → 아래"} (누르면 바꾼다)`}
-				>
-					<ArrowRightLeft size={12} style={horizontal ? undefined : { transform: "rotate(90deg)" }} />
-					{dirPref === "auto" ? "자동" : horizontal ? "가로" : "세로"}
-				</button>
+				<div className="seg tiny qm-dir" role="group" aria-label="흐름 방향">
+					{DIRS.map(([k, Icon, label, tip]) => (
+						<button key={k} type="button" aria-pressed={dirPref === k} onClick={() => chooseDir(k)} title={k === "auto" ? `${tip} — 지금 ${horizontal ? "왼→오른" : "위→아래"}` : tip} aria-label={label}>
+							<Icon size={12} />
+							<span className="qm-dir-l">{label}</span>
+						</button>
+					))}
+				</div>
 				<button type="button" className="btn ghost" style={{ height: 20 }} onClick={onTuning} title="정적 검사·인덱스 초안·실행 계획 규칙">
 					<Stethoscope size={12} /> 튜닝{others ? ` ${others}` : ""}
 				</button>
