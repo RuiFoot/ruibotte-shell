@@ -82,8 +82,13 @@ export function useSetting(key: string, def: string): [string, (v: string) => vo
 	const [v, setV] = useState(def);
 	useEffect(() => {
 		let alive = true;
-		void api.settingGet(key).then((x) => alive && x && setV(x));
-		const off = onSettingLive([key], (_, x) => setV(x || def));
+		// 읽기가 오기 전에 다른 화면에서 바뀌면 그 값이 더 새것 — 늦게 온 읽기로 덮지 않는다
+		let touched = false;
+		void api.settingGet(key).then((x) => alive && !touched && x && setV(x));
+		const off = onSettingLive([key], (_, x) => {
+			touched = true;
+			setV(x || def);
+		});
 		return () => {
 			alive = false;
 			off();

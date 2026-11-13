@@ -204,11 +204,11 @@ export function SshPage({ onOpen }: PageProps) {
 /** 설정 › 단축키 — 작업대 F1 도움말과 같은 목록(읽기 전용) */
 export function ShortcutsPage(_: PageProps) {
 	const mac = document.documentElement.dataset.os === "macos";
-	const rows = shortcutRows(mac, false);
+	const rows = shortcutRows(mac);
 	const groups: { title: string; items: [string, string, number][] }[] = [];
 	rows.forEach(([k, v], i) => {
 		if (!v) groups.push({ title: k, items: [] });
-		else groups[groups.length - 1]?.items.push([k, v.replace(/ — 지금.*$/, ""), i]);
+		else groups[groups.length - 1]?.items.push([k, v, i]);
 	});
 	return (
 		<>

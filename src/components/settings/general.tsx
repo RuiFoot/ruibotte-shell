@@ -31,7 +31,8 @@ function useUpdateLabel() {
 export function GeneralPage({ say }: PageProps) {
 	const { u, label } = useUpdateLabel();
 	const [autoRestore, setAutoRestore] = useSetting("session.autoRestore", "0");
-	const [autostart, setAutostart] = useState<boolean | null>(null);
+	/** undefined: 읽는 중 · null: 이 환경에서 못 읽음(눌러 보면 실패 글을 보인다 — 지난 판과 같이) */
+	const [autostart, setAutostart] = useState<boolean | null | undefined>(undefined);
 	useEffect(() => {
 		autostartIsOn()
 			.then(setAutostart)
@@ -53,7 +54,7 @@ export function GeneralPage({ say }: PageProps) {
 					<Toggle
 						on={!!autostart}
 						label="로그인할 때 자동 실행"
-						disabled={autostart === null}
+						disabled={autostart === undefined}
 						onChange={async (v) => {
 							try {
 								if (v) await autostartOn();

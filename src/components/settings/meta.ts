@@ -204,13 +204,13 @@ function buildIndex(): Entry[] {
 	const sc = catOf("shortcuts") as Cat;
 	const mac = document.documentElement.dataset.os === "macos";
 	let sec = "";
-	shortcutRows(mac, false).forEach(([k, v], i) => {
+	shortcutRows(mac).forEach(([k, v], i) => {
 		if (!v) {
 			sec = k;
 			return;
 		}
 		const id = `shortcut.${i}`;
-		add(id, `shortcuts#${id}`, sc, v.replace(/ — 지금.*$/, ""), `단축키 › ${sec} · ${k}`, k);
+		add(id, `shortcuts#${id}`, sc, v, `단축키 › ${sec} · ${k}`, k);
 	});
 	return out;
 }

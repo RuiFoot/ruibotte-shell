@@ -1,8 +1,8 @@
 /**
  * 단축키 모음 — 작업대 F1 도움말과 설정 › 단축키가 함께 쓴다.
- * [키, 설명] — 설명이 비면 묶음 머리글.
+ * [키, 설명] — 설명이 비면 묶음 머리글. locked 를 주면(작업대) 배치 잠금 줄에 지금 상태를 붙인다.
  */
-export function shortcutRows(mac: boolean, locked: boolean): [string, string][] {
+export function shortcutRows(mac: boolean, locked?: boolean): [string, string][] {
 	return [
 		["앱", ""],
 		[mac ? "⌘⇧P" : "Ctrl+Shift+P", "명령 팔레트 — 서버·탭·작업대 동작·설정을 한 칸에서 찾아 실행(초성도)"],
@@ -18,7 +18,7 @@ export function shortcutRows(mac: boolean, locked: boolean): [string, string][] 
 		["Alt+Shift+← ↑ → ↓", "칸 사이 이동(편집기 안에서는 편집기 몫이라 Alt+1·2·3 으로)"],
 		["Alt+M", "초점이 있는 칸 최대화 · 되돌리기"],
 		["Ctrl+Shift+F", "파일 내용 찾기(grep — 결과를 누르면 그 줄로). 터미널 안에서는 터미널 찾기"],
-		["Ctrl+Alt+L", `배치 잠그기·풀기 — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`],
+		["Ctrl+Alt+L", `배치 잠그기·풀기${locked === undefined ? "" : ` — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`}`],
 		["F1", "이 도움말(터미널 안에서는 셸 프로그램 몫 — 명령 팔레트에서 '단축키')"],
 		["파일 트리", ""],
 		["↑ ↓ ← → · Enter", "옮기기 · 접고 펴기 · 열기"],

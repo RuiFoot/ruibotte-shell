@@ -72,6 +72,8 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 	/** 그린 뒤 할 일 — 줄 강조·초점 */
 	const after = useRef<{ flash?: string; focus?: "content" | "search" | `row:${string}` | `cat:${string}`; top?: boolean } | null>(null);
 	const [seq, setSeq] = useState(0);
+	/** 그린 뒤 할 일의 차례 — 늦게 도는 찾기·강조 지우기가 다음 이동을 건드리지 않게 */
+	const gen = useRef(0);
 	const bump = () => setSeq((n) => n + 1);
 
 	const hits = useMemo(() => (q.trim() ? searchSettings(q) : null), [q]);
@@ -105,9 +107,16 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 	useLayoutEffect(() => {
 		const el = root.current;
 		if (!el) return;
+		// 처음 잰 폭이 좁으면 범주 목록부터(iOS), 넓게 보다가 좁아지면 보던 본문 그대로
+		let was: boolean | null = null;
 		const ro = new ResizeObserver(([e]) => {
 			const w = e.contentRect.width;
-			if (w > 0) setNarrow(w < NARROW_PX);
+			if (w <= 0) return;
+			const n = w < NARROW_PX;
+			if (n === was) return;
+			if (n && was === false) setListMode(false);
+			was = n;
+			setNarrow(n);
 		});
 		ro.observe(el);
 		return () => ro.disconnect();
@@ -119,6 +128,7 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 		const job = after.current;
 		if (!job) return;
 		after.current = null;
+		const my = ++gen.current;
 		const main = mainRef.current;
 		if (job.top && main) main.scrollTop = 0;
 		if (job.focus === "search") return void searchRef.current?.focus();
@@ -130,13 +140,17 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 		let tries = 0;
 		// 값을 읽어 와야 보이는 줄(예: 켜야 나오는 받기 폴더)이 있어 몇 번 더 찾아본다
 		const find = () => {
+			if (my !== gen.current) return;
 			const el = main?.querySelector<HTMLElement>(`[data-set-id="${CSS.escape(target)}"]`);
 			if (!el) {
 				if (++tries < 6) window.setTimeout(find, 80);
+				else if (main) main.scrollTop = 0; // 지금은 안 보이는 줄(켜야 나오는 줄 등) — 범주 맨 위로
 				return;
 			}
 			const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+			// 강조할 줄은 가운데로, 뒤로 와서 초점만 돌려주는 줄은 보이게만
 			if (flash) el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+			else el.scrollIntoView({ block: "nearest" });
 			const ctl = el.matches("button") ? el : el.querySelector<HTMLElement>(FOCUSABLE);
 			ctl?.focus({ preventScroll: true });
 			if (flash) {
@@ -157,10 +171,11 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 			bump();
 		} else if (narrow) {
 			setListMode(true);
-			after.current = { focus: `cat:${cat}` };
+			// 검색 중이면 사이드바는 결과 목록이라 범주 단추가 없다 — 검색 칸으로
+			after.current = { focus: q.trim() ? "search" : `cat:${cat}` };
 			bump();
 		}
-	}, [sub, cat, narrow]);
+	}, [sub, cat, narrow, q]);
 
 	// ⌘F · Ctrl+F — 설정 화면이 보일 때만 검색 칸으로
 	useEffect(() => {
@@ -170,7 +185,7 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 			if (!mod || e.shiftKey || e.altKey || e.code !== "KeyF") return;
 			if (!root.current || root.current.offsetParent === null || document.querySelector(".scrim")) return;
 			e.preventDefault();
-			setListMode(true);
+			if (root.current.classList.contains("narrow")) setListMode(true);
 			after.current = { focus: "search" };
 			bump();
 			searchRef.current?.focus();
@@ -237,8 +252,11 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 	};
 
 	const onMainKey = (e: KeyboardEvent<HTMLElement>) => {
-		if (e.key !== "Escape" || e.defaultPrevented) return;
+		if (e.key !== "Escape" || e.defaultPrevented || e.nativeEvent.isComposing) return;
 		if (!sub && !narrow) return;
+		// 글을 치던 칸이면 Esc 로 화면을 떠나 쓰던 글을 잃지 않게
+		const t = e.target as HTMLElement;
+		if ((t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) && t.value) return;
 		e.preventDefault();
 		back();
 	};
@@ -264,6 +282,9 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 		<div className={`stg${narrow ? " narrow" : ""}`} ref={root}>
 			{showSide && (
 				<aside className="stg-side" aria-label="설정">
+					<p className="stg-sr" role="status">
+						{hits ? (hits.length ? `결과 ${hits.length}개` : "결과 없음") : ""}
+					</p>
 					<div className="stg-search">
 						<Search size={13} aria-hidden />
 						<input
@@ -272,7 +293,7 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 							value={q}
 							placeholder="검색"
 							aria-label="설정 검색"
-							aria-controls="stg-hits"
+							aria-controls={hits ? "stg-hits" : undefined}
 							spellCheck={false}
 							onChange={(e) => setQ(e.target.value)}
 							onKeyDown={onSearchKey}
@@ -285,9 +306,6 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 					</div>
 					{hits ? (
 						<div className="stg-hits" id="stg-hits" onKeyDown={onHitKey}>
-							<p className="stg-sr" role="status">
-								{hits.length ? `결과 ${hits.length}개` : "결과 없음"}
-							</p>
 							{hits.length === 0 && <p className="stg-none">“{q.trim()}” 에 맞는 설정이 없습니다</p>}
 							{hits.map((h) => (
 								<button key={h.id} type="button" className="stg-hit" onClick={() => navigate(h.path, "content")}>

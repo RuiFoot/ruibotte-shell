@@ -155,9 +155,9 @@ export function noteCommandRun(id: string) {
  * 경로: "terminal" · "terminal/log"(하위 화면) · "general#update.auto"(그 줄을 잠깐 강조) · "terminal/log#term.log.auto"
  */
 export type SettingsSection = string;
-/** 명령 팔레트의 "설정 › …" — id 는 지난 판 명령 id(settings.<id>, 최근 실행 목록)와 맞춘다 */
+/** 명령 팔레트의 "설정 › …" — 지난 판에 있던 자리는 id(settings.<id>, 최근 실행 목록)를 그대로 둔다(시작→일반, 문제 해결→정보). 옛 settings.update 는 따로 있는 "업데이트 확인" 명령이 맡는다 */
 export const SETTINGS_SECTIONS: { id: string; path: SettingsSection; label: string; keywords: string }[] = [
-	{ id: "general", path: "general", label: "일반(시작·업데이트)", keywords: "시작 자동 실행 autostart 지난 연결 복원 update" },
+	{ id: "start", path: "general", label: "일반(시작·업데이트)", keywords: "시작 자동 실행 autostart 지난 연결 복원 update" },
 	{ id: "appearance", path: "appearance", label: "모양(테마·색·글꼴)", keywords: "화면 테마 다크 밝게 어둡게 색 구성 글꼴 폰트 theme font color" },
 	{ id: "shortcuts", path: "shortcuts", label: "단축키", keywords: "키 shortcut keyboard" },
 	{ id: "terminal", path: "terminal", label: "터미널", keywords: "셸 자동완성 tab 스크롤백 ctrl+v 붙여넣기 복사" },
@@ -167,7 +167,7 @@ export const SETTINGS_SECTIONS: { id: string; path: SettingsSection; label: stri
 	{ id: "files", path: "files", label: "파일·전송", keywords: "rz sz zmodem 받기 폴더" },
 	{ id: "db", path: "db", label: "데이터베이스", keywords: "db sql limit 쓰기 확인 시간 상한 정렬" },
 	{ id: "ssh", path: "ssh", label: "SSH·보안", keywords: "키 호스트 키 known_hosts 경로 가져오기 모니터" },
-	{ id: "about", path: "about", label: "정보", keywords: "버전 문제 보고 릴리스 라이선스 데이터 폴더" },
+	{ id: "help", path: "about", label: "정보", keywords: "버전 문제 보고 릴리스 라이선스 데이터 폴더" },
 ];
 /** 지난 판의 묶음 이름 → 새 경로(설정 › 화면 등 옛 명령·다른 화면의 호출이 그대로 가게) */
 const LEGACY_SECTIONS: Record<string, SettingsSection> = {
