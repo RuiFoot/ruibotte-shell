@@ -1,0 +1,481 @@
+/*
+ * 설정 — macOS 시스템 설정 구조.
+ * 왼쪽: 검색 + 범주(색 사각 아이콘). 크롬이라 사이드바 색(--sidebar, 반투명)을 쓰되 backdrop-filter 는 쓰지 않는다(본문 위 흐림은 무겁다).
+ * 오른쪽: 불투명 본문 — 범주 제목, 둥근 묶음 칸(inset grouped).
+ * 밝은 모드는 회색 바탕 + 흰 칸, 어두운 모드는 어두운 바탕 + 한 단계 밝은 칸(iOS·macOS 와 같은 짝).
+ */
+:root {
+	--stg-bg: var(--surface-2);
+	--stg-card: var(--surface);
+	--stg-sel: var(--accent);
+}
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme="light"]) {
+		--stg-bg: var(--surface);
+		--stg-card: var(--surface-2);
+	}
+}
+:root[data-theme="dark"] {
+	--stg-bg: var(--surface);
+	--stg-card: var(--surface-2);
+}
+
+/* 설정 탭 자리 — 홈처럼 안쪽 여백·스크롤을 두지 않고 두 칸이 채운다 */
+.pane.settings-host {
+	overflow: hidden;
+}
+.stg {
+	display: flex;
+	flex: 1;
+	min-height: 0;
+	background: var(--stg-bg);
+}
+
+/* ── 사이드바 ───────────────────────── */
+.stg-side {
+	display: flex;
+	flex-direction: column;
+	flex: none;
+	width: 236px;
+	min-height: 0;
+	padding: 12px 10px;
+	background: var(--sidebar);
+	border-right: 0.5px solid var(--hairline);
+}
+html:not([data-backdrop="os"]) .stg-side {
+	background: var(--sidebar-solid);
+}
+.stg.narrow .stg-side {
+	flex: 1;
+	width: auto;
+	border-right: 0;
+	background: var(--stg-bg);
+	padding: 16px 16px 24px;
+}
+
+.stg-search {
+	position: relative;
+	display: flex;
+	align-items: center;
+	flex: none;
+	height: 28px;
+	margin-bottom: 10px;
+	padding: 0 6px 0 8px;
+	gap: 6px;
+	border-radius: var(--r-sm);
+	background: var(--fill);
+	color: var(--text-3);
+}
+.stg-search:focus-within {
+	box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.stg-search input {
+	flex: 1;
+	min-width: 0;
+	height: 100%;
+	padding: 0;
+	border: 0;
+	background: transparent;
+	font: inherit;
+	font-size: 13px;
+	color: var(--text);
+	outline: none;
+}
+.stg-search input::placeholder {
+	color: var(--text-3);
+}
+.stg-search input::-webkit-search-cancel-button {
+	display: none;
+}
+.stg-clear {
+	display: grid;
+	place-items: center;
+	flex: none;
+	width: 16px;
+	height: 16px;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: var(--text-3);
+	color: var(--stg-card);
+}
+.stg-clear:focus-visible {
+	border-radius: 50%;
+}
+
+.stg-nav,
+.stg-hits {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	margin: 0 -4px;
+	padding: 0 4px 8px;
+}
+.stg-navgrp + .stg-navgrp {
+	margin-top: 14px;
+}
+.stg-cat,
+.stg-hit {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	min-height: 28px;
+	padding: 3px 8px 3px 5px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text);
+	font-size: 13px;
+	text-align: left;
+}
+.stg-cat:hover,
+.stg-hit:hover {
+	background: var(--fill);
+}
+.stg-cat:focus-visible,
+.stg-hit:focus-visible {
+	outline-offset: -2px;
+}
+/* 고른 범주 — 사이드바에 초점이 있으면 강조 색, 아니면 회색(macOS 와 같이) */
+.stg-cat[aria-current="page"] {
+	background: var(--fill-hover);
+	font-weight: 500;
+}
+.stg-nav:focus-within .stg-cat[aria-current="page"] {
+	background: var(--stg-sel);
+	color: #fff;
+}
+.stg-cat-name {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.stg-ico {
+	display: grid;
+	place-items: center;
+	flex: none;
+	width: 21px;
+	height: 21px;
+	border-radius: 6px;
+	color: #fff;
+	box-shadow: inset 0 0 0 0.5px rgb(255 255 255 / 0.18);
+}
+.stg-ico.sm {
+	width: 16px;
+	height: 16px;
+	border-radius: 4.5px;
+}
+
+/* 좁은 창 — iOS 설정처럼 둥근 묶음 목록 */
+.stg.narrow .stg-navgrp {
+	border-radius: var(--r-md);
+	background: var(--stg-card);
+	box-shadow: var(--shadow-card);
+	overflow: hidden;
+}
+.stg.narrow .stg-navgrp + .stg-navgrp {
+	margin-top: 20px;
+}
+.stg.narrow .stg-cat {
+	min-height: 44px;
+	padding: 0 12px;
+	gap: 12px;
+	border-radius: 0;
+	font-size: 14px;
+}
+.stg.narrow .stg-cat {
+	position: relative;
+}
+.stg.narrow .stg-cat + .stg-cat::before {
+	content: "";
+	position: absolute;
+	top: 0;
+	left: 53px;
+	right: 0;
+	border-top: 0.5px solid var(--hairline);
+}
+.stg.narrow .stg-cat .stg-ico {
+	width: 29px;
+	height: 29px;
+	border-radius: 7px;
+}
+
+.stg-hit {
+	align-items: flex-start;
+	padding-top: 5px;
+	padding-bottom: 5px;
+}
+.stg-hit .stg-ico {
+	margin-top: 1px;
+}
+.stg-hit-text {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+.stg-hit-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.stg-hit small {
+	color: var(--text-3);
+	font-size: 11px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.stg-none {
+	margin: 18px 8px;
+	color: var(--text-3);
+	font-size: 12px;
+	text-align: center;
+}
+.stg-sr {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+
+/* ── 본문 ───────────────────────────── */
+.stg-main {
+	flex: 1;
+	min-width: 0;
+	overflow: auto;
+	background: var(--stg-bg);
+}
+.stg-col {
+	max-width: 660px;
+	margin: 0 auto;
+	padding: 22px 28px 48px;
+}
+.stg.narrow .stg-col {
+	padding: 14px 16px 40px;
+}
+.stg-head {
+	margin-bottom: 14px;
+}
+.stg-head h1 {
+	margin: 0;
+	font-size: 22px;
+	font-weight: 700;
+	letter-spacing: -0.02em;
+	color: var(--text);
+}
+.stg-back {
+	display: inline-flex;
+	align-items: center;
+	gap: 1px;
+	height: 26px;
+	margin: 0 0 4px -6px;
+	padding: 0 8px 0 2px;
+	border: 0;
+	border-radius: var(--r-sm);
+	background: transparent;
+	color: var(--accent);
+	font-size: 13px;
+}
+.stg-back:hover {
+	background: var(--accent-soft);
+}
+
+.stg-group + .stg-group {
+	margin-top: 22px;
+}
+.stg-ghead {
+	margin: 0 0 6px 12px;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--text-2);
+}
+.stg-card {
+	border-radius: var(--r-md);
+	background: var(--stg-card);
+	box-shadow: var(--shadow-card);
+	overflow: hidden;
+}
+.stg-gfoot {
+	margin: 6px 12px 0;
+	color: var(--text-3);
+	font-size: 11.5px;
+	line-height: 1.45;
+}
+
+.stg-row {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	width: 100%;
+	min-height: 42px;
+	padding: 9px 14px;
+	border: 0;
+	background: transparent;
+	color: var(--text);
+	text-align: left;
+	font-size: 13px;
+}
+/* 줄 사이 얇은 선 — 왼쪽은 들여서(글 시작에 맞춰) */
+.stg-row + .stg-row::before {
+	content: "";
+	position: absolute;
+	top: 0;
+	left: 14px;
+	right: 0;
+	border-top: 0.5px solid var(--hairline);
+}
+.stg-row.block {
+	display: block;
+}
+.stg-text {
+	display: flex;
+	flex-direction: column;
+	flex: 1;
+	min-width: 0;
+}
+.stg-name {
+	font-size: 13px;
+	line-height: 1.35;
+}
+.stg-text small {
+	margin-top: 2px;
+	color: var(--text-2);
+	font-size: 11.5px;
+	line-height: 1.45;
+}
+.stg-ctl {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	flex: none;
+	max-width: 58%;
+	min-width: 0;
+}
+.stg-ctl > .folder-pick {
+	max-width: 100%;
+}
+
+/* › 줄 */
+.stg-link:hover {
+	background: var(--fill);
+}
+.stg-link:active {
+	background: var(--fill-hover);
+}
+.stg-link:focus-visible {
+	outline-offset: -3px;
+	border-radius: var(--r-md);
+}
+.stg-value {
+	flex: none;
+	max-width: 45%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--text-2);
+	font-size: 13px;
+}
+.stg-chev {
+	flex: none;
+	margin-right: -4px;
+	color: var(--text-3);
+}
+
+/* 검색·바로 가기로 온 줄 — 잠깐 강조 */
+.stg-row.stg-flash {
+	animation: stg-flash 1.6s ease-out;
+}
+@keyframes stg-flash {
+	0%,
+	35% {
+		background: var(--accent-soft);
+	}
+	100% {
+		background: transparent;
+	}
+}
+
+.stg-kbd {
+	display: inline-block;
+	padding: 1px 6px;
+	border-radius: 5px;
+	background: var(--fill);
+	box-shadow: inset 0 -0.5px 0 var(--hairline-strong);
+	font-family: var(--font-ui);
+	font-size: 11.5px;
+	color: var(--text-2);
+	white-space: nowrap;
+}
+.btn .stg-kbd {
+	margin-left: 6px;
+	padding: 0 5px;
+	background: transparent;
+	box-shadow: none;
+	color: var(--text-3);
+}
+
+.toggle:disabled {
+	opacity: 0.45;
+}
+
+/* 정보 — 가운데 아이콘·이름(macOS "이 Mac에 관하여" 처럼) */
+.stg-about {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 2px;
+	margin: 6px 0 22px;
+	text-align: center;
+}
+.stg-about img {
+	width: 72px;
+	height: 72px;
+	margin-bottom: 8px;
+}
+.stg-about .nm {
+	font-size: 20px;
+	font-weight: 700;
+	letter-spacing: -0.02em;
+	color: var(--text);
+}
+.stg-about .ver {
+	font-size: 13px;
+	color: var(--text-2);
+}
+.stg-about .muted {
+	font-size: 12px;
+	color: var(--text-3);
+}
+
+/* 넓은 조절기(색 구성 격자·단어 목록·미리보기) */
+.stg-row.block .stg-text .scheme-grid,
+.stg-row.block .syn-preview,
+.stg-row.block .hi-words {
+	margin-top: 10px;
+}
+.stg-card .syn-preview {
+	background: var(--stg-bg);
+}
+
+/* 줄 안의 세그먼트·선택 상자가 줄 높이를 밀지 않게 */
+.stg-ctl .seg.tiny {
+	flex: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.stg-row.stg-flash {
+		animation: none;
+		background: var(--accent-soft);
+	}
+}
+.stg-card > .stg-row.block > .scheme-grid {
+	margin-top: 0;
+	padding: 4px 0;
+}

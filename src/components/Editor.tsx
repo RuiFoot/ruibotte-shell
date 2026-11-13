@@ -20,6 +20,7 @@ import { jsonPathAt } from "../lib/jsonPath";
 import { DiffTools, navChunk, trackSide, wsConfig } from "./DiffView";
 import { altView, BinaryPreview, MarkdownView, TableView } from "./Preview";
 import { Select } from "./Select";
+import { onSettingLive, setSettingLive } from "../lib/settingsBus";
 
 const ENCODINGS = ["UTF-8", "EUC-KR", "UTF-16LE", "UTF-16BE", "Shift_JIS", "windows-1252"];
 
@@ -49,7 +50,7 @@ const MINIMAP = {
 };
 /** 미니맵 켜고 끄기 — 열린 편집기 모두에 */
 function setMinimapPref(on: boolean) {
-	void api.settingSet("editor.minimap", on ? "1" : "0");
+	setSettingLive("editor.minimap", on ? "1" : "0");
 	window.dispatchEvent(new CustomEvent<boolean>(MINIMAP_EVENT, { detail: on }));
 }
 
@@ -300,7 +301,12 @@ export function EditorView_({
 		void api.settingGet("editor.minimap").then((v) => setMinimap(v !== "0"));
 		const on = (e: Event) => setMinimap((e as CustomEvent<boolean>).detail);
 		window.addEventListener(MINIMAP_EVENT, on);
-		return () => window.removeEventListener(MINIMAP_EVENT, on);
+		// 설정 › 편집기 에서 바꿔도
+		const off = onSettingLive(["editor.minimap"], (_, v) => setMinimap(v !== "0"));
+		return () => {
+			window.removeEventListener(MINIMAP_EVENT, on);
+			off();
+		};
 	}, []);
 	// 미니맵(오른쪽 개요 막대 — Orbit Monaco 와 같이 기본 켬). 아주 긴 파일(5만 줄 넘음)은 그리는 값이 커서 뺀다
 	const loadedLen = file?.text?.length ?? 0;

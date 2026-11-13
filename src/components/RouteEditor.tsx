@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { accountName, api, type CondKind, type Hop, type NetInfo, type Profile, type ProxyKind, type Route, routes as routeApi } from "../lib/ipc";
 import { agoMs } from "./ServerCard";
 import { Select } from "./Select";
+import { setSettingLive } from "../lib/settingsBus";
 
 export const COND_LABEL: Record<CondKind, string> = { gateway: "기본 게이트웨이", dns: "DNS 접미사", wifi: "Wi-Fi 이름", reach: "닿는 호스트" };
 const PROXY_LABEL: Record<ProxyKind, string> = { http: "HTTP 프록시", socks5: "SOCKS5 프록시", command: "프록시 명령" };
@@ -149,7 +150,7 @@ export function RoutesBox({ profileId, others, onFirst }: { profileId?: number; 
 					value={wait}
 					onChange={(v) => {
 						setWait(v);
-						void api.settingSet("ssh.routeTimeoutSec", String(v));
+						setSettingLive("ssh.routeTimeoutSec", String(v));
 					}}
 					options={TIMEOUTS.map((n) => ({ value: n, label: `${n}초`, hint: n === 4 ? "기본" : undefined }))}
 					title="경로가 여럿일 때, 한 경로에서 이 시간 안에 SSH 인사가 오지 않으면 다음 경로로 넘어갑니다(모든 서버 공통)"

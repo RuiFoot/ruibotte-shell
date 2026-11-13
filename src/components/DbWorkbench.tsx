@@ -65,6 +65,7 @@ import { editingExtensions } from "../lib/cmEditing";
 import { dbCompletionSource } from "../lib/sqlComplete";
 import { formatSqlIn } from "../lib/sqlFormat";
 import { dropEditor, forgetWatch, holdBackground, publishPlan, touchEditor, waitBackground } from "../lib/queryWatch";
+import { onSettingLive, setSettingLive } from "../lib/settingsBus";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
@@ -392,6 +393,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 	const [totalRows, setTotalRows] = useState<number | null>(null);
 	useEffect(() => {
 		void api.settingGet("db.thousands").then((v) => setThousands(v === "1"));
+		return onSettingLive(["db.thousands"], (_, v) => setThousands(v === "1"));
 	}, []);
 	useEffect(() => setWhere(p.source?.where ?? ""), [p.source?.where]);
 	const filterTimer = useRef<number | undefined>(undefined);
@@ -981,7 +983,7 @@ function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
 							title="숫자 천 단위 구분"
 							onClick={() => {
 								setThousands(!thousands);
-								void api.settingSet("db.thousands", thousands ? "0" : "1");
+								setSettingLive("db.thousands", thousands ? "0" : "1");
 							}}
 						>
 							1,000
@@ -1673,6 +1675,14 @@ export function DbWorkbench({
 		void api.settingGet("db.timeout").then((v) => v && setTimeoutMs(Number(v) || 0));
 		void api.settingGet("db.pageSize").then((v) => v && setPageSize(Number(v) || 1000));
 		void api.settingGet("db.fmtCase").then((v) => (v === "lower" || v === "preserve" || v === "upper") && setFmtCase(v));
+		// 설정 › 데이터베이스 에서 바꾸면 열린 작업대도 따라간다
+		return onSettingLive(["db.autoLimit", "db.confirmWrites", "db.timeout", "db.pageSize", "db.fmtCase"], (k, v) => {
+			if (k === "db.autoLimit") setAutoLimit(v === "1");
+			else if (k === "db.confirmWrites") setConfirmWrites(v === "1");
+			else if (k === "db.timeout") setTimeoutMs(Number(v) || 0);
+			else if (k === "db.pageSize") setPageSize(Number(v) || 1000);
+			else if (v === "lower" || v === "preserve" || v === "upper") setFmtCase(v);
+		});
 	}, []);
 	const [txState, setTxState] = useState<TxState>({ inTx: false, stmts: 0, manual: false });
 	const inTx = txState.inTx;
@@ -2322,7 +2332,7 @@ export function DbWorkbench({
 								<Square size={12} /> 취소
 							</button>
 						)}
-						<Select size="sm" value={timeoutMs} onChange={(v) => (setTimeoutMs(v), void api.settingSet("db.timeout", String(v)))} title="문장 시간 상한 — 넘으면 멈춘다(PostgreSQL·MySQL 은 서버가, 그 밖은 앱이 재다가 취소)" options={TIMEOUTS} />
+						<Select size="sm" value={timeoutMs} onChange={(v) => (setTimeoutMs(v), setSettingLive("db.timeout", String(v)))} title="문장 시간 상한 — 넘으면 멈춘다(PostgreSQL·MySQL 은 서버가, 그 밖은 앱이 재다가 취소)" options={TIMEOUTS} />
 						<span className="sep" />
 						{!readOnly && (
 							<>
@@ -2362,7 +2372,7 @@ export function DbWorkbench({
 							title="자동 LIMIT — LIMIT 없는 SELECT 에 행 상한을 서버 쪽에도 붙인다(PostgreSQL·MySQL·MariaDB·Oracle)"
 							onClick={() => {
 								setAutoLimit((x) => !x);
-								void api.settingSet("db.autoLimit", autoLimit ? "0" : "1");
+								setSettingLive("db.autoLimit", autoLimit ? "0" : "1");
 							}}
 						>
 							<span className="lbl keep">LIMIT</span>
@@ -2373,7 +2383,7 @@ export function DbWorkbench({
 							title="쓰기 확인 — INSERT·UPDATE·DELETE·DDL·GRANT 를 실행 전에 모두 묻는다"
 							onClick={() => {
 								setConfirmWrites((x) => !x);
-								void api.settingSet("db.confirmWrites", confirmWrites ? "0" : "1");
+								setSettingLive("db.confirmWrites", confirmWrites ? "0" : "1");
 							}}
 						>
 							<Lock size={13} /> <span className="lbl">쓰기 확인</span>
@@ -2382,7 +2392,7 @@ export function DbWorkbench({
 						<Select
 							size="sm"
 							value={pageSize}
-							onChange={(v) => (setPageSize(v), void api.settingSet("db.pageSize", String(v)))}
+							onChange={(v) => (setPageSize(v), setSettingLive("db.pageSize", String(v)))}
 							title="표 보기 한 쪽 행 수(서버에서 쪽 단위로 읽음)"
 							options={[100, 500, 1000, 5000, 10_000].map((n) => ({ value: n, label: `쪽 ${n.toLocaleString()}행` }))}
 						/>
@@ -2461,7 +2471,7 @@ export function DbWorkbench({
 									label: `${tick(fmtCase === c)}정렬 키워드 — ${c === "upper" ? "대문자" : c === "lower" ? "소문자" : "그대로"}`,
 									run: () => {
 										setFmtCase(c);
-										void api.settingSet("db.fmtCase", c);
+										setSettingLive("db.fmtCase", c);
 									},
 								})),
 							]}
