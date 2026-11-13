@@ -301,11 +301,24 @@ pub(crate) struct ResultSet {
     view: Mutex<Option<Vec<usize>>>,
     /// 다 받았는지(취소·상한으로 멈춘 것도 끝) — 받는 중에는 정렬·거르기·내보내기를 하지 않는다
     done: AtomicBool,
+    /// 이 결과가 쓰는 메모리 어림(바이트) — 엔진 루프가 넣은 행 크기의 합. 버려질 때 전체 합계에서 뺀다
+    mem: AtomicUsize,
+}
+
+/// 열려 있는 모든 결과가 쓰는 메모리 어림의 합 — 결과를 많이 열어 둔 채 큰 SELECT 를 거듭해 앱이 부푸는 것을 막는다
+static RESULTS_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// 모든 결과를 합친 상한(결과 하나는 MEMORY_CAP) — 넘으면 새로 받는 결과를 "memory" 로 멈춘다(앞서 받은 결과는 그대로 둔다)
+const GLOBAL_MEMORY_CAP: usize = 1024 * 1024 * 1024;
+
+impl Drop for ResultSet {
+    fn drop(&mut self) {
+        RESULTS_BYTES.fetch_sub(self.mem.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
 }
 
 impl ResultSet {
     fn new(columns: Vec<Col>, rows: Vec<Row>, done: bool) -> Self {
-        ResultSet { columns, rows: RwLock::new(rows), view: Mutex::new(None), done: AtomicBool::new(done) }
+        ResultSet { columns, rows: RwLock::new(rows), view: Mutex::new(None), done: AtomicBool::new(done), mem: AtomicUsize::new(0) }
     }
     fn len(&self) -> usize {
         self.rows.read().unwrap().len()
@@ -1287,6 +1300,13 @@ impl<'a> Live<'a> {
             self.halt("memory");
             return false;
         }
+        if RESULTS_BYTES.fetch_add(size, Ordering::Relaxed) + size > GLOBAL_MEMORY_CAP {
+            RESULTS_BYTES.fetch_sub(size, Ordering::Relaxed);
+            drop(g);
+            self.halt("memory");
+            return false;
+        }
+        rs.mem.fetch_add(size, Ordering::Relaxed);
         g.push(row);
         if g.len() == FIRST_BATCH {
             self.first_batch.notify_one();
@@ -1827,52 +1847,89 @@ pub(crate) fn db_rows_core(dbs: &DbConns, result: u32, from: usize, to: usize) -
     }
 }
 
+/// 정렬 열쇠 — 행마다 한 번만 만들어 둔다(비교마다 문자열을 다시 바꾸지 않는다). 숫자 < 문자열이라 어떤 값끼리도 전순서
+enum SortKey {
+    Num(f64),
+    Str(String),
+}
+
+fn sort_key(v: &str, numeric: bool) -> SortKey {
+    if numeric {
+        if let Ok(f) = v.trim().parse::<f64>() {
+            if !f.is_nan() {
+                // -0 과 0 은 같은 값 — total_cmp 가 가르지 않게
+                return SortKey::Num(if f == 0.0 { 0.0 } else { f });
+            }
+        }
+        return SortKey::Str(v.to_string());
+    }
+    SortKey::Str(v.to_lowercase())
+}
+
+fn cmp_key(a: &SortKey, b: &SortKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SortKey::Num(x), SortKey::Num(y)) => x.total_cmp(y),
+        (SortKey::Num(_), SortKey::Str(_)) => Ordering::Less,
+        (SortKey::Str(_), SortKey::Num(_)) => Ordering::Greater,
+        (SortKey::Str(x), SortKey::Str(y)) => x.cmp(y),
+    }
+}
+
 /// 받은 행을 정렬·거르기 — 서버에 다시 묻지 않는다. 숫자 열은 숫자로, NULL 은 늘 맨 뒤.
-/// 거르기: 낱말을 띄어 쓰면 모두 들어간 행(대소문자 무시, 아무 열). 돌려주는 값은 보이는 행 수
+/// 거르기: 낱말을 띄어 쓰면 모두 들어간 행(대소문자 무시, 아무 열 — 낱말은 칸 하나 안에서 찾는다). 돌려주는 값은 보이는 행 수
 pub(crate) fn view_core(r: &ResultSet, sort: Option<usize>, desc: bool, filter: Option<&str>) -> usize {
-    let words: Vec<String> = filter.unwrap_or("").split_whitespace().map(|w| w.to_lowercase()).collect();
+    let words: Vec<String> = filter.unwrap_or("").split_whitespace().take(64).map(|w| w.to_lowercase()).collect();
     let rows = r.rows.read().unwrap();
     if sort.is_none() && words.is_empty() {
         *r.view.lock().unwrap() = None;
         return rows.len();
     }
-    let mut idx: Vec<usize> = (0..rows.len())
-        .filter(|&i| {
-            words.is_empty() || {
-                let hay: String = rows[i].iter().map(|v| v.as_deref().unwrap_or("null").to_lowercase()).collect::<Vec<_>>().join("");
-                words.iter().all(|w| hay.contains(w.as_str()))
-            }
-        })
-        .collect();
+    let mut idx: Vec<usize> = if words.is_empty() {
+        (0..rows.len()).collect()
+    } else {
+        (0..rows.len())
+            .filter(|&i| {
+                // 낱말마다 어느 한 칸에는 들어 있어야 한다 — 칸을 이어 붙여 칸 경계에 걸리던 오검출을 막는다
+                let all: u64 = if words.len() == 64 { u64::MAX } else { (1u64 << words.len()) - 1 };
+                let mut found = 0u64;
+                for cell in rows[i].iter() {
+                    let hay = cell.as_deref().unwrap_or("null").to_lowercase();
+                    for (k, w) in words.iter().enumerate() {
+                        if hay.contains(w.as_str()) {
+                            found |= 1 << k;
+                        }
+                    }
+                    if found == all {
+                        return true;
+                    }
+                }
+                found == all
+            })
+            .collect()
+    };
     if let Some(c) = sort.filter(|c| *c < r.columns.len()) {
         let numeric = matches!(r.columns[c].kind, "int" | "numeric");
-        let key = |i: usize| rows[i].get(c).cloned().flatten();
-        idx.sort_by(|&a, &b| {
-            use std::cmp::Ordering;
-            match (key(a), key(b)) {
-                (None, None) => Ordering::Equal,
-                (None, _) => Ordering::Greater,
-                (_, None) => Ordering::Less,
-                (Some(x), Some(y)) => {
-                    let o = if numeric {
-                        match (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
-                            (Ok(p), Ok(q)) => p.partial_cmp(&q).unwrap_or(Ordering::Equal),
-                            _ => x.cmp(&y),
-                        }
-                    } else {
-                        x.to_lowercase().cmp(&y.to_lowercase())
-                    };
-                    if desc { o.reverse() } else { o }
-                }
+        // 열쇠를 미리 만든다 — None(NULL)은 desc 여도 맨 뒤
+        let mut keyed: Vec<(Option<SortKey>, usize)> = idx.iter().map(|&i| (rows[i].get(c).and_then(|v| v.as_deref()).map(|v| sort_key(v, numeric)), i)).collect();
+        keyed.sort_by(|(x, _), (y, _)| match (x, y) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Greater,
+            (_, None) => std::cmp::Ordering::Less,
+            (Some(p), Some(q)) => {
+                let o = cmp_key(p, q);
+                if desc { o.reverse() } else { o }
             }
         });
+        idx = keyed.into_iter().map(|(_, i)| i).collect();
     }
     let n = idx.len();
     *r.view.lock().unwrap() = Some(idx);
     n
 }
 
-#[tauri::command]
+/// 정렬·거르기는 수십만 행에서 수백 ms 걸릴 수 있어 메인 스레드가 아닌 별도 스레드에서 돈다(async 명령)
+#[tauri::command(async)]
 pub fn db_view(dbs: State<'_, DbConns>, result: u32, sort: Option<usize>, desc: bool, filter: Option<String>) -> R<usize> {
     let r = dbs.results.lock().unwrap().get(&result).cloned().ok_or_else(|| e("CLOSED", "결과가 없습니다"))?;
     r.need_done()?;
@@ -1892,61 +1949,98 @@ pub fn db_export(dbs: State<'_, DbConns>, result: u32, format: String, path: Str
     r.need_done()?;
     let all = r.rows.read().unwrap();
     let vis = r.visible(&all);
-    let mut out = String::new();
-    match format.as_str() {
+    // 결과가 수백 MB 여도 한 문자열로 모으지 않고 행마다 흘려 쓴다
+    let file = std::fs::File::create(&path).map_err(|x| e("OTHER", x.to_string()))?;
+    let mut w = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let res = export_write(&mut w, &r.columns, &vis, &format, insert_prefix.as_deref().unwrap_or(""), mysql.unwrap_or(false)).and_then(|_| std::io::Write::flush(&mut w));
+    if let Err(x) = res {
+        drop(w);
+        let _ = std::fs::remove_file(&path);
+        return Err(e("OTHER", x.to_string()));
+    }
+    Ok(vis.len())
+}
+
+/// 내보내기 본체 — 파일 내용은 예전에 한 문자열로 만들어 쓰던 것과 바이트 단위로 같다
+fn export_write<W: std::io::Write>(w: &mut W, columns: &[Col], vis: &[&Row], format: &str, prefix: &str, my: bool) -> std::io::Result<()> {
+    match format {
         "sql" => {
-            let prefix = insert_prefix.unwrap_or_default();
-            let my = mysql.unwrap_or(false);
-            for row in &vis {
-                let vals: Vec<String> = row
-                    .iter()
-                    .zip(&r.columns)
-                    .map(|(v, c)| match v {
-                        None => "NULL".to_string(),
-                        Some(x) if matches!(c.kind, "int" | "numeric") && x.trim().parse::<f64>().is_ok() => x.trim().to_string(),
-                        Some(x) => lit(x, my),
-                    })
-                    .collect();
-                out.push_str(&format!("{prefix}({});\n", vals.join(", ")));
+            for row in vis {
+                w.write_all(prefix.as_bytes())?;
+                w.write_all(b"(")?;
+                for (k, (v, c)) in row.iter().zip(columns).enumerate() {
+                    if k > 0 {
+                        w.write_all(b", ")?;
+                    }
+                    match v {
+                        None => w.write_all(b"NULL")?,
+                        Some(x) if matches!(c.kind, "int" | "numeric") && x.trim().parse::<f64>().is_ok() => w.write_all(x.trim().as_bytes())?,
+                        Some(x) => w.write_all(lit(x, my).as_bytes())?,
+                    }
+                }
+                w.write_all(b");\n")?;
             }
         }
         "json" => {
-            let arr: Vec<serde_json::Map<String, serde_json::Value>> = vis
-                .iter()
-                .map(|row| {
-                    r.columns
-                        .iter()
-                        .zip(row.iter())
-                        .map(|(c, v)| (c.name.clone(), v.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)))
-                        .collect()
-                })
-                .collect();
-            out = serde_json::to_string_pretty(&arr).map_err(|x| e("OTHER", x.to_string()))?;
+            // serde_json::to_string_pretty(&Vec<Map>) 와 같은 모양 — 행(객체)마다 만들어 2칸 들여 쓴다
+            if vis.is_empty() {
+                w.write_all(b"[]")?;
+            } else {
+                w.write_all(b"[")?;
+                for (n, row) in vis.iter().enumerate() {
+                    let obj: serde_json::Map<String, Value> = columns.iter().zip(row.iter()).map(|(c, v)| (c.name.clone(), v.clone().map(Value::String).unwrap_or(Value::Null))).collect();
+                    let text = serde_json::to_string_pretty(&obj).map_err(std::io::Error::other)?;
+                    w.write_all(if n == 0 { b"\n" } else { b",\n" })?;
+                    for (li, line) in text.split('\n').enumerate() {
+                        if li > 0 {
+                            w.write_all(b"\n")?;
+                        }
+                        w.write_all(b"  ")?;
+                        w.write_all(line.as_bytes())?;
+                    }
+                }
+                w.write_all(b"\n]")?;
+            }
         }
         f => {
             let sep = if f == "tsv" { '\t' } else { ',' };
-            let cell = |s: &str| -> String {
-                if sep == ',' && (s.contains([',', '"', '\n', '\r'])) {
-                    format!("\"{}\"", s.replace('"', "\"\""))
+            let cell = |w: &mut W, s: &str| -> std::io::Result<()> {
+                if sep == ',' && s.contains([',', '"', '\n', '\r']) {
+                    w.write_all(b"\"")?;
+                    w.write_all(s.replace('"', "\"\"").as_bytes())?;
+                    w.write_all(b"\"")
                 } else if sep == '\t' {
-                    s.replace(['\t', '\n'], " ")
+                    w.write_all(s.replace(['\t', '\n'], " ").as_bytes())
                 } else {
-                    s.to_string()
+                    w.write_all(s.as_bytes())
                 }
             };
+            let mut sep_buf = [0u8; 4];
+            let sep_b = sep.encode_utf8(&mut sep_buf).as_bytes();
             if f == "csv" {
-                out.push('\u{feff}');
+                w.write_all("\u{feff}".as_bytes())?;
             }
-            out.push_str(&r.columns.iter().map(|c| cell(&c.name)).collect::<Vec<_>>().join(&sep.to_string()));
-            out.push_str("\r\n");
-            for row in &vis {
-                out.push_str(&row.iter().map(|v| v.as_deref().map(cell).unwrap_or_default()).collect::<Vec<_>>().join(&sep.to_string()));
-                out.push_str("\r\n");
+            for (k, c) in columns.iter().enumerate() {
+                if k > 0 {
+                    w.write_all(sep_b)?;
+                }
+                cell(w, &c.name)?;
+            }
+            w.write_all(b"\r\n")?;
+            for row in vis {
+                for (k, v) in row.iter().enumerate() {
+                    if k > 0 {
+                        w.write_all(sep_b)?;
+                    }
+                    if let Some(x) = v {
+                        cell(w, x)?;
+                    }
+                }
+                w.write_all(b"\r\n")?;
             }
         }
     }
-    std::fs::write(&path, out).map_err(|x| e("OTHER", x.to_string()))?;
-    Ok(vis.len())
+    Ok(())
 }
 
 // ── 실행 계획 ───────────────────────
@@ -2105,12 +2199,21 @@ pub fn db_read_csv(path: String) -> R<CsvData> {
 pub fn db_save_hex(path: String, hex: String) -> R<usize> {
     let h = hex.trim();
     let h = h.strip_prefix("0x").or_else(|| h.strip_prefix("0X")).or_else(|| h.strip_prefix("\\x")).unwrap_or(h);
+    let bytes = parse_hex(h)?;
+    std::fs::write(&path, &bytes).map_err(|x| e("OTHER", x.to_string()))?;
+    Ok(bytes.len())
+}
+
+/// 16진 글 → 바이트. 비ASCII·홀수 길이·16진이 아닌 글자(`+f` 같은 부호도)는 오류 — 바이트 인덱스로 자르다 panic(=앱 종료) 나지 않게 먼저 검증
+fn parse_hex(h: &str) -> R<Vec<u8>> {
+    if !h.is_ascii() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(e("OTHER", "16진 글이 아닙니다 (0-9, a-f 만 쓸 수 있습니다)"));
+    }
     if h.len() % 2 != 0 {
         return Err(e("OTHER", "16진 글 길이가 홀수입니다"));
     }
-    let bytes = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16)).collect::<Result<Vec<u8>, _>>().map_err(|_| e("OTHER", "16진 글이 아닙니다"))?;
-    std::fs::write(&path, &bytes).map_err(|x| e("OTHER", x.to_string()))?;
-    Ok(bytes.len())
+    let nib = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+    Ok(h.as_bytes().chunks(2).map(|p| nib(p[0]) << 4 | nib(p[1])).collect())
 }
 
 // ── 객체 트리 ───────────────────────
@@ -2355,8 +2458,9 @@ pub async fn db_table_meta(dbs: State<'_, DbConns>, conn: u32, schema: Option<St
         .into_iter()
         .map(|r| {
             let data_type = r.get(1).cloned().flatten().unwrap_or_default();
-            let enum_values = if my && data_type.starts_with("enum(") {
-                Some(data_type[5..data_type.len() - 1].split(',').map(|x| x.trim().trim_matches('\'').replace("''", "'")).collect())
+            let enum_body = if my { data_type.strip_prefix("enum(").map(|b| b.strip_suffix(')').unwrap_or(b)) } else { None };
+            let enum_values = if let Some(body) = enum_body {
+                Some(body.split(',').map(|x| x.trim().trim_matches('\'').replace("''", "'")).collect())
             } else {
                 r.get(5).cloned().flatten().map(|x| x.split('\u{1f}').map(String::from).collect())
             };
@@ -2419,19 +2523,38 @@ pub(crate) async fn apply(dbs: &DbConns, conn: u32, stmts: Vec<EditStmt>) -> R<A
         Engine::Pg { client, .. } => {
             client.batch_execute(if in_tx { "SAVEPOINT rb_apply" } else { "BEGIN" }).await.map_err(pg_err)?;
             let mut res: R<()> = Ok(());
-            for (i, st) in stmts.iter().enumerate() {
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = st.params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-                match client.execute(st.sql.as_str(), &params).await {
-                    Ok(n) => {
-                        affected.push(n);
-                        if let Err(x) = one(n, i, st) {
-                            res = Err(x);
-                            break;
+            // 묶음(64문장)을 한꺼번에 보낸다 — tokio_postgres 는 같은 연결의 요청을 파이프라인으로 보내 문장마다 왕복을 기다리지 않는다.
+            // 결과는 순서대로 본다: 처음 실패(SQL 오류·1행 아님)가 이기고 거기서 멈춘다 — 이미 간 뒤 문장은 아래 ROLLBACK 이 되돌린다
+            'chunks: for (ci, chunk) in stmts.chunks(64).enumerate() {
+                // 1) 묶음을 먼저 모두 준비(Parse) — 준비 오류(없는 열·타입)가 나면 그 진짜 오류가 먼저 보고되고, 앞 문장의 "트랜잭션 중단됨" 오류에 가려지지 않는다
+                let mut prepared = Vec::with_capacity(chunk.len());
+                for r in futures_util::future::join_all(chunk.iter().map(|st| client.prepare(st.sql.as_str()))).await {
+                    match r {
+                        Ok(p) => prepared.push(p),
+                        Err(x) => {
+                            res = Err(pg_err(x));
+                            break 'chunks;
                         }
                     }
-                    Err(x) => {
-                        res = Err(pg_err(x));
-                        break;
+                }
+                // 2) 준비된 문장을 순서대로 한꺼번에 실행(파이프라인)
+                let futs = chunk.iter().zip(&prepared).map(|(st, ps)| async move {
+                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = st.params.iter().map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+                    client.execute(ps, &params).await
+                });
+                for (k, (st, r)) in chunk.iter().zip(futures_util::future::join_all(futs).await).enumerate() {
+                    match r {
+                        Ok(n) => {
+                            affected.push(n);
+                            if let Err(x) = one(n, ci * 64 + k, st) {
+                                res = Err(x);
+                                break 'chunks;
+                            }
+                        }
+                        Err(x) => {
+                            res = Err(pg_err(x));
+                            break 'chunks;
+                        }
                     }
                 }
             }
@@ -2821,6 +2944,328 @@ mod live_edit {
             query(&dbs, c, "DROP TABLE rb_e".into(), None).await.unwrap();
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+// ── 쿼리 기록용 암호 가리기 ───────────────────────
+
+/// 따옴표 글(`'..'` `".."`)의 끝 — 시작 위치(따옴표 자리) b[i] 에서 부른다. 닫는 따옴표 다음 위치. 안 닫혔으면 글 끝.
+/// bs=true 면 MySQL 식(`\'` 는 글자), false 면 PG 표준 글(`\` 는 그냥 글자). 어느 쪽인지 모르므로 부르는 쪽이 두 번 훑는다
+fn quoted_end(b: &[u8], i: usize, bs: bool) -> usize {
+    let q = b[i];
+    let mut j = i + 1;
+    while j < b.len() {
+        if bs && b[j] == b'\\' {
+            j += 2;
+            continue;
+        }
+        if b[j] == q {
+            if b.get(j + 1) == Some(&q) {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// `$tag$` 로 시작하는 달러 인용 글이면 글 끝 — `$1` 같은 매개변수는 아니다
+fn dollar_quote(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'$') || (j > i + 1 && b[i + 1].is_ascii_digit()) {
+        return None;
+    }
+    let tag = &b[i..=j];
+    let body = j + 1;
+    let end = b[body..].windows(tag.len()).position(|w| w == tag).map(|p| body + p + tag.len()).unwrap_or(b.len());
+    Some(end)
+}
+
+/// 공백과 `/* … */` 주석을 건너뛴다
+fn skip_blank(b: &[u8], mut j: usize) -> usize {
+    loop {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) == Some(&b'/') && b.get(j + 1) == Some(&b'*') {
+            j = b[j + 2..].windows(2).position(|w| w == b"*/").map(|p| j + 2 + p + 2).unwrap_or(b.len());
+        } else {
+            return j;
+        }
+    }
+}
+
+fn mask_pass(sql: &str, bs: bool) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let (mut last, mut i, mut ident_left) = (0usize, 0usize, 0u8);
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' | b'`' => i = quoted_end(b, i, bs),
+            b'-' if b.get(i + 1) == Some(&b'-') => i = b[i..].iter().position(|&c| c == b'\n').map(|p| i + p).unwrap_or(b.len()),
+            // MySQL 의 # 주석 — PG 연산자(`#>` `#-` `a # b`)와 헷갈리지 않게 앞이 시작·공백이고 다음이 연산자 글자가 아닐 때만
+            b'#' if (i == 0 || b[i - 1].is_ascii_whitespace()) && !matches!(b.get(i + 1), Some(b'>' | b'-' | b'#')) => i = b[i..].iter().position(|&c| c == b'\n').map(|p| i + p).unwrap_or(b.len()),
+            b'/' if b.get(i + 1) == Some(&b'*') => i = b[i + 2..].windows(2).position(|w| w == b"*/").map(|p| i + 2 + p + 2).unwrap_or(b.len()),
+            b'$' => i = dollar_quote(b, i).unwrap_or(i + 1),
+            b';' => {
+                ident_left = 0;
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
+                let s = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80) {
+                    i += 1;
+                }
+                let w = &b[s..i];
+                let is = |k: &str| w.eq_ignore_ascii_case(k.as_bytes());
+                if is("IDENTIFIED") {
+                    ident_left = 10;
+                    continue;
+                }
+                // PASSWORD · MASTER_PASSWORD · SOURCE_PASSWORD · OLD_PASSWORD … 낱말 끝이 PASSWORD 인 것
+                let pw = w.len() >= 8 && w[w.len() - 8..].eq_ignore_ascii_case(b"PASSWORD");
+                let kw = pw || (ident_left > 0 && (is("BY") || is("AS") || is("USING") || is("REPLACE")));
+                ident_left = ident_left.saturating_sub(1);
+                if !kw {
+                    continue;
+                }
+                // 키워드 다음: (FOR 사용자) · (=) · (PASSWORD 는 여는 괄호) · (N/E/U&/_utf8mb4 같은 접두) · 따옴표 글
+                let mut j = skip_blank(b, i);
+                if pw && w.len() == 8 && b.get(j..j + 3).is_some_and(|f| f.eq_ignore_ascii_case(b"FOR")) && b.get(j + 3).is_some_and(|c| c.is_ascii_whitespace()) {
+                    // SET PASSWORD FOR 'bob'@'%' = '…' — 사용자 지정(따옴표 포함)을 건너 `=` 까지
+                    let start = j;
+                    j += 3;
+                    while j < b.len() && j - start < 256 && b[j] != b'=' && b[j] != b';' {
+                        j = if matches!(b[j], b'\'' | b'"' | b'`') { quoted_end(b, j, bs) } else { j + 1 };
+                    }
+                    if b.get(j) != Some(&b'=') {
+                        continue;
+                    }
+                }
+                if b.get(j) == Some(&b'=') {
+                    j = skip_blank(b, j + 1);
+                }
+                if pw && b.get(j) == Some(&b'(') {
+                    j = skip_blank(b, j + 1);
+                }
+                let mut p = j;
+                while p < b.len() && p - j < 12 && (b[p].is_ascii_alphanumeric() || b[p] == b'_' || b[p] == b'&') {
+                    p += 1;
+                }
+                let q = if p > j && b.get(p) == Some(&b'\'') { p } else { j };
+                let end = match b.get(q) {
+                    Some(b'\'') | Some(b'"') => Some(quoted_end(b, q, bs)),
+                    Some(b'$') => dollar_quote(b, q),
+                    _ => None,
+                };
+                if let Some(end) = end {
+                    out.push_str(&sql[last..j]);
+                    out.push_str("'***'");
+                    last = end;
+                    i = end;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+
+/// 쿼리 기록에 남기기 전에 암호 글을 `'***'` 로 바꾼다 — `IDENTIFIED [WITH x] BY '…'`(MariaDB·MySQL, `BY PASSWORD '해시'`·`REPLACE '…'`·`USING`·`AS` 포함),
+/// `PASSWORD '…'` · `PASSWORD = '…'` · `PASSWORD('…')` · `SET PASSWORD FOR 사용자 = '…'` · `MASTER_PASSWORD='…'`(CREATE/ALTER USER·ROLE·LOGIN, CHANGE MASTER). 대소문자 무시.
+/// 따옴표 글 해석이 엔진마다 달라(`\'`) 두 가지로 훑어 한 번이라도 걸리면 가린다 — 일부러 넉넉히 가리는 쪽(`WHERE password = '…'` 도 가려진다).
+/// 문자열 안에 든 접속 문자열(`CONNECTION 'host=h password=…'`)은 다루지 않는다
+pub(crate) fn mask_sql_secrets(sql: &str) -> String {
+    mask_pass(&mask_pass(sql, true), false)
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_sql_secrets as m;
+
+    #[test]
+    fn masks_passwords() {
+        assert_eq!(m("CREATE USER 'bob'@'%' IDENTIFIED BY 'p@ss''w;d'"), "CREATE USER 'bob'@'%' IDENTIFIED BY '***'");
+        assert_eq!(m("create user bob identified by \"x y\" password expire"), "create user bob identified by '***' password expire");
+        assert_eq!(m("ALTER USER bob IDENTIFIED WITH mysql_native_password BY 'a\\'b' REPLACE 'old'"), "ALTER USER bob IDENTIFIED WITH mysql_native_password BY '***' REPLACE '***'");
+        assert_eq!(m("CREATE USER u IDENTIFIED BY PASSWORD '*ABCDEF0123'"), "CREATE USER u IDENTIFIED BY PASSWORD '***'");
+        assert_eq!(m("SET PASSWORD FOR bob = PASSWORD('secret')"), "SET PASSWORD FOR bob = PASSWORD('***')");
+        assert_eq!(m("SET PASSWORD = 'secret'"), "SET PASSWORD = '***'");
+        assert_eq!(m("ALTER USER bob WITH PASSWORD 'secret' VALID UNTIL 'infinity'"), "ALTER USER bob WITH PASSWORD '***' VALID UNTIL 'infinity'");
+        assert_eq!(m("create role r login password E'se\\'cret'"), "create role r login password '***'");
+        assert_eq!(m("CREATE LOGIN a WITH PASSWORD = N'pw', DEFAULT_DATABASE = x"), "CREATE LOGIN a WITH PASSWORD = '***', DEFAULT_DATABASE = x");
+        assert_eq!(m("ALTER ROLE a PASSWORD $$se'cret$$ ;"), "ALTER ROLE a PASSWORD '***' ;");
+        assert_eq!(m("ALTER ROLE a PASSWORD $t$se$$cret$t$"), "ALTER ROLE a PASSWORD '***'");
+        // Fable 점검에서 나온 놓친 문법들
+        assert_eq!(m("SET PASSWORD FOR 'bob'@'%' = 'secret1'"), "SET PASSWORD FOR 'bob'@'%' = '***'");
+        assert_eq!(m("CHANGE MASTER TO MASTER_HOST='h', MASTER_PASSWORD='secret2'"), "CHANGE MASTER TO MASTER_HOST='h', MASTER_PASSWORD='***'");
+        assert_eq!(m("ALTER LOGIN a WITH PASSWORD = 'new1' OLD_PASSWORD = 'old1'"), "ALTER LOGIN a WITH PASSWORD = '***' OLD_PASSWORD = '***'");
+        assert_eq!(m("# it's a note\nALTER USER a IDENTIFIED BY 'secret3'"), "# it's a note\nALTER USER a IDENTIFIED BY '***'");
+        assert_eq!(m(r"SELECT 'dir\' AS p; ALTER USER a PASSWORD 'secret4'"), r"SELECT 'dir\' AS p; ALTER USER a PASSWORD '***'");
+        assert_eq!(m("ALTER USER a IDENTIFIED BY /* c */ 'secret6'"), "ALTER USER a IDENTIFIED BY /* c */ '***'");
+        assert_eq!(m("SELECT a$b$ FROM t; ALTER USER a IDENTIFIED BY 'secret5'"), "SELECT a$b$ FROM t; ALTER USER a IDENTIFIED BY '***'");
+        assert_eq!(m("ALTER ROLE a PASSWORD U&'secret7'"), "ALTER ROLE a PASSWORD '***'");
+        assert_eq!(m("CREATE USER a IDENTIFIED BY _utf8mb4'secret9'"), "CREATE USER a IDENTIFIED BY '***'");
+        // 안 닫힌 글은 끝까지 가린다
+        assert_eq!(m("ALTER USER a IDENTIFIED BY 'oops"), "ALTER USER a IDENTIFIED BY '***'");
+    }
+
+    #[test]
+    fn leaves_others() {
+        for s in [
+            "SELECT * FROM t WHERE name = 'password'",
+            "SELECT 'IDENTIFIED BY ''x''' AS a, b FROM t ORDER BY 'x'",
+            "SELECT password_hash, pw FROM users WHERE id = $1",
+            "ALTER USER bob PASSWORD NULL",
+            "-- IDENTIFIED BY 'x'\nSELECT 1 /* PASSWORD 'y' */",
+            "SELECT '한글 password' , 'IDENTIFIED' BY",
+            "",
+        ] {
+            assert_eq!(m(s), s);
+        }
+        // 앞 문장의 IDENTIFIED 가 다음 문장에 번지지 않는다
+        assert_eq!(m("ALTER USER a IDENTIFIED BY 'p'; SELECT 1 AS \"col\", 2 AS 'x'"), "ALTER USER a IDENTIFIED BY '***'; SELECT 1 AS \"col\", 2 AS 'x'");
+        // PG 연산자 # 는 주석이 아니다
+        assert_eq!(m("SELECT a #> '{x}' FROM t; SET PASSWORD = 'z'"), "SELECT a #> '{x}' FROM t; SET PASSWORD = '***'");
+        // 주석 안은 두고 뒤쪽 문장만 가린다
+        assert_eq!(m("/* a */ SET PASSWORD = 'z' -- 'q'"), "/* a */ SET PASSWORD = '***' -- 'q'");
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    /// 예전 구현(한 문자열로 모아 쓰기) — 새 구현이 바이트 단위로 같은지 비교하는 기준
+    fn old_export(columns: &[Col], vis: &[&Row], format: &str, prefix: &str, my: bool) -> String {
+        let mut out = String::new();
+        match format {
+            "sql" => {
+                for row in vis {
+                    let vals: Vec<String> = row
+                        .iter()
+                        .zip(columns)
+                        .map(|(v, c)| match v {
+                            None => "NULL".to_string(),
+                            Some(x) if matches!(c.kind, "int" | "numeric") && x.trim().parse::<f64>().is_ok() => x.trim().to_string(),
+                            Some(x) => lit(x, my),
+                        })
+                        .collect();
+                    out.push_str(&format!("{prefix}({});\n", vals.join(", ")));
+                }
+            }
+            "json" => {
+                let arr: Vec<serde_json::Map<String, serde_json::Value>> = vis
+                    .iter()
+                    .map(|row| columns.iter().zip(row.iter()).map(|(c, v)| (c.name.clone(), v.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null))).collect())
+                    .collect();
+                out = serde_json::to_string_pretty(&arr).unwrap();
+            }
+            f => {
+                let sep = if f == "tsv" { '\t' } else { ',' };
+                let cell = |s: &str| -> String {
+                    if sep == ',' && (s.contains([',', '"', '\n', '\r'])) {
+                        format!("\"{}\"", s.replace('"', "\"\""))
+                    } else if sep == '\t' {
+                        s.replace(['\t', '\n'], " ")
+                    } else {
+                        s.to_string()
+                    }
+                };
+                if f == "csv" {
+                    out.push('\u{feff}');
+                }
+                out.push_str(&columns.iter().map(|c| cell(&c.name)).collect::<Vec<_>>().join(&sep.to_string()));
+                out.push_str("\r\n");
+                for row in vis {
+                    out.push_str(&row.iter().map(|v| v.as_deref().map(cell).unwrap_or_default()).collect::<Vec<_>>().join(&sep.to_string()));
+                    out.push_str("\r\n");
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn export_bytes_same_as_old() {
+        let col = |n: &str, k: &'static str| Col { name: n.into(), kind: k };
+        let cols = vec![col("id", "int"), col("na,me", "text"), col("memo\"x", "text")];
+        let s = |x: &str| Some(x.to_string());
+        let rows: Vec<Row> = vec![
+            vec![s("1"), s("김'철수"), s("줄\n바꿈\t탭")],
+            vec![None, s("a,b"), s("q\"uote\r")],
+            vec![s(" 22 "), s(""), None],
+            vec![s("x1"), s("{\"j\":1}"), s("back\\slash")],
+        ];
+        let all: Vec<&Row> = rows.iter().collect();
+        let none: Vec<&Row> = vec![];
+        for fmt in ["csv", "tsv", "json", "sql"] {
+            for my in [false, true] {
+                for vis in [&all[..], &none[..], &all[1..2]] {
+                    let mut buf = Vec::new();
+                    export_write(&mut buf, &cols, vis, fmt, "INSERT INTO t (a) VALUES ", my).unwrap();
+                    let want = old_export(&cols, vis, fmt, "INSERT INTO t (a) VALUES ", my);
+                    assert_eq!(String::from_utf8(buf).unwrap(), want, "{fmt} my={my} n={}", vis.len());
+                }
+            }
+        }
+        // 열 이름이 겹치거나 열이 없는 경우도 JSON 모양이 같다
+        let dup = vec![col("a", "text"), col("a", "text")];
+        let r2: Vec<Row> = vec![vec![s("1"), s("2")]];
+        let v2: Vec<&Row> = r2.iter().collect();
+        let mut buf = Vec::new();
+        export_write(&mut buf, &dup, &v2, "json", "", false).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), old_export(&dup, &v2, "json", "", false));
+        let r3: Vec<Row> = vec![vec![], vec![]];
+        let v3: Vec<&Row> = r3.iter().collect();
+        let mut buf = Vec::new();
+        export_write(&mut buf, &[], &v3, "json", "", false).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), old_export(&[], &v3, "json", "", false));
+    }
+
+    #[test]
+    fn hex_parse() {
+        assert_eq!(parse_hex("00ff7A").unwrap(), vec![0, 255, 0x7a]);
+        assert_eq!(parse_hex("").unwrap(), Vec::<u8>::new());
+        assert!(parse_hex("abc").is_err());
+        assert!(parse_hex("한글").is_err());
+        assert!(parse_hex("a한").is_err());
+        assert!(parse_hex("+f").is_err());
+        assert!(parse_hex("zz").is_err());
+    }
+
+    #[test]
+    fn view_filter_not_across_cells() {
+        let col = |n: &str| Col { name: n.into(), kind: "text" };
+        let row = |a: &str, b: &str| vec![Some(a.to_string()), Some(b.to_string())];
+        let r = ResultSet::new(vec![col("a"), col("b")], vec![row("ab", "cd"), row("abcd", "x"), row("x", "y")], true);
+        // 예전에는 "ab"+"cd" 를 이어 붙여 "bc" 가 칸 경계에서 걸렸다
+        assert_eq!(view_core(&r, None, false, Some("bc")), 1);
+        assert_eq!(view_core(&r, None, false, Some("ab cd")), 2);
+        assert_eq!(view_core(&r, None, false, Some("ab y")), 0);
+    }
+
+    #[test]
+    fn view_sort_total_order() {
+        let col = |n: &str, k: &'static str| Col { name: n.into(), kind: k };
+        let v = |x: Option<&str>| vec![x.map(str::to_string)];
+        // 숫자·숫자 아닌 글·NaN·-0 이 섞여도 panic 없이 정렬(숫자 → 글, NULL 맨 뒤)
+        let rows: Vec<Row> = ["10", "abc", "NaN", "-0", "0", "2", "inf"].iter().map(|x| v(Some(x))).chain([v(None)]).collect();
+        let r = ResultSet::new(vec![col("n", "numeric")], rows, true);
+        assert_eq!(view_core(&r, Some(0), false, None), 8);
+        let got: Vec<Option<String>> = r.visible(&r.rows.read().unwrap()).into_iter().map(|x| x[0].clone()).collect();
+        let got: Vec<_> = got.iter().map(|x| x.as_deref()).collect();
+        assert_eq!(got, vec![Some("-0"), Some("0"), Some("2"), Some("10"), Some("inf"), Some("NaN"), Some("abc"), None]);
+        view_core(&r, Some(0), true, None);
+        let got: Vec<Option<String>> = r.visible(&r.rows.read().unwrap()).into_iter().map(|x| x[0].clone()).collect();
+        assert_eq!(got.last().unwrap(), &None);
+        assert_eq!(got[0].as_deref(), Some("abc"));
     }
 }
 
