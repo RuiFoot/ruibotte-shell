@@ -9,7 +9,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::ssh::{err, Conn, SshConns, R};
-use crate::sudo::{exec, q, sudo};
+use crate::sudo::{exec, exec_idle, q, sudo, sudo_idle};
 
 /// 한 번 재는 스크립트 — 구획마다 `@이름` 줄로 나눈다
 const SCRIPT: &str = r#"export LC_ALL=C
@@ -22,6 +22,15 @@ echo @df; df -PkT 2>/dev/null || df -Pk
 echo @io; cat /proc/diskstats 2>/dev/null
 echo @ps; awk '{l=$0; o=index(l,"("); c=0; for(k=length(l);k>o;k--) if(substr(l,k,1)==")"){c=k;break}; n=substr(l,o+1,c-o-1); split(substr(l,c+2),f," "); print $1"\t"(f[12]+f[13])"\t"f[22]"\t"f[1]"\t"n}' /proc/[0-9]*/stat 2>/dev/null
 echo @user; ps -eo pid=,user= 2>/dev/null || awk 'NR==FNR{split($0,a,":"); u[a[3]]=a[1]; next} /^Uid:/{split(FILENAME,p,"/"); print p[3], ($2 in u ? u[$2] : $2)}' /etc/passwd /proc/[0-9]*/status 2>/dev/null
+"#;
+
+/// 가벼운 판(작은 상태 줄) — CPU·메모리·부하·디스크만. 프로세스(ps·awk 로 /proc 전체)·네트워크·디스크 IO 는 묻지 않는다
+const SCRIPT_LITE: &str = r#"export LC_ALL=C
+echo @host; hostname 2>/dev/null; uname -sr 2>/dev/null; echo 4096
+echo @stat; grep -E '^(cpu|procs_)' /proc/stat
+echo @mem; cat /proc/meminfo
+echo @load; cat /proc/loadavg; cat /proc/uptime
+echo @df; df -PkT 2>/dev/null || df -Pk
 "#;
 
 #[derive(Serialize, Default, Debug, Clone, Copy)]
@@ -288,15 +297,21 @@ pub(crate) fn parse(text: &str) -> R<Stats> {
     Ok(s)
 }
 
+/// lite = true 면 CPU·메모리·부하·디스크만(작은 상태 줄이 자주 부른다 — 서버 부담·전송량을 줄인다)
 #[tauri::command]
-pub async fn ssh_stats(conns: State<'_, SshConns>, conn: u32) -> R<Stats> {
-    stats(&*conns.get(conn)?).await
+pub async fn ssh_stats(conns: State<'_, SshConns>, conn: u32, lite: Option<bool>) -> R<Stats> {
+    stats(&*conns.get(conn)?, lite.unwrap_or(false)).await
 }
 
-pub(crate) async fn stats(c: &Conn) -> R<Stats> {
-    let o = tokio::time::timeout(Duration::from_secs(15), exec(c, SCRIPT, None))
-        .await
-        .map_err(|_| err("NETWORK", "서버가 응답하지 않습니다"))??;
+pub(crate) async fn stats(c: &Conn, lite: bool) -> R<Stats> {
+    // 시간 초과로 빠져나와도 채널은 닫는다(run_exec) — 바깥 timeout 으로 버리면 서버에 채널이 남았다
+    let o = exec_idle(c, if lite { SCRIPT_LITE } else { SCRIPT }, None, Duration::from_secs(15)).await.map_err(|e| {
+        if e.code_is("NETWORK") {
+            err("NETWORK", "서버가 응답하지 않습니다")
+        } else {
+            e
+        }
+    })?;
     parse(&String::from_utf8_lossy(&o.stdout))
 }
 
@@ -329,14 +344,16 @@ pub async fn ssh_du(conns: State<'_, SshConns>, conn: u32, path: String, as_root
 
 pub(crate) async fn du(c: &Conn, path: &str, as_root: bool) -> R<Vec<DuEntry>> {
     let inner = format!("cd -- {} && {{ du -xk --max-depth=1 . 2>/dev/null || du -xk -d 1 . 2>/dev/null; }}; true", q(path));
-    let run = async {
-        if as_root {
-            sudo(c, &format!("nice -n 19 sh -c {}", q(&inner)), None).await
+    // du 는 하위 폴더 하나를 다 셀 때까지 조용하다 — 출력 없이 3분이면 멈춘다(채널은 닫는다)
+    let idle = Duration::from_secs(180);
+    let cmd = format!("nice -n 19 sh -c {}", q(&inner));
+    let o = if as_root { sudo_idle(c, &cmd, None, idle).await } else { exec_idle(c, &cmd, None, idle).await }.map_err(|e| {
+        if e.code_is("NETWORK") {
+            err("NETWORK", "3분 안에 끝나지 않았습니다 — 더 안쪽 폴더에서 다시 보세요")
         } else {
-            exec(c, &format!("nice -n 19 sh -c {}", q(&inner)), None).await
+            e
         }
-    };
-    let o = tokio::time::timeout(Duration::from_secs(180), run).await.map_err(|_| err("NETWORK", "3분 안에 끝나지 않았습니다 — 더 안쪽 폴더에서 다시 보세요"))??;
+    })?;
     Ok(parse_du(&String::from_utf8_lossy(&o.stdout)))
 }
 
@@ -399,6 +416,16 @@ mod tests {
     }
 
     #[test]
+    fn lite_has_no_procs() {
+        let t = "@host\nh\nLinux 5\n4096\n@stat\ncpu 1 0 1 8 0 0 0 0\ncpu0 1 0 1 8 0 0 0 0\n@mem\nMemTotal: 1000 kB\nMemAvailable: 500 kB\n@load\n0.1 0.2 0.3 1/2 3\n10.0 5.0\n@df\nFilesystem Type 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 ext4 1000 600 400 60% /\n";
+        let s = parse(t).unwrap();
+        assert!(s.procs.is_empty() && s.net.is_empty() && s.io.is_empty());
+        assert_eq!(s.disks.len(), 1);
+        assert_eq!(s.mem.available, 500);
+        assert!(SCRIPT_LITE.len() < SCRIPT.len() / 2 && !SCRIPT_LITE.contains("@ps"));
+    }
+
+    #[test]
     fn rejects_non_linux() {
         assert!(parse("@host\nmac\nDarwin 24\n4096\n@stat\n").is_err());
     }
@@ -431,10 +458,12 @@ mod live {
         let cid = crate::ssh::test_connect(&store, &conns, &host, port, "rbtest", &pw).await;
         let c = conns.get(cid).unwrap();
         let t = std::time::Instant::now();
-        let a = stats(&c).await.unwrap();
+        let a = stats(&c, false).await.unwrap();
         let first = t.elapsed();
         let t = std::time::Instant::now();
-        let b = stats(&c).await.unwrap();
+        let b = stats(&c, false).await.unwrap();
+        let l = stats(&c, true).await.unwrap();
+        assert!(l.procs.is_empty() && !l.disks.is_empty() && l.mem.total > 0 && l.cpu.len() == b.cpu.len());
         println!("stats {first:?} / {:?}  host={} kernel={} ncpu={} procs={} disks={:?} net={} io={}", t.elapsed(), b.host, b.kernel, b.ncpu, b.procs.len(), b.disks.iter().map(|d| &d.mount).collect::<Vec<_>>(), b.net.len(), b.io.len());
         assert!(b.cpu[0].total >= a.cpu[0].total);
         assert!(b.procs.iter().any(|p| p.name == "sshd" && p.user == "root"));

@@ -19,6 +19,9 @@ type Candidate = {
 	proxyCommand?: string | null;
 };
 
+/** ~/.ssh/known_hosts 에 가져올 호스트 키 */
+type KnownScan = { path: string; total: number; hashed: number; already: number; fresh: number };
+
 /** 가져오기 — ~/.ssh/config·PuTTY 세션에서 골라 내 연결로 */
 export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
 	const [list, setList] = useState<Candidate[] | null>(null);
@@ -28,6 +31,18 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 	const [merge, setMerge] = useState(true);
 	// 경로(ProxyJump·ProxyCommand)를 넣으며 알릴 말 — 있으면 닫기 전에 보여 준다
 	const [notes, setNotes] = useState<string[] | null>(null);
+	// known_hosts — 이미 아는 서버는 첫 접속 때 지문을 묻지 않게
+	const [known, setKnown] = useState<KnownScan | null>(null);
+	const [takeKnown, setTakeKnown] = useState(false);
+
+	useEffect(() => {
+		invoke<KnownScan>("known_hosts_scan", { path: null })
+			.then((k) => {
+				setKnown(k);
+				setTakeKnown(k.fresh > 0);
+			})
+			.catch(() => setKnown(null));
+	}, []);
 
 	useEffect(() => {
 		invoke<Candidate[]>("import_candidates", { sshConfigPath: null })
@@ -102,7 +117,11 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 				if (id != null && (c.proxyJump || c.proxyCommand)) routeItems.push({ profileId: id, proxyJump: c.proxyJump, proxyCommand: c.proxyCommand });
 			}
 			// 점프 단계는 같이 가져온 별칭을 가리킬 수 있어 모두 만든 뒤에
-			const said = routeItems.length ? await routeApi.importRoutes(routeItems) : [];
+			const said: string[] = routeItems.length ? [...(await routeApi.importRoutes(routeItems))] : [];
+			if (takeKnown && known?.fresh) {
+				const added = await invoke<number>("known_hosts_import", { path: null });
+				said.push(`known_hosts 호스트 키 ${added}줄을 가져왔습니다 — 그 서버들은 처음 접속할 때 지문을 묻지 않습니다.`);
+			}
 			if (said.length) {
 				setNotes(said);
 				return;
@@ -117,7 +136,7 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
 			<div className="sheet" style={{ width: "min(560px, calc(100vw - 32px))" }}>
 				<h3>접속 정보 가져오기</h3>
-				<p style={{ color: "var(--text-2)", marginTop: -8 }}>~/.ssh/config 와 PuTTY 저장 세션에서 찾았습니다. DB 는 "DB 파일…"로 DataGrip·DBeaver 파일을 고르세요. 암호는 가져오지 않습니다. "이미 있음"은 같은 서버에 같은 사용자 계정이 있다는 뜻입니다.</p>
+				<p style={{ color: "var(--text-2)", marginTop: -8 }}>~/.ssh/config·known_hosts 와 PuTTY 저장 세션에서 찾았습니다. DB 는 "DB 파일…"로 DataGrip·DBeaver 파일을 고르세요. 암호는 가져오지 않습니다. "이미 있음"은 같은 서버에 같은 사용자 계정이 있다는 뜻입니다.</p>
 				{dbs.length > 0 && (
 					<p style={{ fontSize: 12.5 }}>
 						DB {dbs.length}개: {dbs.map((d) => `${d.name}(${d.engine})`).join(", ")}
@@ -171,6 +190,12 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 						))}
 					</ul>
 				)}
+				{known && known.total > 0 && (
+					<label className="check" title={`${known.path} — 해시된 줄(${known.hashed}개)도 접속할 때 주소로 대조합니다. 적힌 키와 다른 키를 내밀면 "키가 바뀜"으로 알립니다.`}>
+						<input type="checkbox" checked={takeKnown} disabled={!known.fresh} onChange={(e) => setTakeKnown(e.target.checked)} /> known_hosts 호스트 키도 가져오기 —{" "}
+						{known.fresh ? `새 ${known.fresh}줄(모두 ${known.total}줄, 해시 ${known.hashed}줄)` : `모두 가져왔습니다(${known.total}줄)`}
+					</label>
+				)}
 				<label className="check" title="예: 같은 서버에 root·deploy 두 줄이 있으면 서버 하나에 계정 두 개로 넣습니다">
 					<input type="checkbox" checked={merge} onChange={(e) => setMerge(e.target.checked)} /> 같은 주소·포트의 다른 사용자는 한 서버의 계정으로 합치기(이미 있는 서버에도)
 				</label>
@@ -186,8 +211,8 @@ export function ImportSheet({ onClose, onDone }: { onClose: () => void; onDone: 
 							가져오기 끝 — 닫기
 						</button>
 					) : (
-						<button type="button" className="btn primary" disabled={!pick.size && !dbs.length} onClick={() => void run()}>
-							{pick.size + dbs.length}개 가져오기
+						<button type="button" className="btn primary" disabled={!pick.size && !dbs.length && !(takeKnown && known?.fresh)} onClick={() => void run()}>
+							{pick.size + dbs.length}개 가져오기{takeKnown && known?.fresh ? " + 호스트 키" : ""}
 						</button>
 					)}
 				</div>

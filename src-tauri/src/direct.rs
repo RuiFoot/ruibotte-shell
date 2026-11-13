@@ -169,13 +169,15 @@ pub async fn direct_start(
         error: None,
         ms: 0,
         dest_conn: Some(to_conn),
+        conn: Some(from_conn),
     }));
     let _ = app.emit("transfer", prog.lock().unwrap().clone());
     let cancel = transfers.cancel.clone();
+    transfers.begin(id);
     tauri::async_runtime::spawn(async move {
         let started = Instant::now();
         let (code, stderr, cancelled) = run(&a, &b, &sh, &dest, &prog, &cancel, id, &app, started).await;
-        cancel.lock().unwrap().remove(&id);
+        crate::transfer::finish(&app, id);
         let mut p = prog.lock().unwrap().clone();
         p.ms = started.elapsed().as_millis() as u64;
         if cancelled {

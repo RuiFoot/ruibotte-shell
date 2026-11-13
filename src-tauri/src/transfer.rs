@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use futures_util::TryStreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -21,6 +21,22 @@ const CHUNK: usize = 256 * 1024;
 pub struct Transfers {
     pub(crate) next: AtomicU32,
     pub(crate) cancel: Arc<Mutex<HashSet<u32>>>,
+    /// 돌고 있는 전송 — 끝난 전송의 취소는 받지 않는다(취소 집합에 쌓이지 않게)
+    pub(crate) live: Arc<Mutex<HashSet<u32>>>,
+}
+
+impl Transfers {
+    /// 전송 시작 — 명령 안에서(작업을 띄우기 전에) 부른다: 그 사이 온 취소도 받게
+    pub(crate) fn begin(&self, id: u32) {
+        self.live.lock().unwrap().insert(id);
+    }
+}
+
+/// 전송 끝 — 돌고 있음·취소 표시를 지운다
+pub(crate) fn finish(app: &AppHandle, id: u32) {
+    let t = app.state::<Transfers>();
+    t.live.lock().unwrap().remove(&id);
+    t.cancel.lock().unwrap().remove(&id);
 }
 
 #[derive(Serialize, Clone)]
@@ -47,6 +63,9 @@ pub(crate) struct Progress {
     /// 받는 서버 연결(서버 → 서버) — 끝나면 그 서버 트리를 새로 읽게
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dest_conn: Option<u32>,
+    /// 출발 연결(올리기·받기는 그 서버, 서버 → 서버는 보내는 쪽) — 화면이 탭별로 거른다
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) conn: Option<u32>,
 }
 
 pub(crate) struct Item {
@@ -127,22 +146,38 @@ pub(crate) async fn walk_remote(c: &Conn, src: &str, dest: PathBuf, out: &mut Ve
     let m = c.sftp.metadata(src.to_string()).await.map_err(sftp_err)?;
     if m.is_dir() {
         out.push(Item { src: src.into(), dest: dest.to_string_lossy().into_owned(), size: 0, dir: true });
-        let mut kids: Vec<_> = c.sftp.read_dir(src.to_string()).await.map_err(sftp_err)?.collect();
-        kids.sort_by_key(|e| e.file_name());
-        for k in kids {
-            let name = k.file_name();
-            if name == "." || name == ".." {
-                continue;
-            }
-            let path = rjoin(src, &name);
-            // 목록의 속성은 링크 자체(lstat) — 폴더를 가리키는 링크는 건너뛴다
-            if k.metadata().is_symlink() && c.sftp.metadata(path.clone()).await.map(|t| t.is_dir()).unwrap_or(true) {
-                continue;
-            }
-            Box::pin(walk_remote(c, &path, dest.join(local_safe_name(&name)), out)).await?;
-        }
+        Box::pin(walk_remote_dir(c, src, dest, out)).await
     } else {
         out.push(Item { src: src.into(), dest: dest.to_string_lossy().into_owned(), size: m.size.unwrap_or(0), dir: false });
+        Ok(())
+    }
+}
+
+/// 폴더 안 — 목록에 딸려 온 속성을 그대로 쓴다(항목마다 metadata 를 다시 묻지 않는다). 링크만 가리키는 곳을 묻는다
+async fn walk_remote_dir(c: &Conn, src: &str, dest: PathBuf, out: &mut Vec<Item>) -> R<()> {
+    let mut kids: Vec<_> = c.sftp.read_dir(src.to_string()).await.map_err(sftp_err)?.collect();
+    kids.sort_by_key(|e| e.file_name());
+    for k in kids {
+        let name = k.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let path = rjoin(src, &name);
+        let to = dest.join(local_safe_name(&name));
+        // 목록의 속성은 링크 자체(lstat) — 폴더를 가리키는(또는 끊긴) 링크는 건너뛰고, 파일을 가리키면 그 크기로
+        let mut m = k.metadata();
+        if m.is_symlink() {
+            match c.sftp.metadata(path.clone()).await {
+                Ok(t) if !t.is_dir() => m = t,
+                _ => continue,
+            }
+        }
+        if m.is_dir() {
+            out.push(Item { src: path.clone(), dest: to.to_string_lossy().into_owned(), size: 0, dir: true });
+            Box::pin(walk_remote_dir(c, &path, to, out)).await?;
+        } else {
+            out.push(Item { src: path, dest: to.to_string_lossy().into_owned(), size: m.size.unwrap_or(0), dir: false });
+        }
     }
     Ok(())
 }
@@ -174,7 +209,8 @@ pub async fn transfer_start(
         walk_remote(&c, &src, Path::new(&dest_dir).join(&name), &mut v).await?;
         v
     };
-    spawn_items(app, transfers.cancel.clone(), c, id, if up { Mode::Up } else { Mode::Down }, name, items, overwrite);
+    transfers.begin(id);
+    spawn_items(app, transfers.cancel.clone(), c, conn, id, if up { Mode::Up } else { Mode::Down }, name, items, overwrite);
     Ok(id)
 }
 
@@ -188,7 +224,8 @@ pub(crate) enum Mode {
 
 /// 항목 목록을 뒤에서 옮긴다(진행률 transfer 이벤트) — 전송·동기화·중계 공용
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: Arc<Conn>, id: u32, mode: Mode, name: String, items: Vec<Item>, overwrite: bool) {
+/// 부르기 전에 [`Transfers::begin`] — 끝나면 [`finish`] 로 정리한다
+pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: Arc<Conn>, conn: u32, id: u32, mode: Mode, name: String, items: Vec<Item>, overwrite: bool) {
     let up = matches!(mode, Mode::Up);
     let total: u64 = items.iter().map(|i| i.size).sum();
     let files_total = items.iter().filter(|i| !i.dir).count() as u32;
@@ -220,6 +257,7 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
                 Mode::Relay(_, to) => Some(*to),
                 _ => None,
             },
+            conn: Some(conn),
         }));
         let _ = app2.emit("transfer", prog.lock().unwrap().clone());
         // 진행률은 따로 150 ms 마다
@@ -297,7 +335,7 @@ pub(crate) fn spawn_items(app: AppHandle, cancel: Arc<Mutex<HashSet<u32>>>, c: A
         }
         .await;
         let _ = stop_tx.send(());
-        cancel.lock().unwrap().remove(&id);
+        finish(&app2, id);
         let mut p = prog.lock().unwrap().clone();
         p.ms = started.elapsed().as_millis() as u64;
         match result {
@@ -354,7 +392,7 @@ async fn relay_one(a: &Conn, b: &Conn, it: &Item, prog: &Arc<Mutex<Progress>>, c
     }
     dst.shutdown().await.map_err(|e| e.to_string())?;
     let mine = hex::encode(hasher.finalize());
-    let (ha, hb) = (remote_sha256(a, &it.src).await, remote_sha256(b, &part).await);
+    let (ha, hb) = tokio::join!(remote_sha256(a, &it.src, it.size), remote_sha256(b, &part, it.size));
     // 이어 보냈으면 앞부분을 이번에 읽지 않았으므로 내 해시는 쓰지 않고 양쪽 서버 해시끼리만 맞춘다
     let bad = if resumed { matches!((&ha, &hb), (Some(x), Some(y)) if x != y) } else { [&ha, &hb].into_iter().flatten().any(|h| *h != mine) };
     if bad {
@@ -390,24 +428,25 @@ pub async fn relay_start(
     for it in &mut items {
         it.dest = it.dest.replace('\\', "/");
     }
-    spawn_items(app, transfers.cancel.clone(), a, id, Mode::Relay(b, to_conn), name, items, overwrite);
+    transfers.begin(id);
+    spawn_items(app, transfers.cancel.clone(), a, from_conn, id, Mode::Relay(b, to_conn), name, items, overwrite);
     Ok(id)
 }
 
-/// 원격 sha256 — 서버에 sha256sum 이 없으면 None(확인 건너뜀)
-pub(crate) async fn remote_sha256(c: &Conn, path: &str) -> Option<String> {
-    let mut ch = c.handle_ref().channel_open_session().await.ok()?;
-    let q = format!("sha256sum -- '{}' 2>/dev/null", path.replace('\'', "'\\''"));
-    ch.exec(true, q.as_str()).await.ok()?;
-    let mut out = Vec::new();
-    while let Some(m) = ch.wait().await {
-        if let russh::ChannelMsg::Data { data } = m {
-            out.extend_from_slice(&data);
-        }
-    }
-    let s = String::from_utf8_lossy(&out);
+/// 원격 sha256 — 서버에 sha256sum 이 없거나 제때 끝나지 않으면 None(확인 건너뜀).
+/// 시간 상한은 크기에 맞춰(30초 + 40 MiB/s 로 읽는 시간) — 넘으면 채널을 닫는다
+pub(crate) async fn remote_sha256(c: &Conn, path: &str, size: u64) -> Option<String> {
+    let q = format!("sha256sum -- {} 2>/dev/null", crate::sudo::q(path));
+    let limit = sha_limit(size);
+    let o = crate::ssh::run_exec(c, &q, None, crate::ssh::ExecLimit { idle: limit, total: Some(limit), max_out: 64 * 1024 }).await.ok()?;
+    let s = String::from_utf8_lossy(&o.stdout);
     let h = s.split_whitespace().next()?.to_lowercase();
-    (h.len() == 64).then_some(h)
+    (h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).then_some(h)
+}
+
+/// 크기에 맞춘 해시 시간 상한
+pub(crate) fn sha_limit(size: u64) -> Duration {
+    Duration::from_secs(30 + size / (40 * 1024 * 1024))
 }
 
 /// 파일 하나 — `<이름>.rbpart` 에 쓰고(있으면 이어서), sha256 이 맞으면 최종 이름으로
@@ -463,7 +502,7 @@ pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Pro
         }
         dst.shutdown().await.map_err(|e| e.to_string())?;
         let mine = hex::encode(hasher.finalize());
-        let theirs = remote_sha256(c, &part).await;
+        let theirs = remote_sha256(c, &part, it.size).await;
         if let Some(t) = &theirs {
             if *t != mine {
                 let _ = c.sftp.remove_file(part.clone()).await;
@@ -505,7 +544,7 @@ pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Pro
         dst.flush().await.map_err(|e| e.to_string())?;
         drop(dst);
         let mine = hex::encode(hasher.finalize());
-        let theirs = remote_sha256(c, &it.src).await;
+        let theirs = remote_sha256(c, &it.src, it.size).await;
         if let Some(t) = &theirs {
             if *t != mine {
                 let _ = std::fs::remove_file(&part);
@@ -518,9 +557,12 @@ pub(crate) async fn copy_one(c: &Conn, it: &Item, up: bool, prog: &Arc<Mutex<Pro
     }
 }
 
+/// 취소 — 돌고 있는 전송만(끝난 id 는 받지 않는다)
 #[tauri::command]
 pub fn transfer_cancel(transfers: State<'_, Transfers>, id: u32) {
-    transfers.cancel.lock().unwrap().insert(id);
+    if transfers.live.lock().unwrap().contains(&id) {
+        transfers.cancel.lock().unwrap().insert(id);
+    }
 }
 
 /// 진행률을 따로 보이지 않는 한 파일 전송용(경로 매핑 자동 반영)
@@ -541,6 +583,7 @@ pub(crate) fn dummy_progress() -> Arc<Mutex<Progress>> {
         error: None,
         ms: 0,
         dest_conn: None,
+        conn: None,
     }))
 }
 
@@ -570,7 +613,7 @@ mod live {
         std::fs::write(&src, &data).unwrap();
         let prog = Arc::new(Mutex::new(Progress {
             id: 1, direction: "up", name: String::new(), dest: String::new(), bytes_done: 0, bytes_total: 0,
-            files_done: 0, files_total: 0, skipped: 0, verified: 0, resumed: 0, state: "running", error: None, ms: 0, dest_conn: None,
+            files_done: 0, files_total: 0, skipped: 0, verified: 0, resumed: 0, state: "running", error: None, ms: 0, dest_conn: None, conn: None,
         }));
         let cancel: Arc<Mutex<HashSet<u32>>> = Default::default();
         let up = Item { src: src.to_string_lossy().into(), dest: "/home/rbtest/big.bin".into(), size: data.len() as u64, dir: false };
@@ -658,7 +701,8 @@ pub async fn ssh_copy(conns: State<'_, SshConns>, conn: u32, from: String, to: S
     // 작은따옴표 감싸기는 sudo::q 로 — 여기서 쓰던 "'\''" 는 Rust 에서 역슬래시가 빠진 ''' 라 경로가 깨지고 명령이 섞여 들어갔다
     let q = crate::sudo::q;
     let cmd = format!("[ -e {t} ] && {{ echo '같은 이름이 이미 있습니다' >&2; exit 1; }}; cp -a -- {f} {t}", f = q(&from), t = q(&to));
-    let o = crate::sudo::exec(&c, &cmd, None).await?;
+    // cp -a 는 끝날 때까지 출력이 없다 — 큰 폴더 복사가 30초 idle 로 끊기지 않게 길게
+    let o = crate::sudo::exec_idle(&c, &cmd, None, Duration::from_secs(3600)).await?;
     if o.code != Some(0) {
         return Err(err("SFTP", o.stderr.trim().lines().last().unwrap_or("복사하지 못했습니다").to_string()));
     }

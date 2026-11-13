@@ -5,12 +5,11 @@
 //! sudo 설정은 연결한 계정을 따른다: off(안 씀) · ask(켤 때 물음, 이 연결 동안만 기억) · saved(저장한 암호) · nopasswd(암호 없이).
 //! sudo 대상 사용자가 root 가 아니면 `sudo -u <사용자>`.
 
-use russh::ChannelMsg;
 use serde::Serialize;
 use tauri::State;
 
 use crate::secrets;
-use crate::ssh::{err, Conn, SshConns, R};
+use crate::ssh::{err, Conn, ExecLimit, SshConns, R};
 use crate::textcodec::{self, TextMeta};
 
 pub(crate) const MAX_TEXT: usize = 8 * 1024 * 1024;
@@ -25,28 +24,20 @@ pub(crate) fn q(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// 출력 없이 기다릴 최대 시간 — 넘으면 채널을 닫고 NETWORK(서버에서 멈춘 명령에 화면이 매이지 않게)
+pub(crate) const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) async fn exec(c: &Conn, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
-    let mut ch = c.handle_ref().channel_open_session().await.map_err(|e| err("OTHER", e.to_string()))?;
-    ch.exec(true, cmd).await.map_err(|e| err("OTHER", e.to_string()))?;
-    if let Some(input) = stdin {
-        ch.data(input).await.map_err(|e| err("OTHER", e.to_string()))?;
+    exec_idle(c, cmd, stdin, IDLE).await
+}
+
+/// 오래 조용한 명령(du·rm -rf 등)용 — idle 을 고른다
+pub(crate) async fn exec_idle(c: &Conn, cmd: &str, stdin: Option<&[u8]>, idle: std::time::Duration) -> R<Out> {
+    let o = crate::ssh::run_exec(c, cmd, stdin, ExecLimit { idle, total: None, max_out: MAX_TEXT + 1024 }).await?;
+    if o.cut {
+        return Err(err("SFTP", "파일이 너무 큽니다"));
     }
-    ch.eof().await.map_err(|e| err("OTHER", e.to_string()))?;
-    let mut out = Out { code: None, stdout: Vec::new(), stderr: String::new() };
-    while let Some(m) = ch.wait().await {
-        match m {
-            ChannelMsg::Data { data } => {
-                out.stdout.extend_from_slice(&data);
-                if out.stdout.len() > MAX_TEXT + 1024 {
-                    return Err(err("SFTP", "파일이 너무 큽니다"));
-                }
-            }
-            ChannelMsg::ExtendedData { data, .. } => out.stderr.push_str(&String::from_utf8_lossy(&data)),
-            ChannelMsg::ExitStatus { exit_status } => out.code = Some(exit_status),
-            _ => {}
-        }
-    }
-    Ok(out)
+    Ok(Out { code: o.code, stdout: o.stdout, stderr: o.stderr })
 }
 
 fn needs_password(o: &Out) -> bool {
@@ -79,12 +70,17 @@ fn sudo_cmd(c: &Conn, cmd: &str) -> R<String> {
 
 /// `sudo -n <cmd>` — 암호가 필요하면 이번에 넣은(또는 저장한) 암호로 한 번 인증하고 다시
 pub(crate) async fn sudo(c: &Conn, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
-    sudo_with(c, None, cmd, stdin).await
+    sudo_with(c, None, cmd, stdin, IDLE).await
 }
 
-async fn sudo_with(c: &Conn, typed: Option<&str>, cmd: &str, stdin: Option<&[u8]>) -> R<Out> {
+/// 오래 조용한 명령용 sudo — idle 을 고른다
+pub(crate) async fn sudo_idle(c: &Conn, cmd: &str, stdin: Option<&[u8]>, idle: std::time::Duration) -> R<Out> {
+    sudo_with(c, None, cmd, stdin, idle).await
+}
+
+async fn sudo_with(c: &Conn, typed: Option<&str>, cmd: &str, stdin: Option<&[u8]>, idle: std::time::Duration) -> R<Out> {
     let full = sudo_cmd(c, cmd)?;
-    let o = exec(c, &full, stdin).await?;
+    let o = exec_idle(c, &full, stdin, idle).await?;
     if !needs_password(&o) {
         return check(o);
     }
@@ -101,7 +97,7 @@ async fn sudo_with(c: &Conn, typed: Option<&str>, cmd: &str, stdin: Option<&[u8]
     if v.code != Some(0) {
         return Err(err("AUTH_FAILED", if v.stderr.contains("not in the sudoers") { "이 계정은 sudo 를 쓸 수 없습니다" } else { "sudo 암호가 맞지 않습니다" }));
     }
-    check(exec(c, &full, stdin).await?)
+    check(exec_idle(c, &full, stdin, idle).await?)
 }
 
 fn check(o: Out) -> R<Out> {
@@ -139,7 +135,7 @@ pub(crate) fn join(dir: &str, name: &str) -> String {
 pub async fn sudo_check(store: State<'_, crate::store::Store>, conns: State<'_, SshConns>, conn: u32, password: Option<String>, save: bool) -> R<bool> {
     let c = conns.get(conn)?;
     let typed = password.filter(|p| !p.is_empty());
-    sudo_with(&c, typed.as_deref(), "true", None).await?;
+    sudo_with(&c, typed.as_deref(), "true", None, IDLE).await?;
     if let Some(p) = typed {
         *c.sudo_pw.lock().unwrap() = Some(p.clone());
         if let (true, Some(id)) = (save, c.account_id) {
@@ -193,7 +189,7 @@ pub struct FileText {
 #[tauri::command]
 pub async fn sudo_read_text(conns: State<'_, SshConns>, conn: u32, path: String, encoding: Option<String>) -> R<FileText> {
     let c = conns.get(conn)?;
-    let st = sudo(&c, &format!("stat -c '%s %Y' -- {}", q(&path)), None).await?;
+    let st = sudo(&c, &format!("stat -L -c '%s %Y' -- {}", q(&path)), None).await?;
     let st = String::from_utf8_lossy(&st.stdout).to_string();
     let mut it = st.split_whitespace();
     let size: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
@@ -216,7 +212,7 @@ pub struct Saved {
     pub(crate) mtime: Option<u32>,
 }
 
-/// 저장 = `sudo tee` — 같은 파일(inode)에 써서 소유자·권한을 지킨다
+/// 저장 = `sudo tee` — 같은 파일(inode)에 써서 소유자·권한을 지킨다. 연 뒤 바뀌었으면(mtime·크기) CONFLICT, 쓴 뒤 크기가 다르면 SIZE_MISMATCH
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn sudo_write_text(
@@ -226,21 +222,31 @@ pub async fn sudo_write_text(
     text: String,
     meta: TextMeta,
     expect_mtime: Option<u32>,
+    expect_size: Option<u64>,
 ) -> R<Saved> {
     let c = conns.get(conn)?;
-    if let Some(exp) = expect_mtime {
-        let st = sudo(&c, &format!("stat -c '%Y' -- {}", q(&path)), None).await?;
-        let now: Option<u32> = String::from_utf8_lossy(&st.stdout).trim().parse().ok();
-        if now.is_some_and(|t| t != exp) {
-            return Err(err("CONFLICT", "연 뒤에 서버에서 파일이 바뀌었습니다. 다시 열어 확인하세요."));
-        }
+    if expect_mtime.is_some() || expect_size.is_some() {
+        // 없는 파일이면 stat 이 실패한다 — 그때는 비교 없이 새로 만든다
+        let (size, mtime) = match sudo(&c, &format!("stat -L -c '%s %Y' -- {}", q(&path)), None).await {
+            Ok(st) => parse_stat(&st.stdout),
+            Err(e) if e.code_is("SFTP") && e.message_ref().contains("No such file") => (None, None),
+            Err(e) => return Err(e),
+        };
+        crate::ssh::check_unchanged(mtime, size, expect_mtime, expect_size)?;
     }
     let bytes = textcodec::encode(&text, &meta).map_err(|e| err("ENCODING", e))?;
     sudo(&c, &format!("tee -- {} > /dev/null", q(&path)), Some(&bytes)).await?;
-    let st = sudo(&c, &format!("stat -c '%s %Y' -- {}", q(&path)), None).await?;
-    let st = String::from_utf8_lossy(&st.stdout).to_string();
-    let mut it = st.split_whitespace();
-    Ok(Saved { size: it.next().and_then(|x| x.parse().ok()).unwrap_or(bytes.len() as u64), mtime: it.next().and_then(|x| x.parse().ok()) })
+    let st = sudo(&c, &format!("stat -L -c '%s %Y' -- {}", q(&path)), None).await?;
+    let (size, mtime) = parse_stat(&st.stdout);
+    crate::ssh::check_written(size, bytes.len())?;
+    Ok(Saved { size: size.unwrap_or(bytes.len() as u64), mtime })
+}
+
+/// `stat -c '%s %Y'` → (크기, mtime)
+fn parse_stat(out: &[u8]) -> (Option<u64>, Option<u32>) {
+    let s = String::from_utf8_lossy(out);
+    let mut it = s.split_whitespace();
+    (it.next().and_then(|x| x.parse().ok()), it.next().and_then(|x| x.parse().ok()))
 }
 
 #[tauri::command]
@@ -256,6 +262,7 @@ pub async fn sudo_op(conns: State<'_, SshConns>, conn: u32, op: String, path: St
         "remove" => format!("rm -rf -- {}", q(&path)),
         _ => return Err(err("OTHER", "알 수 없는 작업")),
     };
-    sudo(&c, &cmd, None).await?;
+    // rm -rf·mv 는 끝날 때까지 출력이 없다 — 큰 폴더에서 30초 idle 로 끊기지 않게 길게
+    sudo_idle(&c, &cmd, None, std::time::Duration::from_secs(3600)).await?;
     Ok(())
 }

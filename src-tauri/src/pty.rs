@@ -312,6 +312,13 @@ pub fn pty_open(
                     }
                 }
             }
+            // 셸이 끝났으면 바로 거둔다(유닉스에서 좀비로 남지 않게) — 화면이 닫을 때까지 기다리지 않는다
+            {
+                use tauri::Manager;
+                if let Some(s) = app.state::<Ptys>().map.lock().unwrap().get_mut(&id) {
+                    let _ = s.child.try_wait();
+                }
+            }
             let _ = app.emit("pty-exit", ExitEvent { id });
         })
         .map_err(|e| e.to_string())?;
@@ -345,9 +352,15 @@ pub fn pty_resize(ptys: State<'_, Ptys>, id: u32, cols: u16, rows: u16) -> Resul
 
 #[tauri::command]
 pub fn pty_close(ptys: State<'_, Ptys>, id: u32) {
-    if let Some(mut s) = ptys.map.lock().unwrap().remove(&id) {
+    let s = ptys.map.lock().unwrap().remove(&id);
+    if let Some(mut s) = s {
         s.flow.reset();
         let _ = s.child.kill();
+        // 끝난 자식을 거둔다(wait) — 안 하면 유닉스에서 좀비 프로세스로 남는다. 끝나기를 기다리는 일이라 따로
+        let _ = std::thread::Builder::new().name(format!("pty-reap-{id}")).spawn(move || {
+            let _ = s.child.wait();
+            drop(s);
+        });
     }
 }
 

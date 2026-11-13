@@ -631,3 +631,261 @@ mod jdbc_tests {
         assert_eq!(parse_jdbc("jdbc:oracle:thin:@//o:1521/ORCLPDB1"), Some(("oracle", "o".into(), 1521, "ORCLPDB1".into())));
     }
 }
+
+// ── ~/.ssh/known_hosts ───────────────
+// 가져오기 = 그 파일의 줄들을 앱 데이터 폴더의 known_hosts 로 옮겨 둔다(OpenSSH 형식 그대로, 해시된 |1| 줄 포함).
+// 접속할 때 이 주소에 고정한 키가 없으면 여기서 대조한다: 서버 키가 적혀 있으면 묻지 않고 믿고 고정(TOFU 저장소로),
+// 같은 종류의 다른 키만 적혀 있으면 "키가 바뀜"으로 알린다. @revoked 키는 믿지 않는다. @cert-authority 줄은 아직 쓰지 않는다.
+
+/// known_hosts 에 적힌 키 하나(이 주소에 맞는 것)
+#[derive(Clone, Debug)]
+pub(crate) struct KnownKey {
+    pub(crate) algorithm: String,
+    pub(crate) fingerprint: String,
+    pub(crate) revoked: bool,
+}
+
+fn user_known_hosts() -> PathBuf {
+    home().join(".ssh").join("known_hosts")
+}
+
+/// 가져온 줄을 두는 곳 — 앱 데이터 폴더(app.db 옆)
+fn app_known_hosts(store: &Store) -> Option<PathBuf> {
+    store.path.parent().map(|d| d.join("known_hosts"))
+}
+
+/// HMAC-SHA1(해시된 호스트 이름 |1|salt|hash 대조용)
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..20].copy_from_slice(&Sha1::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let (mut ipad, mut opad) = ([0x36u8; 64], [0x5cu8; 64]);
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = Sha1::new().chain_update(ipad).chain_update(msg).finalize();
+    Sha1::new().chain_update(opad).chain_update(inner).finalize().into()
+}
+
+fn b64(s: &str) -> Option<Vec<u8>> {
+    use russh::keys::ssh_key::encoding::base64::{Base64, Encoding as _};
+    Base64::decode_vec(s).ok()
+}
+
+/// OpenSSH 의 호스트 패턴(* ?)
+fn wild(pat: &str, text: &str) -> bool {
+    fn rec(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => (0..=t.len()).any(|i| rec(&p[1..], &t[i..])),
+            (Some(b'?'), Some(_)) => rec(&p[1..], &t[1..]),
+            (Some(a), Some(b)) if a == b => rec(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    rec(pat.as_bytes(), text.as_bytes())
+}
+
+/// known_hosts 의 호스트 칸이 host:port 에 맞는지 — 포트 22 는 `host`, 그 밖은 `[host]:port` 로 적힌다(해시도 그 글자로)
+fn host_matches(field: &str, host: &str, port: u16) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
+    let name = if port == 22 { h } else { format!("[{h}]:{port}") };
+    if let Some(rest) = field.strip_prefix("|1|") {
+        let Some((salt, hash)) = rest.split_once('|') else { return false };
+        let (Some(salt), Some(hash)) = (b64(salt), b64(hash)) else { return false };
+        return hmac_sha1(&salt, name.as_bytes())[..] == hash[..];
+    }
+    let mut hit = false;
+    for pat in field.split(',') {
+        let (neg, pat) = match pat.strip_prefix('!') {
+            Some(p) => (true, p),
+            None => (false, pat),
+        };
+        if wild(&pat.to_lowercase(), &name) {
+            if neg {
+                return false;
+            }
+            hit = true;
+        }
+    }
+    hit
+}
+
+/// 한 줄 → (표식, 호스트 칸, 키). 주석·빈 줄·읽을 수 없는 키는 None
+fn parse_known_line(line: &str) -> Option<(Option<&str>, &str, russh::keys::ssh_key::PublicKey)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut it = line.split_whitespace();
+    let mut first = it.next()?;
+    let marker = if first.starts_with('@') {
+        let m = first;
+        // 아는 표식만 — 모르는 표식 줄은 OpenSSH 처럼 무시(일반 신뢰 키로 읽지 않는다)
+        if m != "@revoked" && m != "@cert-authority" {
+            return None;
+        }
+        first = it.next()?;
+        Some(m)
+    } else {
+        None
+    };
+    let (kind, data) = (it.next()?, it.next()?);
+    let key = russh::keys::ssh_key::PublicKey::from_openssh(&format!("{kind} {data}")).ok()?;
+    Some((marker, first, key))
+}
+
+/// 텍스트에서 host:port 에 맞는 키들
+pub(crate) fn known_keys_in(text: &str, host: &str, port: u16) -> Vec<KnownKey> {
+    use russh::keys::HashAlg;
+    text.lines()
+        .filter_map(parse_known_line)
+        .filter(|(m, _, _)| *m != Some("@cert-authority"))
+        .filter(|(_, hosts, _)| host_matches(hosts, host, port))
+        .map(|(m, _, k)| KnownKey { algorithm: k.algorithm().to_string(), fingerprint: k.fingerprint(HashAlg::Sha256).to_string(), revoked: m == Some("@revoked") })
+        .collect()
+}
+
+/// 가져온 known_hosts 에서 host:port 의 키들(가져온 적이 없으면 빈 것)
+pub(crate) fn known_keys(store: &Store, host: &str, port: u16) -> Vec<KnownKey> {
+    let Some(p) = app_known_hosts(store) else { return Vec::new() };
+    match std::fs::read_to_string(p) {
+        Ok(t) => known_keys_in(&t, host, port),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownHostsScan {
+    path: String,
+    /// 쓸 수 있는 키 줄
+    total: usize,
+    /// 그중 호스트 이름이 해시된 줄(접속할 때 대조한다)
+    hashed: usize,
+    /// 이미 가져온 줄 수(앱 쪽)
+    already: usize,
+    /// 새로 들어갈 줄 수
+    fresh: usize,
+}
+
+/// 쓸 수 있는 줄만(공백을 하나로 맞춰 같은 줄을 알아본다)
+fn usable_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| parse_known_line(l).is_some_and(|(m, _, _)| m != Some("@cert-authority")))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+fn hashed_line(l: &str) -> bool {
+    let mut it = l.split(' ');
+    let first = it.next().unwrap_or("");
+    let hosts = if first.starts_with('@') { it.next().unwrap_or("") } else { first };
+    hosts.starts_with("|1|")
+}
+
+type KnownScan = (PathBuf, Vec<String>, std::collections::HashSet<String>);
+
+fn scan_known(store: &Store, path: Option<String>) -> Result<KnownScan, String> {
+    let src = path.filter(|p| !p.trim().is_empty()).map(PathBuf::from).unwrap_or_else(user_known_hosts);
+    let text = std::fs::read_to_string(&src).map_err(|e| format!("{} 를 읽지 못했습니다: {e}", src.display()))?;
+    let have: std::collections::HashSet<String> = app_known_hosts(store)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| usable_lines(&t).into_iter().collect())
+        .unwrap_or_default();
+    Ok((src, usable_lines(&text), have))
+}
+
+/// ~/.ssh/known_hosts(또는 고른 파일)에 가져올 키가 몇 줄인지 — 파일이 없으면 total 0
+#[tauri::command(async)]
+pub fn known_hosts_scan(store: State<'_, Store>, path: Option<String>) -> Result<KnownHostsScan, String> {
+    let src = path.clone().filter(|p| !p.trim().is_empty()).map(PathBuf::from).unwrap_or_else(user_known_hosts);
+    if !src.is_file() {
+        return Ok(KnownHostsScan { path: src.to_string_lossy().into_owned(), total: 0, hashed: 0, already: 0, fresh: 0 });
+    }
+    let (src, lines, have) = scan_known(&store, path)?;
+    Ok(KnownHostsScan {
+        path: src.to_string_lossy().into_owned(),
+        total: lines.len(),
+        hashed: lines.iter().filter(|l| hashed_line(l)).count(),
+        already: have.len(),
+        fresh: lines.iter().filter(|l| !have.contains(*l)).count(),
+    })
+}
+
+/// 가져오기 — 새 줄만 앱 쪽 known_hosts 에 덧붙인다. 돌려주는 값 = 더한 줄 수
+#[tauri::command(async)]
+pub fn known_hosts_import(store: State<'_, Store>, path: Option<String>) -> Result<usize, String> {
+    let (_, lines, mut have) = scan_known(&store, path)?;
+    let dest = app_known_hosts(&store).ok_or("앱 데이터 폴더를 찾지 못했습니다")?;
+    let mut text = std::fs::read_to_string(&dest).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let mut added = 0;
+    for l in lines {
+        if have.insert(l.clone()) {
+            text.push_str(&l);
+            text.push('\n');
+            added += 1;
+        }
+    }
+    if added > 0 {
+        // 새 파일에 다 쓴 뒤 바꾼다(쓰다 끊겨도 앞서 가져온 것이 반쯤 남지 않게)
+        let tmp = dest.with_extension("tmp");
+        std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    }
+    Ok(added)
+}
+
+#[cfg(test)]
+mod known_tests {
+    use super::*;
+
+    const ED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+
+    #[test]
+    fn hmac_vector() {
+        // RFC 2202 시험 1
+        assert_eq!(hex::encode(hmac_sha1(&[0x0b; 20], b"Hi There")), "b617318655057264e28bc0b6fb378c8ef146be00");
+    }
+
+    #[test]
+    fn matches_plain_wild_port_negated_and_hashed() {
+        assert!(host_matches("srv.example,10.0.0.5", "SRV.example", 22));
+        assert!(!host_matches("srv.example", "srv.example", 2222));
+        assert!(host_matches("[srv.example]:2222", "srv.example", 2222));
+        assert!(host_matches("*.example,!bad.example", "a.example", 22));
+        assert!(!host_matches("*.example,!bad.example", "bad.example", 22));
+        // 해시: salt 를 정해 만든 줄과 대조
+        use russh::keys::ssh_key::encoding::base64::{Base64, Encoding as _};
+        let salt = [7u8; 20];
+        let h = hmac_sha1(&salt, b"[srv.example]:2222");
+        let field = format!("|1|{}|{}", Base64::encode_string(&salt), Base64::encode_string(&h));
+        assert!(host_matches(&field, "srv.example", 2222));
+        assert!(!host_matches(&field, "srv.example", 22));
+        assert!(hashed_line(&format!("{field} {ED}")));
+        assert!(hashed_line(&format!("@revoked {field} {ED}")));
+        assert!(!hashed_line(&format!("srv.example {ED}")));
+    }
+
+    #[test]
+    fn keys_for_host_skip_ca_mark_revoked() {
+        let text = format!("# c\n\nsrv.example {ED}\n@cert-authority *.example {ED}\n@revoked other.example {ED}\n@weird srv.example {ED}\nbroken line\nother.example ssh-rsa notbase64\n");
+        let k = known_keys_in(&text, "srv.example", 22);
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].algorithm, "ssh-ed25519");
+        assert!(k[0].fingerprint.starts_with("SHA256:"));
+        assert!(!k[0].revoked);
+        let r = known_keys_in(&text, "other.example", 22);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].revoked);
+        assert_eq!(usable_lines(&text).len(), 2);
+    }
+}

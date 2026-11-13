@@ -8,7 +8,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +26,8 @@ use crate::store::{Account, PinnedKey, Store};
 use crate::textcodec::{self, TextMeta};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+/// 인증 전체 상한 — 서버가 keyboard-interactive 로 끝없이 묻거나 에이전트가 답하지 않아도 여기서 끊는다
+const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 /// 편집기로 여는 파일 상한 — 넘으면 읽기만 권한다
 const MAX_TEXT: u64 = 8 * 1024 * 1024;
 
@@ -65,6 +67,12 @@ pub struct SshError {
 impl SshError {
     pub(crate) fn message_owned(self) -> String {
         self.message
+    }
+    pub(crate) fn message_ref(&self) -> &str {
+        &self.message
+    }
+    pub(crate) fn code_is(&self, code: &str) -> bool {
+        self.code == code
     }
 }
 
@@ -121,6 +129,26 @@ pub(crate) fn map_russh(e: russh::Error) -> SshError {
         }
         russh::Error::Disconnect | russh::Error::HUP => err("CLOSED", "연결이 끊겼습니다"),
         other => err("OTHER", other.to_string()),
+    }
+}
+
+/// 채널을 못 연 오류 → 사람 말(서버의 세션 수 제한·셸 금지 계정 등)
+pub(crate) fn open_err(e: russh::Error) -> SshError {
+    match e {
+        russh::Error::ChannelOpenFailure(why) => {
+            use russh::ChannelOpenFailure as F;
+            let why = match why {
+                F::AdministrativelyProhibited => "관리자 설정으로 막힘".to_string(),
+                F::ResourceShortage => "서버 자원 부족".to_string(),
+                F::ConnectFailed => "연결 실패".to_string(),
+                F::UnknownChannelType => "지원하지 않는 채널".to_string(),
+                F::Other { code, reason } => format!("{code} {reason}"),
+            };
+            let mut x = err("OTHER", format!("서버가 새 채널을 열어 주지 않았습니다({why})"));
+            x.hint = Some("한 연결에 열 수 있는 세션 수(sshd 의 MaxSessions)를 넘었거나, 이 계정은 명령 실행이 막혀 있을 수 있습니다 — 터미널·탭을 몇 개 닫고 다시 하세요.".into());
+            x
+        }
+        other => map_russh(other),
     }
 }
 
@@ -361,6 +389,7 @@ pub async fn ssh_connect(app: AppHandle, store: State<'_, Store>, conns: State<'
             }
             if c.handle.is_closed() {
                 crate::tunnel::stop_conn(id).await;
+                crate::sync::stop_conn(&app, id);
                 let _ = app.emit("ssh-closed", Closed { conn: id });
                 let _ = app.emit("forward-changed", Closed { conn: id });
                 break;
@@ -588,8 +617,14 @@ pub(crate) async fn link_route(
         hops.push(h);
     }
 
-    // 대상 — 이 경로 주소에 고정한 키, 없으면 같은 서버 다른 경로에서 고정한 키와 같으면 믿는다
+    // 대상 — 이 경로 주소에 고정한 키, 없으면 같은 서버 다른 경로에서 고정한 키·가져온 known_hosts 의 키와 같으면 믿는다
     let pinned = store.host_key(&r.host, r.port);
+    let known = if pinned.is_none() { crate::importer::known_keys(store, &r.host, r.port) } else { Vec::new() };
+    let revoked: Vec<String> = known.iter().filter(|k| k.revoked).map(|k| k.fingerprint.clone()).collect();
+    let mut also: Vec<String> = also.to_vec();
+    also.extend(known.iter().filter(|k| !k.revoked).map(|k| k.fingerprint.clone()));
+    also.retain(|f| !revoked.contains(f));
+    let also = &also[..];
     let seen = Arc::new(Mutex::new(None));
     let remote = crate::tunnel::RemoteMap::default();
     let handler = Client {
@@ -631,18 +666,35 @@ pub(crate) async fn link_route(
                     || pinned.as_ref().map(|p| p.fingerprint == s.fingerprint).unwrap_or(false)
                     || (pinned.is_none() && also.contains(&s.fingerprint));
                 if !accepted {
-                    let mismatch = pinned.is_some();
+                    // 가져온 known_hosts 에 이 서버 키가 적혀 있는데 맞지 않으면(종류가 달라도) "바뀜"으로 — 다른 종류 키를 내밀어
+                    // 첫 접속 확인으로 넘어가는 길을 막는다(같은 종류를 먼저 고른다). 폐기 표시된 이 키도 바뀜으로
+                    let known_other = pinned
+                        .is_none()
+                        .then(|| {
+                            known
+                                .iter()
+                                .find(|k| k.revoked && k.fingerprint == s.fingerprint)
+                                .or_else(|| known.iter().find(|k| !k.revoked && k.algorithm == s.algorithm))
+                                .or_else(|| known.iter().find(|k| !k.revoked))
+                        })
+                        .flatten();
+                    let mismatch = pinned.is_some() || known_other.is_some();
                     return Err((
                         SshError {
                             code: if mismatch { "HOSTKEY_MISMATCH" } else { "HOSTKEY_UNKNOWN" },
-                            message: if mismatch {
-                                "서버의 호스트 키가 고정한 키와 다릅니다. 서버를 다시 설치했거나 다른 서버로 연결되고 있을 수 있습니다.".into()
-                            } else {
-                                "처음 접속하는 서버입니다. 지문을 확인하세요.".into()
+                            message: match (&pinned, known_other) {
+                                (Some(_), _) => "서버의 호스트 키가 고정한 키와 다릅니다. 서버를 다시 설치했거나 다른 서버로 연결되고 있을 수 있습니다.".into(),
+                                (None, Some(k)) if k.revoked => "서버가 내민 호스트 키가 가져온 known_hosts 에서 폐기(@revoked)된 키입니다. 다른 서버로 연결되고 있을 수 있습니다.".into(),
+                                (None, Some(k)) if k.algorithm == s.algorithm => "서버의 호스트 키가 가져온 known_hosts 에 적힌 키와 다릅니다. 서버를 다시 설치했거나 다른 서버로 연결되고 있을 수 있습니다.".into(),
+                                (None, Some(k)) => format!(
+                                    "가져온 known_hosts 에는 이 서버의 다른 종류 키({})만 적혀 있는데 서버가 {} 키를 내밀었습니다. 서버 설정이 바뀌었거나 다른 서버로 연결되고 있을 수 있습니다 — 지문을 확인하세요.",
+                                    k.algorithm, s.algorithm
+                                ),
+                                (None, None) => "처음 접속하는 서버입니다. 지문을 확인하세요.".into(),
                             },
                             fingerprint: Some(s.fingerprint),
                             algorithm: Some(s.algorithm),
-                            pinned_fingerprint: pinned.map(|p| p.fingerprint),
+                            pinned_fingerprint: pinned.map(|p| p.fingerprint).or_else(|| known_other.map(|k| k.fingerprint.clone())),
                             ..Default::default()
                         },
                         false,
@@ -764,8 +816,23 @@ pub(crate) async fn open_authed(store: &Store, req: &ConnectReq) -> R<Authed> {
     Ok(Authed { handle, jump: jumps, seen_key, newly_pinned, used_saved, account, remote, route: used })
 }
 
-/// 인증 하나 — 에이전트·개인키·암호(안 되면 keyboard-interactive). 비밀이 모자라면 NEED_SECRET
+/// 인증 하나 — 에이전트·개인키·암호(안 되면 keyboard-interactive). 비밀이 모자라면 NEED_SECRET.
+/// 전체에 [`AUTH_TIMEOUT`] 상한(서버·에이전트가 답하지 않아도 접속 화면이 멈추지 않게)
 pub(crate) async fn authenticate(handle: &mut Handle<Client>, auth: &str, user: &str, key_path: Option<&str>, secret: Option<&str>) -> R<bool> {
+    tokio::time::timeout(AUTH_TIMEOUT, authenticate_inner(handle, auth, user, key_path, secret))
+        .await
+        .map_err(|_| {
+            let mut x = err("NETWORK", format!("서버가 {}초 안에 인증을 끝내지 않았습니다", AUTH_TIMEOUT.as_secs()));
+            x.hint = Some(if auth == "agent" {
+                "SSH 에이전트가 답하지 않았을 수 있습니다(키 사용 확인 창이 떠 있는지 보세요).".into()
+            } else {
+                "서버의 인증 단계(PAM·LDAP 등)가 느리거나 멈췄을 수 있습니다.".into()
+            });
+            x
+        })?
+}
+
+async fn authenticate_inner(handle: &mut Handle<Client>, auth: &str, user: &str, key_path: Option<&str>, secret: Option<&str>) -> R<bool> {
     if auth == "agent" {
         agent_auth(handle, user).await
     } else if auth == "key" {
@@ -781,22 +848,32 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, auth: &str, user: 
         let Some(pw) = secret else {
             return Err(err("NEED_SECRET", "암호를 입력하세요"));
         };
-        let mut ok = handle.authenticate_password(user, pw).await.map_err(map_russh)?.success();
-        if !ok {
-            // 암호 방식이 꺼지고 keyboard-interactive 만 켠 서버(흔함)
-            ok = keyboard_interactive(handle, user, pw).await.unwrap_or(false);
+        let ok = handle.authenticate_password(user, pw).await.map_err(map_russh)?.success();
+        if ok {
+            return Ok(true);
         }
-        Ok(ok)
+        // 암호 방식이 꺼지고 keyboard-interactive 만 켠 서버(흔함). 암호가 아닌 것(OTP 등)을 물으면 그 문구를 담은 오류로 사람에게
+        match keyboard_interactive(handle, user, pw).await {
+            Ok(ok) => Ok(ok),
+            Err(KbdInt::Human(x)) => Err(*x),
+            Err(KbdInt::Net) => Ok(false),
+        }
     }
 }
 
 /// 점프 단계 하나 — 받은 전송로 위에 SSH 를 열고, 고정된 호스트 키·저장된 비밀만 쓴다(여기서는 묻지 않는다)
 pub(crate) async fn hop_session(store: &Store, p: &crate::store::Profile, a: &Account, io: crate::route::BoxIo, limit: Duration) -> R<Handle<Client>> {
-    let pinned = store.host_key(&p.host, p.port).ok_or_else(|| {
-        err("OTHER", format!("점프 서버 {} 의 호스트 키가 아직 고정되지 않았습니다. 그 서버로 한 번 접속해 지문을 확인하세요.", p.name))
-    })?;
+    // 고정한 키가 없으면 가져온 known_hosts 의 키로만(맞으면 고정한다). 둘 다 없으면 묻지 않고 멈춘다
+    let pinned = store.host_key(&p.host, p.port);
+    let known: Vec<String> = match &pinned {
+        Some(_) => Vec::new(),
+        None => crate::importer::known_keys(store, &p.host, p.port).into_iter().filter(|k| !k.revoked).map(|k| k.fingerprint).collect(),
+    };
+    if pinned.is_none() && known.is_empty() {
+        return Err(err("OTHER", format!("점프 서버 {} 의 호스트 키가 아직 고정되지 않았습니다. 그 서버로 한 번 접속해 지문을 확인하세요.", p.name)));
+    }
     let seen = Arc::new(Mutex::new(None));
-    let handler = Client { pinned: Some(pinned.clone()), trust: None, also: Vec::new(), seen: seen.clone(), remote: Default::default() };
+    let handler = Client { pinned: pinned.clone(), trust: None, also: known.clone(), seen: seen.clone(), remote: Default::default() };
     let named = |mut x: SshError| {
         x.message = format!("점프 서버 {}: {}", p.name, x.message);
         x
@@ -805,8 +882,10 @@ pub(crate) async fn hop_session(store: &Store, p: &crate::store::Profile, a: &Ac
         .await
         .map_err(|_| err("NETWORK", format!("점프 서버 {} 에서 {}초 안에 SSH 인사가 오지 않았습니다", p.name, limit.as_secs())))?
         .map_err(|e| {
-            if let Some(s) = seen.lock().unwrap().as_ref().filter(|s| s.fingerprint != pinned.fingerprint) {
-                return err("HOSTKEY_MISMATCH", format!("점프 서버 {} 의 호스트 키가 고정한 키와 다릅니다({}). 그 서버로 직접 접속해 확인하세요.", p.name, s.fingerprint));
+            let ok = |f: &str| pinned.as_ref().map(|k| k.fingerprint == f).unwrap_or_else(|| known.iter().any(|k| k == f));
+            if let Some(s) = seen.lock().unwrap().as_ref().filter(|s| !ok(&s.fingerprint)) {
+                let whose = if pinned.is_some() { "고정한 키" } else { "가져온 known_hosts 의 키" };
+                return err("HOSTKEY_MISMATCH", format!("점프 서버 {} 의 호스트 키가 {whose}와 다릅니다({}). 그 서버로 직접 접속해 확인하세요.", p.name, s.fingerprint));
             }
             named(map_russh(e))
         })?;
@@ -823,6 +902,12 @@ pub(crate) async fn hop_session(store: &Store, p: &crate::store::Profile, a: &Ac
     })?;
     if !ok {
         return Err(err("AUTH_FAILED", format!("점프 서버 {} 인증에 실패했습니다(계정 {})", p.name, a.username)));
+    }
+    // known_hosts 로 믿은 점프 서버 — 이제 고정한다(다음부터는 고정 키로)
+    if pinned.is_none() {
+        if let Some(s) = seen.lock().unwrap().clone() {
+            let _ = store.pin_host_key(&p.host, p.port, &s);
+        }
     }
     Ok(h)
 }
@@ -872,16 +957,60 @@ where
     Ok(Some(false))
 }
 
-async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, pw: &str) -> Result<bool, russh::Error> {
+enum KbdInt {
+    /// 저장한 암호로 답할 수 없는 질문 — 사람에게 넘긴다(질문 문구를 담아)
+    Human(Box<SshError>),
+    /// 망 오류 — 암호 실패와 같이 다룬다
+    Net,
+}
+
+/// 암호를 묻는 문구인지 — 새 암호·확인·일회용 코드는 아니다
+fn asks_password(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    let pw = ["password", "passwort", "mot de passe", "contraseña", "암호", "비밀번호", "パスワード", "密码"].iter().any(|k| p.contains(k));
+    // 영어 낱말은 낱말 단위로(호스트·사용자 이름 bob@decode01 의 "code" 에 걸리지 않게), 한국어는 글귀로
+    let words: Vec<&str> = p.split(|c: char| !c.is_alphanumeric() && c != '-').filter(|w| !w.is_empty()).collect();
+    let other_word = ["new", "again", "retype", "confirm", "otp", "one-time", "verification", "token", "code", "passcode"].iter().any(|k| words.contains(k));
+    let other_ko = ["새 ", "확인", "인증 코드", "일회용"].iter().any(|k| p.contains(k));
+    pw && !other_word && !other_ko
+}
+
+/// keyboard-interactive — 질문이 하나이고 화면에 안 보이는(echo 끔) 암호 질문일 때만 저장 암호로 한 번 답한다.
+/// 그 밖의 질문(OTP·여러 질문·두 번째 암호 질문 아닌 것)은 답하지 않고 Human 으로(같은 암호를 아무 질문에나 보내지 않게)
+async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, pw: &str) -> Result<bool, KbdInt> {
     use russh::client::KeyboardInteractiveAuthResponse as K;
-    let mut resp = handle.authenticate_keyboard_interactive_start(user, None::<String>).await?;
-    for _ in 0..4 {
+    let mut resp = handle.authenticate_keyboard_interactive_start(user, None::<String>).await.map_err(|_| KbdInt::Net)?;
+    let mut answered = false;
+    for _ in 0..6 {
         match resp {
             K::Success => return Ok(true),
             K::Failure { .. } => return Ok(false),
-            K::InfoRequest { prompts, .. } => {
-                let answers = prompts.iter().map(|_| pw.to_string()).collect();
-                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+            K::InfoRequest { prompts, instructions, .. } => {
+                // 빈 질문(안내만)은 빈 답으로 넘긴다
+                if prompts.is_empty() {
+                    resp = handle.authenticate_keyboard_interactive_respond(Vec::new()).await.map_err(|_| KbdInt::Net)?;
+                    continue;
+                }
+                let one_pw = prompts.len() == 1 && !prompts[0].echo && asks_password(&prompts[0].prompt);
+                if one_pw && answered {
+                    // 답한 뒤 또 암호를 물음 = 틀린 암호
+                    return Ok(false);
+                }
+                if !one_pw {
+                    let asked: Vec<String> = prompts.iter().map(|p| p.prompt.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    let mut x = err(
+                        "AUTH_FAILED",
+                        format!("서버가 암호 말고 다른 것을 묻습니다: «{}» — 이 질문에는 앱이 대신 답하지 않습니다.", if asked.is_empty() { "(빈 질문)".to_string() } else { asked.join(" / ") }),
+                    );
+                    x.hint = Some(if instructions.trim().is_empty() {
+                        "일회용 코드(OTP)·2단계 인증을 쓰는 서버일 수 있습니다 — 터미널의 ssh 로 접속하거나, 서버에서 이 계정에 키 인증을 허용하세요.".into()
+                    } else {
+                        format!("서버 안내: {}", instructions.trim())
+                    });
+                    return Err(KbdInt::Human(Box::new(x)));
+                }
+                answered = true;
+                resp = handle.authenticate_keyboard_interactive_respond(vec![pw.to_string()]).await.map_err(|_| KbdInt::Net)?;
             }
         }
     }
@@ -916,8 +1045,10 @@ pub async fn ssh_test(store: State<'_, Store>, conns: State<'_, SshConns>, req: 
 }
 
 #[tauri::command]
-pub async fn ssh_disconnect(conns: State<'_, SshConns>, conn: u32) -> R<()> {
+pub async fn ssh_disconnect(app: AppHandle, conns: State<'_, SshConns>, conn: u32) -> R<()> {
     crate::tunnel::stop_conn(conn).await;
+    // 이 연결로 올리던 경로 매핑 자동 반영도 멈춘다(끊긴 연결로 계속 시도하지 않게)
+    crate::sync::stop_conn(&app, conn);
     crate::container::forget(conn);
     let c = conns.map.lock().unwrap().remove(&conn);
     if let Some(c) = c {
@@ -951,7 +1082,7 @@ pub async fn ssh_shell_open(
     // tmux 로 열기: 서버에 tmux 가 있으면 rbs-<빈 번호> 세션에 붙는다(없으면 만든다)
     let use_tmux = c.tmux && tmux_available(&c).await;
     let kind = if use_tmux { String::new() } else { login_shell(&c).await };
-    let ch = c.handle.channel_open_session().await.map_err(map_russh)?;
+    let ch = c.handle.channel_open_session().await.map_err(open_err)?;
     ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(map_russh)?;
     ch.request_shell(true).await.map_err(map_russh)?;
     let (read, write) = ch.split();
@@ -1082,7 +1213,7 @@ impl InitFilter {
         Self { prefix, buf: Vec::new(), until: tokio::time::Instant::now() + Duration::from_secs(4) }
     }
     /// 받은 것을 넣는다 — 다 걸렀으면 true(이후는 바로 보낸다)
-    fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> bool {
+    fn feed(&mut self, data: &[u8], out: &mut VecDeque<u8>) -> bool {
         self.buf.extend_from_slice(data);
         if let Some(mi) = find_bytes(&self.buf, READY_MARK) {
             let end = mi + READY_MARK.len();
@@ -1090,8 +1221,8 @@ impl InitFilter {
                 Some(p) => self.buf[..p].iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0),
                 None => mi,
             };
-            out.extend_from_slice(&self.buf[..cut]);
-            out.extend_from_slice(&self.buf[end..]);
+            out.extend(&self.buf[..cut]);
+            out.extend(&self.buf[end..]);
             self.buf.clear();
             return true;
         }
@@ -1101,8 +1232,8 @@ impl InitFilter {
         }
         false
     }
-    fn flush(&mut self, out: &mut Vec<u8>) {
-        out.append(&mut self.buf);
+    fn flush(&mut self, out: &mut VecDeque<u8>) {
+        out.extend(self.buf.drain(..));
     }
 }
 
@@ -1190,7 +1321,8 @@ fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut r
     use futures_util::FutureExt;
     tauri::async_runtime::spawn(async move {
         let mut code = None;
-        let mut pending: Vec<u8> = Vec::new();
+        // 앞에서 덜어 내고 뒤에 붙인다 — Vec 의 drain(..n) 은 남은 것을 매번 앞으로 옮겼다(큰 출력에서 O(n²))
+        let mut pending: VecDeque<u8> = VecDeque::new();
         let mut open = true;
         'outer: loop {
             // 보낼 수 있는 만큼 보낸다
@@ -1229,7 +1361,7 @@ fn spawn_shell_reader(app: AppHandle, c: Arc<Conn>, conn: u32, shell: u32, mut r
                                             init = None;
                                         }
                                     }
-                                    None => pending.extend_from_slice(&data),
+                                    None => pending.extend(&data[..]),
                                 }
                             }
                             Some(ChannelMsg::ExitStatus { exit_status }) => code = Some(exit_status),
@@ -1311,23 +1443,90 @@ pub(crate) async fn tmux_available(c: &Conn) -> bool {
     ok
 }
 
-/// 짧은 명령 하나 — 표준출력(1 MiB 상한)
+/// 짧은 명령 하나 — 표준출력(1 MiB 상한, 넘으면 거기까지)
 async fn exec_out(c: &Conn, cmd: &str, limit: Duration) -> R<String> {
-    let run = async {
-        let mut ch = c.handle.channel_open_session().await.map_err(map_russh)?;
-        ch.exec(true, cmd).await.map_err(map_russh)?;
-        let mut out = Vec::new();
-        while let Some(m) = ch.wait().await {
-            if let ChannelMsg::Data { data } = m {
-                out.extend_from_slice(&data);
-                if out.len() > 1024 * 1024 {
-                    break;
-                }
+    let o = run_exec(c, cmd, None, ExecLimit { idle: limit, total: Some(limit), max_out: 1024 * 1024 }).await?;
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// exec 한 번의 결과
+pub(crate) struct ExecOut {
+    pub(crate) code: Option<u32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: String,
+    /// 표준출력이 max_out 을 넘어 거기서 끊었다
+    pub(crate) cut: bool,
+}
+
+/// exec 시간·크기 상한 — idle: 출력·진행 없이 기다릴 최대 시간, total: 전체(없으면 idle 만), max_out: 표준출력 상한
+#[derive(Clone, Copy)]
+pub(crate) struct ExecLimit {
+    pub(crate) idle: Duration,
+    pub(crate) total: Option<Duration>,
+    pub(crate) max_out: usize,
+}
+
+/// exec 채널로 명령 하나. 시간 초과·출력 상한으로 빠져나오면 채널을 닫는다(서버에 채널·프로세스를 남기지 않게).
+/// stdin 은 조각으로 보내고 조각마다 idle 상한을 건다
+pub(crate) async fn run_exec(c: &Conn, cmd: &str, stdin: Option<&[u8]>, lim: ExecLimit) -> R<ExecOut> {
+    let deadline = lim.total.map(|t| tokio::time::Instant::now() + t);
+    let step = || match deadline {
+        Some(d) => lim.idle.min(d.saturating_duration_since(tokio::time::Instant::now())),
+        None => lim.idle,
+    };
+    let slow = || err("NETWORK", "서버가 제때 답하지 않았습니다");
+    let ch = tokio::time::timeout(step(), c.handle.channel_open_session()).await.map_err(|_| err("NETWORK", "서버가 새 채널을 제때 열어 주지 않았습니다"))?.map_err(open_err)?;
+    let mut ch = ch;
+    let mut out = ExecOut { code: None, stdout: Vec::new(), stderr: String::new(), cut: false };
+    let mut closed = false;
+    let r: R<()> = async {
+        tokio::time::timeout(step(), ch.exec(true, cmd)).await.map_err(|_| slow())?.map_err(map_russh)?;
+        if let Some(input) = stdin {
+            for part in input.chunks(256 * 1024) {
+                tokio::time::timeout(step(), ch.data(part)).await.map_err(|_| slow())?.map_err(map_russh)?;
             }
         }
-        Ok::<_, SshError>(String::from_utf8_lossy(&out).into_owned())
-    };
-    tokio::time::timeout(limit, run).await.map_err(|_| err("NETWORK", "응답이 없습니다"))?
+        // 입력 끝 — 표준입력을 읽는 명령이 기다리며 멈추지 않게(입력이 없어도)
+        tokio::time::timeout(step(), ch.eof()).await.map_err(|_| slow())?.map_err(map_russh)?;
+        loop {
+            let left = step();
+            if left.is_zero() {
+                return Err(slow());
+            }
+            let Ok(m) = tokio::time::timeout(left, ch.wait()).await else {
+                return Err(slow());
+            };
+            match m {
+                Some(ChannelMsg::Data { data }) => {
+                    out.stdout.extend_from_slice(&data);
+                    if out.stdout.len() > lim.max_out {
+                        out.stdout.truncate(lim.max_out);
+                        out.cut = true;
+                        return Ok(());
+                    }
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    if out.stderr.len() < 64 * 1024 {
+                        out.stderr.push_str(&String::from_utf8_lossy(&data));
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => out.code = Some(exit_status),
+                // exec 요청을 서버가 거절(셸 금지 계정 등) — 채널은 열린 채라 기다리면 상한까지 멈춘다
+                Some(ChannelMsg::Failure) => return Err(err("OTHER", "서버가 명령 실행을 거절했습니다(이 계정은 셸·명령이 막혀 있을 수 있습니다)")),
+                Some(ChannelMsg::Close) | None => {
+                    closed = true;
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    .await;
+    if !closed {
+        // 다 받기 전에 빠져나왔다 — 채널을 닫아 서버 쪽 프로세스에 끝을 알린다
+        let _ = tokio::time::timeout(Duration::from_secs(2), ch.close()).await;
+    }
+    r.map(|_| out)
 }
 
 #[derive(Serialize)]
@@ -1482,16 +1681,18 @@ pub async fn sftp_list(conns: State<'_, SshConns>, conn: u32, path: String) -> R
 }
 
 pub(crate) async fn list(conns: &SshConns, conn: u32, path: String) -> R<Vec<FsEntry>> {
+    use futures_util::StreamExt;
     let c = conns.get(conn)?;
     let dir = c.sftp.read_dir(path.clone()).await.map_err(sftp_err)?;
     let mut out: Vec<FsEntry> = Vec::new();
+    let mut links: Vec<FsEntry> = Vec::new();
     for e in dir {
         let name = e.file_name();
         if name == "." || name == ".." {
             continue;
         }
         let m = e.metadata();
-        let mut kind = if m.is_dir() {
+        let kind = if m.is_dir() {
             "dir"
         } else if m.is_symlink() {
             "link"
@@ -1500,18 +1701,27 @@ pub(crate) async fn list(conns: &SshConns, conn: u32, path: String) -> R<Vec<FsE
         } else {
             "other"
         };
-        let full = join(&path, &name);
-        let target = if kind == "link" { c.sftp.read_link(full.clone()).await.ok() } else { None };
+        let entry = FsEntry { path: join(&path, &name), name, kind, size: m.size.unwrap_or(0), mtime: m.mtime, mode: m.permissions, target: None };
         if kind == "link" {
-            // 링크가 가리키는 것이 폴더면 폴더처럼 펼친다
-            if let Ok(t) = c.sftp.metadata(full.clone()).await {
-                if t.is_dir() {
-                    kind = "dir";
-                }
-            }
+            links.push(entry);
+        } else {
+            out.push(entry);
         }
-        out.push(FsEntry { name, path: full, kind, size: m.size.unwrap_or(0), mtime: m.mtime, mode: m.permissions, target });
     }
+    // 링크는 가리키는 곳·종류를 한꺼번에(링크마다 왕복 두 번을 차례로 기다리지 않게) — 폴더를 가리키면 폴더처럼 펼친다
+    let sftp = &c.sftp;
+    let resolved: Vec<FsEntry> = futures_util::stream::iter(links.into_iter().map(|mut e| async move {
+        let (t, m) = tokio::join!(sftp.read_link(e.path.clone()), sftp.metadata(e.path.clone()));
+        e.target = t.ok();
+        if m.is_ok_and(|m| m.is_dir()) {
+            e.kind = "dir";
+        }
+        e
+    }))
+    .buffer_unordered(16)
+    .collect()
+    .await;
+    out.extend(resolved);
     out.sort_by(|a, b| (a.kind != "dir").cmp(&(b.kind != "dir")).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(out)
 }
@@ -1558,8 +1768,48 @@ pub struct Saved {
     mtime: Option<u32>,
 }
 
-/// 저장 — 연 뒤 서버에서 바뀌었으면(mtime·크기) 덮어쓰지 않고 알린다(expectMtime 을 주면)
+/// 연 뒤 서버에서 바뀌었는지 — mtime(주면)·크기(주면) 중 하나라도 다르면 CONFLICT. 파일이 없어졌으면 통과(새로 만든다)
+pub(crate) fn check_unchanged(now_mtime: Option<u32>, now_size: Option<u64>, expect_mtime: Option<u32>, expect_size: Option<u64>) -> R<()> {
+    let mtime_moved = matches!((expect_mtime, now_mtime), (Some(e), Some(n)) if e != n);
+    let size_moved = matches!((expect_size, now_size), (Some(e), Some(n)) if e != n);
+    if mtime_moved || size_moved {
+        return Err(err("CONFLICT", "연 뒤에 서버에서 파일이 바뀌었습니다. 다시 열어 확인하세요."));
+    }
+    Ok(())
+}
+
+/// 쓴 뒤 크기 확인 — 다르면 SIZE_MISMATCH(잘렸거나 다른 곳에서 동시에 썼다)
+pub(crate) fn check_written(now: Option<u64>, want: usize) -> R<()> {
+    match now {
+        Some(n) if n != want as u64 => {
+            let mut x = err("SIZE_MISMATCH", format!("저장한 뒤 서버의 파일 크기({n} 바이트)가 보낸 크기({want} 바이트)와 다릅니다. 다시 열어 내용을 확인하세요."));
+            x.hint = Some("디스크가 가득 찼거나(할당량), 저장하는 동안 다른 프로그램이 같은 파일에 썼을 수 있습니다.".into());
+            Err(x)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// 제자리 덮어쓰기 — 같은 파일(inode)을 잘라서 쓴다(CREATE|TRUNCATE|WRITE): 소유자·권한·하드 링크·심볼릭 링크가 그대로.
+/// (russh-sftp 의 `SftpSession::write` 는 WRITE 만 켜서 짧아진 저장에 옛 꼬리가 남고, 없는 파일은 만들지 못했다.)
+/// 쓴 뒤 크기를 확인한다
+pub(crate) async fn sftp_overwrite(sftp: &SftpSession, path: &str, bytes: &[u8]) -> R<russh_sftp::client::fs::Metadata> {
+    use russh_sftp::protocol::OpenFlags;
+    use tokio::io::AsyncWriteExt;
+    let mut f = sftp.open_with_flags(path.to_string(), OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE).await.map_err(sftp_err)?;
+    let wrote = f.write_all(bytes).await;
+    // 쓰다 실패해도 핸들은 닫는다
+    let closed = f.shutdown().await;
+    wrote.map_err(|e| err("SFTP", format!("쓰지 못했습니다: {e}")))?;
+    closed.map_err(|e| err("SFTP", format!("저장을 마치지 못했습니다: {e}")))?;
+    let m = sftp.metadata(path.to_string()).await.map_err(sftp_err)?;
+    check_written(m.size, bytes.len())?;
+    Ok(m)
+}
+
+/// 저장 — 연 뒤 서버에서 바뀌었으면(mtime·크기) 덮어쓰지 않고 알린다(expectMtime·expectSize 를 주면)
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn sftp_write_text(
     conns: State<'_, SshConns>,
     conn: u32,
@@ -1567,19 +1817,16 @@ pub async fn sftp_write_text(
     text: String,
     meta: TextMeta,
     expect_mtime: Option<u32>,
+    expect_size: Option<u64>,
 ) -> R<Saved> {
     let c = conns.get(conn)?;
-    if let Some(exp) = expect_mtime {
+    if expect_mtime.is_some() || expect_size.is_some() {
         if let Ok(m) = c.sftp.metadata(path.clone()).await {
-            if m.mtime.is_some_and(|t| t != exp) {
-                return Err(err("CONFLICT", "연 뒤에 서버에서 파일이 바뀌었습니다. 다시 열어 확인하세요."));
-            }
+            check_unchanged(m.mtime, m.size, expect_mtime, expect_size)?;
         }
     }
     let bytes = textcodec::encode(&text, &meta).map_err(|e| err("ENCODING", e))?;
-    // 같은 파일에 덮어써 소유자·권한을 지킨다(TRUNCATE)
-    c.sftp.write(path.clone(), &bytes).await.map_err(sftp_err)?;
-    let m = c.sftp.metadata(path).await.map_err(sftp_err)?;
+    let m = sftp_overwrite(&c.sftp, &path, &bytes).await?;
     Ok(Saved { size: m.size.unwrap_or(bytes.len() as u64), mtime: m.mtime })
 }
 
@@ -1593,21 +1840,7 @@ pub async fn sftp_realpath(conns: State<'_, SshConns>, conn: u32, path: String) 
 #[tauri::command]
 pub async fn ssh_exec(conns: State<'_, SshConns>, conn: u32, cmd: String) -> R<String> {
     let c = conns.get(conn)?;
-    let run = async {
-        let mut ch = c.handle.channel_open_session().await.map_err(map_russh)?;
-        ch.exec(true, cmd.as_str()).await.map_err(map_russh)?;
-        let mut out = Vec::new();
-        while let Some(m) = ch.wait().await {
-            if let ChannelMsg::Data { data } = m {
-                out.extend_from_slice(&data);
-                if out.len() > 1024 * 1024 {
-                    break;
-                }
-            }
-        }
-        Ok::<_, SshError>(String::from_utf8_lossy(&out).into_owned())
-    };
-    tokio::time::timeout(Duration::from_secs(10), run).await.map_err(|_| err("NETWORK", "응답이 없습니다"))?
+    exec_out(&c, &cmd, Duration::from_secs(10)).await
 }
 
 // ── 파일 조작 ────────────────────────
@@ -1645,7 +1878,35 @@ pub async fn sftp_remove(conns: State<'_, SshConns>, conn: u32, path: String) ->
         return Err(err("SFTP", "최상위 폴더는 지울 수 없습니다"));
     }
     let c = conns.get(conn)?;
-    Box::pin(remove_rec(&c, path)).await
+    remove(&c, path).await
+}
+
+pub(crate) async fn remove(c: &Conn, path: String) -> R<u32> {
+    let m = c.sftp.symlink_metadata(path.clone()).await.map_err(sftp_err)?;
+    if !m.is_dir() {
+        // 파일·링크(링크 자체만)
+        c.sftp.remove_file(path).await.map_err(sftp_err)?;
+        return Ok(1);
+    }
+    // 폴더는 서버에서 rm -rf 한 번에(항목마다 SFTP 왕복하지 않게). 셸이 막힌 SFTP 전용 계정이면 SFTP 로 하나씩
+    let p = crate::sudo::q(&path);
+    // find 는 -- 를 모른다 — - 로 시작하는 상대 경로가 식으로 읽히지 않게 ./ 를 붙인다
+    let fp = if path.starts_with('/') { p.clone() } else { crate::sudo::q(&format!("./{path}")) };
+    let cmd = format!("n=$(find {fp} 2>/dev/null | wc -l); rm -rf -- {p} && printf '__rb_rm=%s' \"$n\"");
+    match run_exec(c, &cmd, None, ExecLimit { idle: Duration::from_secs(300), total: None, max_out: 4096 }).await {
+        // 표식이 있어야 rm 이 실제로 돌았다(명령을 무시하는 SFTP 전용 계정은 빈 출력·끝 코드 0)
+        Ok(o) if o.code == Some(0) && String::from_utf8_lossy(&o.stdout).contains("__rb_rm=") => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            Ok(s.rsplit("__rb_rm=").next().and_then(|n| n.trim().parse().ok()).unwrap_or(1))
+        }
+        Ok(o) if o.stderr.lines().any(|l| l.starts_with("rm: ")) => {
+            // rm 이 일부를 못 지웠다(권한 등) — 그 까닭을
+            Err(err("SFTP", o.stderr.trim().lines().rfind(|l| l.starts_with("rm: ")).unwrap_or("지우지 못했습니다").to_string()))
+        }
+        // 시간 초과는 그대로 알린다(서버에서 아직 지우는 중일 수 있어 SFTP 로 다시 돌지 않는다)
+        Err(e) if e.code == "NETWORK" => Err(e),
+        Ok(_) | Err(_) => Box::pin(remove_rec(c, path)).await,
+    }
 }
 
 async fn remove_rec(c: &Conn, path: String) -> R<u32> {
@@ -1800,6 +2061,30 @@ mod tests {
     }
 
     #[test]
+    fn password_prompts_only() {
+        assert!(asks_password("Password: "));
+        assert!(asks_password("(rbtest@host) Password:"));
+        assert!(asks_password("암호:"));
+        assert!(!asks_password("Verification code: "));
+        assert!(!asks_password("Enter PASSCODE:"));
+        assert!(!asks_password("New password: "));
+        assert!(!asks_password("Retype new password: "));
+        assert!(!asks_password("OTP Password: "));
+        assert!(asks_password("Password for bob@decode01:"));
+    }
+
+    #[test]
+    fn conflict_and_size_checks() {
+        assert!(check_unchanged(Some(10), Some(5), Some(10), Some(5)).is_ok());
+        assert_eq!(check_unchanged(Some(11), Some(5), Some(10), None).unwrap_err().code, "CONFLICT");
+        assert_eq!(check_unchanged(Some(10), Some(6), Some(10), Some(5)).unwrap_err().code, "CONFLICT");
+        // 파일이 없어졌으면(값 없음) 비교하지 않는다
+        assert!(check_unchanged(None, None, Some(10), Some(5)).is_ok());
+        assert!(check_written(Some(3), 3).is_ok());
+        assert_eq!(check_written(Some(4), 3).unwrap_err().code, "SIZE_MISMATCH");
+    }
+
+    #[test]
     fn levels_add_algorithms() {
         assert!(!preferred("off").key.contains(&Algorithm::Rsa { hash: None }));
         assert!(preferred("rsa").key.contains(&Algorithm::Rsa { hash: None }));
@@ -1859,6 +2144,67 @@ mod live_jump {
         let l = list(&conns, ok.conn_id, ok.home.clone()).await.unwrap();
         assert!(l.iter().any(|e| e.name == "app"));
         secrets::forget(&secrets::account_key(jacc));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod live_save {
+    use super::*;
+
+    /// RB_SSH_TEST·RB_SSH_TEST_PW — 저장 잘림(짧게 고친 저장에 옛 꼬리가 남지 않음)·없는 파일 저장·크기 충돌·
+    /// exec 시간 초과·폴더 지우기(rm -rf)·링크 폴더 목록
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_save_truncates_and_exec_limits() {
+        let spec = std::env::var("RB_SSH_TEST").unwrap();
+        let pw = std::env::var("RB_SSH_TEST_PW").unwrap();
+        let mut it = spec.split(':');
+        let host = it.next().unwrap().to_string();
+        let port: u16 = it.next().unwrap().parse().unwrap();
+        let dir = std::env::temp_dir().join(format!("rbshell-save-{}", std::process::id()));
+        let store = Store::open(dir.clone(), false).unwrap();
+        let conns = SshConns::default();
+        let cid = test_connect(&store, &conns, &host, port, "rbtest", &pw).await;
+        let c = conns.get(cid).unwrap();
+        let base = "/home/rbtest/rb-save-test";
+        let _ = run_exec(&c, &format!("rm -rf {base}; mkdir -p {base}/d/e && touch {base}/d/e/f {base}/d/g && ln -s {base}/d {base}/link"), None, ExecLimit { idle: Duration::from_secs(10), total: None, max_out: 1024 }).await.unwrap();
+
+        // 1) 긴 내용 → 짧은 내용: 옛 꼬리가 남으면 안 된다
+        let f = format!("{base}/a.txt");
+        sftp_overwrite(&c.sftp, &f, "0123456789\n".repeat(100).as_bytes()).await.unwrap();
+        let m = sftp_overwrite(&c.sftp, &f, b"short\n").await.unwrap();
+        assert_eq!(m.size, Some(6));
+        assert_eq!(c.sftp.read(f.clone()).await.unwrap(), b"short\n");
+        // 2) 없는 파일 저장 = 새로 만든다
+        let n = format!("{base}/new.txt");
+        sftp_overwrite(&c.sftp, &n, b"hello").await.unwrap();
+        assert_eq!(c.sftp.read(n.clone()).await.unwrap(), b"hello");
+        // 3) 크기로 충돌 판정 — mtime 이 같아도(같은 초) 크기가 다르면 CONFLICT
+        let now = c.sftp.metadata(f.clone()).await.unwrap();
+        assert!(check_unchanged(now.mtime, now.size, now.mtime, Some(6)).is_ok());
+        assert_eq!(check_unchanged(now.mtime, now.size, now.mtime, Some(7)).unwrap_err().code, "CONFLICT");
+        assert!(check_unchanged(now.mtime, now.size, None, None).is_ok());
+        // 4) 링크가 가리키는 폴더는 폴더로
+        let l = list(&conns, cid, base.to_string()).await.unwrap();
+        let link = l.iter().find(|e| e.name == "link").unwrap();
+        assert_eq!(link.kind, "dir");
+        assert_eq!(link.target.as_deref(), Some(format!("{base}/d").as_str()));
+        // 5) exec 시간 초과는 상한 안에 NETWORK 로 끝나고, 같은 연결은 계속 쓸 수 있다
+        let t = std::time::Instant::now();
+        let e = run_exec(&c, "sleep 20", None, ExecLimit { idle: Duration::from_secs(1), total: None, max_out: 1024 }).await.err().unwrap();
+        assert_eq!(e.code, "NETWORK");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let cut = run_exec(&c, "yes | head -c 100000", None, ExecLimit { idle: Duration::from_secs(5), total: None, max_out: 1000 }).await.unwrap();
+        assert!(cut.cut && cut.stdout.len() == 1000);
+        assert_eq!(exec_out(&c, "printf ok", Duration::from_secs(5)).await.unwrap(), "ok");
+        // 6) 폴더 지우기 — rm -rf 한 번(링크는 링크만)
+        assert_eq!(remove(&c, format!("{base}/link")).await.unwrap(), 1);
+        assert!(c.sftp.try_exists(format!("{base}/d/e/f")).await.unwrap(), "링크를 지울 때 가리키는 폴더 안은 남는다");
+        let k = remove(&c, format!("{base}/d")).await.unwrap();
+        assert_eq!(k, 4, "d, d/e, d/e/f, d/g");
+        assert!(!c.sftp.try_exists(format!("{base}/d")).await.unwrap());
+        remove(&c, base.to_string()).await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }
