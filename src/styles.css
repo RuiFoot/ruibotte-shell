@@ -1587,6 +1587,13 @@ html[data-os="macos"] .sidebar {
 	color: var(--text-3);
 	opacity: 0.75;
 }
+/* IME 조합 글자(xterm 의 조합 표시) — 기본 검은 상자 대신 터미널 색 그대로, 밑줄로 조합 중임을. 자리·크기는 xterm 이 정한다 */
+.term-host .xterm .composition-view {
+	background: var(--ime-bg, var(--term-bg));
+	color: var(--ime-fg, var(--term-fg));
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
 .term-pop {
 	position: absolute;
 	z-index: 6;

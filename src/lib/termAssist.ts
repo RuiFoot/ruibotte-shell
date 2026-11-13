@@ -25,6 +25,8 @@ export type TermAssist = {
 	data: (d: string) => boolean;
 	/** 키 — false 면 여기서 처리함(xterm·자동완성으로 보내지 않는다) */
 	key: (e: KeyboardEvent) => boolean;
+	/** 빈칸 템플릿 중인지 */
+	templating: () => boolean;
 	/** 풀이할 글자 — 고른 글자, 없으면 지금 입력 줄 */
 	explainText: () => string;
 	/** 출력 바이트(큰 출력 중엔 계산하지 않는다) */
@@ -332,6 +334,7 @@ export function attachAssist(o: {
 		template,
 		data,
 		key,
+		templating: () => tpl != null,
 		explainText,
 		output: (n) => {
 			const now = performance.now();

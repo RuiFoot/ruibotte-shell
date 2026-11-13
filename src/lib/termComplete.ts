@@ -34,8 +34,8 @@ export type CompletionSource = {
 export type Completer = {
 	/** 프롬프트 시작(OSC 133 A) */
 	prompt: () => void;
-	/** 명령 실행(Enter) — 기록 */
-	submitted: () => void;
+	/** 명령 실행(Enter) — 기록. typed: 친 키로 모은 줄(에코가 아직 화면에 오지 않았을 때 — 한글은 Enter 가 마지막 음절을 확정하며 함께 간다) */
+	submitted: (typed?: string) => void;
 	/** 사람이 입력함(프롬프트 상태에서) */
 	typed: () => void;
 	cwd: (p: string) => void;
@@ -53,6 +53,11 @@ export type Completer = {
 	mode: () => string;
 	/** 잠깐 멈추기(빈칸 템플릿 동안 — 목록·흐린 제안·Tab 을 쓰지 않는다) */
 	hold: (on: boolean) => void;
+	/**
+	 * IME 조합 중(한글 등) — 목록·흐린 제안을 닫고 쉰다. 조합 글자는 아직 화면 버퍼에 없어 그 사이 계산한 제안은 한 글자 늦고,
+	 * 받으면(→) 확정 글자보다 앞서 셸로 간다. 끝(off)은 확정 글자가 셸로 간 뒤 — 다시 그리기는 그 에코가 화면에 온 뒤(onRender)
+	 */
+	composing: (on: boolean) => void;
 	/** Tab 으로 앱 목록 열기(설정 — 기본 끔: Tab 은 셸 완성) */
 	setTabList: (on: boolean) => void;
 	dispose: () => void;
@@ -117,6 +122,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	let replace = 0;
 	let timer: number | undefined;
 	let held = false;
+	/** IME 조합 중 */
+	let ime = false;
 	let tabList = true;
 	/** Tab 계산 중(겹쳐 돌지 않게) — 그동안 온 Tab 은 버리지 않고 세어 두었다가 차례로 처리한다(연타로 파고들기) */
 	let tabBusy = false;
@@ -190,7 +197,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 
 	const renderGhost = () => {
 		const line = currentInput();
-		if (held || line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
+		if (held || ime || line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
 		// 치는 동안에는 목록을 띄우지 않는다 — 흐린 제안은 지난 명령에서만(서버에 묻지 않음), 목록은 Tab
 		const g = ghost(line, hist.list);
 		ghostEl.textContent = g;
@@ -198,7 +205,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	};
 
 	const renderPop = () => {
-		if (!items.length || held) return closePop();
+		if (!items.length || held || ime) return closePop();
 		const wasHidden = pop.hidden;
 		pop.innerHTML = "";
 		items.slice(0, MAX_POP).forEach((c, i) => {
@@ -290,7 +297,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const runQueuedTab = () => {
 		if (!tabQueued || drilling || tabBusy) return;
 		tabQueued--;
-		if (!promptOn || held) {
+		if (!promptOn || held || ime) {
 			tabQueued = 0;
 			return;
 		}
@@ -315,8 +322,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			tabBusy = false;
 		}
 		try {
-			// 계산하는 사이 줄이 바뀌었으면 아무것도 하지 않는다(셸에 Tab 을 넘기지도 않는다)
-			if (currentInput() !== before) return;
+			// 계산하는 사이 줄이 바뀌었거나 조합이 시작됐으면 아무것도 하지 않는다(셸에 Tab 을 넘기지도 않는다)
+			if (currentInput() !== before || ime) return;
 			tabShow(has);
 		} finally {
 			runQueuedTab();
@@ -408,7 +415,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 				const l = currentInput();
 				// 공백 뒤·3글자 미만 낱말에는 띄우지 않는다(치는 중에 목록이 깜박이지 않게)
 				const token = l?.split(/\s+/).pop() ?? "";
-				if (!l || !l.trim() || /\s$/.test(l) || token.length < 3 || SHORT_ARG.test(token) ||!pop.hidden || !atLineEnd() || held) return;
+				if (!l || !l.trim() || /\s$/.test(l) || token.length < 3 || SHORT_ARG.test(token) || !pop.hidden || !atLineEnd() || held || ime) return;
 				void compute(true).then((has) => {
 					if (has) autoOpen = true;
 				});
@@ -453,9 +460,11 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			closePop();
 			hideGhost();
 		},
-		submitted: () => {
+		submitted: (typed) => {
 			const l = currentInput();
-			if (l) remember(l);
+			// 화면 줄이 친 줄의 앞부분일 때만 친 줄로(↑·Ctrl+R 로 불러온 줄은 화면 줄이 맞다)
+			const c = typed && l != null && typed.length > l.length && typed.startsWith(l) ? typed : l;
+			if (c) remember(c);
 			promptOn = false;
 			tabQueued = 0;
 			inputStart = null;
@@ -474,7 +483,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		},
 		key: (e) => {
 			if (e.type === "keydown" && promptOn && !["Shift", "Control", "Alt", "Meta"].includes(e.key)) keyed = true;
-			if (e.type !== "keydown" || !promptOn || mode === "off" || held) return true;
+			if (e.type !== "keydown" || !promptOn || mode === "off" || held || ime) return true;
 			const plainTab = e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
 			// 파고드는 중·계산 중에 온 Tab 은 세어 두었다가 끝나면 차례로(버리지 않는다)
 			if ((drilling || tabBusy) && plainTab) {
@@ -545,6 +554,17 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			held = on;
 			if (on) {
 				window.clearTimeout(autoTimer);
+				closePop();
+				hideGhost();
+			}
+		},
+		composing: (on) => {
+			if (ime === on) return;
+			ime = on;
+			if (on) {
+				window.clearTimeout(timer);
+				window.clearTimeout(autoTimer);
+				tabQueued = 0;
 				closePop();
 				hideGhost();
 			}

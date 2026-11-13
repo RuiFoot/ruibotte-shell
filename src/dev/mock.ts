@@ -340,9 +340,13 @@ export function installMock() {
 				case "ctr_op":
 					return null;
 				case "ssh_shell_write":
-				case "pty_write":
+				case "pty_write": {
+					// 화면 점검: 셸로 간 입력을 차례대로 남긴다(window.__rbWrites — 한글 조합 확정이 한 번만 가는지 등)
+					const w = window as unknown as { __rbWrites?: string[] };
+					(w.__rbWrites ??= []).push(String(args.data ?? ""));
 					shellWrite(String(args.data ?? ""));
 					return null;
+				}
 				case "pty_shells":
 					return [
 						{ id: "bash", label: "Git Bash", program: "bash.exe", args: [], kind: "bash", admin: false },
