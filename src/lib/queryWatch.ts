@@ -3,6 +3,7 @@
  * 보고 있는 칸이 있을 때만 그 칸이 멈춤 뒤에 문장을 읽는다. 입력 지연이 생기지 않게 여기서는 아무 계산도 하지 않는다.
  */
 import { StateEffect, StateField } from "@codemirror/state";
+import { invoke } from "@tauri-apps/api/core";
 import { Decoration, type DecorationSet, EditorView } from "@codemirror/view";
 import type { ExplainOk } from "../components/DbExplain";
 
@@ -94,6 +95,20 @@ export function runBackground<T>(conn: number, f: () => Promise<T>): Promise<T> 
 		if (bg.get(conn) === tail) bg.delete(conn);
 	});
 	return next;
+}
+/** 뒤 조회 상한 — 사용자 실행을 오래 막지 않게 */
+export const BG_TIMEOUT_MS = 3000;
+/** 뒤 조회 하나(SELECT) — 연결마다 한 줄로(같은 연결 BUSY 방지), 짧은 시간 상한. 사용자 실행 중이면 "BUSY" 로 실패 */
+export function backgroundRows(conn: number, sql: string, max: number, timeoutMs = BG_TIMEOUT_MS): Promise<(string | null)[][]> {
+	return runBackground(conn, async () => {
+		const ok = await invoke<{ resultId?: number | null; rowCount: number }>("db_query", { conn, sql, maxRows: max, timeoutMs, stream: null });
+		if (!ok.resultId) return [];
+		try {
+			return await invoke<(string | null)[][]>("db_rows", { result: ok.resultId, from: 0, to: ok.rowCount });
+		} finally {
+			void invoke("db_result_close", { result: ok.resultId });
+		}
+	});
 }
 /** 뒤 조회가 끝나기를 기다린다(최대 ms) — 끝났으면 바로 */
 export async function waitBackground(conn: number, ms = 4000): Promise<void> {

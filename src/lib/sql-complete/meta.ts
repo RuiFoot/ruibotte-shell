@@ -101,7 +101,15 @@ export function createMeta(deps: MetaDeps) {
 	const defSchema = memo(async (): Promise<string | null> => {
 		const sql = defaultSchemaSql(deps.engine);
 		let cur: string | null = null;
-		if (sql && deps.query) cur = (await deps.query(sql, 1).catch(() => []))[0]?.[0] ?? null;
+		if (sql && deps.query) {
+			const rows = await deps.query(sql, 1).catch((e) => {
+				// 사용자 실행과 부딪혔으면(BUSY) 짐작으로 굳히지 않고 실패로 — 다음 완성 때 다시 묻는다
+				const x = e as { message?: string; code?: string } | undefined;
+				if (x?.code === "BUSY" || String(x?.message ?? e) === "BUSY") throw e;
+				return [];
+			});
+			cur = rows[0]?.[0] ?? null;
+		}
 		const all = await schemaList.get().catch(() => [] as string[]);
 		const hit = cur ? all.find((s) => s.toLowerCase() === cur.toLowerCase()) : undefined;
 		if (hit) return hit;

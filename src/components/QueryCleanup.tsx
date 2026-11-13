@@ -17,6 +17,7 @@ import "../styles/sqlclean.css";
 import { codeHighlight } from "../lib/cmTheme";
 import type { IndexInfo } from "../lib/dbtools";
 import type { ColMeta } from "../lib/edits";
+import { runBackground } from "../lib/queryWatch";
 import { formatSqlText } from "../lib/sqlFormat";
 import { type ExplainOk, planFindings, planTotals } from "./DbExplain";
 import { wsConfig } from "./DiffView";
@@ -286,20 +287,28 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 		}
 	};
 
+	// 기본 구현은 같은 연결의 뒤 조회 줄로(사용자 실행과 BUSY 로 부딪히지 않게 — 실행 중이면 "BUSY" 로 실패), 시간 상한 유지
 	const firstRow = useCallback(
 		async (q: string, ms: number): Promise<(string | null)[] | null> => {
 			if (queryFirstRow) return queryFirstRow(q, ms);
-			const ok = await invoke<{ resultId?: number | null; rowCount: number }>("db_query", { conn, sql: q, maxRows: 2, timeoutMs: ms, stream: null });
-			if (!ok.resultId) return null;
-			try {
-				const rows = await invoke<(string | null)[][]>("db_rows", { result: ok.resultId, from: 0, to: Math.min(1, ok.rowCount) });
-				return rows[0] ?? null;
-			} finally {
-				void invoke("db_result_close", { result: ok.resultId });
-			}
+			return runBackground(conn, async () => {
+				const ok = await invoke<{ resultId?: number | null; rowCount: number }>("db_query", { conn, sql: q, maxRows: 2, timeoutMs: ms, stream: null });
+				if (!ok.resultId) return null;
+				try {
+					const rows = await invoke<(string | null)[][]>("db_rows", { result: ok.resultId, from: 0, to: Math.min(1, ok.rowCount) });
+					return rows[0] ?? null;
+				} finally {
+					void invoke("db_result_close", { result: ok.resultId });
+				}
+			});
 		},
 		[conn, queryFirstRow],
 	);
+	const busyNote = (e: unknown) => {
+		const x = e as { message?: string; code?: string };
+		const m = String(x?.message ?? e);
+		return m === "BUSY" || x?.code === "BUSY" ? "쿼리가 실행 중이라 하지 않았습니다 — 끝난 뒤 다시 하세요" : m;
+	};
 
 	const runVerify = async () => {
 		if (!isSelect || !output) return;
@@ -341,20 +350,20 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 						: "열 목록이 * 라 행 수만 비교했습니다.";
 			setVerify({ state: "done", same, mode: c.mode, rows, note });
 		} catch (e) {
-			setVerify({ state: "error", note: String((e as { message?: string }).message ?? e) });
+			setVerify({ state: "error", note: busyNote(e) });
 		}
 	};
 
 	const runPlans = async () => {
 		if (!output) return;
 		setPlans({ state: "busy" });
-		const ex = explain ?? ((q: string) => invoke<ExplainOk>("db_explain", { conn, sql: q, analyze: false }));
+		const ex = explain ?? ((q: string) => runBackground(conn, () => invoke<ExplainOk>("db_explain", { conn, sql: q, analyze: false })));
 		try {
 			const a = await ex(sql);
 			const b = await ex(output);
 			setPlans({ state: "done", a, b });
 		} catch (e) {
-			setPlans({ state: "error", note: String((e as { message?: string }).message ?? e) });
+			setPlans({ state: "error", note: busyNote(e) });
 		}
 	};
 

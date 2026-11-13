@@ -10,7 +10,7 @@ import { useEffect, useMemo, useState } from "react";
 import { type Fk, fkSql, indexColsSql, type IndexInfo, parseIndexRows } from "./dbtools";
 import type { ColMeta } from "./edits";
 import { allFindings, type Finding, type QueryMap, type Resolved, resolveCols, type TableMeta } from "./queryLint";
-import { currentView, runBackground, subscribeEditor } from "./queryWatch";
+import { backgroundRows, currentView, subscribeEditor } from "./queryWatch";
 import { splitSql, type Stmt } from "./sql";
 
 const PAUSE_MS = 300;
@@ -30,21 +30,8 @@ export type AnalyzeDeps = {
 	inTx: boolean;
 };
 
-/** 메타데이터 조회 상한 — 사용자 실행을 오래 막지 않게 */
-const BG_TIMEOUT_MS = 3000;
-type QueryOk = { resultId?: number | null; rowCount: number };
-/** 뒤 조회 — 연결마다 한 줄로(같은 연결 BUSY 방지), 짧은 시간 상한 */
-function bgRows(conn: number, sql: string, max: number): Promise<(string | null)[][]> {
-	return runBackground(conn, async () => {
-		const ok = await invoke<QueryOk>("db_query", { conn, sql, maxRows: max, timeoutMs: BG_TIMEOUT_MS, stream: null });
-		if (!ok.resultId) return [];
-		try {
-			return await invoke<(string | null)[][]>("db_rows", { result: ok.resultId, from: 0, to: ok.rowCount });
-		} finally {
-			void invoke("db_result_close", { result: ok.resultId });
-		}
-	});
-}
+/** 뒤 조회 — 연결마다 한 줄로(같은 연결 BUSY 방지), 짧은 시간 상한(queryWatch) */
+const bgRows = (conn: number, sql: string, max: number) => backgroundRows(conn, sql, max);
 
 export type Snapshot = {
 	/** 문장(편집기 위치) */

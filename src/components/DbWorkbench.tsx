@@ -65,7 +65,7 @@ import { codeHighlight } from "../lib/cmTheme";
 import { editingExtensions } from "../lib/cmEditing";
 import { expandStarCommand, type SqlSource, sqlAutocompleteConfig, sqlCompletionSource } from "../lib/sqlComplete";
 import { formatSqlIn } from "../lib/sqlFormat";
-import { dropEditor, forgetWatch, holdBackground, publishPlan, queryMapMarks, touchEditor, waitBackground } from "../lib/queryWatch";
+import { backgroundRows, dropEditor, forgetWatch, holdBackground, publishPlan, queryMapMarks, touchEditor, waitBackground } from "../lib/queryWatch";
 import { onSettingLive, setSettingLive } from "../lib/settingsBus";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
@@ -176,27 +176,33 @@ function completionOf(conn: number, engine: string, epoch: () => number): SqlSou
 		s = sqlCompletionSource({
 			engine,
 			tree: (path) => invoke<Node[]>("db_tree", { conn, path }),
-			query: (sql, max) => queryRows(conn, sql, max),
-			fks: (schema) => fksOf(conn, epoch(), engine, schema),
+			// 기본 스키마·행 수·FK 는 뒤 조회 줄로(사용자 실행과 같은 연결 BUSY 로 부딪히지 않게 — 실행 중이면 BUSY 로 실패해 다음에 다시), 짧은 시간 상한
+			query: (sql, max) => backgroundRows(conn, sql, max),
+			fks: (schema) => fksLoad(conn, epoch(), engine, schema),
 		});
 		completions.set(conn, s);
 	}
 	return s;
 }
 
-/** 외래 키 기억 — 연결·epoch·스키마마다 */
+/** 외래 키 기억 — 연결·epoch·스키마마다. 뒤 조회 줄로 읽고, 못 읽었으면(BUSY 등) 기억하지 않는다(다음에 다시) */
 const fkCache = new Map<string, Promise<Fk[]>>();
-function fksOf(conn: number, epoch: number, engine: string, schema: string): Promise<Fk[]> {
+function fksLoad(conn: number, epoch: number, engine: string, schema: string): Promise<Fk[]> {
 	const k = `${conn}:${epoch}:${schema}`;
 	let p = fkCache.get(k);
 	if (!p) {
 		const sql = fkSql(engine, schema);
-		p = sql ? queryRows(conn, sql, 50000).then((rows) => rows.map((r) => ({ table: r[0] ?? "", column: r[1] ?? "", refTable: r[2] ?? "", refColumn: r[3] ?? "" }))) : Promise.resolve([]);
-		p = p.catch(() => []);
+		const q: Promise<Fk[]> = sql ? backgroundRows(conn, sql, 50000).then((rows) => rows.map((r) => ({ table: r[0] ?? "", column: r[1] ?? "", refTable: r[2] ?? "", refColumn: r[3] ?? "" }))) : Promise.resolve([]);
+		p = q.catch((e) => {
+			if (fkCache.get(k) === p) fkCache.delete(k);
+			throw e;
+		});
 		fkCache.set(k, p);
 	}
 	return p;
 }
+/** 외래 키(못 읽으면 빈 목록) */
+const fksOf = (conn: number, epoch: number, engine: string, schema: string): Promise<Fk[]> => fksLoad(conn, epoch, engine, schema).catch(() => []);
 
 /** 값 → SQL 글자(숫자 열이면 그대로) */
 function sqlLit(val: string | null, kind?: string) {
