@@ -126,6 +126,8 @@ type Ctx = {
 	locked: boolean;
 	/** 지금 데이터베이스(MySQL 한정 없는 표 이름) */
 	database: string;
+	/** 서버 버전 문자열(다시 연결하면 새 값) */
+	version: string;
 	/** 쿼리 분석 칸 열기(그 탭으로) */
 	openAnalysis: (tab?: AnalysisTab) => void;
 	/** 두 문장의 계획(튜닝 비교) — 실행 중 표시를 올리고, ANALYZE 는 묻는다 */
@@ -1794,7 +1796,7 @@ function AnalysisDock(props: IDockviewPanelProps<{ tab?: AnalysisTab; seq?: numb
 	);
 	return (
 		<Suspense fallback={<div className="dock-watermark">불러오는 중…</div>}>
-			<QueryAnalysisLazy deps={deps} visible={visible} actions={actions} tab={tab} onTab={pick} database={ctx.database} />
+			<QueryAnalysisLazy deps={deps} visible={visible} actions={actions} tab={tab} onTab={pick} database={ctx.database} serverVersion={ctx.version} />
 		</Suspense>
 	);
 }
@@ -2593,10 +2595,11 @@ export function DbWorkbench({
 			importCsv: (schema, table) => setCsvTarget({ schema, table }),
 			locked,
 			database: curDb,
+			version: ver,
 			openAnalysis,
 			explainPair,
 		}),
-		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked, curDb, openAnalysis, explainPair],
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked, curDb, ver, openAnalysis, explainPair],
 	);
 	const live = useMemo<Live>(() => ({ running, messages }), [running, messages]);
 	// 실행이 끝나면 뒤 조회(쿼리 지도 메타데이터)를 다시 허락

@@ -23,7 +23,24 @@ const TABS: { id: AnalysisTab; label: string; tip: string }[] = [
  * 크기 0 에서 지도를 맞춘 뒤 다시 보일 때 고치지 않아 잘리고 겹쳤다(0.14.0). 칸 자체가 가려져
  * 크기 0 이 됐다 돌아올 때는, 그 사이 문장 구조가 바뀌었으면 지도를 새로 그려 다시 맞춘다.
  */
-export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, database }: { deps: AnalyzeDeps; visible: boolean; actions: TuningActions; tab: AnalysisTab; onTab: (t: AnalysisTab) => void; database: string }) {
+export function QueryAnalysisPanel({
+	deps,
+	visible,
+	actions,
+	tab,
+	onTab,
+	database,
+	serverVersion,
+}: {
+	deps: AnalyzeDeps;
+	visible: boolean;
+	actions: TuningActions;
+	tab: AnalysisTab;
+	onTab: (t: AnalysisTab) => void;
+	database: string;
+	/** 서버 버전 문자열(다듬기 결과 비교의 EXCEPT 지원 판별) */
+	serverVersion?: string | null;
+}) {
 	// 세 탭이 같은 분석기를 함께 본다(연결마다 하나) — 칸이 보이면 탭과 상관없이 편집기를 듣는다
 	const { state, refresh } = useAnalysis(deps, visible);
 	const snap = state.snap;
@@ -177,6 +194,7 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 								getMeta={getMeta}
 								onApply={applyCleanup}
 								onHighlight={highlightCleanup}
+								serverVersion={serverVersion ?? null}
 								serverBlocked={serverBlocked}
 							/>
 						) : (
