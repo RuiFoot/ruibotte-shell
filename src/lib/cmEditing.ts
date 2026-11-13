@@ -19,11 +19,15 @@ const wordsFrom2 = (ctx: CompletionContext) => {
 	return completeAnyWord(ctx);
 };
 
-export function editingExtensions(): Extension[] {
+/** autocompletion() 에 덧댈 것 — SQL 편집기는 자기 소스 하나(override)로 순서·거르기를 직접 정한다 */
+export type CompletionOverride = Pick<NonNullable<Parameters<typeof autocompletion>[0]>, "override" | "icons" | "addToOptions" | "tooltipClass">;
+
+/** completion 을 주면 그 설정으로(언어·문서 낱말 소스는 쓰지 않는다), 안 주면 지금까지처럼 */
+export function editingExtensions(opts: { completion?: CompletionOverride } = {}): Extension[] {
 	return [
 		// 치는 동안 낱말마다 목록이 깜박이지 않게 — 잠깐 멈추면(200ms) 열고, 문서 안 낱말은 두 글자부터
-		autocompletion({ activateOnTyping: true, activateOnTypingDelay: 200, maxRenderedOptions: 80, icons: true }),
-		EditorState.languageData.of(() => [{ autocomplete: wordsFrom2 }]),
+		autocompletion({ activateOnTyping: true, activateOnTypingDelay: 200, maxRenderedOptions: 80, icons: true, ...opts.completion }),
+		opts.completion ? [] : EditorState.languageData.of(() => [{ autocomplete: wordsFrom2 }]),
 		closeBrackets(),
 		EditorState.allowMultipleSelections.of(true),
 		rectangularSelection({ eventFilter: (e) => e.altKey }),

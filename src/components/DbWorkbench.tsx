@@ -62,7 +62,7 @@ import { Select } from "./Select";
 import { SnippetPalette } from "./SnippetPalette";
 import { codeHighlight } from "../lib/cmTheme";
 import { editingExtensions } from "../lib/cmEditing";
-import { dbCompletionSource } from "../lib/sqlComplete";
+import { expandStarCommand, type SqlSource, sqlAutocompleteConfig, sqlCompletionSource } from "../lib/sqlComplete";
 import { formatSqlIn } from "../lib/sqlFormat";
 import { dropEditor, forgetWatch, holdBackground, publishPlan, touchEditor, waitBackground } from "../lib/queryWatch";
 import { onSettingLive, setSettingLive } from "../lib/settingsBus";
@@ -167,18 +167,20 @@ function okToDiscardEdits(titles: string[], what: string): boolean {
 	return confirm(`반영하지 않은 편집이 있습니다.\n· ${list}${titles.length > 8 ? "\n…" : ""}\n\n${what} 이 편집은 버려집니다. 계속할까요?`);
 }
 
-/** 연결마다 하나 — 열어 둔 SQL 편집기들이 같은 이름 목록을 함께 쓴다 */
-const completions = new Map<number, ReturnType<typeof dbCompletionSource>>();
-function completionFor(conn: number): ReturnType<typeof dbCompletionSource> {
-	// 편집기는 이 감싼 함수를 한 번 받고, 속(이름 기억)은 데이터베이스를 바꾸면 갈아 끼운다
-	return (cx) => {
-		let s = completions.get(conn);
-		if (!s) {
-			s = dbCompletionSource((path) => invoke<Node[]>("db_tree", { conn, path }));
-			completions.set(conn, s);
-		}
-		return s(cx);
-	};
+/** 연결마다 하나 — 열어 둔 SQL 편집기들이 같은 이름 목록을 함께 쓴다(데이터베이스를 바꾸면 지우고 새로) */
+const completions = new Map<number, SqlSource>();
+function completionOf(conn: number, engine: string, epoch: () => number): SqlSource {
+	let s = completions.get(conn);
+	if (!s) {
+		s = sqlCompletionSource({
+			engine,
+			tree: (path) => invoke<Node[]>("db_tree", { conn, path }),
+			query: (sql, max) => queryRows(conn, sql, max),
+			fks: (schema) => fksOf(conn, epoch(), engine, schema),
+		});
+		completions.set(conn, s);
+	}
+	return s;
 }
 
 /** 외래 키 기억 — 연결·epoch·스키마마다 */
@@ -299,9 +301,8 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					ranField,
 					// 빈 편집기에 할 수 있는 것을 알려 준다(처음 연 사람이 실행 키를 찾지 않게)
 					placeholder("SQL 을 쓰고 Ctrl+Enter 로 실행 — 커서가 있는 문장만, Ctrl+Shift+Enter 는 전체 · 왼쪽 표를 두 번 누르면 내용 보기"),
-					...editingExtensions(),
-					// DB 이름(스키마·표·열·별칭) 완성 — 키워드 완성은 sql() 이 함께 낸다
-					EditorState.languageData.of(() => [{ autocomplete: completionFor(ctx.conn) }]),
+					// DB 완성(문맥·표·열·조인·함수·키워드·문서 낱말을 한 소스가 순서대로) — 편집기는 감싼 함수를 받고 속은 데이터베이스를 바꾸면 갈아 끼운다
+					...editingExtensions({ completion: sqlAutocompleteConfig((cx) => completionOf(ctx.conn, ctx.engine, () => ctxRef.current.epoch)(cx)) }),
 					sql({
 						dialect:
 							ctx.engine === "postgres" ? PostgreSQL : ctx.mysql ? MySQL : ctx.engine === "mssql" ? MSSQL : ctx.engine === "oracle" || ctx.engine === "tibero" ? PLSQL : StandardSQL,
@@ -310,6 +311,8 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					keymap.of([
 						{ key: "Mod-Enter", preventDefault: true, run: (view) => (runRef.current(pickStatements(view, false)), true) },
 						{ key: "Mod-e", preventDefault: true, run: () => (ctxRef.current.explain(), true) },
+						// SELECT * 의 * 옆에서 — 열 목록으로 펼치기
+						{ key: "Alt-Enter", run: expandStarCommand(() => completionOf(ctx.conn, ctx.engine, () => ctxRef.current.epoch)) },
 						{
 							key: "Escape",
 							run: () => {

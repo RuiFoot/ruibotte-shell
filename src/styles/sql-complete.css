@@ -1,0 +1,143 @@
+/* SQL 편집기 완성 목록 — 종류 아이콘·출처·형식·표지(공통 팝업 모양은 styles.css 의 .cm-tooltip-autocomplete) */
+
+.cm-editor .sqlc {
+	--sqlc-table: #007aff;
+	--sqlc-view: #af52de;
+	--sqlc-column: #0a8f8f;
+	--sqlc-key: #c27c00;
+	--sqlc-function: #d63384;
+	--sqlc-join: #248a3d;
+	--sqlc-muted: var(--text-3);
+}
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme="light"]) .cm-editor .sqlc {
+		--sqlc-table: #0a84ff;
+		--sqlc-view: #bf5af2;
+		--sqlc-column: #40c8e0;
+		--sqlc-key: #ffb340;
+		--sqlc-function: #ff6fae;
+		--sqlc-join: #30d158;
+	}
+}
+:root[data-theme="dark"] .cm-editor .sqlc {
+	--sqlc-table: #0a84ff;
+	--sqlc-view: #bf5af2;
+	--sqlc-column: #40c8e0;
+	--sqlc-key: #ffb340;
+	--sqlc-function: #ff6fae;
+	--sqlc-join: #30d158;
+}
+
+/* 폭은 내용대로 — 칸 오른쪽 끝 가까이에서 열려도 좁아져 잘리지 않고(편집기가 왼쪽으로 옮긴다) */
+.cm-editor .cm-tooltip.cm-tooltip-autocomplete.sqlc {
+	width: max-content;
+	max-width: min(640px, 92vw);
+}
+.cm-editor .cm-tooltip.cm-tooltip-autocomplete.sqlc > ul {
+	min-width: 300px;
+	max-width: min(640px, 92vw);
+	/* 기본(10em, 일곱 줄)보다 길게 — 열·표 목록은 한눈에 더 보여야 고르기 쉽다 */
+	max-height: min(300px, 45vh);
+}
+.cm-editor .sqlc > ul > li {
+	gap: 7px;
+	padding: 2px 8px 2px 6px;
+}
+.cm-editor .sqlc .cm-completionLabel {
+	white-space: nowrap;
+}
+
+/* 종류 아이콘 */
+.cm-editor .sqlc-ic {
+	display: inline-flex;
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+	color: var(--sqlc-muted);
+}
+.cm-editor .sqlc-ic-table,
+.cm-editor .sqlc-ic-cte {
+	color: var(--sqlc-table);
+}
+.cm-editor .sqlc-ic-view {
+	color: var(--sqlc-view);
+}
+.cm-editor .sqlc-ic-column {
+	color: var(--sqlc-column);
+}
+.cm-editor .sqlc-ic-key {
+	color: var(--sqlc-key);
+}
+.cm-editor .sqlc-ic-function {
+	color: var(--sqlc-function);
+}
+.cm-editor .sqlc-ic-join,
+.cm-editor .sqlc-ic-star {
+	color: var(--sqlc-join);
+}
+.cm-editor .sqlc-ic-alias,
+.cm-editor .sqlc-ic-schema {
+	color: var(--text-2);
+}
+
+/* 이름 옆 흐린 글(별칭·스키마·인자) */
+.cm-editor .sqlc-src {
+	overflow: hidden;
+	min-width: 0;
+	max-width: 220px;
+	font-size: 11.5px;
+	color: var(--text-3);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.cm-editor .sqlc .cm-completionDetail {
+	flex: none;
+	font-family: var(--font-mono);
+	font-size: 11px;
+}
+
+/* 표지 */
+.cm-editor .sqlc-badges {
+	display: inline-flex;
+	flex: none;
+	gap: 3px;
+	margin-left: 2px;
+}
+.cm-editor .sqlc-badge {
+	padding: 0 4px;
+	border-radius: 4px;
+	font-family: var(--font-ui);
+	font-size: 9.5px;
+	font-weight: 600;
+	line-height: 15px;
+	letter-spacing: 0.02em;
+	color: var(--text-2);
+	background: var(--fill);
+}
+.cm-editor .sqlc-badge-pk {
+	color: var(--sqlc-key);
+	background: color-mix(in srgb, var(--sqlc-key) 16%, transparent);
+}
+.cm-editor .sqlc-badge-null {
+	font-weight: 500;
+	color: var(--text-3);
+	background: transparent;
+	box-shadow: inset 0 0 0 0.5px var(--hairline-strong);
+}
+
+/* 고른 줄(파란 바탕) — 흐린 글·아이콘·표지를 흰색 계열로 */
+.cm-editor .sqlc li[aria-selected] .sqlc-ic,
+.cm-editor .sqlc li[aria-selected] .sqlc-src {
+	color: rgb(255 255 255 / 0.85);
+}
+.cm-editor .sqlc li[aria-selected] .sqlc-badge {
+	color: #fff;
+	background: rgb(255 255 255 / 0.22);
+	box-shadow: none;
+}
+/* 형식 칸이 없는 줄(표지만) — 표지를 오른쪽 끝으로 */
+.cm-editor .sqlc li:not(:has(.cm-completionDetail)) .sqlc-badges {
+	margin-left: auto;
+}
