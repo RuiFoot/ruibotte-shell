@@ -148,6 +148,9 @@ export function TerminalView({
 	/** 줄 바꾸지 않기(가로 스크롤) — 긴 줄(docker ps 등)을 접지 않고 옆으로 밀어 본다. Alt+Z */
 	const [wide, setWide] = useState(false);
 	const wideRef = useRef(false);
+	/** 전체 화면 프로그램(vim·less·htop — 대체 화면) 중에는 줄 바꾸지 않기를 잠깐 내려 칸 폭에 맞춘다(320열로 그리면 화면 밖으로 잘린다) */
+	const [altScreen, setAltScreen] = useState(false);
+	const altRef = useRef(false);
 	const refitRef = useRef<() => void>(() => {});
 	/** WebGL 렌더러 다시 붙이기(문맥을 잃은 터미널이 다시 앞에 올 때) */
 	const webglRetryRef = useRef<() => void>(() => {});
@@ -188,8 +191,25 @@ export function TerminalView({
 		const next = !wideRef.current;
 		wideRef.current = next;
 		setWide(next);
-		noteClip(next ? "줄 바꾸지 않음 — Shift+휠로 옆으로 · Alt+Z 로 되돌리기" : "줄 바꿈으로 되돌림", true);
+		// 마지막으로 고른 쪽이 새 터미널의 기본이 된다
+		void api.settingSet("term.noWrap", next ? "1" : "0");
+		noteClip(next ? "줄 바꾸지 않음 — Shift+휠로 옆으로 · Alt+Z 로 되돌리기(새 터미널도 이대로)" : "줄 바꿈으로 되돌림(새 터미널도 이대로)", true);
 	};
+	// 기본은 줄 바꾸지 않기(긴 줄 — docker ps 등 — 을 옆으로 밀어 본다). 끄려면 Alt+Z(그 선택이 기억된다)
+	useEffect(() => {
+		let gone = false;
+		void api.settingGet("term.noWrap").then((v) => {
+			if (gone) return;
+			const on = v !== "0";
+			if (on !== wideRef.current) {
+				wideRef.current = on;
+				setWide(on);
+			}
+		});
+		return () => {
+			gone = true;
+		};
+	}, []);
 	const toggleWideRef = useRef(toggleWide);
 	toggleWideRef.current = toggleWide;
 	// 클래스(nowrap)가 붙은 뒤 다시 맞춘다 — 끄면 왼쪽 끝으로
@@ -480,7 +500,7 @@ export function TerminalView({
 		});
 		// 칸에 맞추기 — 줄 바꾸지 않기면 열 수를 넉넉히(WIDE_COLS) 두고 가로로 밀어 본다(줄 수는 가로 막대 자리만큼 하나 덜)
 		const refit = () => {
-			if (!wideRef.current) {
+			if (!wideRef.current || altRef.current) {
 				fit.fit();
 				return;
 			}
@@ -491,6 +511,15 @@ export function TerminalView({
 			if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
 		};
 		refitRef.current = refit;
+		// 대체 화면에 들어가고 나올 때 폭을 다시 맞춘다(줄 바꾸지 않기는 셸 출력에만)
+		term.buffer.onBufferChange((b) => {
+			const alt = b.type === "alternate";
+			if (alt === altRef.current) return;
+			altRef.current = alt;
+			setAltScreen(alt);
+			if (!alt && host.current) host.current.scrollLeft = 0;
+			refit();
+		});
 		refit();
 		termRef.current = term;
 		fitRef.current = fit;
@@ -1376,7 +1405,7 @@ export function TerminalView({
 				</div>
 			)}
 			<div
-				className={`term-host${wide ? " nowrap" : ""}`}
+				className={`term-host${wide && !altScreen ? " nowrap" : ""}`}
 				ref={host}
 				onClick={() => termRef.current?.focus()}
 				onContextMenu={(e) => {
