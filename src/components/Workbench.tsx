@@ -12,7 +12,7 @@ import { CLOSE_DOC_EVENT, confirmDiscard, forgetOwner, isDirty, setDirty } from 
 import "dockview-react/dist/styles/dockview.css";
 import { listen } from "@tauri-apps/api/event";
 import { Activity, ChevronDown, Wrench, Server, ArrowDownUp, ArrowLeftRight, Columns2, FileText, FolderTree, Monitor, Plus, Radio, Route, Rows2, Container, SquareTerminal, ShieldAlert, X, ArrowUp, ArrowDown } from "lucide-react";
-import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, lazy, memo, Suspense, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
 	api,
 	asSshError,
@@ -35,9 +35,7 @@ import {
 	containerFs,
 } from "../lib/ipc";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { DiffView } from "./DiffView";
-import { EditorView_ } from "./Editor";
-import { BinaryPreview, previewKind } from "./Preview";
+import { previewKind } from "../lib/previewKind";
 import { freeName, useConflictAsk } from "./ConflictSheet";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { ForwardChips, ForwardSheet, TmuxSheet } from "./ForwardPanel";
@@ -45,10 +43,7 @@ import { RouteChip } from "./RouteChip";
 import { MiniMonitor } from "./MiniMonitor";
 import { QuickOpen } from "./QuickOpen";
 import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
-import { MonitorPanel } from "./MonitorPanel";
 import { Select } from "./Select";
-import { SyncPanel } from "./SyncPanel";
-import { TailView } from "./TailView";
 import { invoke } from "@tauri-apps/api/core";
 import type { CompletionSource } from "../lib/termComplete";
 import { type DragEntry, FileTree } from "./FileTree";
@@ -57,12 +52,22 @@ import { TerminalView } from "./Terminal";
 import { askText } from "../lib/ask";
 import { ctxContainer } from "../lib/shellCtx";
 import type { SudoCtx } from "./panels/common";
-import { ContentSearch } from "./panels/ContentSearch";
-import { DockerPanel } from "./panels/DockerPanel";
-import { ServicesPanel } from "./panels/ServicesPanel";
-import { WebPortsPanel } from "./panels/WebPortsPanel";
 import { type Command, useCommands } from "../lib/commands";
 import { FORMS } from "../lib/cmdAssist";
+
+// 처음 열 때 읽는 칸들 — 작업대를 여는 데 편집기(CodeMirror)·마크다운·표·비교 코드를 같이 읽지 않게
+const EditorView_ = lazy(() => import("./Editor").then((m) => ({ default: m.EditorView_ })));
+const BinaryPreview = lazy(() => import("./Preview").then((m) => ({ default: m.BinaryPreview })));
+const DiffView = lazy(() => import("./DiffView").then((m) => ({ default: m.DiffView })));
+const TailView = lazy(() => import("./TailView").then((m) => ({ default: m.TailView })));
+const MonitorPanel = lazy(() => import("./MonitorPanel").then((m) => ({ default: m.MonitorPanel })));
+const SyncPanel = lazy(() => import("./SyncPanel").then((m) => ({ default: m.SyncPanel })));
+const ContentSearch = lazy(() => import("./panels/ContentSearch").then((m) => ({ default: m.ContentSearch })));
+const DockerPanel = lazy(() => import("./panels/DockerPanel").then((m) => ({ default: m.DockerPanel })));
+const ServicesPanel = lazy(() => import("./panels/ServicesPanel").then((m) => ({ default: m.ServicesPanel })));
+const WebPortsPanel = lazy(() => import("./panels/WebPortsPanel").then((m) => ({ default: m.WebPortsPanel })));
+/** 칸 안의 lazy 부분이 올 때까지 빈 칸 */
+const Lz = ({ children }: { children: ReactNode }) => <Suspense fallback={<div className="panel-fill" />}>{children}</Suspense>;
 
 /**
  * IDE식 작업대 — 트리·편집기·터미널이 모두 도킹 칸이다.
@@ -87,7 +92,6 @@ type Ctx = {
 	ctrFs: (name: string) => FsBackend;
 	/** 트리를 서버로 되돌리기(다음 프롬프트까지) */
 	leaveCtr: () => void;
-	activePanel: string | null;
 	/** 끌어 놓기 — destConn: 받는 트리의 연결(다른 서버 칸이면 그 서버). 서버가 다르면 중계 */
 	drop: (src: DragEntry, destSide: "remote" | "local", destDir: string, destConn?: number) => void;
 	/** 다른 서버 칸의 파일 접근 */
@@ -133,6 +137,10 @@ type Ctx = {
 	owner: string;
 	/** sudo 켜짐 — 자원 칸의 du·kill 용(암호·대상 사용자는 연결한 계정을 따른다) */
 	sudoOn: boolean;
+	/** 지금 칸 최대화·되돌리기(Alt+M) */
+	toggleMaximize: () => void;
+	/** 활성 칸(칸마다 boolean 만 구독) */
+	activeStore: ActiveStore;
 	/** 이 터미널 옆(오른쪽·아래)에 새 터미널 */
 	splitTerminal: (panelId: string, dir: "right" | "below") => void;
 	/** 원격 작업대: 이 터미널을 root 셸로(sudo -i)·나오기 */
@@ -158,36 +166,90 @@ type Ctx = {
 	profileId?: number;
 };
 const WbCtx = createContext<Ctx | null>(null);
+
+/**
+ * 활성 칸 store — 활성 칸이 바뀔 때 모든 칸(트리·터미널·편집기…)이 다시 그려지지 않게,
+ * 칸마다 "내가 활성인가" boolean 만 구독한다(useSyncExternalStore 는 값이 같으면 다시 그리지 않는다).
+ */
+type ActiveStore = {
+	panel: string | null;
+	/** 이 작업대(앱 탭)가 앞에 보이는가 */
+	app: boolean;
+	subs: Set<() => void>;
+	sub: (f: () => void) => () => void;
+	set: (panel: string | null, app?: boolean) => void;
+};
+function makeActiveStore(): ActiveStore {
+	const st: ActiveStore = {
+		panel: null,
+		app: false,
+		subs: new Set(),
+		sub: (f) => {
+			st.subs.add(f);
+			return () => void st.subs.delete(f);
+		},
+		set: (panel, app) => {
+			if (st.panel === panel && (app === undefined || st.app === app)) return;
+			st.panel = panel;
+			if (app !== undefined) st.app = app;
+			for (const f of st.subs) f();
+		},
+	};
+	return st;
+}
 const useWb = () => useContext(WbCtx) as Ctx;
+/** 이 칸이 지금 활성(초점)인가 — 앱 탭이 가려져 있으면 아니다 */
+const useIsActive = (id: string) => {
+	const st = useWb().activeStore;
+	return useSyncExternalStore(st.sub, () => st.app && st.panel === id);
+};
+/** 이 작업대(앱 탭)가 앞에 보이는가 — 가려진 탭은 서버에 묻지 않는다 */
+const useAppActive = () => {
+	const st = useWb().activeStore;
+	return useSyncExternalStore(st.sub, () => st.app);
+};
 
 function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 	const ctx = useWb();
-	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
+	const which = props.params.which;
+	const fs = which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
 	// 원격 트리는 / 를 뿌리로 두고 시작 폴더(또는 홈)를 펼쳐 보인다 — 이전 판과 같은 틀
-	const start = props.params.which === "remote" ? ctx.startPath || fs.home : fs.home;
+	const start = which === "remote" ? ctx.startPath || fs.home : fs.home;
 	const [root, setRoot] = useState(fs.side === "remote" ? "/" : fs.home);
 	const [reveal, setReveal] = useState<{ path: string; nonce: number } | null>(() => (fs.side === "remote" ? { path: start, nonce: 1 } : null));
-	const follows = props.params.which === "remote" || !ctx.local;
+	const follows = which === "remote" || !ctx.local;
 	const [note, setNote] = useState<string | null>(null);
+	const { follow, setFollow, cd, termOtherSide, openFile, drop, sendTo, openTail, compare, compareLabel, archive, relay, newTerminal, leaveCtr } = ctx;
+	const hasLocal = !!ctx.local;
+	const inCtr = fs.container;
+	const fsSide = fs.side;
 	// 트리에서 폴더를 고르면(같이) 터미널이 그 폴더로 — 프롬프트가 아니면 알리고 보내지 않는다
-	const onSelectDir = (dir: string) => {
-		if (!ctx.follow || !follows) return;
-		if (!ctx.cd(dir, true)) {
-			setNote(ctx.termOtherSide() ? "터미널이 트리와 다른 곳(서버·컨테이너)에 있어 cd 하지 않았습니다" : "터미널이 명령을 실행 중이라 cd 하지 않았습니다");
-			window.setTimeout(() => setNote(null), 3000);
-		}
-	};
+	const onSelectDir = useCallback(
+		(dir: string) => {
+			if (!follow || !follows) return;
+			if (!cd(dir, true)) {
+				setNote(termOtherSide() ? "터미널이 트리와 다른 곳(서버·컨테이너)에 있어 cd 하지 않았습니다" : "터미널이 명령을 실행 중이라 cd 하지 않았습니다");
+				window.setTimeout(() => setNote(null), 3000);
+			}
+		},
+		[follow, follows, cd, termOtherSide],
+	);
 	// 터미널을 따라가기: 원격 트리(또는 내 PC 작업대의 트리)만
 	useEffect(() => {
-		const follows = props.params.which === "remote" || !ctx.local;
 		if (!follows) return;
 		const on = (ev: Event) => setReveal({ path: (ev as CustomEvent<string>).detail, nonce: Date.now() });
 		window.addEventListener(`rb-cwd-${ctx.treeKey}`, on);
 		return () => window.removeEventListener(`rb-cwd-${ctx.treeKey}`, on);
-	}, [ctx.treeKey, ctx.local, props.params.which]);
+	}, [ctx.treeKey, follows]);
+	// 인라인 콜백을 칸 안에서 안정시킨다 — FileTree 의 memo 가 효과를 내도록
+	const onSyncChange = useCallback((m: "together" | "apart") => setFollow(m === "together"), [setFollow]);
+	const onOpen = useCallback((e: FsEntry) => openFile(which, e, undefined, undefined, inCtr), [openFile, which, inCtr]);
+	const onDrop = useCallback((src: DragEntry, dir: string) => drop(src, fsSide, dir), [drop, fsSide]);
+	const onSend = useCallback((e: FsEntry) => sendTo(which, e), [sendTo, which]);
+	const onTail = useCallback((e: FsEntry) => openTail(which, e), [openTail, which]);
+	const onCompare = useCallback((e: FsEntry) => compare(which, e), [compare, which]);
+	const compareLabelFor = useCallback((e: FsEntry) => compareLabel(which, e), [compareLabel, which]);
 	// 터미널이 docker exec 로 들어간 컨테이너 — 트리가 컨테이너 파일을 본다(SFTP 전송·실시간 보기 등은 서버 파일 전용이라 끈다)
-	const inCtr = fs.container;
-	const hostOnly = <T,>(f: T) => (inCtr ? undefined : f);
 	return (
 		<div className="panel-fill">
 			{inCtr && (
@@ -197,7 +259,7 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 						컨테이너 <b>{inCtr}</b>
 					</span>
 					<small>터미널에서 exit 하면 서버 트리로</small>
-					<button type="button" className="btn ghost" onClick={ctx.leaveCtr} title="지금 트리만 서버 파일로 되돌립니다 — 터미널이 컨테이너에서 다음 프롬프트를 그리면 다시 따라갑니다">
+					<button type="button" className="btn ghost" onClick={leaveCtr} title="지금 트리만 서버 파일로 되돌립니다 — 터미널이 컨테이너에서 다음 프롬프트를 그리면 다시 따라갑니다">
 						서버 트리
 					</button>
 				</div>
@@ -209,22 +271,22 @@ function TreePanel(props: IDockviewPanelProps<{ which: Which }>) {
 				onRoot={setRoot}
 				reveal={reveal}
 				onSelectDir={onSelectDir}
-				sync={follows ? (ctx.follow ? "together" : "apart") : undefined}
-				onSyncChange={follows ? (m) => ctx.setFollow(m === "together") : undefined}
+				sync={follows ? (follow ? "together" : "apart") : undefined}
+				onSyncChange={follows ? onSyncChange : undefined}
 				note={note}
-				onOpen={(e) => ctx.openFile(props.params.which, e, undefined, undefined, inCtr)}
-				onDrop={hostOnly((src: DragEntry, dir: string) => ctx.drop(src, fs.side, dir))}
-				onSend={ctx.local && !inCtr ? (e) => ctx.sendTo(props.params.which, e) : undefined}
-				sendLabel={props.params.which === "local" ? "서버로 올리기" : "내 PC로 받기"}
-				onCd={props.params.which === "remote" || !ctx.local ? ctx.cd : undefined}
-				onTail={hostOnly((e: FsEntry) => ctx.openTail(props.params.which, e))}
-				onCompare={hostOnly((e: FsEntry) => ctx.compare(props.params.which, e))}
-				compareLabel={(e) => ctx.compareLabel(props.params.which, e)}
-				onArchive={props.params.which === "remote" && fs.side === "remote" && !inCtr ? ctx.archive : undefined}
-				onRelay={props.params.which === "remote" && ctx.hasPeers && !inCtr ? ctx.relay : undefined}
-				onUploadPick={props.params.which === "remote" && !inCtr ? ctx.uploadPick : undefined}
-				onDownloadTo={props.params.which === "remote" && !inCtr ? ctx.downloadTo : undefined}
-				onNewTerminal={follows && !inCtr ? ctx.newTerminal : undefined}
+				onOpen={onOpen}
+				onDrop={inCtr ? undefined : onDrop}
+				onSend={hasLocal && !inCtr ? onSend : undefined}
+				sendLabel={which === "local" ? "서버로 올리기" : "내 PC로 받기"}
+				onCd={which === "remote" || !hasLocal ? cd : undefined}
+				onTail={inCtr ? undefined : onTail}
+				onCompare={inCtr ? undefined : onCompare}
+				compareLabel={compareLabelFor}
+				onArchive={which === "remote" && fsSide === "remote" && !inCtr ? archive : undefined}
+				onRelay={which === "remote" && ctx.hasPeers && !inCtr ? relay : undefined}
+				onUploadPick={which === "remote" && !inCtr ? ctx.uploadPick : undefined}
+				onDownloadTo={which === "remote" && !inCtr ? ctx.downloadTo : undefined}
+				onNewTerminal={follows && !inCtr ? newTerminal : undefined}
 			/>
 		</div>
 	);
@@ -259,6 +321,7 @@ function PeerTreePanel(props: IDockviewPanelProps<{ peer: Peer }>) {
 
 function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; name: string; line?: { n: number; seq: number }; peer?: Peer; ctr?: string }>) {
 	const ctx = useWb();
+	const isActive = useIsActive(props.api.id);
 	const fs = props.params.peer
 		? ctx.peerFs(props.params.peer)
 		: props.params.ctr
@@ -280,16 +343,20 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 	return (
 		<div className="panel-fill">
 			{kind ? (
+				<Lz>
 				<BinaryPreview fs={fs} path={props.params.path} kind={kind} />
+			</Lz>
 			) : (
-				<EditorView_
+				<Lz>
+					<EditorView_
 					fs={fs}
 					path={props.params.path}
-					active={ctx.activePanel === props.api.id}
+					active={isActive}
 					onDirtyChange={onDirty}
 					line={props.params.line}
 					onTail={props.params.ctr ? undefined : () => ctx.openTail(props.params.which, { name: props.params.name, path: props.params.path, kind: "file", size: 0 })}
-				/>
+										/>
+									</Lz>
 			)}
 		</div>
 	);
@@ -297,6 +364,8 @@ function EditorPanel(props: IDockviewPanelProps<{ which: Which; path: string; na
 
 function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; shell?: string }>) {
 	const ctx = useWb();
+	const isActive = useIsActive(props.api.id);
+	const appActive = useAppActive();
 	// 내 PC 작업대: 셸 고르기(기본은 설정 › 터미널 › 내 PC 셸)
 	const [shell, setShell] = useState<string | undefined>(props.params.shell ?? (ctx.localShells ? ctx.defaultShell : undefined));
 	useEffect(() => {
@@ -329,7 +398,7 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 		<div className="panel-fill">
 			<TerminalView
 				backend={ctx.term}
-				active={ctx.activePanel === props.api.id}
+				active={isActive}
 				cwd={props.params.cwd ?? ctx.startPath}
 				label={ctx.label}
 				toolbar={false}
@@ -355,13 +424,13 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 				}}
 				defaultEncoding={ctx.termEncoding}
 				onOpenPath={(p, c) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 }, undefined, undefined, ctxContainer(c) ?? undefined)}
-				onSplit={(dir) => ctx.splitTerminal(props.api.id, dir)}
+				onSplit={(dir) => ctx.splitTerminal(props.api.id, dir)} onMaximize={ctx.toggleMaximize}
 				statusExtra={
 					visible && ctx.fs.side === "remote" && ctx.fs.conn != null ? (
 						<>
 							<RouteChip conn={ctx.fs.conn} />
 							{ctx.openForwards && <ForwardChips conn={ctx.fs.conn} onOpen={ctx.openForwards} />}
-							<MiniMonitor conn={ctx.fs.conn} onOpen={ctx.openMonitor} />
+							<MiniMonitor conn={ctx.fs.conn} onOpen={ctx.openMonitor} enabled={appActive} />
 						</>
 					) : undefined
 				}
@@ -380,7 +449,11 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 function TailPanel(props: IDockviewPanelProps<{ which: Which; path: string }>) {
 	const ctx = useWb();
 	const fs = props.params.which === "local" ? ctx.local ?? ctx.fs : ctx.fs;
-	return <TailView fs={fs} path={props.params.path} />;
+	return (
+		<Lz>
+			<TailView fs={fs} path={props.params.path} />
+		</Lz>
+	);
 }
 
 function DiffPanel(props: IDockviewPanelProps<{ a: { which: Which; path: string }; b: { which: Which; path: string } }>) {
@@ -391,13 +464,21 @@ function DiffPanel(props: IDockviewPanelProps<{ a: { which: Which; path: string 
 	};
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 열 때 한 번
 	const sides = useMemo(() => [side(props.params.a), side(props.params.b)] as const, []);
-	return <DiffView a={sides[0]} b={sides[1]} />;
+	return (
+		<Lz>
+			<DiffView a={sides[0]} b={sides[1]} />
+		</Lz>
+	);
 }
 
 function SyncDock() {
 	const ctx = useWb();
 	if (ctx.fs.conn == null || !ctx.syncInfo) return null;
-	return <SyncPanel conn={ctx.fs.conn} remoteHome={ctx.fs.home} user={ctx.syncInfo.user} host={ctx.syncInfo.host} port={ctx.syncInfo.port} onRun={ctx.showTransfers} />;
+	return (
+		<Lz>
+			<SyncPanel conn={ctx.fs.conn} remoteHome={ctx.fs.home} user={ctx.syncInfo.user} host={ctx.syncInfo.host} port={ctx.syncInfo.port} onRun={ctx.showTransfers} />
+		</Lz>
+	);
 }
 
 /** 칸이 보이는지(자동 새로 고침·실시간 보기는 보일 때만) */
@@ -415,30 +496,44 @@ function ServicesDock(props: IDockviewPanelProps) {
 	const ctx = useWb();
 	const visible = usePanelVisible(props.api);
 	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return remoteOnly;
-	return <ServicesPanel conn={ctx.fs.conn} sudo={ctx.sudo} sudoOn={ctx.sudoOn} visible={visible} onOpenTerminal={ctx.openTerminalCmd} />;
+	return (
+		<Lz>
+			<ServicesPanel conn={ctx.fs.conn} sudo={ctx.sudo} sudoOn={ctx.sudoOn} visible={visible} onOpenTerminal={ctx.openTerminalCmd} />
+		</Lz>
+	);
 }
 function DockerDock(props: IDockviewPanelProps) {
 	const ctx = useWb();
 	const visible = usePanelVisible(props.api);
 	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return remoteOnly;
-	return <DockerPanel conn={ctx.fs.conn} sudo={ctx.sudo} visible={visible} onOpenTerminal={ctx.openTerminalCmd} />;
+	return (
+		<Lz>
+			<DockerPanel conn={ctx.fs.conn} sudo={ctx.sudo} visible={visible} onOpenTerminal={ctx.openTerminalCmd} />
+		</Lz>
+	);
 }
 function WebPortsDock(props: IDockviewPanelProps) {
 	const ctx = useWb();
 	const visible = usePanelVisible(props.api);
 	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return remoteOnly;
-	return <WebPortsPanel conn={ctx.fs.conn} sudo={ctx.sudo} visible={visible} />;
+	return (
+		<Lz>
+			<WebPortsPanel conn={ctx.fs.conn} sudo={ctx.sudo} visible={visible} />
+		</Lz>
+	);
 }
 function SearchDock(_props: IDockviewPanelProps) {
 	const ctx = useWb();
 	return (
-		<ContentSearch
+		<Lz>
+			<ContentSearch
 			side={ctx.fs.side}
 			conn={ctx.fs.conn}
 			sudo={ctx.sudo}
 			startDir={ctx.cwdNow() ?? ctx.fs.home}
 			onOpenFile={(p, line) => ctx.openFile("remote", { name: p.split("/").pop() ?? p, path: p, kind: "file", size: 0 }, line)}
-		/>
+			/>
+		</Lz>
 	);
 }
 
@@ -450,7 +545,11 @@ function MonitorDock(props: IDockviewPanelProps) {
 		return () => d.dispose();
 	}, [props.api]);
 	if (ctx.fs.side !== "remote" || ctx.fs.conn == null) return <div className="panel-fill mon-empty"><p>원격 서버 작업대에서만 볼 수 있습니다</p></div>;
-	return <MonitorPanel conn={ctx.fs.conn} sudoOn={ctx.sudoOn} visible={visible} />;
+	return (
+		<Lz>
+			<MonitorPanel conn={ctx.fs.conn} sudoOn={ctx.sudoOn} visible={visible} />
+		</Lz>
+	);
 }
 
 /** 탭 — 저장 안 한 편집기는 닫기 전에 묻는다 */
@@ -555,9 +654,14 @@ async function askServerToServer(name: string, from: string, to: string, t: Targ
 function TransfersPanel() {
 	const ctx = useWb();
 	const [list, setList] = useState<TransferProgress[]>([]);
+	// 앱 탭마다 이 칸이 있다 — 다른 탭(다른 서버)에서 시작한 전송이 섞여 보이지 않게 출발 연결(conn)이 내 것이 아니면 무시한다
+	const myConn = useRef(ctx.fs.conn);
+	myConn.current = ctx.fs.conn;
 	useEffect(() => {
 		const un = listen<TransferProgress>("transfer", (e) => {
 			const p = e.payload;
+			// 내 작업대가 시작한 전송은 출발 연결이 다른 서버(peer)여도 도착 연결(destConn)이 내 것이다 — 둘 다 아니면 다른 탭의 전송
+			if (p.conn != null && p.conn !== myConn.current && p.destConn !== myConn.current) return;
 			setList((l) => {
 				const i = l.findIndex((x) => x.id === p.id);
 				if (i < 0) return [p, ...l].slice(0, 50);
@@ -568,11 +672,11 @@ function TransfersPanel() {
 			if (p.state === "done" || p.state === "cancelled") {
 				// 서버 → 서버는 받는 서버 트리를, 아니면 받은 쪽(올리기=이 서버, 받기=내 PC)
 				if (p.destConn != null) notifyFsChanged("remote", parentDir(p.dest), p.destConn);
-				else notifyFsChanged(p.direction === "up" ? "remote" : "local", parentDir(p.dest), ctx.fs.conn);
-			}
-		});
-		return () => void un.then((f) => f());
-	}, [ctx.fs.conn]);
+							else notifyFsChanged(p.direction === "up" ? "remote" : "local", parentDir(p.dest), p.conn ?? myConn.current);
+						}
+					});
+					return () => void un.then((f) => f());
+				}, []);
 	const [archives, setArchives] = useState<{ path: string; dest: string; bytes: number; state: string; error?: string | null }[]>([]);
 	useEffect(() => {
 		const un = listen<{ path: string; dest: string; bytes: number; state: string; error?: string | null }>("archive", (e) => {
@@ -835,7 +939,7 @@ const inTerminal = (t: EventTarget | null) => !!(t as HTMLElement | null)?.close
 
 const openEditors = new Map<string, { which: Which; path: string; name: string }[]>();
 
-export function Workbench({
+export const Workbench = memo(function Workbench({
 	fs,
 	local,
 	term,
@@ -873,6 +977,14 @@ export function Workbench({
 	/** 원격: 이 연결의 서버(포트 포워딩 규칙·tmux 설정) */
 	server?: { profileId: number; conn: number; tmux: boolean; name: string };
 }) {
+	// App 이 렌더마다 새로 만드는 객체 props 를 값이 같으면 같은 참조로 — ctx 가 이유 없이 바뀌지 않게
+	const syncInfoS = useMemo(() => (syncInfo ? { user: syncInfo.user, host: syncInfo.host, port: syncInfo.port } : undefined), [syncInfo?.user, syncInfo?.host, syncInfo?.port]);
+	const sudoS = useMemo(() => (sudo ? { mode: sudo.mode, user: sudo.user || "root" } : undefined), [sudo?.mode, sudo?.user]);
+	const hasServer = !!server;
+	const serverProfileId = server?.profileId;
+	const onConnectOtherRef = useRef(onConnectOther);
+	onConnectOtherRef.current = onConnectOther;
+	const hasConnectOther = !!onConnectOther;
 	const [fwdOpen, setFwdOpen] = useState(false);
 	const [tmuxOpen, setTmuxOpen] = useState(false);
 	const [sudoOn, setSudoOn] = useState(false);
@@ -1004,7 +1116,8 @@ export function Workbench({
 		window.addEventListener(CLOSE_DOC_EVENT, on);
 		return () => window.removeEventListener(CLOSE_DOC_EVENT, on);
 	}, [active, owner]);
-	const [activePanel, setActivePanel] = useState<string | null>(null);
+	const [activeStore] = useState(makeActiveStore);
+useEffect(() => activeStore.set(activeStore.panel, active), [active, activeStore]);
 	const termSeq = useRef(1);
 	/** 되살릴 때 작업대가 가려져 있어 크기 바로잡기를 미뤘다 */
 	const repairPending = useRef(false);
@@ -1144,6 +1257,7 @@ export function Workbench({
 	);
 
 	/** 전송 칸 — 전송이 시작되면 조용히(포커스 없이) 붙고, 도구 막대에서 누르면 앞으로 */
+	const showTransfersRef = useRef<(focus?: boolean) => void>(() => {});
 	const showTransfers = (focus = false) => {
 		const d = dock.current;
 		if (!d) return;
@@ -1205,7 +1319,7 @@ export function Workbench({
 				}
 				if (src.side === "remote" && destSide === "remote" && srcConn != null && destConn != null) {
 					const peerOf = (c: number) => peersRef.current.find((p) => p.conn === c);
-					const target = destConn === fs.conn ? syncInfo : peerOf(destConn)?.target;
+					const target = destConn === fs.conn ? syncInfoS : peerOf(destConn)?.target;
 					const from = srcConn === fs.conn ? fs.label : (peerOf(srcConn)?.label ?? "보내는 서버");
 					const to = destConn === fs.conn ? fs.label : (peerOf(destConn)?.label ?? "받는 서버");
 					const how = target ? await askServerToServer(src.name, from, to, target) : "relay";
@@ -1230,7 +1344,7 @@ export function Workbench({
 				alert(asSshError(e).message);
 			}
 		},
-		[fs, fsOf, conflict.ask, syncInfo],
+		[fs, fsOf, conflict.ask, syncInfoS],
 	);
 
 	/** 우클릭 › 올리기/받기 — 반대편 홈 폴더로 */
@@ -1265,6 +1379,7 @@ export function Workbench({
 		[drop, fs],
 	);
 
+	showTransfersRef.current = showTransfers;
 	/** 편집기들이 있는 칸 옆에(없으면 트리 오른쪽) */
 	const addBeside = (opts: { id: string; component: string; title: string; params: object }) => {
 		const d = dock.current;
@@ -1308,14 +1423,15 @@ export function Workbench({
 				alert(asSshError(x).message);
 			}
 		},
-		[fs],
+		// biome-ignore lint/correctness/useExhaustiveDependencies: fs 는 연결 번호만 쓴다
+		[fs.conn],
 	);
 
 	const relay = useCallback(
 		async (e: FsEntry, fromConn?: number) => {
 			const from = fromConn ?? fs.conn;
 			if (from == null) return;
-			const targets: Peer[] = [...(fs.conn != null ? [{ conn: fs.conn, label: fs.label, home: fs.home }] : []), ...peers].filter((p) => p.conn !== from);
+			const targets: Peer[] = [...(fs.conn != null ? [{ conn: fs.conn, label: fs.label, home: fs.home }] : []), ...peersRef.current].filter((p) => p.conn !== from);
 			if (!targets.length) return;
 			const pick =
 				targets.length === 1
@@ -1327,7 +1443,8 @@ export function Workbench({
 			// 같은 이름 처리는 끌어 놓기와 같은 시트로
 			void drop({ side: "remote", conn: from, path: e.path, name: e.name, kind: e.kind }, "remote", dest, pick.conn);
 		},
-		[fs, peers, drop],
+		// biome-ignore lint/correctness/useExhaustiveDependencies: fs 는 연결·이름·홈만 쓴다
+		[fs.conn, fs.label, fs.home, drop],
 	);
 
 	const openSync = () => {
@@ -1466,7 +1583,7 @@ export function Workbench({
 		let p = conn != null ? peers.find((x) => x.conn === conn) : undefined;
 		if (!p) {
 			if (!peers.length) {
-				onConnectOther?.();
+				onConnectOtherRef.current?.();
 				return;
 			}
 			p =
@@ -1596,7 +1713,7 @@ export function Workbench({
 				});
 		});
 		e.api.onDidActivePanelChange((ev) => {
-			setActivePanel(ev.panel?.id ?? null);
+			activeStore.set(ev.panel?.id ?? null);
 			if (ev.panel?.id.startsWith("term-")) lastTerm.current = ev.panel.id;
 		});
 		e.api.onDidLayoutChange(() => {
@@ -1608,7 +1725,8 @@ export function Workbench({
 				if (!d || gone.current) return;
 				// 가려진 앱 탭에서는 작업대 크기가 0 으로 다시 그려진다 — 그 배치를 저장하면 다음에 칸이 찌그러져 열린다
 				if (!activeRef.current || d.width < 240 || d.height < 160) return;
-				void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
+				// 최대화 중에는 배치(숨은 칸이 있는 상태)를 저장하지 않는다 — 열린 편집기 목록은 그래도 저장
+				if (!d.hasMaximizedGroup()) void api.settingSet(savedKey, JSON.stringify(stripEditors(d.toJSON())));
 				const eds = d.panels.filter((p) => p.id.startsWith("edit:")).map((p) => p.params as { which: Which; path: string; name: string; peer?: unknown; ctr?: unknown });
 				openEditors.set(owner, eds);
 				// 다른 서버 칸에서 연 파일은 그 연결이 있어야 하니 앱을 다시 열 때는 빼고 남긴다
@@ -1617,6 +1735,40 @@ export function Workbench({
 		});
 	};
 
+	// ctx 에 싣는 함수는 참조를 안정시킨다 — 칸(트리 등)의 memo 가 효과를 내도록
+	const dropV = useCallback((src: DragEntry, side: "remote" | "local", dir: string, destConn?: number) => void drop(src, side, dir, destConn), [drop]);
+	const newTerminalCb = useCallback((dir: string) => addTerminalRef.current(dir), []);
+	const archiveV = useCallback((e: FsEntry) => void archive(e), [archive]);
+	const relayV = useCallback((e: FsEntry, fromConn?: number) => void relay(e, fromConn), [relay]);
+	const leaveCtr = useCallback(() => setCtr(null), []);
+	const termOtherSide = useCallback(() => {
+		const id = visibleShell()?.id;
+		return !!id && termCtx.current.has(id) && ctxContainer(termCtx.current.get(id)) !== ctrRef.current;
+		// biome-ignore lint/correctness/useExhaustiveDependencies: visibleShell 은 ref 만 읽는다
+	}, []);
+	const openCtrTree = useCallback(
+		(name: string, panelId: string) => {
+			termCtx.current.set(panelId, `docker:${name}`);
+			lastTerm.current = panelId;
+			if (fs.conn == null) return;
+			setCtr(name);
+			void invoke<[string, string]>("ctr_where", { conn: fs.conn, ctr: name })
+				.then(([cwd]) => {
+					lastCwd.current = cwd;
+					window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: cwd }));
+				})
+				.catch((e) => alert(asSshError(e).message));
+		},
+		[fs.conn],
+	);
+	const addTerminalNear = useCallback((id?: string) => addTerminalRef.current(undefined, undefined, id), []);
+	const openMonitorCb = useCallback(() => openMonitorRef.current(), []);
+	const openTerminalCmdCb = useCallback((cmd: string, title: string, ctr?: string) => openTerminalCmdRef.current(cmd, title, ctr), []);
+	const cwdNow = useCallback(() => lastCwd.current, []);
+	const showTransfersFocus = useCallback(() => showTransfersRef.current(true), []);
+	const openForwards = useCallback(() => setFwdOpen(true), []);
+	const rootShellV = useCallback((id: string, on: boolean) => void rootShell(id, on), [rootShell]);
+	const toggleMaximize = useCallback(() => toggleMaxRef.current(), []);
 	const ctx = useMemo<Ctx>(
 		() => ({
 			fs: fsNow,
@@ -1625,8 +1777,7 @@ export function Workbench({
 			label,
 			startPath,
 			openFile,
-			activePanel: active ? activePanel : null,
-			drop: (src: DragEntry, side: "remote" | "local", dir: string, destConn?: number) => void drop(src, side, dir, destConn),
+			drop: dropV,
 			peerFs,
 			sendTo,
 			cd,
@@ -1634,40 +1785,26 @@ export function Workbench({
 			setFollow,
 			uploadPick: local && fs.side === "remote" ? uploadPick : undefined,
 			downloadTo: local && fs.side === "remote" ? downloadTo : undefined,
-			newTerminal: (dir: string) => addTerminalRef.current(dir),
+			newTerminal: newTerminalCb,
 			termEncoding,
 			localShells: fs.side === "local" ? shellList : undefined,
 			defaultShell,
 			registerShell,
 			onCwd,
 			ctrFs,
-			openCtrTree: (name: string, panelId: string) => {
-				termCtx.current.set(panelId, `docker:${name}`);
-				lastTerm.current = panelId;
-				if (fs.conn == null) return;
-				setCtr(name);
-				void invoke<[string, string]>("ctr_where", { conn: fs.conn, ctr: name })
-					.then(([cwd]) => {
-						lastCwd.current = cwd;
-						window.dispatchEvent(new CustomEvent(`rb-cwd-${instance.current}`, { detail: cwd }));
-					})
-					.catch((e) => alert(asSshError(e).message));
-			},
-			termOtherSide: () => {
-				const id = visibleShell()?.id;
-				return !!id && termCtx.current.has(id) && ctxContainer(termCtx.current.get(id)) !== ctrRef.current;
-			},
-			leaveCtr: () => setCtr(null),
+			openCtrTree,
+			termOtherSide,
+			leaveCtr,
 			broadcast,
 			completion,
 			openTail,
 			compare,
 			compareLabel,
-			archive: (e: FsEntry) => void archive(e),
-			relay: (e: FsEntry, fromConn?: number) => void relay(e, fromConn),
+			archive: archiveV,
+			relay: relayV,
 			hasPeers: peers.length > 0,
-			showTransfers: () => showTransfers(true),
-			syncInfo,
+			showTransfers: showTransfersFocus,
+			syncInfo: syncInfoS,
 			treeKey: instance.current,
 			owner,
 			sudoOn: sudoOn && !!sudoFs,
@@ -1675,16 +1812,18 @@ export function Workbench({
 			locked,
 			broadcastOn,
 			setBroadcast: setBroadcastOn,
-			addTerminalNear: (id?: string) => addTerminalRef.current(undefined, undefined, id),
-			openMonitor: () => openMonitorRef.current(),
-			sudo: sudo ? { mode: sudo.mode, user: sudo.user || "root" } : undefined,
-			openTerminalCmd: (cmd: string, title: string, ctr?: string) => openTerminalCmdRef.current(cmd, title, ctr),
-			cwdNow: () => lastCwd.current,
-			openForwards: server ? () => setFwdOpen(true) : undefined,
-			profileId: server?.profileId,
-			rootShell: fs.side === "remote" && sudoMode !== "off" ? (id: string, on: boolean) => void rootShell(id, on) : undefined,
+			addTerminalNear,
+			openMonitor: openMonitorCb,
+			sudo: sudoS,
+			openTerminalCmd: openTerminalCmdCb,
+			cwdNow,
+			openForwards: hasServer ? openForwards : undefined,
+			profileId: serverProfileId,
+			rootShell: fs.side === "remote" && sudoMode !== "off" ? rootShellV : undefined,
+			toggleMaximize,
+			activeStore,
 		}),
-		[fsNow, local, term, label, startPath, openFile, activePanel, active, drop, sendTo, cd, registerShell, onCwd, ctrFs, broadcast, completion, openTail, compare, compareLabel, archive, relay, peers, peerFs, syncInfo, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, setFollow, shellList, defaultShell, splitTerminal, rootShell, fs.side, locked, broadcastOn, server, sudo],
+		[fsNow, local, term, label, startPath, openFile, dropV, sendTo, cd, registerShell, onCwd, ctrFs, broadcast, completion, openTail, compare, compareLabel, archiveV, relayV, peers.length, peerFs, syncInfoS, sudoOn, sudoFs, sudoMode, owner, follow, uploadPick, downloadTo, termEncoding, shellList, defaultShell, splitTerminal, rootShellV, fs.side, locked, broadcastOn, hasServer, serverProfileId, sudoS, newTerminalCb, openCtrTree, termOtherSide, leaveCtr, addTerminalNear, openMonitorCb, openTerminalCmdCb, cwdNow, showTransfersFocus, openForwards, toggleMaximize, activeStore, fs.conn],
 	);
 
 	useEffect(() => {
@@ -1715,6 +1854,46 @@ export function Workbench({
 			defaultLayout(dock.current, terminalOnly);
 		}
 	};
+	/** 이 칸 최대화·되돌리기(Alt+M) — DB 작업대와 같은 규칙: 최대화 중이면 되돌리고, 아니면 초점이 있는 칸을 최대화 */
+	const toggleMaxRef = useRef<() => void>(() => {});
+	toggleMaxRef.current = () => {
+		const d = dock.current;
+		if (!d) return;
+		if (d.hasMaximizedGroup()) return d.exitMaximizedGroup();
+		const p = d.activePanel ?? d.panels.find((x) => x.api.isVisible);
+		if (p) d.maximizeGroup(p);
+	};
+	/** 칸 안으로 초점 */
+	const focusIn = (p: { view: { content: { element: HTMLElement } } }) =>
+		requestAnimationFrame(() => (p.view.content.element.querySelector("textarea, .tree-body, .cm-content, [tabindex]") as HTMLElement | null)?.focus());
+	/** 칸 사이 이동(Alt+Shift+방향키) — 지금 칸 가장자리에서 그 방향으로 맞닿은(가장 가까운) 칸 */
+	const movePane = (dir: "left" | "right" | "up" | "down") => {
+		const d = dock.current;
+		const cur = d?.activeGroup ?? d?.activePanel?.group;
+		if (!d || !cur) return;
+		const c = cur.element.getBoundingClientRect();
+		let best: { g: (typeof d.groups)[number]; gap: number; overlap: number } | null = null;
+		for (const g of d.groups) {
+			if (g === cur || !g.api.isVisible || !g.activePanel) continue;
+			const r = g.element.getBoundingClientRect();
+			if (r.width <= 0 || r.height <= 0) continue;
+			const horiz = dir === "left" || dir === "right";
+			const gap = dir === "right" ? r.left - c.right : dir === "left" ? c.left - r.right : dir === "down" ? r.top - c.bottom : c.top - r.bottom;
+			const overlap = horiz ? Math.min(r.bottom, c.bottom) - Math.max(r.top, c.top) : Math.min(r.right, c.right) - Math.max(r.left, c.left);
+			if (gap < -4 || overlap <= 0) continue;
+			if (!best || gap < best.gap - 1 || (Math.abs(gap - best.gap) <= 1 && overlap > best.overlap)) best = { g, gap, overlap };
+		}
+		const p = best?.g.activePanel;
+		if (p) {
+			p.api.setActive();
+			focusIn(p);
+		}
+	};
+	/** 초점이 있는(없으면 보이는) 터미널 */
+	const focusedTerm = () => {
+		const a = dock.current?.activePanel;
+		return a?.id.startsWith("term-") ? a.id : targetTerm();
+	};
 	/** 명령 대상 터미널 — 보이는(없으면 첫) 터미널 칸 */
 	const targetTerm = () => visibleShell()?.id ?? dock.current?.panels.find((p) => p.id.startsWith("term-"))?.id;
 
@@ -1729,8 +1908,13 @@ export function Workbench({
 		const list: Command[] = [
 			w("quickOpen", "파일 빠른 열기", () => setQuickOpen(true), { keys: "Alt+O", keywords: "찾기 열기 이름 경로 file open" }),
 			w("newTerminal", "새 터미널", () => addTerminalRef.current(lastCwd.current ?? undefined, undefined, targetTerm()), { hint: "지금 폴더에서, 같은 칸의 탭으로", keywords: "terminal shell 셸" }),
-			w("splitRight", "터미널 오른쪽으로 나누기", split("right"), { disabled: locked, hint: lockHint, keywords: "split 분할" }),
-			w("splitBelow", "터미널 아래로 나누기", split("below"), { disabled: locked, hint: lockHint, keywords: "split 분할" }),
+			w("splitRight", "터미널 오른쪽으로 나누기", split("right"), { keys: "Alt+Shift+=", disabled: locked, hint: lockHint, keywords: "split 분할" }),
+							w("splitBelow", "터미널 아래로 나누기", split("below"), { keys: "Alt+Shift+-", disabled: locked, hint: lockHint, keywords: "split 분할" }),
+							w("maximize", "칸 최대화·되돌리기", () => toggleMaxRef.current(), { keys: "Alt+M", hint: "초점이 있는 칸을 작업대 가득(다시 누르면 되돌림)", keywords: "maximize 최대화 확대 zoom 전체화면" }),
+							w("paneLeft", "왼쪽 칸으로 이동", () => movePane("left"), { keys: "Alt+Shift+←", keywords: "pane focus 칸 이동 포커스" }),
+							w("paneRight", "오른쪽 칸으로 이동", () => movePane("right"), { keys: "Alt+Shift+→", keywords: "pane focus 칸 이동 포커스" }),
+							w("paneUp", "위쪽 칸으로 이동", () => movePane("up"), { keys: "Alt+Shift+↑", keywords: "pane focus 칸 이동 포커스" }),
+							w("paneDown", "아래쪽 칸으로 이동", () => movePane("down"), { keys: "Alt+Shift+↓", keywords: "pane focus 칸 이동 포커스" }),
 			w("broadcast", broadcastOn ? "동시 입력 끄기" : "동시 입력 켜기", () => setBroadcastOn(!broadcastRef.current), { hint: "한 터미널에 친 것을 이 작업대의 모든 터미널에", keywords: "broadcast 브로드캐스트" }),
 			w("termPane", "터미널 칸 숨기기·보이기", toggleTermPane, { keys: "Ctrl+`" }),
 			w("focusTree", "트리로 옮기기", () => focusPanel((id) => id === "tree" || id === "localtree"), { keys: "Alt+1" }),
@@ -1843,6 +2027,22 @@ export function Workbench({
 						e.preventDefault();
 						e.stopPropagation();
 						openTool("search", "내용 찾기");
+					} else if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.code === "KeyM") {
+						// 이 칸 최대화·되돌리기(DB 작업대 Alt+M 과 같은 규칙)
+						e.preventDefault();
+						e.stopPropagation();
+						toggleMaxRef.current();
+					} else if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && (e.code === "Equal" || e.code === "Minus")) {
+						// 터미널 나누기 — Alt+Shift+= 오른쪽, Alt+Shift+- 아래(Windows Terminal 과 같음). 터미널에 초점이 없으면 보이는 터미널을
+						e.preventDefault();
+						e.stopPropagation();
+						const t = focusedTerm();
+						if (t) splitTerminal(t, e.code === "Equal" ? "right" : "below");
+					} else if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.key.startsWith("Arrow") && !(e.target as HTMLElement | null)?.closest?.(".cm-editor")) {
+						// 칸 사이 이동 — 편집기 안의 Alt+Shift+방향키는 편집기 몫(줄 복사·구문 선택), 거기서는 Alt+1·2·3
+						e.preventDefault();
+						e.stopPropagation();
+						movePane(e.key === "ArrowLeft" ? "left" : e.key === "ArrowRight" ? "right" : e.key === "ArrowUp" ? "up" : "down");
 					} else if (e.key === "F1") {
 						// 터미널 안의 F1 은 셸 프로그램 몫(htop·mc 등)
 						if (inTerminal(e.target)) return;
@@ -1865,7 +2065,7 @@ export function Workbench({
 								<Monitor size={14} /> <span className="lbl">내 PC</span>
 							</button>
 						)}
-						{fs.side === "remote" && (peers.length > 0 || onConnectOther) && (
+						{fs.side === "remote" && (peers.length > 0 || hasConnectOther) && (
 							<button
 								type="button"
 								className={`btn ghost${shownIds.includes("peer:") ? " on" : ""}`}
@@ -2061,7 +2261,7 @@ export function Workbench({
 			)}
 		</WbCtx.Provider>
 	);
-}
+});
 
 /** F1 — 단축키 모음 */
 function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => void }) {
@@ -2077,6 +2277,9 @@ function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => voi
 		["Alt+1 · 2 · 3", "트리 · 문서 · 터미널로"],
 		["Ctrl+`", "터미널 칸 숨기기·보이기"],
 		["Alt+O", "파일 빠른 열기(이름으로 찾기 · /경로 바로 열기)"],
+		["Alt+Shift+= · Alt+Shift+-", "터미널 오른쪽 · 아래로 나누기(배치가 잠겨 있으면 막힘)"],
+		["Alt+Shift+← ↑ → ↓", "칸 사이 이동(편집기 안에서는 편집기 몫이라 Alt+1·2·3 으로)"],
+		["Alt+M", "초점이 있는 칸 최대화 · 되돌리기"],
 		["Ctrl+Shift+F", "파일 내용 찾기(grep — 결과를 누르면 그 줄로). 터미널 안에서는 터미널 찾기"],
 		["Ctrl+Alt+L", `배치 잠그기·풀기 — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`],
 		["F1", "이 도움말(터미널 안에서는 셸 프로그램 몫 — 명령 팔레트에서 '단축키')"],

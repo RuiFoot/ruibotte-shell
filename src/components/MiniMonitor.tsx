@@ -70,6 +70,10 @@ class Poller {
 		this.snap = { ...this.snap, ...p };
 		for (const f of this.subs) f();
 	}
+	/** 한참 쉬었다 다시 읽을 때 — 오래된 CPU 표본과의 차이로 평균이 흐려지지 않게 */
+	forgetPrev() {
+		this.prev = null;
+	}
 	restart() {
 		window.clearTimeout(this.timer);
 		const my = ++this.gen;
@@ -81,7 +85,7 @@ class Poller {
 				const t0 = performance.now();
 				let ok = false;
 				try {
-					const s = await invoke<Lite>("ssh_stats", { conn: this.conn });
+					const s = await invoke<Lite>("ssh_stats", { conn: this.conn, lite: true });
 					if (my !== this.gen) return;
 					ok = true;
 					const t = s.cpu[0];
@@ -125,7 +129,10 @@ function subPoller(conn: number, f: () => void) {
 	const first = p.subs.size === 0;
 	window.clearTimeout(p.dropTimer);
 	p.subs.add(f);
-	if (first) p.restart();
+	if (first) {
+		p.forgetPrev();
+		p.restart();
+	}
 	return () => {
 		const q = pollers.get(conn);
 		if (!q) return;
@@ -145,13 +152,13 @@ function subPoller(conn: number, f: () => void) {
  * 상태 줄에 붙는 작은 서버 자원 표시 — CPU·메모리·가장 찬 디스크를 숫자와 짧은 꺾은선으로.
  * 켜고 끄기·간격은 우클릭(또는 ⋯)으로 고르고 모든 서버에 같이 기억한다. 기본은 "자동":
  * 응답이 빠르면 5초, 느리거나(0.8초 넘음) 실패하면 간격을 두 배씩(최대 1분) 늘리고 다시 빨라지면 줄인다.
- * 창이 안 보일 때는 읽지 않는다. 80% 넘으면 주황, 90% 넘으면 빨강. 누르면 자세한 자원 칸을 연다.
+ * 창이 안 보이거나 이 작업대(앱 탭)가 뒤에 가려져 있을 때(enabled=false)는 읽지 않는다. 80% 넘으면 주황, 90% 넘으면 빨강. 누르면 자세한 자원 칸을 연다.
  */
-export function MiniMonitor({ conn, onOpen }: { conn: number; onOpen: () => void }) {
+export function MiniMonitor({ conn, onOpen, enabled = true }: { conn: number; onOpen: () => void; /** 이 작업대(앱 탭)가 앞에 보일 때만 읽는다 */ enabled?: boolean }) {
 	loadEvery();
 	const every = useSyncExternalStore(subEvery, () => everyNow);
 	const setEvery = (v: Every) => setEveryGlobal(v);
-	const sub = useCallback((f: () => void) => subPoller(conn, f), [conn]);
+	const sub = useCallback((f: () => void) => (enabled ? subPoller(conn, f) : () => undefined), [conn, enabled]);
 	const snap = useSyncExternalStore(sub, () => pollers.get(conn)?.snap ?? EMPTY);
 	const { cpu, mem, disk, info, err, gap } = snap;
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);

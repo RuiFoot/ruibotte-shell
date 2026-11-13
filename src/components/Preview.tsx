@@ -4,13 +4,14 @@ import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { Maximize, Minus, Plus, Scan, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { type ArchiveListing, archiveFormat, listArchive, NotArchive } from "../lib/archive";
+import { type ArchiveListing, listArchive, NotArchive } from "../lib/archive";
 import type { FsBackend } from "../lib/ipc";
 import { DataGrid } from "./DataGrid";
 import { Select } from "./Select";
 
-/** 확장자로 보기 방식 고르기 */
-export type PreviewKind = "image" | "pdf" | "hex" | "sheet" | "docx" | "archive";
+// previewKind 는 작업대가 편집기·미리보기 묶음을 읽기 전에 쓰므로 가벼운 모듈로 뺐다
+export { type PreviewKind, previewKind } from "../lib/previewKind";
+import type { PreviewKind } from "../lib/previewKind";
 /**
  * 미리보기 안 링크 — 앱 화면이 그 주소로 넘어가 버리지 않게(작업 중인 화면을 잃는다) 막고,
  * http(s)·mailto 는 기본 브라우저로 연다. 문서 안 #이동은 그대로 둔다
@@ -21,17 +22,6 @@ function openLinkOutside(e: React.MouseEvent) {
 	if (!a || !href || href.startsWith("#")) return;
 	e.preventDefault();
 	if (/^(https?:|mailto:)/i.test(href)) void openUrl(href);
-}
-
-export function previewKind(path: string): PreviewKind | null {
-	const ext = path.split(".").pop()?.toLowerCase() ?? "";
-	if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "avif"].includes(ext)) return "image";
-	if (ext === "pdf") return "pdf";
-	if (["xlsx", "xlsm", "xls", "ods", "xlsb"].includes(ext)) return "sheet";
-	if (ext === "docx") return "docx";
-	if (archiveFormat(path)) return "archive";
-	if (["zip", "gz", "tgz", "jar", "war", "class", "so", "dll", "exe", "bin", "o", "a", "iso", "img", "db", "sqlite", "xz", "bz2", "7z"].includes(ext)) return "hex";
-	return null;
 }
 
 /** 편집기 옆에 켤 수 있는 보기 — 마크다운·CSV/TSV 표 */
