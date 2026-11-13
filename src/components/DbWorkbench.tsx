@@ -65,7 +65,7 @@ import { codeHighlight } from "../lib/cmTheme";
 import { editingExtensions } from "../lib/cmEditing";
 import { dbCompletionSource } from "../lib/sqlComplete";
 import { formatSqlIn } from "../lib/sqlFormat";
-import { dropEditor, forgetWatch, holdBackground, publishPlan, touchEditor, waitBackground } from "../lib/queryWatch";
+import { dropEditor, forgetWatch, holdBackground, publishPlan, queryMapMarks, touchEditor, waitBackground } from "../lib/queryWatch";
 import { onSettingLive, setSettingLive } from "../lib/settingsBus";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
@@ -487,6 +487,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					search({ top: true }),
 					codeHighlight,
 					ranField,
+					queryMapMarks,
 					// 빈 편집기에 할 수 있는 것을 알려 준다(처음 연 사람이 실행 키를 찾지 않게) — 글을 쓰면 사라진다
 					placeholder(emptyHint),
 					...editingExtensions(),

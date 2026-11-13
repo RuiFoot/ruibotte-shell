@@ -317,7 +317,7 @@ class Analyzer {
 		try {
 			map = await invoke<QueryMap>("sql_map", { sql: stmt.text, engine: d.engine });
 		} catch (e) {
-			map = { ok: false, error: String(e), kind: "other", dialect: "", scopes: [], tables: [], joins: [], cols: [], facts: [] };
+			map = { ok: false, error: String(e), kind: "other", dialect: "", scopes: [], tables: [], joins: [], cols: [], facts: [], clauses: [], outs: [] };
 		}
 		if (my !== this.seq) return;
 		if (!map.ok) {

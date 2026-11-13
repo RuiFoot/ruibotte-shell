@@ -35,49 +35,6 @@
 	text-overflow: ellipsis;
 	z-index: 5;
 }
-.qm-node {
-	font-family: var(--font-ui);
-	font-size: 11.5px;
-	text-align: left;
-	border-radius: 10px;
-	overflow: hidden;
-}
-.qm-node.missing .qm-head {
-	background: color-mix(in srgb, var(--danger) 16%, transparent);
-}
-.qm-head {
-	display: flex;
-	align-items: center;
-	gap: 6px;
-	padding: 6px 10px;
-	background: var(--accent-soft);
-	border-bottom: 0.5px solid var(--hairline-strong);
-}
-.qm-head b {
-	flex: 1;
-	min-width: 0;
-	font-size: 12.5px;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
-.qm-badge {
-	flex: none;
-	padding: 0 5px;
-	border-radius: 5px;
-	background: var(--fill);
-	color: var(--text-2);
-	font-size: 10px;
-	line-height: 16px;
-}
-.qm-sub {
-	padding: 2px 10px 0;
-	color: var(--text-3);
-	font-size: 10.5px;
-	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
-}
 .qm-col {
 	display: flex;
 	width: 100%;
@@ -160,56 +117,373 @@
 	color: var(--text-3);
 	font-size: 10.5px;
 }
-.qm-group {
-	border: 1px dashed var(--hairline-strong);
-	border-radius: 12px;
-	background: color-mix(in srgb, var(--fill) 35%, transparent);
+/* ── 단계 그래프(결과가 주인공) ── */
+.qmap-panel {
+	--qf-lit: #ff9f0a;
+	--qf-where: #ff9f0a;
+	--qf-join: var(--accent);
+	--qf-group: #bf5af2;
+	--qf-window: #5e5ce6;
+	--qf-distinct: #ff375f;
+	--qf-order: #30b350;
+	--qf-union: #5e5ce6;
+	--qf-table: #8e8e93;
 }
-.qm-group.k-cte {
-	border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+.qmap-panel .react-flow__handle {
+	width: 6px;
+	height: 6px;
+	min-width: 0;
+	min-height: 0;
+	border: 0;
+	background: transparent;
+	opacity: 0;
+	pointer-events: none;
 }
-.qm-group.k-union {
-	border-style: dotted;
-}
-.qm-group-head {
-	padding: 5px 10px;
-	color: var(--text-2);
-	font-family: var(--font-mono);
-	font-size: 11px;
-	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
+.react-flow__node-qtable,
+.react-flow__node-qstage,
+.react-flow__node-qout,
+.react-flow__node-qresult,
+.react-flow__node-qgroup {
+	padding: 0;
+	border: 0;
+	background: transparent;
+	box-shadow: none;
 }
 .react-flow__node-qgroup {
-	padding: 0 !important;
-	border: 0 !important;
-	background: transparent !important;
-	box-shadow: none !important;
+	cursor: pointer;
 }
-.react-flow__node-qtable {
+.qf-node {
+	--k: var(--qf-table);
+	position: relative;
+	width: 100%;
+	height: 100%;
+	overflow: hidden;
+	box-sizing: border-box;
 	border: 0.5px solid var(--hairline-strong);
-	border-radius: 10px;
+	border-radius: 11px;
+	background: var(--elevated-solid);
 	box-shadow: var(--shadow-card);
+	color: var(--text);
+	font-family: var(--font-ui);
+	font-size: 11.5px;
+	text-align: left;
+	cursor: pointer;
+	transition:
+		opacity 0.15s,
+		box-shadow 0.15s;
 }
-.qm-edge .react-flow__edge-path {
-	stroke: var(--text-3);
+.qf-node.k-join {
+	--k: var(--qf-join);
 }
-.qm-edge.k-inner .react-flow__edge-path,
-.qm-edge.k-left .react-flow__edge-path,
-.qm-edge.k-right .react-flow__edge-path,
-.qm-edge.k-full .react-flow__edge-path {
-	stroke: var(--accent);
+.qf-node.k-where {
+	--k: var(--qf-where);
 }
-.qm-edge.bad .react-flow__edge-path {
-	stroke: var(--danger);
+.qf-node.k-group {
+	--k: var(--qf-group);
 }
-.qm-edge .react-flow__edge-text {
+.qf-node.k-window {
+	--k: var(--qf-window);
+}
+.qf-node.k-distinct {
+	--k: var(--qf-distinct);
+}
+.qf-node.k-order {
+	--k: var(--qf-order);
+}
+.qf-node.k-union {
+	--k: var(--qf-union);
+}
+.qf-node.k-out,
+.qf-node.k-result {
+	--k: var(--accent);
+}
+.qf-node.k-result {
+	border: 1.5px solid color-mix(in srgb, var(--accent) 70%, transparent);
+	border-radius: 14px;
+	box-shadow:
+		0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent),
+		var(--shadow-card);
+}
+.qf-node.bad,
+.qf-node.warned {
+	border-color: color-mix(in srgb, var(--danger) 70%, transparent);
+}
+.qf-node.missing .qf-head {
+	background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.qf-node.at-cursor {
+	box-shadow:
+		0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent),
+		var(--shadow-card);
+}
+.qf-node.picked {
+	box-shadow:
+		0 0 0 2.5px var(--accent),
+		var(--shadow-card);
+}
+.qf-node.lit {
+	box-shadow:
+		0 0 0 2px color-mix(in srgb, var(--qf-lit) 75%, transparent),
+		var(--shadow-card);
+}
+.qf-node.dim {
+	opacity: 0.32;
+}
+.qf-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 30px;
+	padding: 0 9px;
+	border-bottom: 0.5px solid var(--hairline);
+}
+.qf-head b {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-ico {
+	display: inline-flex;
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	border-radius: 6px;
+	background: color-mix(in srgb, var(--k) 17%, transparent);
+	color: var(--k);
+}
+.qf-ico.big {
+	width: 28px;
+	height: 28px;
+	border-radius: 8px;
+	background: var(--accent);
+	color: #fff;
+}
+.qf-badge {
+	flex: none;
+	padding: 0 5px;
+	border-radius: 5px;
+	background: var(--fill);
+	color: var(--text-2);
+	font-size: 10px;
+	line-height: 16px;
+}
+.qf-warn {
+	display: inline-flex;
+	flex: none;
+	align-items: center;
+	gap: 2px;
+	padding: 0 4px;
+	border-radius: 5px;
+	background: color-mix(in srgb, var(--accent) 14%, transparent);
+	color: var(--accent);
+	font-size: 10px;
+	line-height: 16px;
+}
+.qf-warn.warn {
+	background: color-mix(in srgb, var(--danger) 15%, transparent);
+	color: var(--danger);
+}
+.qf-tsub {
+	padding: 2px 9px 0;
+	overflow: hidden;
+	color: var(--text-3);
+	font-size: 10.5px;
+	line-height: 14px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-cols {
+	padding: 3px 0 4px;
+}
+.qf-cols .qm-col {
+	line-height: 18px;
+	padding: 0 9px;
+}
+.qm-col.lit,
+.qf-row.lit {
+	background: color-mix(in srgb, var(--qf-lit) 24%, transparent);
+}
+.qf-none {
+	padding: 2px 9px;
+	color: var(--text-3);
+	font-size: 10.5px;
+}
+.qf-code {
+	display: -webkit-box;
+	margin: 6px 9px 0;
+	padding: 3px 6px;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	border-radius: 6px;
+	background: var(--fill);
+	color: var(--text);
 	font-family: var(--font-mono);
 	font-size: 10.5px;
-	fill: var(--text);
+	line-height: 14px;
+	word-break: break-all;
 }
-.qm-edge .react-flow__edge-textbg {
+.qf-sub {
+	margin: 4px 9px 0;
+	overflow: hidden;
+	color: var(--text-3);
+	font-size: 10.5px;
+	line-height: 14px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-node.bad .qf-sub {
+	color: var(--danger);
+}
+.qf-rhead {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	height: 46px;
+	padding: 0 12px;
+	border-bottom: 0.5px solid var(--hairline);
+	background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.qf-rhead > div {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	min-width: 0;
+}
+.qf-rhead b {
+	overflow: hidden;
+	font-size: 14px;
+	font-weight: 650;
+	letter-spacing: -0.015em;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-rhead small {
+	color: var(--text-3);
+	font-size: 10.5px;
+}
+.qf-rows {
+	padding: 3px 0 5px;
+}
+.qf-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: 100%;
+	height: 18px;
+	padding: 0 9px;
+	border: 0;
+	background: none;
+	color: var(--text);
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.k-result .qf-row {
+	height: 22px;
+	padding: 0 12px;
+	font-size: 12.5px;
+}
+.qf-row:hover {
+	background: var(--fill);
+}
+.qf-rname {
+	flex: none;
+	max-width: 60%;
+	overflow: hidden;
+	font-weight: 500;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-rhint {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	color: var(--text-3);
+	font-family: var(--font-mono);
+	font-size: 10.5px;
+	text-align: right;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-rtag {
+	flex: none;
+	padding: 0 4px;
+	border-radius: 4px;
+	background: color-mix(in srgb, var(--qf-group) 18%, transparent);
+	color: var(--text-2);
+	font-size: 9.5px;
+	line-height: 14px;
+}
+.qf-group {
+	width: 100%;
+	height: 100%;
+	box-sizing: border-box;
+	border: 1px dashed var(--hairline-strong);
+	border-radius: 15px;
+	background: color-mix(in srgb, var(--fill) 45%, transparent);
+}
+.qf-group.k-cte {
+	border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+	background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.qf-group.k-union {
+	border-color: color-mix(in srgb, var(--qf-union) 50%, transparent);
+	background: color-mix(in srgb, var(--qf-union) 5%, transparent);
+}
+.qf-group-head {
+	padding: 4px 10px;
+	overflow: hidden;
+	color: var(--text-2);
+	font-family: var(--font-mono);
+	font-size: 10.5px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qf-edge .react-flow__edge-path {
+	stroke: var(--text-3);
+	stroke-width: 1.3;
+	transition: opacity 0.15s;
+}
+.qf-edge.spine .react-flow__edge-path {
+	stroke: color-mix(in srgb, var(--accent) 75%, var(--text-3));
+	stroke-width: 1.8;
+}
+.qf-edge.bad .react-flow__edge-path {
+	stroke: var(--danger);
+	stroke-dasharray: 6 4;
+}
+.qf-edge.cross .react-flow__edge-path {
+	stroke-dasharray: 3 4;
+}
+.qf-edge.lit .react-flow__edge-path {
+	stroke: var(--qf-lit);
+	stroke-width: 2.4;
+}
+.qf-edge.dim .react-flow__edge-path {
+	opacity: 0.25;
+}
+.qf-edge .react-flow__edge-text {
+	fill: var(--text-2);
+	font-family: var(--font-ui);
+	font-size: 10.5px;
+}
+.qf-edge .react-flow__edge-textbg {
 	fill: var(--surface);
+}
+.qf-hint {
+	overflow: hidden;
+	color: var(--text-3);
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 .qm-warns {
 	display: flex;

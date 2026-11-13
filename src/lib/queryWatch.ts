@@ -2,7 +2,8 @@
  * SQL 편집기 ↔ 쿼리 지도·튜닝 칸 잇기 — 편집기는 바뀔 때 "건드렸다"만 알리고(할 일 없음),
  * 보고 있는 칸이 있을 때만 그 칸이 멈춤 뒤에 문장을 읽는다. 입력 지연이 생기지 않게 여기서는 아무 계산도 하지 않는다.
  */
-import type { EditorView } from "@codemirror/view";
+import { StateEffect, StateField } from "@codemirror/state";
+import { Decoration, type DecorationSet, EditorView } from "@codemirror/view";
 import type { ExplainOk } from "../components/DbExplain";
 
 type Plan = { sql: string; ok: ExplainOk; analyze: boolean; at: number };
@@ -105,3 +106,42 @@ export const backgroundBusy = (conn: number) => bg.has(conn);
 
 /** 같은 문장인지(공백·끝 ; 차이 무시) */
 export const sameSql = (a: string, b: string) => a.replace(/\s+/g, " ").replace(/;\s*$/, "").trim() === b.replace(/\s+/g, " ").replace(/;\s*$/, "").trim();
+
+/*
+ * 쿼리 지도 → 편집기 강조 — 그래프에서 단계를 누르면 그 절(WHERE …, JOIN … ON …)의 배경을 칠하고 그곳으로 굴린다.
+ * 선택·커서는 건드리지 않는다. 글을 고치면 지운다(위치가 낡으니).
+ */
+const setMarks = StateEffect.define<{ from: number; to: number }[]>();
+const markDeco = Decoration.mark({ class: "cm-qm-mark" });
+const markTheme = EditorView.baseTheme({
+	".cm-qm-mark": { backgroundColor: "color-mix(in srgb, var(--accent, #0a84ff) 22%, transparent)", borderRadius: "2px", boxShadow: "0 0 0 1px color-mix(in srgb, var(--accent, #0a84ff) 30%, transparent)" },
+});
+const markField = StateField.define<DecorationSet>({
+	create: () => Decoration.none,
+	update(v, tr) {
+		for (const e of tr.effects)
+			if (e.is(setMarks)) {
+				const len = tr.state.doc.length;
+				const list = e.value
+					.filter((r) => r.to > r.from && r.from >= 0 && r.to <= len)
+					.sort((a, b) => a.from - b.from)
+					.map((r) => markDeco.range(r.from, r.to));
+				return Decoration.set(list, true);
+			}
+		return tr.docChanged ? Decoration.none : v;
+	},
+	provide: (f) => EditorView.decorations.from(f),
+});
+/** SQL 편집기에 붙이는 확장(쿼리 지도 강조) */
+export const queryMapMarks = [markField, markTheme];
+
+/** 편집기의 범위를 칠한다(빈 목록이면 지운다) — 첫 범위로 굴린다 */
+export function markEditor(conn: number, ranges: { from: number; to: number }[], scroll = true) {
+	const v = currentView(conn);
+	if (!v) return;
+	// 확장을 붙이지 않은 편집기여도 동작하게
+	if (v.state.field(markField, false) === undefined) v.dispatch({ effects: StateEffect.appendConfig.of(queryMapMarks) });
+	const effects: StateEffect<unknown>[] = [setMarks.of(ranges)];
+	if (scroll && ranges.length) effects.push(EditorView.scrollIntoView(ranges[0].from, { y: "nearest", yMargin: 40 }));
+	v.dispatch({ effects });
+}
