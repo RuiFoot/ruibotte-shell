@@ -16,6 +16,7 @@ mod pty;
 mod route;
 mod secrets;
 mod sessionlog;
+mod sqlclean;
 mod sqlmap;
 mod srvtools;
 mod ssh;
@@ -252,6 +253,7 @@ pub fn run() {
             db::db_classify,
             db::db_explain,
             sqlmap::sql_map,
+            sqlclean::sql_cleanup, sqlclean::sql_compare_sql,
             db::db_read_csv,
             db::db_save_hex,
             jdbc::jdbc_status,

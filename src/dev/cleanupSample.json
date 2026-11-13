@@ -1,0 +1,1474 @@
+{
+  "base": {
+    "changed": true,
+    "changes": [
+      {
+        "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+        "id": "commaJoin:183",
+        "kind": "commaJoin",
+        "on": true,
+        "pos": [
+          183,
+          209
+        ],
+        "safety": "safe",
+        "title": "쉼표 조인 → INNER JOIN … ON"
+      },
+      {
+        "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+        "id": "alias:20",
+        "kind": "alias",
+        "on": true,
+        "pos": [
+          20,
+          511
+        ],
+        "safety": "safe",
+        "title": "짧은 별칭 붙이기 (3개 표)"
+      },
+      {
+        "detail": "늘 참인 조건 1개",
+        "id": "trueCond:217",
+        "kind": "trueCond",
+        "on": true,
+        "pos": [
+          217,
+          511
+        ],
+        "safety": "safe",
+        "title": "WHERE 의 1=1·TRUE 조건 지우기"
+      },
+      {
+        "detail": "2곳",
+        "id": "parens:217",
+        "kind": "parens",
+        "on": true,
+        "pos": [
+          217,
+          511
+        ],
+        "safety": "safe",
+        "title": "WHERE 의 불필요한 괄호 벗기기"
+      },
+      {
+        "detail": "같은 조건 1개",
+        "id": "dupCond:217",
+        "kind": "dupCond",
+        "on": true,
+        "pos": [
+          217,
+          511
+        ],
+        "safety": "safe",
+        "title": "WHERE 의 중복 조건 지우기"
+      },
+      {
+        "detail": "2곳",
+        "id": "inOne:217",
+        "kind": "inOne",
+        "on": true,
+        "pos": [
+          217,
+          511
+        ],
+        "safety": "safe",
+        "title": "WHERE 의 IN (값 하나) → ="
+      },
+      {
+        "detail": "1곳",
+        "id": "notCmp:217",
+        "kind": "notCmp",
+        "on": true,
+        "pos": [
+          217,
+          511
+        ],
+        "safety": "safe",
+        "title": "WHERE 의 NOT (a = b) → a <> b"
+      },
+      {
+        "detail": "1묶음",
+        "id": "orToIn:217",
+        "kind": "orToIn",
+        "on": true,
+        "pos": [
+          217,
+          511
+        ],
+        "safety": "safe",
+        "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+      },
+      {
+        "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+        "id": "scalarToJoin:86",
+        "kind": "scalarToJoin",
+        "on": true,
+        "pos": [
+          86,
+          154
+        ],
+        "safety": "check",
+        "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+      }
+    ],
+    "comments": {
+      "kept": 2,
+      "moved": 0,
+      "total": 2
+    },
+    "dialect": "mysql",
+    "error": null,
+    "kind": "select",
+    "notes": [
+      "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+    ],
+    "ok": true,
+    "tables": [
+      {
+        "name": "TB_FILE",
+        "schema": null
+      },
+      {
+        "name": "TB_POST",
+        "schema": null
+      },
+      {
+        "name": "TB_BOARD",
+        "schema": null
+      },
+      {
+        "name": "TB_USER",
+        "schema": null
+      }
+    ],
+    "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+  },
+  "compare": {
+    "cols": 4,
+    "mode": "except",
+    "ok": true,
+    "reason": null,
+    "steps": [
+      {
+        "key": "countA",
+        "label": "원문 행 수",
+        "sql": "SELECT COUNT(*) AS n FROM (SELECT TB_POST.POST_ID AS c1, TB_POST.TITLE AS c2, TB_BOARD.BOARD_NM AS c3, (SELECT count(*) FROM TB_FILE WHERE TB_FILE.POST_ID = TB_POST.POST_ID) AS c4 FROM TB_POST, TB_BOARD, TB_USER WHERE 1 = 1 AND TB_POST.BOARD_ID = TB_BOARD.BOARD_ID AND TB_USER.USER_ID = TB_POST.WRITER_ID AND ((TB_POST.USE_YN IN ('Y'))) AND (TB_BOARD.BOARD_TYPE = 'NOTICE' OR TB_BOARD.BOARD_TYPE = 'FAQ' OR TB_BOARD.BOARD_TYPE = 'QNA') AND TB_POST.USE_YN IN ('Y') AND NOT (TB_USER.STATUS = 'DEL')) AS q"
+      },
+      {
+        "key": "countB",
+        "label": "정리본 행 수",
+        "sql": "SELECT COUNT(*) AS n FROM (SELECT p.POST_ID AS c1, p.TITLE AS c2, b.BOARD_NM AS c3, COALESCE(s.v, 0) AS c4 FROM TB_POST AS p INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID WHERE p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL') AS q"
+      },
+      {
+        "key": "aMinusB",
+        "label": "원문에만 있는 행",
+        "sql": "SELECT COUNT(*) AS n FROM (SELECT * FROM (SELECT TB_POST.POST_ID AS c1, TB_POST.TITLE AS c2, TB_BOARD.BOARD_NM AS c3, (SELECT count(*) FROM TB_FILE WHERE TB_FILE.POST_ID = TB_POST.POST_ID) AS c4 FROM TB_POST, TB_BOARD, TB_USER WHERE 1 = 1 AND TB_POST.BOARD_ID = TB_BOARD.BOARD_ID AND TB_USER.USER_ID = TB_POST.WRITER_ID AND ((TB_POST.USE_YN IN ('Y'))) AND (TB_BOARD.BOARD_TYPE = 'NOTICE' OR TB_BOARD.BOARD_TYPE = 'FAQ' OR TB_BOARD.BOARD_TYPE = 'QNA') AND TB_POST.USE_YN IN ('Y') AND NOT (TB_USER.STATUS = 'DEL')) AS q1 EXCEPT SELECT * FROM (SELECT p.POST_ID AS c1, p.TITLE AS c2, b.BOARD_NM AS c3, COALESCE(s.v, 0) AS c4 FROM TB_POST AS p INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID WHERE p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL') AS q2) AS q"
+      },
+      {
+        "key": "bMinusA",
+        "label": "정리본에만 있는 행",
+        "sql": "SELECT COUNT(*) AS n FROM (SELECT * FROM (SELECT p.POST_ID AS c1, p.TITLE AS c2, b.BOARD_NM AS c3, COALESCE(s.v, 0) AS c4 FROM TB_POST AS p INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID WHERE p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL') AS q1 EXCEPT SELECT * FROM (SELECT TB_POST.POST_ID AS c1, TB_POST.TITLE AS c2, TB_BOARD.BOARD_NM AS c3, (SELECT count(*) FROM TB_FILE WHERE TB_FILE.POST_ID = TB_POST.POST_ID) AS c4 FROM TB_POST, TB_BOARD, TB_USER WHERE 1 = 1 AND TB_POST.BOARD_ID = TB_BOARD.BOARD_ID AND TB_USER.USER_ID = TB_POST.WRITER_ID AND ((TB_POST.USE_YN IN ('Y'))) AND (TB_BOARD.BOARD_TYPE = 'NOTICE' OR TB_BOARD.BOARD_TYPE = 'FAQ' OR TB_BOARD.BOARD_TYPE = 'QNA') AND TB_POST.USE_YN IN ('Y') AND NOT (TB_USER.STATUS = 'DEL')) AS q2) AS q"
+      }
+    ]
+  },
+  "engine": "mariadb",
+  "sql": "-- 게시판 글 목록(레거시 화면)\nselect TB_POST.POST_ID, TB_POST.TITLE, TB_BOARD.BOARD_NM,\n       (select count(*) from TB_FILE where TB_FILE.POST_ID = TB_POST.POST_ID) as FILE_CNT -- 첨부 수\n  from TB_POST, TB_BOARD, TB_USER\n where 1=1\n   and TB_POST.BOARD_ID = TB_BOARD.BOARD_ID\n   and TB_USER.USER_ID = TB_POST.WRITER_ID\n   and ((TB_POST.USE_YN in ('Y')))\n   and (TB_BOARD.BOARD_TYPE = 'NOTICE' or TB_BOARD.BOARD_TYPE = 'FAQ' or TB_BOARD.BOARD_TYPE = 'QNA')\n   and TB_POST.USE_YN in ('Y')\n   and not (TB_USER.STATUS = 'DEL')\n order by TB_POST.REG_DT desc",
+  "variants": {
+    "alias:20": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": false,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  TB_POST.POST_ID,\n  TB_POST.TITLE,\n  TB_BOARD.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST\n  INNER JOIN TB_BOARD ON TB_POST.BOARD_ID = TB_BOARD.BOARD_ID\n  INNER JOIN TB_USER ON TB_USER.USER_ID = TB_POST.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = TB_POST.POST_ID\nWHERE\n  TB_POST.USE_YN = 'Y' AND TB_BOARD.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND TB_USER.STATUS <> 'DEL' ORDER BY TB_POST.REG_DT DESC"
+    },
+    "commaJoin:183": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": false,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "3곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID,\n  TB_BOARD AS b,\n  TB_USER AS u\nWHERE\n  p.BOARD_ID = b.BOARD_ID AND u.USER_ID = p.WRITER_ID AND p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    },
+    "dupCond:217": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": false,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND p.USE_YN = 'Y' AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    },
+    "inOne:217": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": false,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  p.USE_YN IN ('Y') AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    },
+    "notCmp:217": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": false,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND NOT (u.STATUS = 'DEL') ORDER BY p.REG_DT DESC"
+    },
+    "orToIn:217": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": false,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  p.USE_YN = 'Y' AND (b.BOARD_TYPE = 'NOTICE' OR b.BOARD_TYPE = 'FAQ' OR b.BOARD_TYPE = 'QNA') AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    },
+    "parens:217": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": false,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  (p.USE_YN = 'Y') AND (b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA')) AND p.USE_YN = 'Y' AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    },
+    "scalarToJoin:86": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": false,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  (SELECT count(*) FROM TB_FILE WHERE TB_FILE.POST_ID = p.POST_ID) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\nWHERE\n  p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    },
+    "trueCond:217": {
+      "changed": true,
+      "changes": [
+        {
+          "detail": "표 3개, 등호 조건 2개를 ON 으로 옮김",
+          "id": "commaJoin:183",
+          "kind": "commaJoin",
+          "on": true,
+          "pos": [
+            183,
+            209
+          ],
+          "safety": "safe",
+          "title": "쉼표 조인 → INNER JOIN … ON"
+        },
+        {
+          "detail": "TB_POST → p, TB_BOARD → b, TB_USER → u",
+          "id": "alias:20",
+          "kind": "alias",
+          "on": true,
+          "pos": [
+            20,
+            511
+          ],
+          "safety": "safe",
+          "title": "짧은 별칭 붙이기 (3개 표)"
+        },
+        {
+          "detail": "늘 참인 조건 1개",
+          "id": "trueCond:217",
+          "kind": "trueCond",
+          "on": false,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 1=1·TRUE 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "parens:217",
+          "kind": "parens",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 불필요한 괄호 벗기기"
+        },
+        {
+          "detail": "같은 조건 1개",
+          "id": "dupCond:217",
+          "kind": "dupCond",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 중복 조건 지우기"
+        },
+        {
+          "detail": "2곳",
+          "id": "inOne:217",
+          "kind": "inOne",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 IN (값 하나) → ="
+        },
+        {
+          "detail": "1곳",
+          "id": "notCmp:217",
+          "kind": "notCmp",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 NOT (a = b) → a <> b"
+        },
+        {
+          "detail": "1묶음",
+          "id": "orToIn:217",
+          "kind": "orToIn",
+          "on": true,
+          "pos": [
+            217,
+            511
+          ],
+          "safety": "safe",
+          "title": "WHERE 의 같은 열 OR 사슬 → IN (…)"
+        },
+        {
+          "detail": "행마다 다시 돌던 서브쿼리를 한 번 묶어 붙입니다 — 결과를 확인하세요",
+          "id": "scalarToJoin:86",
+          "kind": "scalarToJoin",
+          "on": true,
+          "pos": [
+            86,
+            154
+          ],
+          "safety": "check",
+          "title": "상관 스칼라 서브쿼리(COUNT) → LEFT JOIN (… GROUP BY)"
+        }
+      ],
+      "comments": {
+        "kept": 2,
+        "moved": 0,
+        "total": 2
+      },
+      "dialect": "mysql",
+      "error": null,
+      "kind": "select",
+      "notes": [
+        "표 메타데이터 없이 다듬었습니다 — 열 한정·안 쓰는 LEFT JOIN 지우기는 메타데이터가 있어야 합니다"
+      ],
+      "ok": true,
+      "tables": [
+        {
+          "name": "TB_FILE",
+          "schema": null
+        },
+        {
+          "name": "TB_POST",
+          "schema": null
+        },
+        {
+          "name": "TB_BOARD",
+          "schema": null
+        },
+        {
+          "name": "TB_USER",
+          "schema": null
+        }
+      ],
+      "text": "-- 게시판 글 목록(레거시 화면)\nSELECT\n  p.POST_ID,\n  p.TITLE,\n  b.BOARD_NM,\n  COALESCE(s.v, 0) AS FILE_CNT -- 첨부 수\n\nFROM\n  TB_POST AS p\n  INNER JOIN TB_BOARD AS b ON p.BOARD_ID = b.BOARD_ID\n  INNER JOIN TB_USER AS u ON u.USER_ID = p.WRITER_ID\n  LEFT JOIN (SELECT TB_FILE.POST_ID AS k1, count(*) AS v FROM TB_FILE GROUP BY TB_FILE.POST_ID) AS s ON s.k1 = p.POST_ID\nWHERE\n  1 = 1 AND p.USE_YN = 'Y' AND b.BOARD_TYPE IN ('NOTICE', 'FAQ', 'QNA') AND u.STATUS <> 'DEL' ORDER BY p.REG_DT DESC"
+    }
+  }
+}
