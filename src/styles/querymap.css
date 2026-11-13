@@ -410,3 +410,115 @@
 	min-height: 26px;
 	row-gap: 2px;
 }
+
+/* ── 쿼리 분석 칸 — 구조 · 진단 · 인덱스 (0.15) ─────────────── */
+.qa-panel {
+	background: var(--surface);
+}
+.qa-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	height: 36px;
+	padding: 0 6px 0 8px;
+	border-bottom: 0.5px solid var(--hairline);
+	flex: none;
+	min-width: 0;
+}
+/* 탭 — 눌러 고르는 막대(분절 단추) */
+.qa-tabs {
+	display: inline-flex;
+	flex: none;
+	gap: 2px;
+	padding: 2px;
+	border-radius: 8px;
+	background: var(--fill);
+}
+.qa-tab {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	height: 22px;
+	padding: 0 10px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text-2);
+	font: inherit;
+	font-size: 12px;
+	font-weight: 500;
+	white-space: nowrap;
+}
+.qa-tab:hover {
+	color: var(--text);
+}
+.qa-tab.on {
+	background: var(--elevated-solid);
+	color: var(--text);
+	box-shadow: 0 0.5px 2px rgb(0 0 0 / 0.14);
+}
+.qa-tab i {
+	min-width: 15px;
+	height: 15px;
+	padding: 0 4px;
+	border-radius: 8px;
+	background: var(--fill-hover);
+	color: var(--text-2);
+	font-style: normal;
+	font-size: 10.5px;
+	line-height: 15px;
+	text-align: center;
+	font-variant-numeric: tabular-nums;
+}
+.qa-tab i.warn {
+	background: color-mix(in srgb, var(--danger) 18%, transparent);
+	color: var(--danger);
+}
+.qa-meta {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: right;
+	color: var(--text-3);
+	font-size: 11.5px;
+	font-variant-numeric: tabular-nums;
+}
+.qa-refresh.btn {
+	flex: none;
+	width: 24px;
+	height: 24px;
+	color: var(--text-2);
+}
+/* 탭 내용은 겹쳐 두고 앞 탭만 보인다 — 뒤 탭은 크기를 그대로 둔 채(지도가 0 크기로 맞추지 않게) 투명하게 */
+.qa-body {
+	position: relative;
+	flex: 1;
+	min-height: 0;
+	overflow: hidden;
+}
+.qa-layer {
+	position: absolute;
+	inset: 0;
+	z-index: 0;
+	overflow: hidden;
+	contain: layout paint;
+	background: var(--surface);
+	opacity: 0;
+	visibility: hidden;
+	pointer-events: none;
+}
+.qa-layer.on {
+	z-index: 1;
+	opacity: 1;
+	visibility: visible;
+	pointer-events: auto;
+}
+/* React Flow 노드는 visibility:visible 을 직접 달아 숨긴 탭 밖으로 비친다 — 뒤 탭은 통째로 숨긴다 */
+.qa-layer:not(.on) * {
+	visibility: hidden !important;
+}
+.qa-layer > .panel-fill {
+	height: 100%;
+}

@@ -13,14 +13,15 @@ import {
 	type DockviewApi,
 	type DockviewReadyEvent,
 	type DockviewTheme,
+	type IDockviewHeaderActionsProps,
 	type IDockviewPanelHeaderProps,
 	type IDockviewPanelProps,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import "../styles/db-extra.css";
-import { ChevronRight, Columns3, Database, Download, Eye, FilePlus, KeyRound, LayoutTemplate, Lock, Play, PlayCircle, Search, Square, Table, WrapText, Star } from "lucide-react";
+import { ChevronRight, CircleStop, Columns3, Database, Download, Ellipsis, Eye, FileSearch, History, KeyRound, LayoutTemplate, ListTree, Lock, Play, PlayCircle, Plus, ScanSearch, Search, Square, Table, WandSparkles, Star } from "lucide-react";
 import { DbActivityPanel } from "./panels/DbActivityPanel";
-import { createContext, lazy, type ReactElement, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, lazy, memo, type ReactElement, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ComparePanel, HistoryPanel } from "./DbPanels";
 import { type ExplainOk, ExplainView } from "./DbExplain";
 import { ImportCsvSheet } from "./DbImport";
@@ -31,8 +32,8 @@ import { useCommands } from "../lib/commands";
 import { LayoutLockButton, useLayoutLock } from "../lib/layoutLock";
 
 const ErdPanelLazy = lazy(() => import("./DbErd").then((m) => ({ default: m.ErdPanel })));
-const QueryMapLazy = lazy(() => import("./QueryMap").then((m) => ({ default: m.QueryMapPanel })));
-const QueryTuningLazy = lazy(() => import("./QueryTuning").then((m) => ({ default: m.QueryTuningPanel })));
+const QueryAnalysisLazy = lazy(() => import("./QueryAnalysis").then((m) => ({ default: m.QueryAnalysisPanel })));
+import type { AnalysisTab } from "./QueryAnalysis";
 import { api } from "../lib/ipc";
 import { type Cell, type ColMeta, type EditStmt, buildDelete, buildInsert, buildUpdate, formatRows, previewSql, qualified } from "../lib/edits";
 import {
@@ -52,7 +53,7 @@ import {
 	type Tool,
 	toolSql,
 } from "../lib/dbtools";
-import { quoteIdentFor, selectTop } from "../lib/engines";
+import { ENGINES, quoteIdentFor, selectTop } from "../lib/engines";
 import { type Stmt, splitSql, statementAt } from "../lib/sql";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { CellEditor } from "./CellEditor";
@@ -124,8 +125,8 @@ type Ctx = {
 	locked: boolean;
 	/** 지금 데이터베이스(MySQL 한정 없는 표 이름) */
 	database: string;
-	/** 쿼리 지도·튜닝 칸 열기(SQL 편집기 오른쪽) */
-	openSide: (id: "querymap" | "tuning") => void;
+	/** 쿼리 분석 칸 열기(그 탭으로) */
+	openAnalysis: (tab?: AnalysisTab) => void;
 	/** 두 문장의 계획(튜닝 비교) — 실행 중 표시를 올리고, ANALYZE 는 묻는다 */
 	explainPair: (a: string, b: string, analyze: boolean) => Promise<[ExplainOk, ExplainOk] | null>;
 };
@@ -260,6 +261,194 @@ function pickStatements(v: EditorView, all: boolean): string[] {
 	return r.map((s) => s.text);
 }
 
+const MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const MOD = MAC ? "⌘" : "Ctrl";
+const ALT = MAC ? "⌥" : "Alt";
+
+/** 빈 편집기 안내 — 실행 단축키를 처음부터 보여 준다(DOM 하나, React 를 거치지 않음) */
+function emptyHint(): HTMLElement {
+	const root = document.createElement("div");
+	root.className = "sql-empty";
+	const title = document.createElement("div");
+	title.className = "sql-empty-title";
+	title.textContent = "SQL 을 쓰고 실행하세요 — 커서가 있는 문장만 실행합니다";
+	root.append(title);
+	const keys: [string[], string][] = [
+		[[MOD, "Enter"], "커서 문장 실행"],
+		[[MOD, "Shift", "Enter"], "전체 실행"],
+		[[MOD, "E"], "실행 계획"],
+		[["Shift", ALT, "F"], "포맷"],
+		[[MOD, "Space"], "이름 완성"],
+		[[ALT, "O"], "객체 찾기"],
+	];
+	const list = document.createElement("div");
+	list.className = "sql-empty-keys";
+	for (const [ks, label] of keys) {
+		const row = document.createElement("span");
+		for (const k of ks) {
+			const kbd = document.createElement("kbd");
+			kbd.textContent = k;
+			row.append(kbd);
+		}
+		row.append(document.createTextNode(` ${label}`));
+		list.append(row);
+	}
+	root.append(list);
+	const tip = document.createElement("div");
+	tip.className = "sql-empty-tip";
+	tip.textContent = "왼쪽 표를 두 번 누르면 내용 보기 · 오른쪽 쿼리 분석 칸이 치는 동안 구조·진단·인덱스 초안을 보여 줍니다";
+	root.append(tip);
+	return root;
+}
+
+/** 편집기 도구 막대가 쓰는 작업대 상태 — 바뀔 일이 드문 값만(실행 중 표시는 LiveCtx) */
+type ToolState = {
+	autoLimit: boolean;
+	maxRows: number;
+	timeoutMs: number;
+	manual: boolean;
+	inTx: boolean;
+	txStmts: number;
+	closed: boolean;
+	readOnly: boolean;
+	canCancel: boolean;
+	/** 실행 계획 트리(또는 글)를 볼 수 있다 */
+	canExplain: boolean;
+	/** 실제 실행 계획(ANALYZE) */
+	canAnalyze: boolean;
+	analysisOpen: boolean;
+	/** 작업대 동작 — 렌더마다 새 함수를 넣어도 막대가 다시 그려지지 않게 ref 로 */
+	act: { current: ToolActs };
+};
+type ToolActs = {
+	run: (v: EditorView | null, all: boolean) => void;
+	explain: (v: EditorView | null, analyze: boolean) => void;
+	cancel: () => void;
+	format: (v: EditorView | null) => void;
+	toggleAnalysis: () => void;
+	history: () => void;
+	snippets: () => void;
+	find: () => void;
+	tools: (x: number, y: number) => void;
+	setAutoLimit: (on: boolean) => void;
+	setMaxRows: (n: number) => void;
+	setTimeoutMs: (n: number) => void;
+	toggleManual: () => void;
+	tx: (op: "commit" | "rollback") => void;
+	newSql: () => void;
+};
+const ToolCtx = createContext<ToolState | null>(null);
+
+const ROW_CAPS = [1000, 10_000, 100_000, 1_000_000].map((n) => ({ value: n, label: n.toLocaleString() }));
+
+/**
+ * 편집기 도구 막대 — 쿼리 탭 줄 바로 아래, 편집기마다 하나(그 편집기에 대해 실행).
+ * 주 동작(실행·전체·계획·분석) | 보조(포맷·쿼리 분석·기록·즐겨찾기·찾기·도구…) | 오른쪽 끝 조용한 실행 설정.
+ * 좁아지면 보조 글자부터 숨기고 아이콘만 남긴다(이름은 title).
+ */
+const SqlToolbar = memo(function SqlToolbar({ viewRef }: { viewRef: { current: EditorView | null } }) {
+	const t = useContext(ToolCtx);
+	const { running } = useContext(LiveCtx);
+	if (!t) return null;
+	const a = t.act.current;
+	const v = () => viewRef.current;
+	const off = running || t.closed;
+	return (
+		<div className="dbw-tools" role="toolbar" aria-label="SQL 도구">
+			<div className="dbw-tools-row">
+				<div className="dbw-grp">
+					<button type="button" className="btn dbw-run" disabled={off} onClick={() => a.run(v(), false)} title={`커서 문장(또는 고른 글) 실행 — ${MOD}+Enter`}>
+						<Play size={13} fill="currentColor" /> <span className="lbl keep">실행</span>
+					</button>
+					<button type="button" className="btn ghost" disabled={off} onClick={() => a.run(v(), true)} title={`편집기 전체 실행 — ${MOD}+Shift+Enter`}>
+						<PlayCircle size={14} /> <span className="lbl">전체</span>
+					</button>
+					{t.canExplain && (
+						<button type="button" className="btn ghost" disabled={off} onClick={() => a.explain(v(), false)} title={`실행 계획(EXPLAIN) — 실행하지 않음 · ${MOD}+E`}>
+							<ListTree size={14} /> <span className="lbl">계획</span>
+						</button>
+					)}
+					{t.canAnalyze && (
+						<button type="button" className="btn ghost" disabled={off} onClick={() => a.explain(v(), true)} title="실제 실행 계획(EXPLAIN ANALYZE) — 문장을 실제로 실행해 잽니다(쓰기는 끝나고 되돌림, 묻고 실행)">
+							<FileSearch size={14} /> <span className="lbl">분석</span>
+						</button>
+					)}
+					{running && t.canCancel && (
+						<button type="button" className="btn dbw-cancel" onClick={a.cancel} title="실행 중인 문장 취소 — Esc">
+							<CircleStop size={14} /> <span className="lbl keep">취소</span>
+						</button>
+					)}
+				</div>
+				<span className="dbw-sep" />
+				<div className="dbw-grp">
+					<button type="button" className="btn ghost" onClick={() => a.format(v())} title={`SQL 포맷 — 고른 글만, 없으면 전체 · Shift+${ALT}+F`}>
+						<WandSparkles size={14} /> <span className="lbl">포맷</span>
+					</button>
+					<button type="button" className={`btn ghost${t.analysisOpen ? " on" : ""}`} aria-pressed={t.analysisOpen} onClick={a.toggleAnalysis} title="쿼리 분석 칸 — 치는 동안 구조(쿼리 지도)·진단·인덱스 초안(서버에 묻지 않음)">
+						<ScanSearch size={14} /> <span className="lbl">쿼리 분석</span>
+					</button>
+					<button type="button" className="btn ghost" onClick={a.history} title={`쿼리 기록 — ${ALT}+H`}>
+						<History size={14} /> <span className="lbl">기록</span>
+					</button>
+					<button type="button" className="btn ghost" onClick={a.snippets} title="즐겨찾는 SQL(스니펫)">
+						<Star size={14} /> <span className="lbl">즐겨찾기</span>
+					</button>
+					<button type="button" className="btn ghost" onClick={a.find} title={`객체 찾기 — 표·뷰·열 이름 · ${ALT}+O`}>
+						<Search size={14} /> <span className="lbl">찾기</span>
+					</button>
+					<button type="button" className="btn ghost" onClick={(e) => a.tools(e.clientX, e.clientY + 12)} title="도구 — 표 크기·세션·잠금·활동 감시·쓰기 확인·표 보기 쪽 크기·포맷 키워드·배치">
+						<Ellipsis size={14} /> <span className="lbl">도구</span>
+					</button>
+				</div>
+				<div className="dbw-opts">
+					{t.inTx && (
+						<span className="dbw-tx">
+							<span className="badge warn" title="커밋하거나 되돌리기 전까지 다른 세션에는 보이지 않고, 잠금을 쥐고 있을 수 있습니다. 10분 동안 입력이 없으면 저절로 되돌립니다.">
+								트랜잭션 · {t.txStmts}문장
+							</span>
+							<button type="button" className="btn ghost dbw-mini" onClick={() => a.tx("commit")}>
+								커밋
+							</button>
+							<button type="button" className="btn ghost dbw-mini" onClick={() => a.tx("rollback")}>
+								롤백
+							</button>
+						</span>
+					)}
+					{!t.readOnly && (
+						<button
+							type="button"
+							className={`dbw-chip${t.manual ? " on" : ""}`}
+							aria-pressed={t.manual}
+							onClick={a.toggleManual}
+							title={t.manual ? "수동 커밋 — 쓰기 문장은 트랜잭션 안에서 실행되고, 커밋·되돌리기 뒤에도 이 모드가 이어집니다(눌러 자동 커밋으로)" : "자동 커밋 — 문장마다 바로 반영(눌러 수동 커밋으로)"}
+						>
+							{t.manual ? "수동 커밋" : "자동 커밋"}
+						</button>
+					)}
+					<button
+						type="button"
+						className={`dbw-chip${t.autoLimit ? " on" : ""}`}
+						aria-pressed={t.autoLimit}
+						onClick={() => a.setAutoLimit(!t.autoLimit)}
+						title="자동 LIMIT — LIMIT 없는 SELECT 에 행 상한을 서버 쪽에도 붙인다(PostgreSQL·MySQL·MariaDB·Oracle)"
+					>
+						<span className="dbw-check" aria-hidden>{t.autoLimit ? "✓" : ""}</span>
+						<span className="lbl">자동 </span>LIMIT
+					</button>
+					<span className="dbw-opt" title="결과 행 상한 — 넘으면 받기를 멈춘다">
+						<span className="lbl">행 상한</span>
+						<Select size="sm" value={t.maxRows} onChange={a.setMaxRows} title="결과 행 상한" aria-label="결과 행 상한" options={ROW_CAPS} />
+					</span>
+					<span className="dbw-opt" title="문장 시간 상한 — 넘으면 멈춘다(PostgreSQL·MySQL 은 서버가, 그 밖은 앱이 재다가 취소)">
+						<span className="lbl">시간</span>
+						<Select size="sm" value={t.timeoutMs} onChange={a.setTimeoutMs} title="문장 시간 상한" aria-label="문장 시간 상한" options={TIMEOUTS} />
+					</span>
+				</div>
+			</div>
+		</div>
+	);
+});
+
 function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 	const ctx = useDb();
 	const host = useRef<HTMLDivElement>(null);
@@ -269,6 +458,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 	engineRef.current = ctx.engine;
 	const ctxRef = useRef(ctx);
 	ctxRef.current = ctx;
+	const viewRef = useRef<EditorView | null>(null);
 	useEffect(() => {
 		if (!host.current) return;
 		const key = `${ctx.draftKey}.${props.params.n}`;
@@ -296,8 +486,8 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 					search({ top: true }),
 					codeHighlight,
 					ranField,
-					// 빈 편집기에 할 수 있는 것을 알려 준다(처음 연 사람이 실행 키를 찾지 않게)
-					placeholder("SQL 을 쓰고 Ctrl+Enter 로 실행 — 커서가 있는 문장만, Ctrl+Shift+Enter 는 전체 · 왼쪽 표를 두 번 누르면 내용 보기"),
+					// 빈 편집기에 할 수 있는 것을 알려 준다(처음 연 사람이 실행 키를 찾지 않게) — 글을 쓰면 사라진다
+					placeholder(emptyHint),
 					...editingExtensions(),
 					// DB 이름(스키마·표·열·별칭) 완성 — 키워드 완성은 sql() 이 함께 낸다
 					EditorState.languageData.of(() => [{ autocomplete: completionFor(ctx.conn) }]),
@@ -337,6 +527,7 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 			}),
 		});
 		view = v;
+		viewRef.current = v;
 		const offFlush = onDraftFlush(flush);
 		if (props.params.initial) v.dispatch({ changes: { from: 0, insert: props.params.initial } });
 		else
@@ -348,12 +539,18 @@ function SqlPanel(props: IDockviewPanelProps<{ n: number; initial?: string }>) {
 			flush();
 			offFlush();
 			view = null;
+			viewRef.current = null;
 			ctx.registerEditor(props.api.id, null);
 			dropEditor(ctx.conn, v);
 			v.destroy();
 		};
 	}, [ctx.mysql, ctx.engine, ctx.draftKey, ctx.registerEditor, props.api.id, props.params.n]);
-	return <div className="cm-host" ref={host} style={{ height: "100%" }} />;
+	return (
+		<div className="panel-fill sql-panel">
+			<SqlToolbar viewRef={viewRef} />
+			<div className="cm-host" ref={host} />
+		</div>
+	);
 }
 
 function ResultPanel(props: IDockviewPanelProps<ResultParams>) {
@@ -1439,7 +1636,17 @@ function MessagesPanel() {
 	return (
 		<div className="panel-fill">
 			<div className="msg-list selectable">
-				{messages.length === 0 && <div className="panel-hint">실행하면 여기에 시각·결과·걸린 시간이 쌓입니다.</div>}
+				{messages.length === 0 && (
+					<div className="panel-hint msg-empty">
+						<div>
+							<kbd>{MOD}</kbd>
+							<kbd>Enter</kbd> 커서 문장 실행 · <kbd>{MOD}</kbd>
+							<kbd>Shift</kbd>
+							<kbd>Enter</kbd> 전체 실행
+						</div>
+						<div>결과는 이 묶음의 탭으로 열리고, 여기에는 시각·결과·걸린 시간이 쌓입니다.</div>
+					</div>
+				)}
 				{messages.map((m, i) => (
 					// biome-ignore lint/suspicious/noArrayIndexKey: 시간 순 기록
 					<div key={i} className={`msg-row${m.ok ? "" : " bad"}`} title={m.sql}>
@@ -1537,6 +1744,8 @@ function usePanelVisible(api: IDockviewPanelProps["api"]) {
 	const [visible, setVisible] = useState(api.isVisible);
 	useEffect(() => {
 		const d = api.onDidVisibilityChange((e) => setVisible(e.isVisible));
+		// 처음 그린 뒤 듣기 전에 바뀌었을 수 있다(새로 연 칸이 곧바로 보이는 때) — 들은 뒤 한 번 맞춘다
+		setVisible(api.isVisible);
 		return () => d.dispose();
 	}, [api]);
 	return visible;
@@ -1547,29 +1756,33 @@ function useAnalyzeDeps() {
 	const { conn, engine, epoch, database, inTx } = ctx;
 	return useMemo(() => ({ conn, engine, epoch, defaultSchema: database || null, running, inTx }), [conn, engine, epoch, database, running, inTx]);
 }
-function QueryMapDock(props: IDockviewPanelProps) {
-	const ctx = useDb();
-	const visible = usePanelVisible(props.api);
-	const deps = useAnalyzeDeps();
-	return (
-		<Suspense fallback={<div className="dock-watermark">불러오는 중…</div>}>
-			<QueryMapLazy deps={deps} visible={visible} onTuning={() => ctx.openSide("tuning")} />
-		</Suspense>
-	);
-}
-function TuningDock(props: IDockviewPanelProps) {
+/** 쿼리 분석 칸(구조·진단·인덱스) — 껍데기는 QueryAnalysis, 지도·튜닝 본문은 각 파일 */
+function AnalysisDock(props: IDockviewPanelProps<{ tab?: AnalysisTab; seq?: number }>) {
 	const ctx = useDb();
 	const visible = usePanelVisible(props.api);
 	const deps = useAnalyzeDeps();
 	const { engine } = ctx;
-	// 인덱스 초안은 여기로 오지 않는다(복사·새 탭만)
+	const [tab, setTab] = useState<AnalysisTab>(props.params?.tab ?? "map");
+	// 도구 막대·명령 팔레트가 탭을 골라 열면(seq 가 바뀜) 그 탭으로
+	// biome 없음 — seq 는 같은 탭을 다시 골라도 바꾸는 신호
+	useEffect(() => {
+		if (props.params?.tab) setTab(props.params.tab);
+	}, [props.params?.tab, props.params?.seq]);
+	const pick = useCallback(
+		(t: AnalysisTab) => {
+			setTab(t);
+			// 배치에 함께 저장(다시 켜면 보던 탭으로) — seq 는 그대로
+			props.api.updateParameters({ ...props.params, tab: t });
+		},
+		[props.api, props.params],
+	);
 	const actions = useMemo(
 		() => ({ explain: ctx.explain, openSql: ctx.openSql, canAnalyze: engine === "postgres" || engine === "mysql" || engine === "mariadb", explainPair: ctx.explainPair }),
 		[ctx.explain, ctx.openSql, ctx.explainPair, engine],
 	);
 	return (
 		<Suspense fallback={<div className="dock-watermark">불러오는 중…</div>}>
-			<QueryTuningLazy deps={deps} visible={visible} actions={actions} />
+			<QueryAnalysisLazy deps={deps} visible={visible} actions={actions} tab={tab} onTab={pick} database={ctx.database} />
 		</Suspense>
 	);
 }
@@ -1578,10 +1791,22 @@ function ExplainDock(props: IDockviewPanelProps<{ ok: ExplainOk; sql: string; an
 	return <ExplainView ok={props.params.ok} sql={props.params.sql} analyze={props.params.analyze} />;
 }
 
-const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock, messages: MessagesPanel, explain: ExplainDock, activity: ActivityDock, querymap: QueryMapDock, tuning: TuningDock };
-const FIXED = /^(objects|sql-\d+)$/;
+const components = { objects: ObjectsPanel, sql: SqlPanel, result: ResultPanel, history: HistoryDock, erd: ErdDock, compare: CompareDock, messages: MessagesPanel, explain: ExplainDock, activity: ActivityDock, analysis: AnalysisDock };
+/** 배치에 저장하는 칸 — 결과·계획·기록처럼 실행마다 생기는 칸은 빼고 뼈대만 */
+const FIXED = /^(objects|sql-\d+|messages|analysis)$/;
 /** 배치를 잠그면 닫기를 숨기는 구조 칸 */
 const STRUCT = /^(objects|sql-1|res-\d+|messages)$/;
+
+/** 쿼리 탭 줄 오른쪽 "+" — SQL 편집기가 있는 묶음에만 */
+function SqlTabActions(props: IDockviewHeaderActionsProps) {
+	const t = useContext(ToolCtx);
+	if (!t || !props.panels.some((p) => p.id.startsWith("sql-"))) return null;
+	return (
+		<button type="button" className="btn ghost icon dbw-tab-add" onClick={() => t.act.current.newSql()} title="새 SQL 탭">
+			<Plus size={14} />
+		</button>
+	);
+}
 
 const LockCtx = createContext({ locked: false, owner: "" });
 function LockTab(props: IDockviewPanelHeaderProps) {
@@ -1601,20 +1826,84 @@ function LockTab(props: IDockviewPanelHeaderProps) {
 /** 이 시간 동안 입력이 없으면 열린 트랜잭션을 되돌린다 */
 const TX_IDLE_MS = 10 * 60_000;
 
+/** 배치 판 — 2: 쿼리 분석 칸·메시지 칸이 기본 배치에 들어온 판(0.15) */
+const LAYOUT_V = 2;
+const ANALYSIS_TITLE = "쿼리 분석";
+
+/** 쿼리 분석 칸 — SQL 편집기 오른쪽에 너비 0.32 쯤 */
+function addAnalysis(d: DockviewApi, tab: AnalysisTab = "map") {
+	// 작업대 오른쪽 끝에 위아래 통째로(편집기·메시지 묶음 옆) — 편집기 묶음 안쪽을 가르면 메시지 칸 위에만 끼었다
+	const p = d.addPanel({ id: "analysis", component: "analysis", title: ANALYSIS_TITLE, params: { tab }, position: { direction: "right" } });
+	const w = Math.min(Math.max(320, Math.round((d.width || 1200) * 0.3)), Math.round((d.width || 1200) * 0.45));
+	requestAnimationFrame(() => p.api.setSize({ width: w }));
+	return p;
+}
+/** 메시지 칸 — 편집기 아래(결과·실행 계획이 이 묶음의 탭으로 붙는다) */
+function addMessages(d: DockviewApi) {
+	const sqlRef = d.panels.find((p) => p.id.startsWith("sql-"));
+	const p = d.addPanel({ id: "messages", component: "messages", title: "메시지", position: sqlRef ? { referencePanel: sqlRef.id, direction: "below" } : undefined });
+	requestAnimationFrame(() => p.api.setSize({ height: Math.max(180, Math.round((d.height || 700) * 0.36)) }));
+	return p;
+}
+
 function defaultLayout(d: DockviewApi) {
 	d.clear();
 	d.addPanel({ id: "objects", component: "objects", title: "객체", renderer: "always" });
 	d.addPanel({ id: "sql-1", component: "sql", title: "SQL", params: { n: 1 }, renderer: "always", position: { referencePanel: "objects", direction: "right" } });
-	d.getPanel("objects")?.api.setSize({ width: 270 });
+	addAnalysis(d);
+	addMessages(d);
+	d.getPanel("objects")?.api.setSize({ width: 260 });
+	d.getPanel("sql-1")?.api.setActive();
+}
+
+type GridNode = { type: string; data: unknown; size?: number };
+/**
+ * 저장한 배치 다듬기 — 0.14 의 "쿼리 지도"·"튜닝" 두 칸은 "쿼리 분석" 한 칸으로 옮기고(먼저 나온 자리에, 보던 쪽 탭으로),
+ * 남길 칸만 두고, 빈 묶음은 빼낸다(빈 묶음이 남으면 다음에 열 때 빈 칸이 생겼다). 뿌리까지 비면 null.
+ */
+function tidyLayout(raw: unknown): { panels: Record<string, Record<string, unknown>>; grid: { root: GridNode } } | null {
+	const j = raw as { panels?: Record<string, Record<string, unknown>>; grid?: { root?: GridNode } };
+	if (!j?.panels || !j.grid?.root) return null;
+	const old = ["querymap", "tuning"].filter((id) => j.panels?.[id]);
+	if (old.length && !j.panels.analysis) {
+		const first = old[0];
+		j.panels.analysis = { ...j.panels[first], id: "analysis", contentComponent: "analysis", title: ANALYSIS_TITLE, params: { tab: first === "tuning" ? "diag" : "map" } };
+	}
+	for (const id of old) delete j.panels[id];
+	for (const id of Object.keys(j.panels)) if (!FIXED.test(id)) delete j.panels[id];
+	// 칸 하나는 한 묶음에만(지도·튜닝이 다른 묶음에 있었으면 먼저 나온 쪽에 남는다)
+	const placed = new Set<string>();
+	const tidyGroup = (g: { views: string[]; activeView?: string }) => {
+		g.views = g.views
+			.map((x) => (x === "querymap" || x === "tuning" ? "analysis" : x))
+			.filter((x) => {
+				if (!FIXED.test(x) || !j.panels?.[x] || placed.has(x)) return false;
+				placed.add(x);
+				return true;
+			});
+		if (g.activeView === "querymap" || g.activeView === "tuning") g.activeView = "analysis";
+		if (g.activeView && !g.views.includes(g.activeView)) g.activeView = g.views[0];
+		return g.views.length > 0;
+	};
+	const keep = (node: GridNode): boolean => {
+		if (node.type === "leaf") return tidyGroup(node.data as { views: string[]; activeView?: string });
+		const kids = (node.data as GridNode[]).filter(keep);
+		node.data = kids;
+		return kids.length > 0;
+	};
+	if (!keep(j.grid.root)) return null;
+	const fl = (j as { floatingGroups?: { data: { views: string[]; activeView?: string } }[] }).floatingGroups;
+	if (fl) (j as { floatingGroups?: unknown[] }).floatingGroups = fl.filter((f) => tidyGroup(f.data));
+	return j as { panels: Record<string, Record<string, unknown>>; grid: { root: GridNode } };
 }
 
 const TIMEOUTS = [
-	{ value: 0, label: "시간 상한 없음" },
-	{ value: 30_000, label: "상한 30초" },
-	{ value: 60_000, label: "상한 1분" },
-	{ value: 300_000, label: "상한 5분" },
-	{ value: 900_000, label: "상한 15분" },
-	{ value: 1_800_000, label: "상한 30분" },
+	{ value: 0, label: "없음" },
+	{ value: 30_000, label: "30초" },
+	{ value: 60_000, label: "1분" },
+	{ value: 300_000, label: "5분" },
+	{ value: 900_000, label: "15분" },
+	{ value: 1_800_000, label: "30분" },
 ];
 
 export function DbWorkbench({
@@ -1873,7 +2162,8 @@ export function DbWorkbench({
 				if (oldRid) void db.closeResult(oldRid);
 				if (panel) panel.api.updateParameters(params);
 				else {
-					const ref = d.panels.find((p) => p.id.startsWith("res-"));
+					// 결과는 결과·메시지 묶음의 탭으로(기본 배치는 편집기 아래 메시지 칸)
+					const ref = d.panels.find((p) => p.id.startsWith("res-")) ?? d.getPanel("messages");
 					const sqlRef = d.panels.find((p) => p.id.startsWith("sql-"));
 					panel = d.addPanel({
 						id,
@@ -1978,24 +2268,29 @@ export function DbWorkbench({
 		d.addPanel({ id, component, title, params, renderer: "always", position: ref ? { referencePanel: ref.id, direction: "within" } : undefined });
 	}, []);
 
-	/** 쿼리 지도·튜닝 — SQL 편집기 오른쪽에(둘 다 열면 같은 묶음의 탭으로) */
-	const openSide = useCallback((id: "querymap" | "tuning") => {
+	/** 쿼리 분석 칸 — 있으면 그 탭으로, 없으면 SQL 편집기 오른쪽에 연다 */
+	const analysisSeq = useRef(0);
+	const [analysisOpen, setAnalysisOpen] = useState(false);
+	const openAnalysis = useCallback((tab?: AnalysisTab) => {
 		const d = dock.current;
 		if (!d) return;
-		const ex = d.getPanel(id);
-		if (ex) return void ex.api.setActive();
-		const other = d.getPanel(id === "querymap" ? "tuning" : "querymap");
-		const sqlRef = d.panels.find((p) => p.id.startsWith("sql-"));
-		const p = d.addPanel({
-			id,
-			component: id,
-			title: id === "querymap" ? "쿼리 지도" : "튜닝",
-			renderer: "always",
-			position: other ? { referencePanel: other.id, direction: "within" } : sqlRef ? { referencePanel: sqlRef.id, direction: "right" } : undefined,
-		});
-		// 처음 열 때 작업대 너비의 0.4 쯤(편집기를 너무 좁히지 않게)
-		if (!other && sqlRef) requestAnimationFrame(() => p.api.setSize({ width: Math.max(380, Math.round((d.width || 1200) * 0.4)) }));
+		const ex = d.getPanel("analysis");
+		if (ex) {
+			if (tab) ex.api.updateParameters({ ...(ex.params ?? {}), tab, seq: ++analysisSeq.current });
+			return void ex.api.setActive();
+		}
+		addAnalysis(d, tab);
 	}, []);
+	/** 쿼리 분석 칸 켜고 끄기(도구 막대 단추·명령 팔레트) */
+	const toggleAnalysis = useCallback(() => {
+		const d = dock.current;
+		const ex = d?.getPanel("analysis");
+		if (ex) {
+			// 가려진 탭이면 끄지 않고 앞으로
+			if (!ex.api.isVisible) return void ex.api.setActive();
+			ex.api.close();
+		} else openAnalysis();
+	}, [openAnalysis]);
 
 	const runTool = (t: Tool) => {
 		const sql = toolSql(engine, t);
@@ -2009,8 +2304,8 @@ export function DbWorkbench({
 	};
 
 	/** 실행 계획 — 트리로(PostgreSQL·MySQL·MariaDB·SQL Server), 그 밖 엔진은 결과 탭에 글로 */
-	const explain = async (analyze = false) => {
-		const v = currentEditor();
+	const explain = async (analyze = false, from?: EditorView | null) => {
+		const v = from ?? currentEditor();
 		if (!v) return;
 		const st = pickStatements(v, false)[0];
 		if (!st) return;
@@ -2045,7 +2340,7 @@ export function DbWorkbench({
 				ex.api.setTitle(title);
 				ex.api.setActive();
 			} else {
-				const ref = d.panels.find((p) => p.id.startsWith("res-"));
+				const ref = d.panels.find((p) => p.id.startsWith("res-")) ?? d.getPanel("messages");
 				const sqlRef = d.panels.find((p) => p.id.startsWith("sql-"));
 				const p = d.addPanel({
 					id: "explain",
@@ -2101,8 +2396,8 @@ export function DbWorkbench({
 		d.addPanel({ id: `sql-${n}`, component: "sql", title: `SQL ${n}`, params: { n }, renderer: "always", position: ref ? { referencePanel: ref.id, direction: "within" } : undefined });
 	};
 
-	const formatNow = () => {
-		const v = currentEditor();
+	const formatNow = (from?: EditorView | null) => {
+		const v = from ?? currentEditor();
 		if (v) void formatSqlIn(v, engine, fmtCase).then((ok) => !ok && showNotice("정렬하지 못했습니다 — 이 방언이 읽지 못하는 문장이 있습니다", true));
 	};
 
@@ -2113,6 +2408,14 @@ export function DbWorkbench({
 		if (d.hasMaximizedGroup()) return d.exitMaximizedGroup();
 		const p = d.panels.find((x) => (x.id.startsWith("res-") || x.id === "explain") && x.api.isVisible) ?? d.activePanel;
 		if (p) d.maximizeGroup(p);
+	};
+
+	/** 기본 배치 — 객체 | 편집기(위)·메시지(아래) | 쿼리 분석 */
+	const resetLayout = () => {
+		const d = dock.current;
+		if (!d || lockedRef.current) return;
+		if (!okToDiscardEdits(dirtyTitles(dbOwner(conn)), "기본 배치로 되돌리면 결과 칸이 닫혀")) return;
+		defaultLayout(d);
 	};
 
 	// 명령 팔레트(Ctrl+Shift+P) — 이 DB 작업대가 앞에 있을 때만
@@ -2129,8 +2432,13 @@ export function DbWorkbench({
 		{ id: "db.newSql", group: "db", title: "새 SQL 탭", run: () => openSql("", undefined) },
 		{ id: "db.explain", group: "db", title: "실행 계획(커서 문장)", keys: "Mod+E", run: () => void explain(false) },
 		{ id: "db.find", group: "db", title: "객체 찾기", keys: "Alt+O", run: () => void findObjects() },
-		{ id: "db.queryMap", group: "db", title: "쿼리 지도", hint: "치는 동안 표·조인·조건을 그림으로(서버에 묻지 않음)", run: () => openSide("querymap") },
-		{ id: "db.tuning", group: "db", title: "튜닝 도우미", hint: "정적 검사·인덱스 초안·실행 계획 규칙", run: () => openSide("tuning") },
+		{ id: "db.analysis", group: "db", title: analysisOpen ? "쿼리 분석 칸 끄기" : "쿼리 분석 칸 켜기", hint: "구조(쿼리 지도)·진단·인덱스 초안 — 편집기 오른쪽", run: toggleAnalysis },
+		{ id: "db.queryMap", group: "db", title: "쿼리 분석 — 구조(쿼리 지도)", hint: "치는 동안 표·조인·조건을 그림으로(서버에 묻지 않음)", run: () => openAnalysis("map") },
+		{ id: "db.tuning", group: "db", title: "쿼리 분석 — 진단(튜닝 도우미)", hint: "구조·정적 검사·실행 계획 규칙", run: () => openAnalysis("diag") },
+		{ id: "db.indexDraft", group: "db", title: "쿼리 분석 — 인덱스 초안", hint: "WHERE·JOIN·ORDER 열에 맞춘 CREATE INDEX 초안(실행하지 않음)", run: () => openAnalysis("index") },
+		{ id: "db.format", group: "db", title: "SQL 포맷", keys: "Shift+Alt+F", run: () => formatNow() },
+		{ id: "db.snippets", group: "db", title: "즐겨찾는 SQL(스니펫)", run: () => setSnip(true) },
+		{ id: "db.layoutReset", group: "db", title: "DB 작업대 기본 배치로", disabled: locked, run: resetLayout },
 		{ id: "db.history", group: "db", title: "쿼리 기록", keys: "Alt+H", run: () => openPanel("history", "history", "기록", {}) },
 		{ id: "db.activity", group: "db", title: "실행 중 쿼리·잠금 감시", hint: "막는 관계·쿼리 끊기", run: () => openPanel("activity", "activity", "활동", {}) },
 		{ id: "db.sizes", group: "db", title: "표 크기", run: () => runTool("sizes"), disabled: !toolSql(engine, "sizes") },
@@ -2141,22 +2449,36 @@ export function DbWorkbench({
 	const layoutKey = "layout.db";
 	const onReady = (e: DockviewReadyEvent) => {
 		dock.current = e.api;
+		const syncOpen = () => setAnalysisOpen(!!e.api.getPanel("analysis"));
+		e.api.onDidAddPanel(syncOpen);
+		e.api.onDidRemovePanel(syncOpen);
 		void api.settingGet(layoutKey).then((saved) => {
 			let ok = false;
 			if (saved) {
 				try {
-					const j = JSON.parse(saved);
-					e.api.fromJSON(j);
-					ok = !!e.api.getPanel("objects") || e.api.panels.some((p) => p.id.startsWith("sql-"));
+					const raw = JSON.parse(saved) as { rbLayout?: number };
+					const v = raw.rbLayout ?? 1;
+					delete raw.rbLayout;
+					const j = tidyLayout(raw);
+					if (j) {
+						e.api.fromJSON(j as unknown as Parameters<DockviewApi["fromJSON"]>[0]);
+						ok = !!e.api.getPanel("objects") || e.api.panels.some((p) => p.id.startsWith("sql-"));
+					}
 					for (const p of e.api.panels) {
 						const m = /^sql-(\d+)$/.exec(p.id);
 						if (m) sqlSeq.current = Math.max(sqlSeq.current, Number(m[1]));
+					}
+					// 0.14 까지의 배치 — 새 기본 칸(쿼리 분석·메시지)을 한 번 넣어 준다(그 뒤로는 끈 대로 둔다)
+					if (ok && v < LAYOUT_V) {
+						if (!e.api.getPanel("messages")) addMessages(e.api);
+						if (!e.api.getPanel("analysis")) addAnalysis(e.api);
 					}
 				} catch {
 					ok = false;
 				}
 			}
 			if (!ok) defaultLayout(e.api);
+			syncOpen();
 		});
 		// 결과 칸을 닫으면 백엔드에 남은 결과 행(최대 수백 MB)도 놓는다 — 안 놓으면 큰 SELECT 를 거듭할수록 앱 메모리가 계속 늘었다
 		e.api.onDidRemovePanel((p) => {
@@ -2168,17 +2490,10 @@ export function DbWorkbench({
 			saveTimer.current = window.setTimeout(() => {
 				const d = dock.current;
 				if (!d) return;
-				const j = structuredClone(d.toJSON()) as unknown as { panels: Record<string, unknown>; grid: { root: { type: string; data: unknown } } };
-				for (const id of Object.keys(j.panels)) if (!FIXED.test(id)) delete j.panels[id];
-				const walk = (node: { type: string; data: unknown }) => {
-					if (node.type === "leaf") {
-						const g = node.data as { views: string[]; activeView?: string };
-						g.views = g.views.filter((x) => FIXED.test(x));
-						if (g.activeView && !FIXED.test(g.activeView)) g.activeView = g.views[0];
-					} else for (const k of node.data as { type: string; data: unknown }[]) walk(k);
-				};
-				walk(j.grid.root);
-				void api.settingSet(layoutKey, JSON.stringify(j));
+				// 뼈대 칸만 남기고 빈 묶음은 뺀다(결과만 있던 묶음이 다음에 빈 칸으로 남지 않게)
+				const j = tidyLayout(structuredClone(d.toJSON()));
+				if (!j) return;
+				void api.settingSet(layoutKey, JSON.stringify({ ...j, rbLayout: LAYOUT_V }));
 			}, 600);
 		});
 	};
@@ -2257,10 +2572,10 @@ export function DbWorkbench({
 			importCsv: (schema, table) => setCsvTarget({ schema, table }),
 			locked,
 			database: curDb,
-			openSide,
+			openAnalysis,
 			explainPair,
 		}),
-		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked, curDb, openSide, explainPair],
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked, curDb, openAnalysis, explainPair],
 	);
 	const live = useMemo<Live>(() => ({ running, messages }), [running, messages]);
 	// 실행이 끝나면 뒤 조회(쿼리 지도 메타데이터)를 다시 허락
@@ -2279,10 +2594,60 @@ export function DbWorkbench({
 
 	const tick = (on: boolean) => (on ? "✓ " : "　");
 
+	// 편집기 도구 막대 — 동작은 ref 로(렌더마다 새 함수라도 막대는 상태값이 바뀔 때만 다시 그린다)
+	const toolActs = useRef<ToolActs>(null as unknown as ToolActs);
+	toolActs.current = {
+		run: (v, all) => {
+			const ed = v ?? currentEditor();
+			if (ed) void run(pickStatements(ed, all));
+		},
+		explain: (v, analyze) => void explain(analyze, v),
+		cancel: () => void db.cancel(conn),
+		format: (v) => formatNow(v),
+		toggleAnalysis,
+		history: () => openPanel("history", "history", "기록", {}),
+		snippets: () => setSnip(true),
+		find: () => void findObjects(),
+		tools: (x, y) => setToolsMenu({ x, y }),
+		setAutoLimit: (on) => {
+			setAutoLimit(on);
+			void api.settingSet("db.autoLimit", on ? "1" : "0");
+		},
+		setMaxRows,
+		setTimeoutMs: (v) => {
+			setTimeoutMs(v);
+			void api.settingSet("db.timeout", String(v));
+		},
+		toggleManual: () => void toggleManual(),
+		tx: (op) => void txOp(op),
+		newSql: addSql,
+	};
+	const engineLabel = ENGINES.find((x) => x.key === engine)?.label ?? engine;
+	const treeExplain = engine === "postgres" || engine === "mysql" || engine === "mariadb" || engine === "mssql";
+	const toolState = useMemo<ToolState>(
+		() => ({
+			autoLimit,
+			maxRows,
+			timeoutMs,
+			manual: txState.manual,
+			inTx: txState.inTx,
+			txStmts: txState.stmts,
+			closed,
+			readOnly,
+			canCancel,
+			canExplain: treeExplain || !!explainSql(engine, "x"),
+			canAnalyze: engine === "postgres" || engine === "mysql" || engine === "mariadb",
+			analysisOpen,
+			act: toolActs,
+		}),
+		[autoLimit, maxRows, timeoutMs, txState, closed, readOnly, canCancel, treeExplain, engine, analysisOpen],
+	);
+
 	return (
 		<DbCtx.Provider value={ctx}>
 			<LiveCtx.Provider value={live}>
 			<LockCtx.Provider value={lockValue}>
+			<ToolCtx.Provider value={toolState}>
 				<div
 					className="wb-dock-shell"
 					onKeyDownCapture={() => {
@@ -2292,120 +2657,24 @@ export function DbWorkbench({
 						lastInput.current = Date.now();
 					}}
 				>
-					<div className="wb-bar">
-						<button
-							type="button"
-							className="btn ghost"
-							disabled={running || closed}
-							onClick={() => {
-								const v = currentEditor();
-								if (v) void run(pickStatements(v, false));
-							}}
-							title="커서 문장(또는 고른 글) 실행 — Ctrl+Enter"
-						>
-							<Play size={14} /> 실행
-						</button>
-						<button
-							type="button"
-							className="btn ghost"
-							disabled={running || closed}
-							onClick={() => {
-								const v = currentEditor();
-								if (v) void run(pickStatements(v, true));
-							}}
-							title="전체 실행 — Ctrl+Shift+Enter"
-						>
-							<PlayCircle size={14} /> 전체
-						</button>
-						{canCancel && (
-							<button type="button" className="btn ghost" disabled={!running} onClick={() => void db.cancel(conn)} title="실행 중인 문장 취소">
-								<Square size={12} /> 취소
-							</button>
-						)}
-						<Select size="sm" value={timeoutMs} onChange={(v) => (setTimeoutMs(v), void api.settingSet("db.timeout", String(v)))} title="문장 시간 상한 — 넘으면 멈춘다(PostgreSQL·MySQL 은 서버가, 그 밖은 앱이 재다가 취소)" options={TIMEOUTS} />
-						<span className="sep" />
-						{!readOnly && (
-							<>
-								<button
-									type="button"
-									className={`btn ghost${txState.manual ? " on" : ""}`}
-									onClick={() => void toggleManual()}
-									title={txState.manual ? "수동 커밋 — 쓰기 문장은 트랜잭션 안에서 실행되고, 커밋·되돌리기 뒤에도 이 모드가 이어집니다(눌러 자동 커밋으로)" : "자동 커밋 — 문장마다 바로 반영(눌러 수동 커밋으로)"}
-								>
-									{txState.manual ? "수동 커밋" : "자동 커밋"}
-								</button>
-								{inTx && (
-									<>
-										<span className="badge warn" title="커밋하거나 되돌리기 전까지 다른 세션에는 보이지 않고, 잠금을 쥐고 있을 수 있습니다. 10분 동안 입력이 없으면 저절로 되돌립니다.">
-											트랜잭션 열림 · {txState.stmts}문장
-										</span>
-										<button type="button" className="btn ghost" onClick={() => void txOp("commit")}>
-											커밋
-										</button>
-										<button type="button" className="btn ghost" onClick={() => void txOp("rollback")}>
-											롤백
-										</button>
-									</>
-								)}
-							</>
-						)}
-						<button type="button" className="btn ghost" onClick={(e) => setToolsMenu({ x: e.clientX, y: e.clientY + 12 })} title="DB 도구">
-							도구 ▾
-						</button>
-						<button type="button" className="btn ghost" onClick={() => setSnip(true)} title="즐겨찾는 SQL(스니펫)">
-							<Star size={12} /> SQL
-						</button>
-						<span className="sep" />
-						<button
-							type="button"
-							className={`btn ghost${autoLimit ? " on" : ""}`}
-							title="자동 LIMIT — LIMIT 없는 SELECT 에 행 상한을 서버 쪽에도 붙인다(PostgreSQL·MySQL·MariaDB·Oracle)"
-							onClick={() => {
-								setAutoLimit((x) => !x);
-								void api.settingSet("db.autoLimit", autoLimit ? "0" : "1");
-							}}
-						>
-							<span className="lbl keep">LIMIT</span>
-						</button>
-						<button
-							type="button"
-							className={`btn ghost${confirmWrites ? " on" : ""}`}
-							title="쓰기 확인 — INSERT·UPDATE·DELETE·DDL·GRANT 를 실행 전에 모두 묻는다"
-							onClick={() => {
-								setConfirmWrites((x) => !x);
-								void api.settingSet("db.confirmWrites", confirmWrites ? "0" : "1");
-							}}
-						>
-							<Lock size={13} /> <span className="lbl">쓰기 확인</span>
-						</button>
-						<Select size="sm" value={maxRows} onChange={setMaxRows} title="결과 행 상한" options={[1000, 10_000, 100_000, 1_000_000].map((n) => ({ value: n, label: `최대 ${n.toLocaleString()}행` }))} />
-						<Select
-							size="sm"
-							value={pageSize}
-							onChange={(v) => (setPageSize(v), void api.settingSet("db.pageSize", String(v)))}
-							title="표 보기 한 쪽 행 수(서버에서 쪽 단위로 읽음)"
-							options={[100, 500, 1000, 5000, 10_000].map((n) => ({ value: n, label: `쪽 ${n.toLocaleString()}행` }))}
-						/>
-						<button type="button" className="btn ghost" title="SQL 정렬(Shift+Alt+F) — 고른 글만, 없으면 전체" onClick={formatNow}>
-							<WrapText size={14} /> <span className="lbl">정렬</span>
-						</button>
-						<button type="button" className="btn ghost" onClick={addSql} title="SQL 편집기 하나 더">
-							<FilePlus size={14} /> SQL +
-						</button>
-						<button type="button" className="btn ghost" title={locked ? "배치가 잠겨 있습니다(풀어야 초기화)" : "배치 초기화"} disabled={locked} onClick={() => dock.current && !locked && okToDiscardEdits(dirtyTitles(dbOwner(conn)), "기본 배치로 되돌리면 결과 칸이 닫혀") && defaultLayout(dock.current)}>
-							<LayoutTemplate size={14} /> 기본 배치
-						</button>
-						<LayoutLockButton locked={locked} onChange={setLocked} />
-						<span style={{ flex: 1 }} />
-						{databases.length > 1 && (
-							<Select
-								size="sm"
-								value={curDb}
-								onChange={switchDb}
-								title="데이터베이스 바꾸기 — 같은 서버의 다른 데이터베이스로 다시 연결"
-								options={(databases.includes(curDb) ? databases : [curDb, ...databases]).map((n) => ({ value: n, label: n }))}
-							/>
-						)}
+					{/* 연결 머리 — 지금 데이터베이스·서버 판·읽기 전용, 오른쪽 끝에 배치 */}
+					<div className="wb-bar dbw-head">
+						<span className="dbw-conn" title={`${engineLabel} · ${ver}`}>
+							<Database size={14} />
+							{databases.length > 1 ? (
+								<Select
+									size="sm"
+									value={curDb}
+									onChange={switchDb}
+									title="데이터베이스 바꾸기 — 같은 서버의 다른 데이터베이스로 다시 연결"
+									aria-label="데이터베이스"
+									options={(databases.includes(curDb) ? databases : [curDb, ...databases]).map((n) => ({ value: n, label: n }))}
+								/>
+							) : (
+								<b>{curDb || engineLabel}</b>
+							)}
+							<span className="dbw-ver">{ver}</span>
+						</span>
 						{readOnly && (
 							<span
 								className="badge warn"
@@ -2414,7 +2683,21 @@ export function DbWorkbench({
 								<Lock size={11} /> 읽기 전용{features.includes("readOnlySession") ? "" : "(문장 판별)"}
 							</span>
 						)}
-						<span className="badge">{ver}</span>
+						{confirmWrites && (
+							<span className="badge" title="쓰기 확인 켜짐 — INSERT·UPDATE·DELETE·DDL·GRANT 를 실행 전에 모두 묻습니다(도구 메뉴에서 끔)">
+								쓰기 확인
+							</span>
+						)}
+						{running && (
+							<span className="dbw-running" title="실행 중 — Esc 로 멈춤">
+								<span className="db-streaming-dot" /> 실행 중
+							</span>
+						)}
+						<span style={{ flex: 1 }} />
+						<button type="button" className="btn ghost" title={locked ? "배치가 잠겨 있습니다(풀어야 초기화)" : "칸 배치를 기본으로(객체 | 편집기·메시지 | 쿼리 분석)"} disabled={locked} onClick={resetLayout}>
+							<LayoutTemplate size={14} /> <span className="lbl">기본 배치</span>
+						</button>
+						<LayoutLockButton locked={locked} onChange={setLocked} />
 					</div>
 					{closed && (
 						<div className="db-notice bad">
@@ -2433,7 +2716,7 @@ export function DbWorkbench({
 						</div>
 					)}
 					<div className="wb-dock">
-						<DockviewReact theme={theme} components={components} onReady={onReady} disableDnd={locked} locked={locked} defaultTabComponent={LockTab} />
+						<DockviewReact theme={theme} components={components} onReady={onReady} disableDnd={locked} locked={locked} defaultTabComponent={LockTab} leftHeaderActionsComponent={SqlTabActions} />
 					</div>
 					{toolsMenu && (
 						<ContextMenu
@@ -2441,11 +2724,9 @@ export function DbWorkbench({
 							y={toolsMenu.y}
 							onClose={() => setToolsMenu(null)}
 							items={[
-								{ label: "객체 찾기  Alt+O", run: () => void findObjects(), disabled: !searchSql(engine, "x") },
-								{ label: "실행 계획(커서 문장)  Ctrl+E", run: () => void explain(false), disabled: !explainSql(engine, "x") && engine !== "mssql" },
-								{ label: "실제 실행 계획(ANALYZE)…", run: () => void explain(true), disabled: !(engine === "postgres" || engine === "mysql" || engine === "mariadb") },
-								{ label: "쿼리 지도(치는 동안 구조 보기)", run: () => openSide("querymap") },
-								{ label: "튜닝 도우미", run: () => openSide("tuning") },
+								{ label: "쿼리 분석 — 구조(쿼리 지도)", run: () => openAnalysis("map") },
+								{ label: "쿼리 분석 — 진단(튜닝)", run: () => openAnalysis("diag") },
+								{ label: "쿼리 분석 — 인덱스 초안", run: () => openAnalysis("index") },
 								{ sep: true },
 								{ label: "표 크기", run: () => runTool("sizes"), disabled: !toolSql(engine, "sizes") },
 								{ label: "세션(우클릭으로 멈추기·끊기)", run: () => runTool("sessions"), disabled: !toolSql(engine, "sessions") },
@@ -2453,8 +2734,24 @@ export function DbWorkbench({
 								{ label: "실행 중 쿼리·잠금 감시(자동 새로 고침)", run: () => openPanel("activity", "activity", "활동", {}) },
 								{ label: "읽기 전용 계정 만들기 SQL", run: () => readOnlyUserSql(engine, null) && openSql(readOnlyUserSql(engine, null) as string, "읽기 전용 계정"), disabled: !readOnlyUserSql(engine, null) },
 								{ sep: true },
-								{ label: "쿼리 기록  Alt+H", run: () => openPanel("history", "history", "기록", {}) },
+								{
+									label: `${tick(confirmWrites)}쓰기 확인 — 쓰기 문장을 실행 전에 묻기`,
+									run: () => {
+										setConfirmWrites(!confirmWrites);
+										void api.settingSet("db.confirmWrites", confirmWrites ? "0" : "1");
+									},
+								},
+								...[100, 500, 1000, 5000, 10_000].map((n) => ({
+									label: `${tick(pageSize === n)}표 보기 한 쪽 — ${n.toLocaleString()}행`,
+									run: () => {
+										setPageSize(n);
+										void api.settingSet("db.pageSize", String(n));
+									},
+								})),
+								{ sep: true },
+								{ label: "새 SQL 탭", run: addSql },
 								{ label: "결과 최대화·되돌리기  Alt+M", run: toggleMax },
+								{ label: "기본 배치로", run: resetLayout, disabled: locked },
 								{ label: `${locked ? "배치 잠금 풀기" : "배치 잠그기"}  Ctrl+Alt+L`, run: () => setLocked(!locked) },
 								{ sep: true },
 								...(["upper", "lower", "preserve"] as const).map((c) => ({
@@ -2512,6 +2809,7 @@ export function DbWorkbench({
 						}}
 					/>
 				)}
+			</ToolCtx.Provider>
 			</LockCtx.Provider>
 			</LiveCtx.Provider>
 		</DbCtx.Provider>
