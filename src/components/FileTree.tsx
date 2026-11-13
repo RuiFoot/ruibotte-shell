@@ -32,6 +32,39 @@ type Node = { entries?: FsEntry[]; error?: string };
 const PROTECTED = /^(\/|\/(bin|boot|dev|etc|home|lib|lib32|lib64|media|mnt|opt|proc|root|run|sbin|srv|sys|tmp|usr|var)\/?|[A-Za-z]:\/?|[A-Za-z]:\/(Windows|Program Files|Program Files \(x86\)|ProgramData|Users)\/?)$/i;
 /** 큰 폴더는 이만큼씩 그린다 */
 const PAGE = 500;
+
+/** 행을 감싼 스크롤 칸(overflow auto/scroll 이고 실제로 넘치는 조상) */
+function scrollerOf(el: HTMLElement): HTMLElement | null {
+	for (let p = el.parentElement; p; p = p.parentElement) {
+		const oy = getComputedStyle(p).overflowY;
+		if ((oy === "auto" || oy === "scroll") && p.scrollHeight > p.clientHeight) return p;
+	}
+	return null;
+}
+
+/**
+ * 터미널 따라가기로 고른 폴더를 보이게 — 행이 칸 위쪽 1/4 안에 이미 있으면 그대로 두고,
+ * 아니면(아래쪽에 붙었거나 가려졌으면) 행 하나 여유를 두고 위쪽으로 올려 펼친 안이 아래에 보이게 한다.
+ * 펼친 목록이 그려지기 전일 수 있어 행이 나타날 때까지 몇 프레임 기다린다.
+ */
+function revealScroll(body: HTMLElement | null, path: string, cancelled: () => boolean) {
+	let tries = 0;
+	const tick = () => {
+		if (cancelled() || !body) return;
+		const el = body.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
+		const box = el ? scrollerOf(el) : null;
+		if (!el || !box) {
+			if (++tries < 12) requestAnimationFrame(tick);
+			else el?.scrollIntoView({ block: "nearest" });
+			return;
+		}
+		const b = box.getBoundingClientRect();
+		const r = el.getBoundingClientRect();
+		const comfy = r.top >= b.top && r.bottom <= b.top + b.height / 4;
+		if (!comfy) box.scrollTo({ top: Math.max(0, box.scrollTop + (r.top - b.top) - r.height) });
+	};
+	requestAnimationFrame(tick);
+}
 /** 탐색기에서 끌어 놓은 파일을 보내는 조각 크기 */
 const CHUNK = 4 * 1024 * 1024;
 
@@ -214,7 +247,8 @@ export const FileTree = memo(function FileTree({
 				return n;
 			});
 			setCur(target);
-			requestAnimationFrame(() => bodyRef.current?.querySelector<HTMLElement>(`[data-path="${CSS.escape(target)}"]`)?.scrollIntoView({ block: "nearest" }));
+			// 따라간 폴더를 위쪽으로 올려 그 안(펼친 내용)이 아래에 보이게 — "nearest" 는 아래 끝에 붙여 안이 가려졌다
+			revealScroll(bodyRef.current, target, () => gone);
 		})();
 		return () => {
 			gone = true;
