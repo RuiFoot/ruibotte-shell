@@ -1458,8 +1458,11 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 		const b = d.bounds;
 		const pad = 28;
 		const z = Math.min(1.05, (W - pad * 2) / Math.max(1, b.w), (H - pad * 2) / Math.max(1, b.h));
+		// 이 배율까지 줄여 다 들어가면 전체를 가운데에(작은 그래프가 세로로 길 때도 통째로),
+		// 더 크면 결과 쪽을 읽을 만한 배율(MINZ)로
+		const FITZ = 0.45;
 		const MINZ = 0.6;
-		if (z >= MINZ || !d.result) {
+		if (z >= FITZ || !d.result) {
 			const zz = Math.max(0.12, z);
 			void inst.setViewport({ zoom: zz, x: (W - b.w * zz) / 2 - b.x * zz, y: (H - b.h * zz) / 2 - b.y * zz });
 			return;
