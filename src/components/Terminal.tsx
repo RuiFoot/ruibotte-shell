@@ -71,6 +71,8 @@ const FIND_OPTS = {
 
 /** 줄 바꾸지 않기의 열 수 — docker ps·ps aux 같은 긴 줄이 한 줄에 들어가게 */
 const WIDE_COLS = 320;
+/** 수식 키만 누름(조합을 끝내지 않는다) */
+const MOD_KEY_NAMES = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph", "CapsLock", "Process"]);
 
 export function TerminalView({
 	backend,
@@ -948,14 +950,37 @@ export function TerminalView({
 			});
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
+		/**
+		 * 앱이 가로채는 Ctrl/⌘/Alt 조합(복사·붙여넣기·찾기·글자 크기·명령 사이 이동·Alt+Z·Alt+P·풀이) — 아래 appKey 와 같은 규칙.
+		 * 한글 조합 중·꼬리에도 xterm 으로 넘기지 않는다(넘기면 ^V·^C 가 셸로 간다). 229(IME 가 처리 중인 키)는 IME 몫
+		 */
+		const appShortcut = (e: KeyboardEvent) => {
+			if (e.type !== "keydown" || e.keyCode === 229 || MOD_KEY_NAMES.has(e.key)) return false;
+			const mod = e.ctrlKey || e.metaKey;
+			if (!mod && !e.altKey) return false;
+			if (mod && !e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) return true;
+			const plainCtrl = IS_MAC ? e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey : e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+			if (plainCtrl && e.code === "KeyC") return term.hasSelection();
+			if (plainCtrl && e.code === "KeyV") return IS_MAC || !ctrlVSend;
+			if (mod && e.shiftKey && !e.altKey && (e.code === "KeyC" || e.code === "KeyV" || e.code === "KeyF" || (ax && e.code === "KeyE"))) return true;
+			if (mod && !e.shiftKey && (e.key === "=" || e.key === "+" || e.key === "-" || e.key === "0")) return true;
+			if (e.altKey && !mod && e.code === "KeyZ") return true;
+			return e.altKey && e.code === "KeyP";
+		};
 		term.attachCustomKeyEventHandler((e) => {
-			// ── IME 조합(한글 등) — 앱의 키 가로채기(Tab 목록·흐린 제안·단축키·빈칸 이동)를 모두 건너뛰고 xterm 에 맡긴다 ──
+			// ── IME 조합(한글 등) — 앱의 키 가로채기(Tab 목록·흐린 제안·빈칸 이동)를 모두 건너뛰고 xterm 에 맡긴다. 앱 단축키(Ctrl/⌘/Alt)만은 앱이 ──
 			const wk = ime.key(e);
 			if (wk !== undefined) return wk;
-			if (ime.composing() || e.isComposing || e.keyCode === 229) return true;
+			const shortcut = appShortcut(e);
+			if ((ime.composing() || e.isComposing || e.keyCode === 229) && !shortcut) return true;
 			if (ime.tail() && e.type === "keydown") {
-				// 조합을 끝낸 키(Windows: Enter·Tab·방향키는 조합을 끝내고 한 번 더 온다) — 확정 글자가 아직 셸로 가지 않았다.
-				// xterm 에 넘기면 확정 글자를 먼저 보내고 그 키를 처리한다. 빈칸 이동(Tab·Esc)만은 확정 글자가 간 뒤에 앱이 처리
+				// 조합을 끝낸 키(Windows: Enter·Tab·방향키·Ctrl+V 는 조합을 끝내고 한 번 더 온다) — 확정 글자가 아직 셸로 가지 않았다.
+				// xterm 에 넘기면 확정 글자를 먼저 보내고 그 키를 처리한다. 빈칸 이동(Tab·Esc)·앱 단축키는 확정 글자가 간 뒤에 앱이 처리
+				if (shortcut) {
+					e.preventDefault();
+					window.setTimeout(() => appKey(e), 0);
+					return false;
+				}
 				if (ax?.templating() && (e.key === "Tab" || e.key === "Escape") && !e.ctrlKey && !e.altKey && !e.metaKey) {
 					e.preventDefault();
 					e.stopPropagation();
@@ -964,6 +989,10 @@ export function TerminalView({
 				}
 				return true;
 			}
+			return appKey(e);
+		});
+		/** 조합 밖 키 처리 — false 면 xterm 이 처리하지 않는다 */
+		const appKey = (e: KeyboardEvent): boolean => {
 			// 입력 보조(D25) — 빈칸 Tab 이 자동완성 Tab 보다 먼저, Ctrl+Shift+E 풀이
 			if (ax && !ax.key(e)) {
 				e.preventDefault();
@@ -1047,7 +1076,7 @@ export function TerminalView({
 				return false;
 			}
 			return true;
-		});
+		};
 		// 여러 줄 붙여넣기 확인 — xterm 이 받기 전에 가로챈다
 		const ta = term.textarea;
 		// 사전에서 "터미널에 넣기" 할 대상 — 마지막으로 포커스를 받은 터미널

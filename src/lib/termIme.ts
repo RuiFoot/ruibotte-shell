@@ -16,8 +16,9 @@ const HANGUL = /^[ᄀ-ᇿ㄰-㆏ꥠ-꥿가-힯ힰ-퟿]/;
 /** 조합을 끝내지 않는 키(Shift 로 된소리, Caps Lock·Ctrl·Alt·Meta 만 누름) */
 const MOD_ONLY = new Set([16, 17, 18, 20, 91, 92, 93, 224]);
 
-/** WKWebView — Tauri macOS 의 웹뷰(Chromium 계열이 아닌 WebKit) */
-export const IS_WEBKIT = /AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent);
+/** WKWebView — Tauri macOS 의 웹뷰(Chromium 계열이 아닌 WebKit). 리눅스 WebKitGTK 도 UA 가 AppleWebKit 이지만 IME 경로가 달라 맥만 */
+export const IS_WEBKIT =
+	/AppleWebKit/.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent) && /Mac/.test(navigator.platform || navigator.userAgent);
 
 export type TermIme = {
 	/** 조합 중(compositionstart~end, WebKit 흉내 조합 포함) */
@@ -134,10 +135,23 @@ export function attachIme(o: {
 			e.stopImmediatePropagation();
 			return;
 		}
-		// 한글이 아닌 글자(숫자·문장 부호·영문) — 앞 음절을 먼저 보내고 xterm 이 이어 처리
-		if (e.inputType === "insertText") flush();
+		// 한글이 아닌 글자(숫자·공백·문장 부호·영문) — 앞 음절을 먼저 보내고 그 글자를 잇는다
+		if (e.inputType === "insertText" && pending != null) {
+			flush();
+			// 흉내 조합 중의 키는 229 로 와서 xterm 에 넘기지 않았다(key) — 그 keydown 이 '본' 상태라 xterm 은 composed 입력을 버린다
+			// (CoreBrowserTerminal._inputEvent: !composed || !keyDownSeen 일 때만 보냄). 그 조건이면 여기서 보낸다(공백·문장 부호 유실 방지)
+			if (e.data && e.composed) {
+				term.input(e.data, true);
+				e.stopImmediatePropagation();
+			}
+		}
 	};
-	if (o.webkit) host.addEventListener("input", onInput, true);
+	/** 다른 칸으로 포커스가 가면 조합 중 음절을 확정해 보낸다(맥 IME 는 흉내 조합을 모른다 — 그대로 두면 음절이 사라진다) */
+	const onBlur = () => flush();
+	if (o.webkit) {
+		host.addEventListener("input", onInput, true);
+		ta?.addEventListener("blur", onBlur);
+	}
 
 	return {
 		composing: () => composing || pending != null,
@@ -153,6 +167,7 @@ export function attachIme(o: {
 			ta?.removeEventListener("compositionstart", onStart);
 			ta?.removeEventListener("compositionend", onEnd);
 			host.removeEventListener("input", onInput, true);
+			ta?.removeEventListener("blur", onBlur);
 			pending = null;
 		},
 	};
