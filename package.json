@@ -13,7 +13,8 @@
 		"app:build": "tauri build",
 		"version:check": "node scripts/check-version.mjs",
 		"version:set": "node scripts/set-version.mjs",
-		"css:check": "node scripts/check-css.mjs"
+		"css:check": "node scripts/check-css.mjs",
+		"test:sql": "node --import ./scripts/test/ts-hook.mjs scripts/test/sql-complete.test.ts"
 	},
 	"dependencies": {
 		"@codemirror/autocomplete": "^6.20.4",

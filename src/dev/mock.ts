@@ -29,6 +29,16 @@ const MOCK_TABLE_COLS = (() => {
 })();
 
 
+/** 목업 DB 표의 열 — [이름, detail] */
+const MOCK_COLUMNS: Record<string, [string, string][]> = {
+	customer: [["id", "bigint · NOT NULL · PK"], ["name", "varchar(200) · NOT NULL"], ["email", "varchar(320) · 인덱스"], ["created_at", "timestamptz · NOT NULL"]],
+	orders: [["id", "bigint · NOT NULL · PK"], ["customer_id", "bigint · NOT NULL · 인덱스"], ["status", "varchar(20) · NOT NULL"], ["total", "numeric(12,2)"], ["created_at", "timestamptz · NOT NULL · 인덱스"]],
+	order_item: [["id", "bigint · NOT NULL · PK"], ["order_id", "bigint · NOT NULL · 인덱스"], ["product_id", "bigint · NOT NULL"], ["qty", "integer · NOT NULL"], ["price", "numeric(12,2)"]],
+	product: [["id", "bigint · NOT NULL · PK"], ["name", "varchar(200) · NOT NULL"], ["price", "numeric(12,2)"], ["category", "varchar(50)"]],
+	v_sales: [["day", "date"], ["orders", "bigint"], ["total", "numeric"]],
+};
+const MOCK_ROWS = [["customer", "48210"], ["orders", "1294033"], ["order_item", "3871200"], ["product", "2380"]];
+
 const settings = new Map<string, string>();
 // 쿼리 분석 칸 점검용 초안(운영 PostgreSQL 프로필의 첫 SQL 탭) — 쿼리 지도 예시 문장들
 settings.set("sql.draft.3.1", `${QUERY_MAP_SAMPLES.map((x) => x.sql).join(";\n\n")};
@@ -447,17 +457,27 @@ export function installMock() {
 					if (p.length === 0) return ["public", "audit"].map((n) => ({ name: n, kind: "schema" }));
 					if (p.length === 1) {
 						const names = [...new Set(["customer", "orders", "order_item", "product", "v_sales", ...MOCK_TABLE_COLS.keys()])];
-						return names.map((n, i) => ({ name: n, kind: n === "v_sales" ? "view" : "table", detail: n === "v_sales" ? null : `${(i + 1) * 1200}행` }));
+						return names.map((n) => ({ name: n, kind: n === "v_sales" ? "view" : "table", detail: null }));
 					}
-					return ["id", "name", "created_at", "status"].map((n, i) => ({ name: n, kind: "column", detail: ["bigint PK", "varchar(200)", "timestamptz", "text"][i] }));
+					// 표마다 열(Rust 와 같은 detail 모양: 형식 · NOT NULL · PK|인덱스) — SQL 완성 화면 점검용, 쿼리 지도 예시 표는 그 열 이름으로
+					const known = MOCK_COLUMNS[String(p[1])];
+					if (known) return known.map(([n, d]) => ({ name: n, kind: "column", detail: d }));
+					const sample = MOCK_TABLE_COLS.get(String(p[1]).toLowerCase());
+					if (sample) return sample.map((n) => ({ name: n, kind: "column", detail: "text" }));
+					return MOCK_COLUMNS.customer.map(([n, d]) => ({ name: n, kind: "column", detail: d }));
 				}
 				case "db_query":
+					// SQL 완성의 기본 스키마·행 수 추정
+					if (/current_schema\(\)/.test(String(args.sql))) return { resultId: 91, columns: [{ name: "s", kind: "text" }], rowCount: 1, truncated: false, ms: 1 };
+					if (/reltuples/.test(String(args.sql))) return { resultId: 92, columns: [{ name: "t", kind: "text" }, { name: "n", kind: "int" }], rowCount: MOCK_ROWS.length, truncated: false, ms: 1 };
 					// 카탈로그(인덱스·FK) 읽기는 빈 결과 — 가짜 행이 인덱스로 읽히지 않게
 					if (/pg_index|pg_constraint/.test(String(args.sql))) return { resultId: null, columns: [], rowCount: 0, truncated: false, ms: 1 };
 					if (/current_database\(\)/.test(String(args.sql))) return { resultId: 2, columns: [{ name: "current_database", kind: "text" }], rowCount: 1, truncated: false, ms: 1 };
 					return { resultId: 1, columns: [{ name: "id", kind: "int" }, { name: "name", kind: "text" }, { name: "created_at", kind: "datetime" }, { name: "status", kind: "text" }], rowCount: 240, truncated: false, ms: 12, firstRowMs: 4 };
 				case "db_rows": {
 					if (Number(args.result) === 2) return [["app"]];
+					if (args.result === 91) return [["public"]];
+					if (args.result === 92) return MOCK_ROWS;
 					const from = Number(args.from);
 					const to = Number(args.to);
 					return Array.from({ length: Math.max(0, Math.min(240, to) - from) }, (_, i) => [String(from + i + 1), `고객 ${from + i + 1}`, "2026-11-05 09:00:00", i % 7 === 0 ? null : "active"]);
