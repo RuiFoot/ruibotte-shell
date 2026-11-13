@@ -79,6 +79,36 @@ fn apply_backdrop(window: &tauri::WebviewWindow) -> bool {
     }
 }
 
+/// 충돌(panic) 기록 — 앱 데이터 폴더의 crash.log 에 시각·스레드·위치·내용을 덧붙인다(릴리스는 panic=abort 라 그 자리에서 꺼진다).
+/// 파일이 1 MiB 를 넘으면 처음부터 다시 쓴다. 기본 처리(표준 오류 출력)도 그대로 한다
+fn install_panic_log(path: std::path::PathBuf) {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let thread = std::thread::current().name().unwrap_or("?").to_string();
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(알 수 없는 내용)".into());
+        let at = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let big = std::fs::metadata(&path).map(|m| m.len() > 1024 * 1024).unwrap_or(false);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path) {
+            let _ = writeln!(
+                f,
+                "[{secs}] v{} {}-{} thread={thread} at {at}\n  {msg}\n{}\n",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        default(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -100,6 +130,7 @@ pub fn run() {
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             let (dir, portable) = store::data_dir(app_data);
+            install_panic_log(dir.join("crash.log"));
             let st = store::Store::open(dir, portable)?;
             // 예전 판 비밀(서버 기준)을 계정 키로 — 못 옮긴 것은 다음에 켤 때 다시
             let (moved, failed) = st.migrate_secrets();
@@ -200,6 +231,8 @@ pub fn run() {
             transfer::transfer_start,
             sudo::sudo_check,
             importer::import_candidates,
+            importer::known_hosts_scan,
+            importer::known_hosts_import,
             db::db_connect,
             db::db_disconnect,
             db::db_query,

@@ -472,24 +472,67 @@ pub(crate) fn tcp_hint(e: Option<&std::io::Error>, ip: Option<&IpAddr>) -> Strin
     format!("{base}{private}")
 }
 
-/// TCP 연결(이름 풀이 포함) — 주소를 차례로, 남은 시간 안에서
+/// 주소 순서 — IPv6·IPv4 를 번갈아(RFC 8305 §4). 처음 주소의 계열부터
+pub(crate) fn interleave(addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(|a| a.is_ipv6());
+    let (mut a, mut b): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) = addrs.into_iter().partition(|x| x.is_ipv6() == first_v6);
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    while !a.is_empty() || !b.is_empty() {
+        out.extend(a.pop_front());
+        out.extend(b.pop_front());
+    }
+    out
+}
+
+/// 다음 주소를 시작하기까지 기다리는 시간(RFC 8305 의 Connection Attempt Delay)
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// TCP 연결(이름 풀이 포함) — 주소가 여럿이면 Happy Eyeballs 간이판: 250ms 간격으로 다음 주소를 더 시작해 먼저 붙는 것을 쓴다.
+/// 앞 주소가 바로 실패하면 기다리지 않고 다음으로. 전체는 limit 안에서
 pub(crate) async fn tcp(host: &str, port: u16, limit: Duration) -> Result<TcpStream, LegErr> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
     let start = Instant::now();
     let (addrs, _) = resolve(host, port, limit.min(Duration::from_secs(3))).await?;
+    let addrs = interleave(addrs);
+    let deadline = tokio::time::Instant::now() + limit.saturating_sub(start.elapsed());
+    let connect = |a: std::net::SocketAddr| async move { (a, TcpStream::connect(a).await) };
+    let mut running = FuturesUnordered::new();
+    let mut next = 0usize;
     let mut last: Option<(std::io::Error, IpAddr)> = None;
     let mut timed_out = None;
-    for a in &addrs {
-        let left = limit.saturating_sub(start.elapsed());
-        if left.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(left, TcpStream::connect(a)).await {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                return Ok(s);
+    loop {
+        if running.is_empty() {
+            if next >= addrs.len() {
+                break;
             }
-            Ok(Err(e)) => last = Some((e, a.ip())),
-            Err(_) => timed_out = Some(a.ip()),
+            running.push(connect(addrs[next]));
+            next += 1;
+        }
+        let more = next < addrs.len();
+        tokio::select! {
+            r = running.next() => match r {
+                Some((_, Ok(s))) => {
+                    let _ = s.set_nodelay(true);
+                    return Ok(s); // 남은 시도는 버린다(연결 중인 소켓은 닫힌다)
+                }
+                Some((a, Err(e))) => {
+                    last = Some((e, a.ip()));
+                    // 실패하면 250ms 를 기다리지 않고 바로 다음 주소(RFC 8305 §5)
+                    if next < addrs.len() {
+                        running.push(connect(addrs[next]));
+                        next += 1;
+                    }
+                }
+                None => {}
+            },
+            _ = tokio::time::sleep(ATTEMPT_DELAY), if more => {
+                running.push(connect(addrs[next]));
+                next += 1;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                timed_out = addrs.get(next.saturating_sub(1)).map(|a| a.ip());
+                break;
+            }
         }
     }
     match (last, timed_out) {
@@ -793,6 +836,29 @@ pub(crate) async fn read_banner<S: AsyncRead + Unpin>(s: &mut S, limit: Duration
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaves_families() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        let v = interleave(vec![a("[::1]:22"), a("[::2]:22"), a("10.0.0.1:22"), a("10.0.0.2:22"), a("10.0.0.3:22")]);
+        assert_eq!(v, vec![a("[::1]:22"), a("10.0.0.1:22"), a("[::2]:22"), a("10.0.0.2:22"), a("10.0.0.3:22")]);
+        assert!(interleave(Vec::new()).is_empty());
+    }
+
+    /// localhost 가 ::1·127.0.0.1 둘로 풀려도 IPv4 에만 열린 포트에 붙는다(앞 주소가 거절되면 바로 다음)
+    #[tokio::test]
+    async fn tcp_falls_through_addresses() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let t = Instant::now();
+        let s = tcp("localhost", port, Duration::from_secs(5)).await;
+        assert!(s.is_ok(), "{:?}", s.err());
+        assert!(t.elapsed() < Duration::from_secs(4));
+        // 닫힌 포트는 시간을 다 쓰지 않고 거절 오류로
+        drop(l);
+        let e = tcp("127.0.0.1", port, Duration::from_secs(5)).await.err().unwrap();
+        assert!(e.message.contains("연결하지 못했습니다"), "{}", e.message);
+    }
 
     #[test]
     fn expands_proxy_command() {
