@@ -14,7 +14,7 @@ use sqlparser::tokenizer::{Location, Span};
 use std::ops::ControlFlow;
 
 /// 이보다 긴 문장은 지도를 그리지 않는다(치는 동안 파싱 비용)
-const MAX_SQL: usize = 1 << 20;
+const MAX_SQL: usize = 256 << 10;
 
 /// [시작, 끝) — 문장 안의 UTF-16 위치(편집기 위치와 같은 단위)
 type Pos = Option<[u32; 2]>;
@@ -62,6 +62,8 @@ pub struct TableRef {
     pub virt: bool,
     /// UPDATE·DELETE·INSERT 의 대상 표
     pub target: bool,
+    /// 열을 한정할 때 쓰는 원문 표기(별칭 또는 표 이름, 따옴표 그대로) — 바꿔 쓰기용
+    pub qual_text: String,
     pub pos: Pos,
 }
 
@@ -148,12 +150,60 @@ fn parse_one(d: &dyn Dialect, sql: &str) -> Result<Option<Statement>, String> {
 /// 쿼리 구조 지도 — 문장 하나(화면이 커서 문장만 보낸다)
 #[tauri::command(async)]
 pub fn sql_map(sql: String, engine: String) -> QueryMap {
-    build(&sql, &engine)
+    // 긴 AND/OR 사슬은 파서가 반복문으로 읽어 깊은 AST 가 된다 — 그 뒤의 위치 계산·걷기·Drop 이 재귀라
+    // 큰 스택을 가진 전용 스레드에서 끝까지(AST 해제까지) 한다. 일꾼 스레드 기본 스택(2MB)은 수천 항에서 넘친다.
+    let run = std::thread::Builder::new().name("sql-map".into()).stack_size(BIG_STACK).spawn(move || build(&sql, &engine));
+    match run.map(|h| h.join()) {
+        Ok(Ok(m)) => m,
+        _ => QueryMap { error: Some("이 문장은 지도를 그리지 못했습니다".into()), kind: "other", ..Default::default() },
+    }
+}
+
+/// 전용 스레드 스택(예약만 하고 쓰는 만큼만 잡힌다)
+const BIG_STACK: usize = 256 << 20;
+/// 이보다 많은 이항 연산(AND·OR·+·|| …)이 있으면 그리지 않는다 — 깊은 재귀 막기
+const MAX_CHAIN: usize = 4000;
+/// 결과가 이보다 크면 그리지 않는다(화면 쪽 계산·전송 크기)
+const MAX_COLS: usize = 4000;
+
+/// 이항 연산 수 대강 세기(따옴표 안 제외) — 파싱 전에 큰 사슬을 거른다
+fn chain_len(sql: &str) -> usize {
+    let mut n = 0;
+    let mut quoted = false;
+    let b = sql.as_bytes();
+    let mut word = String::new();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'\'' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            word.push(c.to_ascii_lowercase() as char);
+            continue;
+        }
+        if word == "and" || word == "or" {
+            n += 1;
+        }
+        word.clear();
+        if matches!(c, b'+' | b'*' | b'/' | b'=' | b'<' | b'>') || (c == b'|' && b.get(i + 1) == Some(&b'|')) {
+            n += 1;
+        }
+    }
+    if word == "and" || word == "or" {
+        n += 1;
+    }
+    n
 }
 
 pub fn build(sql: &str, engine: &str) -> QueryMap {
     if sql.len() > MAX_SQL {
         return QueryMap { error: Some("문장이 너무 커서 지도를 그리지 않습니다".into()), kind: "other", ..Default::default() };
+    }
+    if chain_len(sql) > MAX_CHAIN {
+        return QueryMap { error: Some("조건·연산이 너무 많아 지도를 그리지 않습니다".into()), kind: "other", ..Default::default() };
     }
     let (d, name) = dialect_of(engine);
     let (st, used) = match parse_one(d.as_ref(), sql) {
@@ -175,44 +225,50 @@ pub fn build(sql: &str, engine: &str) -> QueryMap {
     let mut b = Builder { pos: PosMap::new(sql), ..Default::default() };
     b.statement(&st);
     b.finish();
+    if b.cols.len() > MAX_COLS {
+        return QueryMap { error: Some("열이 너무 많아 지도를 그리지 않습니다".into()), kind: "other", dialect: used, ..Default::default() };
+    }
     QueryMap { ok: true, error: None, kind: b.kind, dialect: used, scopes: b.scopes, tables: b.tables, joins: b.joins, cols: b.cols, facts: b.facts }
 }
 
 /// 줄·열(문자 단위, 1부터) → UTF-16 위치
 #[derive(Default)]
 struct PosMap {
-    /// 줄마다 (바이트 시작, UTF-16 시작)
-    lines: Vec<(usize, u32)>,
-    text: String,
+    /// 문자 번호 → UTF-16 위치(끝에 하나 더) — 위치 하나를 O(1) 로
+    char_u16: Vec<u32>,
+    /// 줄마다 첫 문자 번호(끝에 전체 문자 수)
+    line_char: Vec<usize>,
     units: Vec<u16>,
 }
 
 impl PosMap {
     fn new(s: &str) -> Self {
-        let mut lines = vec![(0usize, 0u32)];
+        let mut char_u16 = Vec::with_capacity(s.len() + 1);
+        let mut line_char = vec![0usize];
         let mut u = 0u32;
-        for (i, ch) in s.char_indices() {
+        for (n, ch) in s.chars().enumerate() {
+            char_u16.push(u);
             u += ch.len_utf16() as u32;
             if ch == '\n' {
-                lines.push((i + 1, u));
+                line_char.push(n + 1);
             }
         }
-        PosMap { lines, text: s.to_string(), units: s.encode_utf16().collect() }
+        char_u16.push(u);
+        let total = char_u16.len() - 1;
+        line_char.push(total);
+        PosMap { char_u16, line_char, units: s.encode_utf16().collect() }
     }
     fn at(&self, l: Location) -> Option<u32> {
         if l.line == 0 || l.column == 0 {
             return None;
         }
-        let (b, u) = *self.lines.get(l.line as usize - 1)?;
-        let rest = self.text.get(b..)?;
-        let mut off = u;
-        for (n, ch) in rest.chars().enumerate() {
-            if n as u64 + 1 >= l.column || ch == '\n' {
-                return Some(off);
-            }
-            off += ch.len_utf16() as u32;
-        }
-        Some(off)
+        let line = l.line as usize - 1;
+        let start = *self.line_char.get(line)?;
+        // 줄 끝(다음 줄 첫 문자 앞의 \n 자리)을 넘지 않게
+        let next = self.line_char.get(line + 1).copied().unwrap_or(start);
+        let end = if line + 2 < self.line_char.len() { next.saturating_sub(1) } else { next };
+        let idx = (start + l.column as usize - 1).min(end.max(start));
+        self.char_u16.get(idx).copied()
     }
     fn span(&self, s: Span) -> Pos {
         let a = self.at(s.start)?;
@@ -266,6 +322,12 @@ struct Builder {
     where_pairs: Vec<(u32, u32, u32)>,
     /// LIMIT·TOP·FETCH 가 있는 묶음
     limited: Vec<u32>,
+    /// SELECT 별칭(묶음, 소문자) — ORDER BY·GROUP BY·HAVING 의 별칭은 열이 아니다
+    aliases: Vec<(u32, String)>,
+    /// WHERE 조건 하나에 함께 나온 열(묶음, 열 id 범위) — 두 표의 열이 섞이면 두 표는 이어졌다
+    where_links: Vec<(u32, u32, u32)>,
+    /// 쉼표 오른쪽에 와도 데카르트 곱이 아닌 표(LATERAL·표 함수)
+    no_cartesian: Vec<u32>,
 }
 
 fn ident_name(i: &Ident) -> String {
@@ -304,17 +366,26 @@ fn op_text(op: &BinaryOperator) -> &'static str {
     }
 }
 
+/// 괄호·Oracle (+) 벗기기
 fn strip(e: &Expr) -> &Expr {
     let mut e = e;
-    while let Expr::Nested(x) = e {
-        e = x;
+    loop {
+        match e {
+            Expr::Nested(x) | Expr::OuterJoin(x) => e = x,
+            _ => return e,
+        }
     }
-    e
+}
+
+/// @변수·@@시스템 변수(MSSQL·MySQL) — 열이 아니다
+fn is_var(i: &Ident) -> bool {
+    i.quote_style.is_none() && i.value.starts_with('@')
 }
 
 /// 그냥 열(감싸지 않은) — 이름 조각들
 fn plain_col(e: &Expr) -> Option<Vec<&Ident>> {
     match strip(e) {
+        Expr::Identifier(i) if is_var(i) => None,
         Expr::Identifier(i) => Some(vec![i]),
         Expr::CompoundIdentifier(v) if !v.is_empty() => Some(v.iter().collect()),
         _ => None,
@@ -384,6 +455,7 @@ impl Visitor for Scan {
             return ControlFlow::Continue(());
         }
         match e {
+            Expr::Identifier(i) if is_var(i) => {}
             Expr::Identifier(i) => self.cols.push((vec![i.clone()], i.span)),
             Expr::CompoundIdentifier(v) if !v.is_empty() => self.cols.push((v.clone(), e.span())),
             _ => {}
@@ -498,15 +570,21 @@ impl Builder {
 
     fn query(&mut self, q: &Query, s: u32, top: bool) {
         if let Some(w) = &q.with {
-            // 먼저 이름을 모두 올린다(재귀·앞쪽 참조)
+            // WITH RECURSIVE 는 이름을 먼저 올린다(자기 참조). 아니면 본문을 읽은 뒤 올린다 —
+            // WITH orders AS (SELECT … FROM orders) 의 안쪽 orders 는 실제 표다
             let mut ids = Vec::new();
             for c in &w.cte_tables {
                 let id = self.scope("cte", Some(ident_name(&c.alias.name)), Some(s), self.pos.span(c.span()));
-                self.ctes.push((c.alias.name.value.to_lowercase(), id, s));
+                if w.recursive {
+                    self.ctes.push((c.alias.name.value.to_lowercase(), id, s));
+                }
                 ids.push(id);
             }
             for (c, id) in w.cte_tables.iter().zip(ids) {
                 self.query(&c.query, id, false);
+                if !w.recursive {
+                    self.ctes.push((c.alias.name.value.to_lowercase(), id, s));
+                }
             }
         }
         self.set_expr(&q.body, s);
@@ -553,7 +631,9 @@ impl Builder {
 
     fn order_list(&mut self, v: &[OrderByExpr], s: u32) {
         for o in v {
-            self.collect(&o.expr, s, "order", None, None);
+            // lower(name) 같은 식은 그 열의 인덱스로 정렬을 받지 못한다
+            let w = if plain_col(&o.expr).is_some() { None } else { Some(wrapper_name(&o.expr).unwrap_or_else(|| "식".into())) };
+            self.collect(&o.expr, s, "order", None, w);
         }
     }
 
@@ -578,6 +658,11 @@ impl Builder {
     fn select(&mut self, sel: &Select, s: u32) {
         if sel.top.is_some() {
             self.limited.push(s);
+        }
+        for item in &sel.projection {
+            if let SelectItem::ExprWithAlias { alias, .. } = item {
+                self.aliases.push((s, alias.value.to_lowercase()));
+            }
         }
         for (i, item) in sel.from.iter().enumerate() {
             let before = self.tables.iter().filter(|t| t.scope == s).map(|t| t.id).next_back();
@@ -686,14 +771,24 @@ impl Builder {
             None
         };
         let id = self.tables.len() as u32;
-        self.tables.push(TableRef { id, scope: s, schema, name, alias: alias.map(ident_name), cte, derived: None, virt: false, target, pos: self.pos.span(n.span()) });
+        let qual_text = alias.map(|a| a.to_string()).unwrap_or_else(|| n.to_string());
+        self.tables.push(TableRef { id, scope: s, schema, name, alias: alias.map(ident_name), cte, derived: None, virt: false, target, qual_text, pos: self.pos.span(n.span()) });
         id
     }
 
     fn factor(&mut self, f: &TableFactor, s: u32) -> Option<u32> {
         match f {
-            TableFactor::Table { name, alias, .. } => Some(self.table_ref(name, alias.as_ref().map(|a| &a.name), s, false)),
-            TableFactor::Derived { subquery, alias, .. } => {
+            TableFactor::Table { name, alias, args, .. } => {
+                let id = self.table_ref(name, alias.as_ref().map(|a| &a.name), s, false);
+                // jsonb_array_elements(o.items) 같은 표 함수 — 실표가 아니고, 앞 표의 열을 받으니 데카르트 곱도 아니다
+                if args.is_some() {
+                    self.tables[id as usize].virt = true;
+                    self.tables[id as usize].cte = None;
+                    self.no_cartesian.push(id);
+                }
+                Some(id)
+            }
+            TableFactor::Derived { subquery, alias, lateral, .. } => {
                 let nm = alias.as_ref().map(|a| ident_name(&a.name));
                 let sub = self.scope("derived", nm.clone(), Some(s), self.pos.span(subquery.span()));
                 let id = self.tables.len() as u32;
@@ -707,8 +802,12 @@ impl Builder {
                     derived: Some(sub),
                     virt: true,
                     target: false,
+                    qual_text: alias.as_ref().map(|a| a.name.to_string()).unwrap_or_default(),
                     pos: self.pos.span(f.span()),
                 });
+                if *lateral {
+                    self.no_cartesian.push(id);
+                }
                 self.query(subquery, sub, false);
                 Some(id)
             }
@@ -719,13 +818,13 @@ impl Builder {
                 if text.chars().count() > 40 {
                     text = text.chars().take(40).collect::<String>() + "…";
                 }
-                let alias = match other {
-                    TableFactor::TableFunction { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::UNNEST { alias, .. } | TableFactor::JsonTable { alias, .. } => {
-                        alias.as_ref().map(|a| ident_name(&a.name))
-                    }
+                let alias_id = match other {
+                    TableFactor::TableFunction { alias, .. } | TableFactor::Function { alias, .. } | TableFactor::UNNEST { alias, .. } | TableFactor::JsonTable { alias, .. } => alias.as_ref().map(|a| &a.name),
                     _ => None,
                 };
-                self.tables.push(TableRef { id, scope: s, schema: None, name: text, alias, cte: None, derived: None, virt: true, target: false, pos: self.pos.span(other.span()) });
+                let (alias, qual_text) = (alias_id.map(ident_name), alias_id.map(|a| a.to_string()).unwrap_or_default());
+                self.tables.push(TableRef { id, scope: s, schema: None, name: text, alias, cte: None, derived: None, virt: true, target: false, qual_text, pos: self.pos.span(other.span()) });
+                self.no_cartesian.push(id);
                 Some(id)
             }
         }
@@ -749,6 +848,9 @@ impl Builder {
             if parts.len() == 1 && parts[0].quote_style.is_none() && matches!(name.to_ascii_lowercase().as_str(), "true" | "false" | "null" | "current_date" | "current_timestamp" | "sysdate") {
                 continue;
             }
+            if parts.len() == 1 && matches!(role, "order" | "group" | "having") && self.is_alias(s, &name) {
+                continue;
+            }
             let qual = (parts.len() > 1).then(|| ident_name(&parts[parts.len() - 2]));
             let id = self.push_col(s, None, qual, name, role, pred, wrapped.clone(), sp);
             first.get_or_insert(id);
@@ -760,18 +862,32 @@ impl Builder {
         first
     }
 
+    /// 이 묶음(또는 그 UNION 갈래)의 SELECT 별칭인가
+    fn is_alias(&self, s: u32, name: &str) -> bool {
+        let low = name.to_lowercase();
+        self.aliases.iter().any(|(sc, n)| *n == low && (*sc == s || (self.scopes[*sc as usize].parent == Some(s) && self.scopes[*sc as usize].kind == "union")))
+    }
+
     /// WHERE·ON·HAVING — AND 로 나눠 조건마다 쓰임을 가른다
     fn cond(&mut self, e: &Expr, s: u32, role: &'static str, join: Option<usize>) {
         let mut parts = Vec::new();
         split_and(e, &mut parts);
         for c in parts {
+            let start = self.cols.len() as u32;
             self.conjunct(c, s, role, join);
+            if role == "where" && join.is_none() {
+                self.where_links.push((s, start, self.cols.len() as u32));
+            }
         }
     }
 
     fn side(&mut self, e: &Expr, s: u32, role: &'static str, pred: &'static str) -> (Option<u32>, bool) {
         if plain_col(e).is_some() {
             return (self.collect(e, s, role, Some(pred), None), false);
+        }
+        // HAVING SUM(x) > 0 의 집계는 "열을 감싼 조건"이 아니다
+        if role == "having" {
+            return (self.collect(e, s, role, Some("other"), None), false);
         }
         if let Some(w) = wrapper_name(e) {
             let mut sc = Scan::default();
@@ -821,12 +937,13 @@ impl Builder {
                 }
             }
             Expr::Like { negated, expr, pattern, .. } | Expr::ILike { negated, expr, pattern, .. } => {
+                let ilike = matches!(strip(c), Expr::ILike { .. });
                 let pat = match lit_kind(pattern) {
                     Some(("str", p)) => Some(p),
                     _ => None,
                 };
                 let leading = pat.as_deref().is_some_and(|p| p.starts_with('%') || p.starts_with('_'));
-                let pred = if !leading && pat.is_some() && !negated { "prefix" } else { "like" };
+                let pred = if !leading && pat.is_some() && !negated && !ilike { "prefix" } else { "like" };
                 let (a, aw) = self.side(expr, s, role, pred);
                 self.collect(pattern, s, role, Some("other"), None);
                 if leading && !negated {
@@ -901,6 +1018,10 @@ impl Builder {
                 None
             }
             None => {
+                // IN·EXISTS·스칼라 서브쿼리는 바깥 표의 열도 한정 없이 쓸 수 있다 — 여기서 정하지 않는다
+                if self.scopes[c.scope as usize].kind == "subquery" && anc.iter().skip(1).any(|a| self.tables.iter().any(|t| t.scope == *a)) {
+                    return None;
+                }
                 let own: Vec<&TableRef> = self.tables.iter().filter(|t| t.scope == c.scope).collect();
                 if own.len() == 1 {
                     Some(own[0].id)
@@ -1008,8 +1129,21 @@ impl Builder {
                     }
                 }
             }
+            for &(ls, a, b) in &self.where_links {
+                if ls != sc {
+                    continue;
+                }
+                let ts: Vec<u32> = (a..b).filter_map(|i| self.cols[i as usize].table).filter(|t| self.tables[*t as usize].scope == sc).collect();
+                for w in ts.windows(2) {
+                    let (ra, rb) = (find(&mut root, w[0]), find(&mut root, w[1]));
+                    root[ra as usize] = rb;
+                }
+            }
             for j in commas {
                 let Some(r) = self.joins[j].right else { continue };
+                if self.no_cartesian.contains(&r) {
+                    continue;
+                }
                 let rr = find(&mut root, r);
                 // 이 쉼표 덩이 앞의 표들과 이어졌는가
                 let joined = ids.iter().filter(|&&t| t < r).any(|&t| find(&mut root, t) == rr);
@@ -1056,6 +1190,7 @@ mod tests {
         let kinds: Vec<&str> = m.joins.iter().map(|j| j.kind).collect();
         assert_eq!(kinds, vec!["inner", "left", "right", "full", "cross"]);
         assert_eq!(tbl(&m, "orders").alias.as_deref(), Some("a"));
+        assert_eq!(tbl(&m, "orders").qual_text, "a");
         // LEFT JOIN items 의 왼쪽은 조건이 가리키는 orders
         let left = &m.joins[1];
         assert_eq!(left.left, Some(tbl(&m, "orders").id));
@@ -1173,6 +1308,7 @@ mod tests {
         assert!(m.ok, "{:?}", m.error);
         let t = tbl(&m, "orders");
         assert_eq!(t.schema.as_deref(), Some("dbo"));
+        assert_eq!(t.qual_text, "[o]");
         assert!(facts(&m, "orderNoLimit").is_empty());
         // MySQL — 백틱 · LIMIT a,b
         let m = build("SELECT `u`.`id` FROM `users` `u` LIMIT 100000, 20", "mysql");
@@ -1248,6 +1384,60 @@ mod tests {
         // Oracle 방언이 못 읽는 것은 일반 방언으로
         let m = build("SELECT e.ename FROM emp e, dept d WHERE e.deptno = d.deptno(+)", "oracle");
         assert!(m.ok || m.error.is_some());
+    }
+
+    #[test]
+    fn deep_chains_do_not_crash() {
+        // 큰 스택 스레드에서 — 일꾼 스레드 기본 스택이면 수천 항에서 넘친다
+        let terms: Vec<String> = (0..1900).map(|i| format!("a = {i}")).collect();
+        let m = sql_map(format!("SELECT 1 FROM t WHERE {}", terms.join(" OR ")), "postgres".into());
+        assert!(m.ok, "{:?}", m.error);
+        let terms: Vec<String> = (0..2100).map(|i| format!("a = {i}")).collect();
+        let m = sql_map(format!("SELECT 1 FROM t WHERE {}", terms.join(" OR ")), "postgres".into());
+        assert!(!m.ok);
+        // 따옴표 안의 and·or 는 세지 않는다
+        assert_eq!(chain_len("SELECT 'a and b or c' FROM t WHERE x = 1 AND y = 2"), 3);
+    }
+
+    #[test]
+    fn fable_review_cases() {
+        // Oracle (+) — 데카르트 곱이 아니다
+        let m = build("SELECT e.ename FROM emp e, dept d WHERE e.deptno = d.deptno(+)", "oracle");
+        assert!(m.ok, "{:?}", m.error);
+        assert!(facts(&m, "cartesian").is_empty(), "{:?}", m.facts);
+        // 표 함수 — 실표·데카르트 곱이 아니다
+        let m = build("SELECT o.id, item FROM orders o, jsonb_array_elements(o.items) item", "postgres");
+        assert!(m.ok, "{:?}", m.error);
+        assert!(facts(&m, "cartesian").is_empty());
+        assert!(m.tables.iter().any(|t| t.name.contains("jsonb_array_elements") && t.virt));
+        // ORDER BY 별칭은 열이 아니다
+        let m = build("SELECT user_id, count(*) AS n FROM orders GROUP BY user_id ORDER BY n DESC", "postgres");
+        assert!(!m.cols.iter().any(|c| c.name == "n"));
+        // HAVING 집계는 감싼 조건이 아니다
+        let m = build("SELECT user_id FROM orders GROUP BY user_id HAVING SUM(amount) > 1000", "postgres");
+        assert!(facts(&m, "fnOnCol").is_empty());
+        // @변수는 열이 아니다
+        let m = build("SELECT name FROM users WHERE id = @id AND @@ROWCOUNT > 0", "mssql");
+        assert!(m.ok, "{:?}", m.error);
+        assert!(!m.cols.iter().any(|c| c.name.starts_with('@')));
+        // 비재귀 CTE 안의 같은 이름은 실제 표
+        let m = build("WITH orders AS (SELECT * FROM orders WHERE paid) SELECT id FROM orders", "postgres");
+        let inner = m.tables.iter().find(|t| t.scope == 1).unwrap();
+        assert!(inner.cte.is_none());
+        assert!(m.tables.iter().find(|t| t.scope == 0).unwrap().cte.is_some());
+        // 재귀 CTE 는 자기 참조
+        let m = build("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t", "postgres");
+        assert!(m.tables.iter().all(|t| t.cte.is_some()), "{:?}", m.tables);
+        // ILIKE 는 접두 검색이 아니다 · ORDER BY 식은 감싼 열
+        let m = build("SELECT 1 FROM users u WHERE u.name ILIKE 'abc%' ORDER BY lower(u.name) LIMIT 5", "postgres");
+        assert!(m.cols.iter().any(|c| c.pred == Some("like")));
+        assert!(m.cols.iter().any(|c| c.role == "order" && c.wrapped.is_some()));
+        // 서브쿼리의 한정 없는 열은 정하지 않는다(바깥 열일 수 있다)
+        let m = build("SELECT 1 FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND email IS NOT NULL)", "postgres");
+        assert!(m.cols.iter().find(|c| c.name == "email").unwrap().table.is_none());
+        // 열 = 열 이 아니어도 두 표를 함께 쓰는 조건이면 이어졌다
+        let m = build("SELECT 1 FROM a, b WHERE a.d BETWEEN b.s AND b.e", "postgres");
+        assert!(facts(&m, "cartesian").is_empty());
     }
 
     #[test]

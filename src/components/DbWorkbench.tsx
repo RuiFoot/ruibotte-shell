@@ -64,7 +64,7 @@ import { codeHighlight } from "../lib/cmTheme";
 import { editingExtensions } from "../lib/cmEditing";
 import { dbCompletionSource } from "../lib/sqlComplete";
 import { formatSqlIn } from "../lib/sqlFormat";
-import { dropEditor, forgetWatch, publishPlan, touchEditor } from "../lib/queryWatch";
+import { dropEditor, forgetWatch, holdBackground, publishPlan, touchEditor, waitBackground } from "../lib/queryWatch";
 
 const theme: DockviewTheme = { name: "rbshell", className: "rbshell-dock", gap: 0, dndOverlayMounting: "relative" };
 
@@ -126,6 +126,8 @@ type Ctx = {
 	database: string;
 	/** 쿼리 지도·튜닝 칸 열기(SQL 편집기 오른쪽) */
 	openSide: (id: "querymap" | "tuning") => void;
+	/** 두 문장의 계획(튜닝 비교) — 실행 중 표시를 올리고, ANALYZE 는 묻는다 */
+	explainPair: (a: string, b: string, analyze: boolean) => Promise<[ExplainOk, ExplainOk] | null>;
 };
 type Msg = { at: number; sql: string; ok: boolean; text: string; ms?: number };
 
@@ -1543,10 +1545,7 @@ function useAnalyzeDeps() {
 	const ctx = useDb();
 	const { running } = useContext(LiveCtx);
 	const { conn, engine, epoch, database, inTx } = ctx;
-	return useMemo(
-		() => ({ conn, engine, epoch, defaultSchema: database || null, running, inTx, fks: (s: string) => fksOf(conn, epoch, engine, s) }),
-		[conn, engine, epoch, database, running, inTx],
-	);
+	return useMemo(() => ({ conn, engine, epoch, defaultSchema: database || null, running, inTx }), [conn, engine, epoch, database, running, inTx]);
 }
 function QueryMapDock(props: IDockviewPanelProps) {
 	const ctx = useDb();
@@ -1562,29 +1561,11 @@ function TuningDock(props: IDockviewPanelProps) {
 	const ctx = useDb();
 	const visible = usePanelVisible(props.api);
 	const deps = useAnalyzeDeps();
-	const { conn, engine } = ctx;
+	const { engine } = ctx;
+	// 인덱스 초안은 여기로 오지 않는다(복사·새 탭만)
 	const actions = useMemo(
-		() => ({
-			explain: ctx.explain,
-			openSql: ctx.openSql,
-			canAnalyze: engine === "postgres" || engine === "mysql" || engine === "mariadb",
-			// 두 문장의 계획 — ANALYZE 는 실제로 실행하므로 묻는다(쓰기 문장은 백엔드가 되돌림). 인덱스 초안은 여기로 오지 않는다
-			explainPair: async (a: string, b: string, analyze: boolean): Promise<[ExplainOk, ExplainOk] | null> => {
-				if (ctx.isRunning()) throw new Error("쿼리가 실행 중입니다 — 끝난 뒤 다시 하세요");
-				if (analyze) {
-					const cls = await db.classify([a, b], engine).catch(() => null);
-					const writes = cls?.some((c) => c.writes);
-					if (!confirm(`두 문장을 실제로 실행해 시간을 잽니다${writes ? "(쓰기 문장은 실행한 뒤 되돌리지만 그동안 잠금이 잡힙니다)" : ""}.
-오래 걸리는 문장이면 그만큼 기다립니다.
-
-계속할까요?`)) return null;
-				}
-				const x = await db.explain(conn, a, analyze);
-				const y = await db.explain(conn, b, analyze);
-				return [x, y];
-			},
-		}),
-		[ctx.explain, ctx.openSql, ctx.isRunning, conn, engine],
+		() => ({ explain: ctx.explain, openSql: ctx.openSql, canAnalyze: engine === "postgres" || engine === "mysql" || engine === "mariadb", explainPair: ctx.explainPair }),
+		[ctx.explain, ctx.openSql, ctx.explainPair, engine],
 	);
 	return (
 		<Suspense fallback={<div className="dock-watermark">불러오는 중…</div>}>
@@ -1873,6 +1854,9 @@ export function DbWorkbench({
 			}
 			// 결과 칸(res-N)은 이번 실행이 덮어쓰거나 닫는다 — 반영하지 않은 표 편집이 있으면 먼저 묻는다
 			if (!okToDiscardEdits(dirtyTitles(dbOwner(conn)), "다시 실행하면")) return;
+			// 쿼리 지도의 뒤 조회(인덱스·FK)가 이 연결을 쓰는 중이면 끝나기를 잠깐 기다린다(BUSY 방지)
+			holdBackground(conn, true);
+			await waitBackground(conn);
 			setRunning(true);
 			// 문장마다 결과 탭 하나(결과 1, 2…) — 남는 예전 탭은 닫는다
 			const existing = d.panels.filter((p) => p.id.startsWith("res-"));
@@ -2045,6 +2029,8 @@ export function DbWorkbench({
 				: "실제 실행 계획(ANALYZE)은 문장을 실제로 실행해 시간을 잽니다. 오래 걸리는 문장이면 그만큼 기다립니다.\n\n계속할까요?";
 			if (!confirm(warn)) return;
 		}
+		holdBackground(conn, true);
+		await waitBackground(conn);
 		setRunning(true);
 		try {
 			const ok = await db.explain(conn, st, analyze);
@@ -2079,6 +2065,32 @@ export function DbWorkbench({
 
 	const explainRef = useRef(explain);
 	explainRef.current = explain;
+
+	/** 튜닝 비교 — 두 문장의 계획을 차례로. 실행 중 표시를 올려 Esc 로 멈출 수 있게 */
+	const explainPair = useCallback(
+		async (a: string, b: string, analyze: boolean): Promise<[ExplainOk, ExplainOk] | null> => {
+			if (runningRef.current) throw new Error("쿼리가 실행 중입니다 — 끝난 뒤 다시 하세요");
+			// PostgreSQL 트랜잭션 안에서 EXPLAIN 이 실패하면 트랜잭션 전체가 깨진다
+			if (engine === "postgres" && txState.inTx) throw new Error("열린 트랜잭션이 있어 비교 EXPLAIN 을 하지 않습니다 — 커밋·되돌리기 뒤에 하세요");
+			if (analyze) {
+				const cls = await db.classify([a, b], engine).catch(() => null);
+				const writes = cls?.some((c) => c.writes);
+				if (!confirm(`두 문장을 실제로 실행해 시간을 잽니다${writes ? "(쓰기 문장은 실행한 뒤 되돌리지만 그동안 잠금이 잡힙니다)" : ""}.\n오래 걸리는 문장이면 그만큼 기다립니다.\n\n계속할까요?`)) return null;
+			}
+			holdBackground(conn, true);
+			await waitBackground(conn);
+			setRunning(true);
+			try {
+				const x = await db.explain(conn, a, analyze);
+				const y = await db.explain(conn, b, analyze);
+				return [x, y];
+			} finally {
+				setRunning(false);
+				holdBackground(conn, false);
+			}
+		},
+		[conn, engine, txState.inTx],
+	);
 
 	const addSql = () => {
 		const d = dock.current;
@@ -2246,10 +2258,15 @@ export function DbWorkbench({
 			locked,
 			database: curDb,
 			openSide,
+			explainPair,
 		}),
-		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked, curDb, openSide],
+		[conn, engine, mysql, readOnly, inTx, run, insertText, registerEditor, openSql, openPanel, historyScope, profileId, openTable, ask, epoch, showNotice, locked, curDb, openSide, explainPair],
 	);
 	const live = useMemo<Live>(() => ({ running, messages }), [running, messages]);
+	// 실행이 끝나면 뒤 조회(쿼리 지도 메타데이터)를 다시 허락
+	useEffect(() => {
+		if (!running) holdBackground(conn, false);
+	}, [running, conn]);
 	const lockValue = useMemo(() => ({ locked, owner: dbOwner(conn) }), [locked, conn]);
 	// 이 작업대가 사라지면 남은 편집 기록도 지운다(칸마다 지우지만 한 번 더)
 	useEffect(

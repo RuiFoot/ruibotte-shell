@@ -9,7 +9,7 @@ import { quoteIdentFor } from "./engines";
 
 export type Pos = [number, number] | null;
 export type MapScope = { id: number; kind: "main" | "cte" | "derived" | "subquery" | "union"; name: string | null; parent: number | null; pos: Pos };
-export type MapTable = { id: number; scope: number; schema: string | null; name: string; alias: string | null; cte: number | null; derived: number | null; virt: boolean; target: boolean; pos: Pos };
+export type MapTable = { id: number; scope: number; schema: string | null; name: string; alias: string | null; cte: number | null; derived: number | null; virt: boolean; target: boolean; qualText: string; pos: Pos };
 export type MapPair = { a: number; b: number; op: string };
 export type MapJoin = { scope: number; left: number | null; right: number | null; kind: string; on: MapPair[]; hasOn: boolean; using: string[]; natural: boolean; pos: Pos };
 export type MapCol = { id: number; scope: number; table: number | null; qual: string | null; name: string; role: string; pred: string | null; wrapped: string | null; pos: Pos };
@@ -69,8 +69,10 @@ export function typeCat(t?: string | null): "num" | "str" | "date" | "bool" | "u
 	if (/^(bool|boolean)\b/.test(x) || x === "bit") return "bool";
 	if (/^(uuid|uniqueidentifier)\b/.test(x)) return "uuid";
 	if (/^jsonb?\b/.test(x)) return "json";
-	if (/^(date|time|timestamp|datetime|smalldatetime|datetime2|datetimeoffset|year|interval)\b/.test(x)) return "date";
-	if (/^((tiny|small|medium|big)?int(eger)?|int[248]|(small|big)?serial|serial[248]?|numeric|decimal|dec|number|float[48]?|double|real|money|smallmoney|binary_(float|double)|fixed)\b/.test(x)) return "num";
+	// MySQL YEAR 는 숫자처럼 비교한다(year_col = 2024)
+	if (/^(year|(tiny|small|medium|big)?int(eger)?|int[248]|(small|big)?serial|serial[248]?|numeric|decimal|dec|number|float[48]?|double|real|money|smallmoney|binary_(float|double)|fixed)\b/.test(x)) return "num";
+	// timestamptz·timetz 처럼 붙여 쓰는 것까지
+	if (/^(date|time|timestamp|datetime|smalldatetime|datetime2|datetimeoffset|interval)/.test(x)) return "date";
 	if (/(blob|bytea|^binary|^varbinary|^raw|^long raw|^image)\b/.test(x)) return "bin";
 	if (/(char|text|clob|string|^enum|^set\(|^citext|^name$|^xml|^nchar|^nvarchar|^varchar2|^nvarchar2)/.test(x)) return "str";
 	return "other";
@@ -89,26 +91,18 @@ export function ident(engine: string, name: string): string {
 }
 
 const slice = (s: string, p: Pos) => (p ? s.slice(p[0], p[1]) : "");
-/** 위치를 괄호 짝까지 늘린다(서브쿼리 끝의 ) 가 위치에 빠지는 경우) */
-export function balanced(s: string, p: [number, number]): [number, number] {
-	let [a, b] = p;
+/** s[open] 의 ( 와 짝인 ) 위치 — 작은따옴표 안은 건너뛴다. 못 찾으면 -1 */
+export function matchParen(s: string, open: number): number {
 	let depth = 0;
-	for (let i = a; i < b; i++) {
-		if (s[i] === "(") depth++;
-		else if (s[i] === ")") depth--;
+	let quoted = false;
+	for (let i = open; i < s.length; i++) {
+		const c = s[i];
+		if (c === "'") quoted = !quoted;
+		else if (quoted) continue;
+		else if (c === "(") depth++;
+		else if (c === ")" && --depth === 0) return i;
 	}
-	while (depth > 0 && b < s.length) {
-		if (s[b] === "(") depth++;
-		else if (s[b] === ")") depth--;
-		b++;
-	}
-	// 앞쪽 여는 괄호가 빠진 경우
-	while (depth < 0 && a > 0) {
-		a--;
-		if (s[a] === "(") depth++;
-		else if (s[a] === ")") depth--;
-	}
-	return [a, b];
+	return -1;
 }
 const replaceAt = (s: string, p: [number, number], t: string) => s.slice(0, p[0]) + t + s.slice(p[1]);
 
@@ -261,7 +255,7 @@ export function structureFindings(r: Resolved, sql: string, engine: string): Fin
 			continue;
 		}
 		if (!f.lit || f.value === null) continue;
-		const conj = f.pos ? balanced(sql, f.pos) : null;
+		const conj = f.pos;
 		if (ca === "str" && f.lit === "num") {
 			let rewrite: string | undefined;
 			if (conj) {
@@ -343,7 +337,7 @@ export function staticFindings(r: Resolved, sql: string, engine: string): Findin
 				const pick = f.text ? own.filter((t) => lower(t.alias ?? t.name) === lower(f.text?.split(".").pop())) : own;
 				if (f.pos && pick.length && pick.every((t) => r.meta[t.id]?.cols?.length)) {
 					const multi = own.length > 1 || !!f.text;
-					const list = pick.flatMap((t) => (r.meta[t.id]?.cols ?? []).map((c) => (multi ? `${ident(engine, t.alias ?? t.name)}.${ident(engine, c.name)}` : ident(engine, c.name))));
+					const list = pick.flatMap((t) => (r.meta[t.id]?.cols ?? []).map((c) => (multi ? `${t.qualText || t.alias || t.name}.${ident(engine, c.name)}` : ident(engine, c.name))));
 					if (list.length) rewrite = replaceAt(sql, f.pos, list.join(", "));
 				}
 				out.push({
@@ -368,11 +362,11 @@ export function staticFindings(r: Resolved, sql: string, engine: string): Findin
 				const colText = slice(sql, col.pos) || cname;
 				const dateLit = (d: string) => (engine === "postgres" || engine === "oracle" || engine === "tibero" ? `DATE '${d}'` : `'${d}'`);
 				if (cmp?.pos && cmp.op === "=" && cmp.value) {
-					const conj = balanced(sql, cmp.pos);
+					const conj = cmp.pos;
 					if (fn === "YEAR" && /^\d{4}$/.test(cmp.value)) {
 						const y = Number(cmp.value);
 						rewrite = replaceAt(sql, conj, `${colText} >= ${dateLit(`${y}-01-01`)} AND ${colText} < ${dateLit(`${y + 1}-01-01`)}`);
-					} else if ((fn === "DATE" || fn === "TRUNC" || fn === "CAST") && /^\d{4}-\d{2}-\d{2}$/.test(cmp.value)) {
+					} else if ((fn === "DATE" || fn === "TRUNC" || (fn === "CAST" && /(\bas\s+date\s*\)|::\s*date)\s*$/i.test(slice(sql, f.pos)))) && /^\d{4}-\d{2}-\d{2}$/.test(cmp.value)) {
 						const d = new Date(`${cmp.value}T00:00:00Z`);
 						if (!Number.isNaN(d.getTime())) {
 							const next = new Date(d.getTime() + 86_400_000).toISOString().slice(0, 10);
@@ -428,16 +422,25 @@ export function staticFindings(r: Resolved, sql: string, engine: string): Findin
 					if (m) nullable = m.nullable && !m.pk;
 				}
 				let rewrite: string | undefined;
-				if (f.pos && sub?.pos && col?.pos && subTables.length === 1 && subSel.length === 1 && !subSel[0].wrapped) {
-					const body = slice(sql, sub.pos).replace(/^\(\s*|\s*\)$/g, "");
-					const m = /^select\s+(?:distinct\s+)?([\w$."`[\]]+)\s+from\s+([\w$."`[\]]+(?:\s+(?:as\s+)?[\w$]+)?)(?:\s+where\s+([\s\S]+))?$/i.exec(body.trim());
-					if (m && !/\b(join|group|order|union|limit)\b|,/i.test(m[2] + (m[3] ?? ""))) {
-						const t = subTables[0];
-						const q = t.alias ?? t.name;
-						const selCol = m[1].includes(".") ? m[1] : `${ident(engine, q)}.${m[1]}`;
-						const outer = slice(sql, col.pos);
-						const conj = balanced(sql, f.pos);
-						rewrite = replaceAt(sql, conj, `NOT EXISTS (SELECT 1 FROM ${m[2]} WHERE ${selCol} = ${outer}${m[3] ? ` AND (${m[3].trim()})` : ""})`);
+				const outerT = col ? r.colTable[col.id] : null;
+				if (f.pos && col?.pos && outerT !== null && outerT !== undefined && subTables.length === 1 && subSel.length === 1 && !subSel[0].wrapped && !col.wrapped) {
+					const conjText = slice(sql, f.pos);
+					const at = /\bnot\s+in\s*\(/i.exec(conjText);
+					const open = at ? f.pos[0] + at.index + at[0].length - 1 : -1;
+					const close = open >= 0 ? matchParen(sql, open) : -1;
+					const body = close > open ? sql.slice(open + 1, close).trim() : "";
+					const m = /^select\s+(?:distinct\s+)?([\w$."`[\]]+)\s+from\s+([\w$."`[\]]+(?:\s+(?:as\s+)?[\w$]+)?)(?:\s+where\s+([\s\S]+))?$/i.exec(body);
+					const t = subTables[0];
+					const outerTable = map.tables[outerT];
+					const outerQual = outerTable.qualText || outerTable.alias || outerTable.name;
+					const innerQual = t.qualText || t.alias || t.name;
+					// 바깥 한정자가 안쪽 표 이름·별칭과 같으면 안쪽으로 읽힌다 — 바꾸지 않는다
+					const shadow = lower(outerQual) === lower(innerQual) || lower(outerQual) === lower(t.name);
+					if (m && !shadow && !/\b(join|group|order|union|limit|having)\b|,/i.test(m[2] + (m[3] ?? ""))) {
+						const selCol = m[1].includes(".") ? m[1] : `${innerQual}.${m[1]}`;
+						const colText = slice(sql, col.pos);
+						const outer = `${outerQual}.${colText.slice(colText.lastIndexOf(".") + 1)}`;
+						rewrite = replaceAt(sql, [f.pos[0], Math.max(f.pos[1], close + 1)], `NOT EXISTS (SELECT 1 FROM ${m[2]} WHERE ${selCol} = ${outer}${m[3] ? ` AND (${m[3]})` : ""})`);
 					}
 				}
 				out.push({
@@ -506,6 +509,7 @@ type Want = { eq: string[]; rest: string[] };
 export function indexFindings(r: Resolved, engine: string): Finding[] {
 	const out: Finding[] = [];
 	const { map } = r;
+	const done = new Set<string>();
 	for (const t of map.tables) {
 		const m = r.meta[t.id];
 		if (!m || m.kind !== "table" || !m.indexes || !m.cols) continue;
@@ -515,7 +519,10 @@ export function indexFindings(r: Resolved, engine: string): Finding[] {
 		const name = (c: { name: string }) => m.cols?.find((x) => lower(x.name) === lower(c.name))?.name ?? c.name;
 		const uniq = (l: string[]) => [...new Set(l.map(lower))].map((x) => l.find((y) => lower(y) === x) as string);
 		const where = mine.filter((c) => c.role === "where" && c.scope === t.scope);
-		const eq = uniq(where.filter((c) => c.pred === "eq" || c.pred === "in").map(name));
+		// 열 = 열(같은 표 안 비교·옛 쉼표 조인)은 상수 등호가 아니다
+		const colPair = new Set(map.facts.filter((f) => f.kind === "cmp" && f.col2 !== null).flatMap((f) => [f.col, f.col2]));
+		const eq = uniq(where.filter((c) => (c.pred === "eq" || c.pred === "in") && !colPair.has(c.id)).map(name));
+		const prefixCols = new Set(where.filter((c) => c.pred === "prefix").map((c) => lower(c.name)));
 		const range = uniq(where.filter((c) => (c.pred === "range" || c.pred === "prefix") && !eq.some((e) => lower(e) === lower(c.name))).map(name));
 		// ORDER BY 가 모두 이 표의 열일 때만 정렬을 인덱스로 받을 수 있다
 		const orders = map.cols.filter((c) => c.scope === t.scope && c.role === "order");
@@ -523,7 +530,7 @@ export function indexFindings(r: Resolved, engine: string): Finding[] {
 		const wants: (Want & { why: string })[] = [];
 		if (eq.length || range.length) {
 			const rest = range.length ? [range[0]] : ordMine.filter((o) => !eq.some((e) => lower(e) === lower(o)));
-			wants.push({ eq: eq.slice(0, 3), rest: rest.slice(0, 2), why: `WHERE ${[...eq.map((e) => `${e} =`), ...range.slice(0, 1).map((x) => `${x} 범위`)].join(", ")}${!range.length && rest.length ? ` + ORDER BY ${rest.join(", ")}` : ""}` });
+			wants.push({ eq, rest: rest.slice(0, 2), why: `WHERE ${[...eq.map((e) => `${e} =`), ...range.slice(0, 1).map((x) => `${x} 범위`)].join(", ")}${!range.length && rest.length ? ` + ORDER BY ${rest.join(", ")}` : ""}` });
 		} else if (ordMine.length && map.facts.some((f) => f.kind === "orderNoLimit") === false && map.scopes.find((s) => s.id === t.scope)?.kind === "main") {
 			// LIMIT 이 붙은 정렬(앞 몇 행) — 정렬 열 인덱스면 정렬 없이 앞에서부터 읽는다
 			wants.push({ eq: [], rest: ordMine.slice(0, 2), why: `ORDER BY ${ordMine.join(", ")} + LIMIT` });
@@ -546,30 +553,43 @@ export function indexFindings(r: Resolved, engine: string): Finding[] {
 				}
 				const c = map.cols[side];
 				if (c.wrapped || !known.has(lower(c.name))) continue;
-				wants.push({ eq: uniq([name(c), ...eq]).slice(0, 3), rest: [], why: `JOIN ${map.cols[other].qual ? `${map.cols[other].qual}.` : ""}${map.cols[other].name} = ${c.qual ? `${c.qual}.` : ""}${c.name}` });
+				// 조인 열로 시작하는 인덱스가 있으면 조인은 받는다
+				if (m.indexes.some((i) => !i.partial && lower(i.cols[0]) === lower(c.name))) continue;
+				wants.push({ eq: uniq([name(c), ...eq]), rest: [], why: `JOIN ${map.cols[other].qual ? `${map.cols[other].qual}.` : ""}${map.cols[other].name} = ${c.qual ? `${c.qual}.` : ""}${c.name}` });
 			}
 		}
-		const done = new Set<string>();
 		for (const w of wants) {
-			const cols = [...w.eq, ...w.rest];
+			// 등호 열이 많아도 덮였는지는 전부로 보고, 초안에는 앞 3개만
+			if (covered(m.indexes, w)) continue;
+			const cols = [...w.eq.slice(0, 3), ...w.rest];
 			if (!cols.length) continue;
-			const key = cols.map(lower).join(",");
+			// 같은 표가 두 번 나와도(자기 조인·CTE) 같은 초안은 한 번
+			const key = `${lower(m.schema)}.${lower(m.name)}:${cols.map(lower).join(",")}`;
 			if (done.has(key)) continue;
 			done.add(key);
-			if (covered(m.indexes, w)) continue;
 			// 다른 초안이 이미 이 열들로 시작하면(더 긴 것이 있으면) 생략
 			const longer = wants.some((x) => x !== w && [...x.eq, ...x.rest].length > cols.length && covered([{ name: "", cols: [...x.eq, ...x.rest], unique: false, primary: false, partial: false }], w));
 			if (longer) continue;
 			const near = m.indexes.find((i) => !i.partial && lower(i.cols[0]) === lower(cols[0]));
-			const ixName = `ix_${m.name}_${cols.join("_")}`.toLowerCase().replace(/[^\w]+/g, "_").slice(0, engine === "oracle" || engine === "tibero" ? 30 : 60);
+			const ora = engine === "oracle" || engine === "tibero";
+			const base = `ix_${m.name}_${cols.join("_")}`.replace(/[^\p{L}\p{N}_]+/gu, "_").slice(0, ora ? 30 : 60);
+			// Oracle 계열은 대문자(따옴표 없이 쓰는 이름), 나머지는 소문자
+			const ixName = ora ? base.toUpperCase() : base.toLowerCase();
+			// PG 접두 LIKE('abc%')는 C 정렬이 아니면 패턴 연산자 클래스가 있어야 인덱스를 쓴다
+			const colDef = (c: string) => {
+				const q = ident(engine, c);
+				if (engine !== "postgres" || !prefixCols.has(lower(c))) return q;
+				const ty = lower(m.cols?.find((x) => lower(x.name) === lower(c))?.dataType);
+				return `${q} ${ty.startsWith("character varying") || ty.startsWith("varchar") ? "varchar_pattern_ops" : ty.startsWith("character") || ty.startsWith("bpchar") ? "bpchar_pattern_ops" : "text_pattern_ops"}`;
+			};
 			const tbl = m.schema && m.schema !== "(기본)" ? `${ident(engine, m.schema)}.${ident(engine, m.name)}` : ident(engine, m.name);
-			const ddl = `CREATE INDEX ${engine === "postgres" ? "CONCURRENTLY " : ""}${ident(engine, ixName)} ON ${tbl} (${cols.map((c) => ident(engine, c)).join(", ")})${engine === "oracle" ? " ONLINE" : ""};`;
+			const ddl = `CREATE INDEX ${engine === "postgres" ? "CONCURRENTLY " : ""}${ident(engine, ixName)} ON ${tbl} (${cols.map(colDef).join(", ")})${engine === "oracle" ? " ONLINE" : ""};`;
 			out.push({
 				key: `ix${t.id}:${key}`,
 				layer: "index",
 				level: "tip",
 				title: `인덱스 초안: ${m.name} (${cols.join(", ")})`,
-				why: `${w.why} 에 맞는 인덱스가 없습니다.${cols.length > 1 ? " 열 순서는 등호 → 범위 → 정렬." : ""}${near ? ` 비슷한 인덱스 ${near.name}(${near.cols.filter(Boolean).join(", ")})가 있습니다 — 새로 만들기보다 늘리는 것도 방법입니다.` : ""}`,
+				why: `${w.why} 에 맞는 인덱스가 없습니다.${cols.length > 1 ? " 열 순서는 등호 → 범위 → 정렬." : ""}${engine === "postgres" && cols.some((c) => prefixCols.has(lower(c))) ? " LIKE 'abc%' 열에는 패턴 연산자 클래스(*_pattern_ops)를 붙였습니다 — 데이터베이스 정렬이 C 면 빼도 됩니다." : ""}${near ? ` 비슷한 인덱스 ${near.name}(${near.cols.filter(Boolean).join(", ")})가 있습니다 — 새로 만들기보다 늘리는 것도 방법입니다.` : ""}`,
 				fix: `표가 작거나 조건이 대부분의 행에 맞으면 인덱스가 도움이 안 됩니다. 쓰기가 많은 표는 인덱스마다 쓰기 비용이 늡니다 — EXPLAIN 으로 확인한 뒤 직접 실행하세요.${engine === "postgres" ? " CONCURRENTLY 는 쓰기를 막지 않는 대신 트랜잭션 밖에서만 됩니다." : engine === "oracle" ? " ONLINE 은 Enterprise Edition 에서만 됩니다." : ""}`,
 				ddl,
 				pos: t.pos,
@@ -585,6 +605,12 @@ export function covered(ix: IndexInfo[], w: Want): boolean {
 	const eqs = new Set(w.eq.map(lower));
 	return ix.some((i) => {
 		if ((i.unique || i.primary) && !i.partial && i.cols.length && i.cols.every((c) => c !== null && eqs.has(lower(c)))) return true;
+		// 인덱스 앞 열들이 모두 등호 열이고, 등호 열을 다 담았거나 인덱스가 거기서 끝나면 덮인 것(등호 4개 이상도)
+		if (!i.partial && w.eq.length >= 3) {
+			let k = 0;
+			while (k < i.cols.length && i.cols[k] !== null && eqs.has(lower(i.cols[k]))) k++;
+			if (k >= 3) return true;
+		}
 		if (i.partial || i.cols.length < need) return false;
 		const head = i.cols.slice(0, w.eq.length).map(lower);
 		if (!w.eq.every((e) => head.includes(lower(e)))) return false;

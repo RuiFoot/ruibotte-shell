@@ -64,7 +64,44 @@ export function subscribePlan(conn: number, f: () => void): () => void {
 /** 연결이 닫히면 */
 export function forgetWatch(conn: number) {
 	watches.delete(conn);
+	bg.delete(conn);
+	held.delete(conn);
 }
+
+/**
+ * 뒤에서 도는 메타데이터 조회(인덱스·FK) — 같은 연결의 db_query 는 한 번에 하나라(BUSY),
+ * 연결마다 한 줄로 세우고, 사용자 실행은 waitBackground 로 그 줄이 빌 때까지(상한) 기다렸다 나간다.
+ */
+const bg = new Map<number, Promise<unknown>>();
+/** 사용자 실행이 이 연결을 쓰는 중(실행 직전부터 끝까지) — 그동안 뒤 조회는 나가지 않는다 */
+const held = new Set<number>();
+export function holdBackground(conn: number, on: boolean) {
+	if (on) held.add(conn);
+	else held.delete(conn);
+}
+export function runBackground<T>(conn: number, f: () => Promise<T>): Promise<T> {
+	const prev = bg.get(conn) ?? Promise.resolve();
+	const next = prev
+		.catch(() => undefined)
+		.then(() => {
+			if (held.has(conn)) throw new Error("BUSY");
+			return f();
+		});
+	const tail = next.catch(() => undefined);
+	bg.set(conn, tail);
+	void tail.then(() => {
+		if (bg.get(conn) === tail) bg.delete(conn);
+	});
+	return next;
+}
+/** 뒤 조회가 끝나기를 기다린다(최대 ms) — 끝났으면 바로 */
+export async function waitBackground(conn: number, ms = 4000): Promise<void> {
+	const p = bg.get(conn);
+	if (!p) return;
+	await Promise.race([p, new Promise((r) => window.setTimeout(r, ms))]);
+}
+/** 지금 뒤 조회가 도는가 */
+export const backgroundBusy = (conn: number) => bg.has(conn);
 
 /** 같은 문장인지(공백·끝 ; 차이 무시) */
 export const sameSql = (a: string, b: string) => a.replace(/\s+/g, " ").replace(/;\s*$/, "").trim() === b.replace(/\s+/g, " ").replace(/;\s*$/, "").trim();

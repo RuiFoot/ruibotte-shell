@@ -8,6 +8,7 @@ import { codeHighlight } from "../lib/cmTheme";
 import { type AnalyzeDeps, useAnalysis } from "../lib/queryAnalysis";
 import type { Finding } from "../lib/queryLint";
 import { currentView, lastPlan, sameSql, subscribePlan } from "../lib/queryWatch";
+import { splitSql } from "../lib/sql";
 import { type ExplainOk, planFindings, planTotals } from "./DbExplain";
 import { wsConfig } from "./DiffView";
 import { jumpTo } from "./QueryMap";
@@ -55,6 +56,8 @@ function Compare({ a, b, actions, onClose, onReplace }: { a: string; b: string; 
 	const right = () => mv.current?.b.state.doc.toString() ?? b;
 	const run = async (analyze: boolean) => {
 		setErr(null);
+		// 오른쪽은 고칠 수 있다 — 문장이 둘 이상이면 EXPLAIN 뒤 문장이 실제로 실행될 수 있어 거절
+		if (splitSql(right()).length !== 1) return setErr("제안 쪽에 문장이 하나만 있어야 비교할 수 있습니다");
 		setBusy(true);
 		try {
 			const r = await actions.explainPair(a, right(), analyze);
@@ -132,7 +135,8 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 	const conn = deps.conn;
 	const [planTick, setPlanTick] = useState(0);
 	useEffect(() => subscribePlan(conn, () => setPlanTick((x) => x + 1)), [conn]);
-	const [cmp, setCmp] = useState<{ a: string; b: string } | null>(null);
+	/** 비교 — 연 때의 문장 위치·본문(그 사이 커서가 다른 문장으로 가도 이 문장을 바꾼다) */
+	const [cmp, setCmp] = useState<{ a: string; b: string; from: number } | null>(null);
 	const [copied, setCopied] = useState<string | null>(null);
 
 	// biome 없음 — planTick 은 다시 읽기 신호
@@ -146,11 +150,16 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 	const findings = snap?.findings ?? [];
 	const replaceInEditor = (text: string) => {
 		const v = currentView(conn);
-		const s = snapRef.current;
-		if (!v || !s) return;
-		const cur = v.state.doc.sliceString(s.stmt.from, s.stmt.from + s.stmt.text.length);
-		if (cur !== s.stmt.text) return alert("편집기의 문장이 그 사이 바뀌었습니다 — 다시 읽은 뒤 해 보세요");
-		v.dispatch({ changes: { from: s.stmt.from, to: s.stmt.from + s.stmt.text.length, insert: text }, scrollIntoView: true });
+		if (!v || !cmp) return;
+		let from = cmp.from;
+		if (v.state.doc.sliceString(from, from + cmp.a.length) !== cmp.a) {
+			// 위쪽을 고쳐 자리가 밀렸으면 같은 본문이 하나뿐일 때만 그 자리로
+			const doc = v.state.doc.toString();
+			const at = doc.indexOf(cmp.a);
+			if (at < 0 || doc.indexOf(cmp.a, at + 1) >= 0) return alert("비교를 연 문장이 그 사이 바뀌었습니다 — 다시 연 뒤 해 보세요");
+			from = at;
+		}
+		v.dispatch({ changes: { from, to: from + cmp.a.length, insert: text }, selection: { anchor: from }, scrollIntoView: true });
 		v.focus();
 		setCmp(null);
 	};
@@ -176,7 +185,7 @@ export function QueryTuningPanel({ deps, visible, actions }: { deps: AnalyzeDeps
 					</button>
 				)}
 				{f.rewrite && snap && (
-					<button type="button" className="btn ghost" onClick={() => setCmp({ a: snap.stmt.text, b: f.rewrite as string })}>
+					<button type="button" className="btn ghost" onClick={() => setCmp({ a: snap.stmt.text, b: f.rewrite as string, from: snap.stmt.from })}>
 						<ArrowLeftRight size={12} /> 바꿔 쓰기 비교
 					</button>
 				)}

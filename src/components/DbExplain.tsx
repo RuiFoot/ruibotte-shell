@@ -33,17 +33,24 @@ function pgRules(p: Record<string, unknown>, kids: PlanNode[], planRows: number 
 	const w: string[] = [];
 	const type = String(p["Node Type"] ?? "");
 	if (actualRows !== undefined && planRows !== undefined && planRows > 0 && (actualRows / planRows > 10 || (actualRows > 0 && planRows / actualRows > 10)))
-		w.push(`예상 행(${planRows.toLocaleString()})과 실제 행(${actualRows.toLocaleString()})이 10배 넘게 다릅니다 — 통계가 낡았을 수 있습니다. ANALYZE ${p["Relation Name"] ?? ""} 로 새로 하세요`);
+		w.push(`예상 행(${planRows.toLocaleString()})과 실제 행(${actualRows.toLocaleString()})이 10배 넘게 다릅니다 — 통계가 낡았을 수 있습니다. ${p["Relation Name"] ? `ANALYZE ${p["Relation Name"]}` : "관련 표를 ANALYZE"} 로 새로 하세요`);
 	const removed = num(p["Rows Removed by Filter"]);
 	const scanned = ((actualRows ?? 0) + (removed ?? 0)) * loops;
 	if (type === "Seq Scan" && p.Filter && (scanned > BIG || (planRows ?? 0) > BIG))
 		w.push(`큰 표 전체 읽기(Seq Scan) + 필터 ${String(p.Filter).slice(0, 80)}${removed ? ` — 버린 행 ${(removed * loops).toLocaleString()}` : ""}. 필터 열에 인덱스가 있는지 보세요`);
 	else if (type === "Seq Scan" && (planRows ?? 0) > 100_000) w.push("큰 표 전체 읽기(Seq Scan) — 조건 열에 인덱스가 있는지 보세요");
 	if (type === "Nested Loop" && kids.length >= 2) {
-		const outer = kids[0];
+		// 바깥·안쪽은 Parent Relationship 으로(앞에 InitPlan·SubPlan 이 올 수 있다)
+		const raw = (p.Plans as Record<string, unknown>[] | undefined) ?? [];
+		const oi = raw.findIndex((x) => x["Parent Relationship"] === "Outer");
+		const ii = raw.findIndex((x) => x["Parent Relationship"] === "Inner");
+		const outer = kids[oi >= 0 ? oi : 0];
+		const inner = kids[ii >= 0 ? ii : 1];
 		const outerRows = outer.actualRows !== undefined ? outer.actualRows * (outer.loops ?? 1) : outer.rows;
-		const innerSeq = /^Seq Scan/.test(kids[1].label);
-		if ((outerRows ?? 0) > BIG)
+		const innerSeq = /^Seq Scan/.test(inner.label);
+		const innerIndex = /Index/.test(inner.label);
+		// 안쪽이 인덱스 조회면 바깥이 아주 많을 때만
+		if ((outerRows ?? 0) > (innerIndex ? 1_000_000 : BIG))
 			w.push(`바깥 행이 많은 Nested Loop(${Math.round(outerRows ?? 0).toLocaleString()}행 × 안쪽) — 안쪽 조인 열에 인덱스가 없거나 행 수 예상이 틀렸을 수 있습니다. Hash Join 이 낫지 않은지 보세요`);
 		else if (innerSeq && (outerRows ?? 0) > 100) w.push("Nested Loop 의 안쪽이 Seq Scan — 바깥 행마다 표를 다시 훑습니다. 안쪽 조인 열에 인덱스를 보세요");
 	}
@@ -56,9 +63,12 @@ function pgRules(p: Record<string, unknown>, kids: PlanNode[], planRows: number 
 }
 
 /** MySQL·MariaDB JSON 계획 블록 규칙 */
-function myRules(o: Record<string, unknown>, access: string | undefined, rows: number | undefined): string[] {
+function myRules(label: string, o: Record<string, unknown>, access: string | undefined, rows: number | undefined): string[] {
 	const w: string[] = [];
 	const yes = (v: unknown) => v === true || v === "true";
+	// MariaDB 는 using_filesort 대신 filesort·temporary_table 블록
+	if (label === "filesort") w.push("filesort — ORDER BY 를 인덱스로 받지 못해 따로 정렬합니다(정렬 열 인덱스·LIMIT 확인)");
+	if (label === "temporary_table") w.push("임시 표 — GROUP BY·DISTINCT·UNION 에 임시 표를 씁니다(그룹 열 인덱스 확인)");
 	if (access === "ALL" && (rows ?? 0) > 1000) w.push(`표 전체 읽기(type=ALL, ${Math.round(rows ?? 0).toLocaleString()}행) — 조건·조인 열에 인덱스가 있는지 보세요`);
 	if (access === "index" && (rows ?? 0) > BIG) w.push("인덱스 전체 훑기(type=index) — 조건이 인덱스 앞 열에 맞지 않아 범위를 좁히지 못합니다");
 	if (yes(o.using_filesort)) w.push("Using filesort — ORDER BY 를 인덱스로 받지 못해 따로 정렬합니다(정렬 열 인덱스·LIMIT 확인)");
@@ -216,7 +226,7 @@ function fromMy(j: unknown): { root: PlanNode; extra: [string, string][] } | nul
 			actualRows,
 			actualMs,
 			self: actualMs ?? cost,
-			warns: myRules(o, access, rows),
+			warns: myRules(label, o, access, rows),
 			props,
 			kids,
 		};

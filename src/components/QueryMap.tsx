@@ -31,8 +31,9 @@ export function jumpTo(conn: number, snap: Snapshot | null, pos: Pos | undefined
 	v.focus();
 }
 
-type ColRow = { name: string; roles: string; pk: boolean; fk: boolean; type?: string; missing: boolean; pos: Pos };
-type TData = { t: MapTable; label: string; badge: string | null; sub: string | null; cols: ColRow[]; more: number; missing: boolean; onCol: (p: Pos) => void };
+/** 열 줄 — 위치는 그릴 때가 아니라 누를 때 지금 그림에서 id 로 찾는다(구조가 같아도 위치는 바뀐다) */
+type ColRow = { name: string; roles: string; pk: boolean; fk: boolean; type?: string; missing: boolean; col: number };
+type TData = { t: MapTable; label: string; badge: string | null; sub: string | null; cols: ColRow[]; more: number; missing: boolean; onCol: (col: number) => void };
 type GData = { label: string; kind: string; w: number; h: number };
 
 const ROLE_ORDER = "SWJGHOUI";
@@ -55,7 +56,7 @@ const TableNode = memo(function TableNode({ data }: NodeProps<Node<TData>>) {
 					className={`qm-col${c.pk ? " pk" : ""}${c.fk ? " fk" : ""}${c.missing ? " missing" : ""}${/[WGO]/.test(c.roles) ? " hot" : ""}`}
 					onClick={(e) => {
 						e.stopPropagation();
-						data.onCol(c.pos);
+						data.onCol(c.col);
 					}}
 					title={`${c.name}${c.type ? ` · ${c.type}` : ""}${c.pk ? " · PK" : ""}${c.fk ? " · FK" : ""}${c.missing ? " · 표에 없는 열" : ""} — ${[...c.roles].map((r) => ROLE_TIP[r]).join(", ")}`}
 				>
@@ -100,7 +101,7 @@ function scopeLabel(s: QueryMap["scopes"][number]) {
 }
 
 /** 지도 그림 — 묶음(CTE·서브쿼리)을 상자로 겹쳐, 표는 FROM 순서대로 왼쪽 → 오른쪽 */
-function build(snap: Snapshot, findings: Finding[], onCol: (p: Pos) => void): { nodes: Node[]; edges: Edge[] } {
+function build(snap: Snapshot, findings: Finding[], onCol: (col: number) => void): { nodes: Node[]; edges: Edge[] } {
 	const { map, resolved } = snap;
 	const meta = resolved?.meta ?? map.tables.map(() => undefined);
 	const colTable = resolved?.colTable ?? map.cols.map((c) => c.table);
@@ -126,7 +127,7 @@ function build(snap: Snapshot, findings: Finding[], onCol: (p: Pos) => void): { 
 		const cm: ColMeta | undefined = meta[tid]?.cols?.find((x) => x.name.toLowerCase() === c.name.toLowerCase());
 		if (ex) {
 			if (r && !ex.roles.includes(r)) ex.roles += r;
-		} else list.push({ name: cm?.name ?? c.name, roles: r, pk: !!cm?.pk, fk: fkCols.get(tid)?.has(c.name.toLowerCase()) ?? false, type: cm?.dataType, missing: !cm && !!meta[tid]?.cols, pos: c.pos });
+		} else list.push({ name: cm?.name ?? c.name, roles: r, pk: !!cm?.pk, fk: fkCols.get(tid)?.has(c.name.toLowerCase()) ?? false, type: cm?.dataType, missing: !cm && !!meta[tid]?.cols, col: c.id });
 	}
 	for (const l of rows.values()) for (const r of l) r.roles = [...r.roles].sort((a, b) => ROLE_ORDER.indexOf(a) - ROLE_ORDER.indexOf(b)).join("");
 
@@ -238,7 +239,7 @@ function build(snap: Snapshot, findings: Finding[], onCol: (p: Pos) => void): { 
 			markerEnd: j.kind === "left" || j.kind === "inner" || j.kind === "full" ? { type: MarkerType.ArrowClosed } : undefined,
 			markerStart: j.kind === "right" || j.kind === "full" ? { type: MarkerType.ArrowClosed } : undefined,
 			style: { strokeWidth: j.kind === "where" ? 1.2 : 1.6, strokeDasharray: dash },
-			data: { pos: j.pos },
+			data: { join: i },
 			labelBgPadding: [4, 2],
 			labelBgBorderRadius: 4,
 		});
@@ -247,12 +248,12 @@ function build(snap: Snapshot, findings: Finding[], onCol: (p: Pos) => void): { 
 	for (const t of map.tables) {
 		const g = t.cte ?? t.derived;
 		if (g === null) continue;
-		edges.push({ id: `c${t.id}`, source: `g${g}`, target: `t${t.id}`, className: "qm-edge k-scope", style: { strokeDasharray: "2 3", strokeWidth: 1 }, data: { pos: t.pos } });
+		edges.push({ id: `c${t.id}`, source: `g${g}`, target: `t${t.id}`, className: "qm-edge k-scope", style: { strokeDasharray: "2 3", strokeWidth: 1 }, data: { table: t.id } });
 	}
 	// 상관 서브쿼리 → 바깥 표
 	for (const f of map.facts)
 		if (f.kind === "correlated" && f.sub !== null && f.table !== null)
-			edges.push({ id: `k${f.sub}`, source: `g${f.sub}`, target: `t${f.table}`, label: "상관", className: "qm-edge k-corr", style: { strokeDasharray: "2 3", strokeWidth: 1 }, data: { pos: f.pos } });
+			edges.push({ id: `k${f.sub}`, source: `g${f.sub}`, target: `t${f.table}`, label: "상관", className: "qm-edge k-corr", style: { strokeDasharray: "2 3", strokeWidth: 1 }, data: { scope: f.sub } });
 	return { nodes, edges };
 }
 
@@ -264,7 +265,7 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	snapRef.current = snap;
 	const rf = useRef<ReactFlowInstance | null>(null);
 	const conn = deps.conn;
-	const onCol = useMemo(() => (p: Pos) => jumpTo(conn, snapRef.current, p), [conn]);
+	const onCol = useMemo(() => (col: number) => jumpTo(conn, snapRef.current, snapRef.current?.map.cols[col]?.pos), [conn]);
 	const mapWarns = useMemo(() => (snap?.findings ?? []).filter((f) => f.layer === "map"), [snap?.findings]);
 	// 구조가 바뀔 때만 다시 그린다(위치만 옮긴 입력은 그대로)
 	const graph = useMemo(() => (snap ? build(snap, mapWarns, onCol) : { nodes: [], edges: [] }), [snap?.shape, mapWarns.length, onCol]);
@@ -290,15 +291,19 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 						}}
 						onNodeClick={(_, n) => {
 							const d = n.data as Partial<TData>;
-							if (d.t) jumpTo(conn, snapRef.current, d.t.pos);
+							if (d.t) jumpTo(conn, snapRef.current, snapRef.current?.map.tables[d.t.id]?.pos);
 							else {
 								const sid = Number(n.id.slice(1));
 								jumpTo(conn, snapRef.current, snapRef.current?.map.scopes[sid]?.pos);
 							}
 						}}
-						onEdgeClick={(_, e) => jumpTo(conn, snapRef.current, (e.data as { pos?: Pos } | undefined)?.pos)}
+						onEdgeClick={(_, e) => {
+							const d = (e.data ?? {}) as { join?: number; table?: number; scope?: number };
+							const m = snapRef.current?.map;
+							jumpTo(conn, snapRef.current, d.join !== undefined ? m?.joins[d.join]?.pos : d.table !== undefined ? m?.tables[d.table]?.pos : d.scope !== undefined ? m?.scopes[d.scope]?.pos : undefined);
+						}}
 						nodesConnectable={false}
-						nodesDraggable
+						nodesDraggable={false}
 						elementsSelectable
 						minZoom={0.2}
 						proOptions={{ hideAttribution: true }}

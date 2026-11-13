@@ -7,11 +7,11 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useState } from "react";
-import { type Fk, indexColsSql, type IndexInfo, parseIndexRows, queryRows } from "./dbtools";
+import { type Fk, fkSql, indexColsSql, type IndexInfo, parseIndexRows } from "./dbtools";
 import type { ColMeta } from "./edits";
 import { allFindings, type Finding, type QueryMap, type Resolved, resolveCols, type TableMeta } from "./queryLint";
-import { currentView, subscribeEditor } from "./queryWatch";
-import { type Stmt, statementAt } from "./sql";
+import { currentView, runBackground, subscribeEditor } from "./queryWatch";
+import { splitSql, type Stmt } from "./sql";
 
 const PAUSE_MS = 300;
 const MAX_DOC = 1_000_000;
@@ -28,8 +28,23 @@ export type AnalyzeDeps = {
 	defaultSchema: string | null;
 	running: boolean;
 	inTx: boolean;
-	fks: (schema: string) => Promise<Fk[]>;
 };
+
+/** 메타데이터 조회 상한 — 사용자 실행을 오래 막지 않게 */
+const BG_TIMEOUT_MS = 3000;
+type QueryOk = { resultId?: number | null; rowCount: number };
+/** 뒤 조회 — 연결마다 한 줄로(같은 연결 BUSY 방지), 짧은 시간 상한 */
+function bgRows(conn: number, sql: string, max: number): Promise<(string | null)[][]> {
+	return runBackground(conn, async () => {
+		const ok = await invoke<QueryOk>("db_query", { conn, sql, maxRows: max, timeoutMs: BG_TIMEOUT_MS, stream: null });
+		if (!ok.resultId) return [];
+		try {
+			return await invoke<(string | null)[][]>("db_rows", { result: ok.resultId, from: 0, to: ok.rowCount });
+		} finally {
+			void invoke("db_result_close", { result: ok.resultId });
+		}
+	});
+}
 
 export type Snapshot = {
 	/** 문장(편집기 위치) */
@@ -52,13 +67,16 @@ type Node = { name: string; kind: string; detail?: string | null };
 /** 연결·epoch 마다 메타데이터 기억 */
 class Meta {
 	private schemas: Promise<string[]> | null = null;
-	private tables = new Map<string, Promise<Node[]>>();
+	private tables = new Map<string, Promise<Node[] | null>>();
+	/** 읽기에 실패한 것이 있었다 — 조금 뒤 다시 맞춘다 */
+	failed = false;
 	private cols = new Map<string, Promise<ColMeta[] | null>>();
 	private idx = new Map<string, Promise<IndexInfo[] | null>>();
-	private fkMap = new Map<string, Promise<Fk[]>>();
+	private fkMap = new Map<string, Promise<Fk[] | null>>();
 	constructor(private conn: number) {}
 
 	private retry<K, V>(m: Map<K, Promise<V>>, k: K) {
+		this.failed = true;
 		window.setTimeout(() => m.delete(k), RETRY_MS);
 	}
 	listSchemas(allow: boolean): Promise<string[]> | null {
@@ -66,19 +84,21 @@ class Meta {
 		this.schemas ??= invoke<Node[]>("db_tree", { conn: this.conn, path: [] })
 			.then((l) => l.filter((n) => n.kind === "schema").map((n) => n.name))
 			.catch(() => {
+				this.failed = true;
 				window.setTimeout(() => (this.schemas = null), RETRY_MS);
 				return [] as string[];
 			});
 		return this.schemas;
 	}
-	listTables(schema: string, allow: boolean): Promise<Node[]> | null {
+	/** 표 목록 — 못 읽었으면 null(빈 목록과 다르다: "없는 표"라 하지 않는다) */
+	listTables(schema: string, allow: boolean): Promise<Node[] | null> | null {
 		const k = schema.toLowerCase();
 		let p = this.tables.get(k);
 		if (!p) {
 			if (!allow) return null;
 			p = invoke<Node[]>("db_tree", { conn: this.conn, path: [schema] }).catch(() => {
 				this.retry(this.tables, k);
-				return [] as Node[];
+				return null;
 			});
 			this.tables.set(k, p);
 		}
@@ -105,7 +125,7 @@ class Meta {
 			const sql = indexColsSql(engine, schema === "(기본)" ? null : schema, table);
 			if (!sql) return Promise.resolve(null);
 			if (!allow) return null;
-			p = queryRows(this.conn, sql, 5000)
+			p = bgRows(this.conn, sql, 5000)
 				.then(parseIndexRows)
 				.catch(() => {
 					this.retry(this.idx, k);
@@ -115,12 +135,20 @@ class Meta {
 		}
 		return p;
 	}
-	fks(schema: string, load: (s: string) => Promise<Fk[]>, allow: boolean): Promise<Fk[]> | null {
+	/** 스키마의 외래 키 — 못 읽었으면 null(FK 없는 조인이라 하지 않는다) */
+	fks(engine: string, schema: string, allow: boolean): Promise<Fk[] | null> | null {
 		const k = schema.toLowerCase();
 		let p = this.fkMap.get(k);
 		if (!p) {
+			const sql = fkSql(engine, schema);
+			if (!sql) return Promise.resolve(null);
 			if (!allow) return null;
-			p = load(schema);
+			p = bgRows(this.conn, sql, 50000)
+				.then((rows) => rows.map((r) => ({ table: r[0] ?? "", column: r[1] ?? "", refTable: r[2] ?? "", refColumn: r[3] ?? "" })) as Fk[] | null)
+				.catch(() => {
+					this.retry(this.fkMap, k);
+					return null;
+				});
 			this.fkMap.set(k, p);
 		}
 		return p;
@@ -136,11 +164,16 @@ class Meta {
 		if (schema) cands = all.filter((s) => s.toLowerCase() === schema.toLowerCase());
 		else if (mysql && prefer) cands = all.filter((s) => s.toLowerCase() === prefer.toLowerCase());
 		else cands = prefer ? [...all.filter((s) => s.toLowerCase() === prefer.toLowerCase()), ...all.filter((s) => s.toLowerCase() !== prefer.toLowerCase())] : all;
-		const complete = cands.length <= MAX_SCHEMAS;
+		let complete = cands.length <= MAX_SCHEMAS;
 		for (const s of cands.slice(0, MAX_SCHEMAS)) {
 			const tp = this.listTables(s, allow);
 			if (!tp) return "wait";
-			const t = (await tp).find((n) => n.name.toLowerCase() === low && n.kind !== "column" && n.kind !== "schema");
+			const list = await tp;
+			if (!list) {
+				complete = false;
+				continue;
+			}
+			const t = list.find((n) => n.name.toLowerCase() === low && n.kind !== "column" && n.kind !== "schema");
 			if (t) return [{ schema: s, name: t.name, kind: t.kind === "view" ? "view" : "table" }, true];
 		}
 		return [null, complete && (!!schema || cands.length > 0)];
@@ -174,6 +207,10 @@ class Analyzer {
 	private seq = 0;
 	private lastText: string | null = null;
 	private metaPending = false;
+	/** 문서가 그대로면 문장 나누기를 다시 하지 않는다(커서만 옮긴 경우) */
+	private lastDoc: unknown = null;
+	private splits: Stmt[] = [];
+	private retryTimer: number | undefined;
 	state: State = { snap: null, off: null, busy: false };
 
 	constructor(deps: AnalyzeDeps) {
@@ -250,17 +287,26 @@ class Analyzer {
 		if (!view) return this.emit({ off: "SQL 편집기를 누르면 그 커서 문장을 그립니다", snap: null });
 		const doc = view.state.doc;
 		if (doc.length > MAX_DOC) return this.emit({ off: "1MB 가 넘는 스크립트라 지도를 끕니다" });
-		const text = doc.toString();
-		const stmt = statementAt(text, view.state.selection.main.head);
+		if (doc !== this.lastDoc) {
+			this.lastDoc = doc;
+			this.splits = splitSql(doc.toString());
+		}
+		const pos = view.state.selection.main.head;
+		const all = this.splits;
+		const stmt = all.find((s) => pos >= s.from && pos <= s.to + 1) ?? [...all].reverse().find((s) => s.to < pos) ?? all[0] ?? null;
 		if (!stmt || !stmt.text.trim()) {
 			this.lastText = null;
 			return this.emit({ off: "커서가 있는 곳에 문장이 없습니다", snap: null });
 		}
-		// 같은 문장 — 위치만 옮긴다
-		if (stmt.text === this.lastText && this.state.snap) {
-			if (this.state.snap.stmt.from !== stmt.from) this.emit({ snap: { ...this.state.snap, stmt } });
+		const snap = this.state.snap;
+		// 지금 그림과 같은 문장 — 위치만 옮긴다(실패해 흐리게 둔 그림이면 다시 또렷하게)
+		if (snap && stmt.text === snap.stmt.text) {
+			this.lastText = stmt.text;
+			if (snap.stmt.from !== stmt.from || snap.stale) this.emit({ snap: { ...snap, stmt, stale: false, error: null } });
 			return;
 		}
+		// 방금 읽기에 실패한 그 문장 그대로 — 다시 읽어도 같다
+		if (stmt.text === this.lastText) return;
 		this.lastText = stmt.text;
 		const my = ++this.seq;
 		const d = this.deps;
@@ -283,18 +329,26 @@ class Analyzer {
 		const quick = await Promise.race([rp, new Promise<null>((r) => window.setTimeout(() => r(null), 120))]);
 		if (my !== this.seq) return;
 		if (!quick) this.emit({ off: null, busy: true, snap: { stmt, map, resolved: null, findings: [], shape: shapeOf(map, null), stale: false, error: null, note: "메타데이터 맞추는 중…" } });
-		const { resolved, note } = await rp;
+		const { resolved, note, retry } = await rp;
 		if (my !== this.seq) return;
+		// 메타데이터를 못 읽은 것이 있으면 조금 뒤 한 번 더(캐시가 비워진 뒤)
+		window.clearTimeout(this.retryTimer);
+		if (retry)
+			this.retryTimer = window.setTimeout(() => {
+				this.lastText = null;
+				this.schedule(0);
+			}, RETRY_MS + 500);
 		const findings = allFindings(resolved, stmt.text, d.engine);
 		this.emit({ busy: false, snap: { stmt, map, resolved, findings, shape: shapeOf(map, resolved), stale: false, error: null, note } });
 	}
 
-	private async resolve(map: QueryMap): Promise<{ resolved: Resolved; note: string | null }> {
+	private async resolve(map: QueryMap): Promise<{ resolved: Resolved; note: string | null; retry: boolean }> {
 		const d = this.deps;
 		const m = metaFor(d.conn, d.epoch);
-		// 실행 중에는 아무것도 묻지 않는다(같은 연결) · PG 트랜잭션 중에는 카탈로그 SQL(인덱스·FK)만 미룬다 — 오류 하나가 트랜잭션을 깨뜨린다
-		const allowTree = !d.running;
-		const allowSql = !d.running && !(d.inTx && d.engine === "postgres");
+		m.failed = false;
+		// 실행 중에는 아무것도 묻지 않는다(같은 연결). PG 트랜잭션 중에는 캐시에 없는 것을 모두 미룬다 — 오류 하나가 트랜잭션을 깨뜨린다
+		const allowTree = !d.running && !(d.inTx && d.engine === "postgres");
+		const allowSql = allowTree;
 		const mysql = d.engine === "mysql" || d.engine === "mariadb";
 		const meta: (TableMeta | null | undefined)[] = map.tables.map(() => undefined);
 		let searched = true;
@@ -322,16 +376,19 @@ class Analyzer {
 				const ip = m.indexes(d.engine, hit.schema, hit.name, allowSql);
 				if (ip === null) pending = true;
 				else indexes = await ip;
-				const fp = m.fks(hit.schema, d.fks, allowSql);
+				const fp = m.fks(d.engine, hit.schema, allowSql);
 				if (fp === null) pending = true;
-				else fks.set(hit.schema.toLowerCase(), await fp);
+				else {
+					const list = await fp;
+					if (list) fks.set(hit.schema.toLowerCase(), list);
+				}
 				meta[t.id] = { schema: hit.schema, name: hit.name, kind: hit.kind, cols, indexes };
 			}),
 		);
 		this.metaPending = pending;
 		const colTable = resolveCols(map, meta);
-		const notes = [pending && (d.running ? "쿼리 실행 중이라 인덱스·FK 는 끝난 뒤 읽습니다" : "트랜잭션 중이라 인덱스·FK 는 끝난 뒤 읽습니다"), noIndex && "이 엔진은 인덱스 목록을 못 읽어 인덱스 검사를 건너뜁니다", !searched && "스키마가 많아 일부 표는 찾지 못했을 수 있습니다"].filter(Boolean);
-		return { resolved: { map, meta, searched, colTable, fks }, note: notes.length ? notes.join(" · ") : null };
+		const notes = [pending && (d.running ? "쿼리 실행 중이라 인덱스·FK 는 끝난 뒤 읽습니다" : "트랜잭션 중이라 새 메타데이터는 끝난 뒤 읽습니다(PostgreSQL — 오류가 트랜잭션을 깨뜨리지 않게)"), noIndex && "이 엔진은 인덱스 목록을 못 읽어 인덱스 검사를 건너뜁니다", !searched && "스키마가 많아 일부 표는 찾지 못했을 수 있습니다"].filter(Boolean);
+		return { resolved: { map, meta, searched, colTable, fks }, note: notes.length ? notes.join(" · ") : null, retry: m.failed };
 	}
 }
 
