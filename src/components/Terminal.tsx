@@ -26,6 +26,7 @@ import { Select } from "./Select";
 import { AssistFormSheet, ExplainCard } from "./CmdAssist";
 import { candidatesFor, cmdDesc, ensureDict, type ExplainPart, explainLine, fillTemplate, hasTemplateFields, optLookup, requestMan, subDesc } from "../lib/cmdAssist";
 import { attachAssist, type TermAssist } from "../lib/termAssist";
+import { attachIme, IS_WEBKIT } from "../lib/termIme";
 import { contextCommand, contextNotice, ctxContainer, type ForeignCtx, type Job, jobFile, looksLikePrompt, parseDockerExec, parseJobs, STOPPED_EXIT } from "../lib/shellCtx";
 
 type Stat = { label: string; ok?: boolean };
@@ -379,6 +380,9 @@ export function TerminalView({
 		const look = getAppearance();
 		const th0 = termTheme(profileIdRef.current);
 		el.style.background = th0.background ?? "";
+		// IME 조합 글자(xterm 조합 표시)를 터미널 색으로 — 서버별 색 덮어쓰기까지 따른다
+		el.style.setProperty("--ime-bg", th0.background ?? "");
+		el.style.setProperty("--ime-fg", th0.foreground ?? "");
 		const term = new XTerm({
 			fontFamily: termFontFamily(),
 			fontSize: look.termSize,
@@ -642,6 +646,14 @@ export function TerminalView({
 					})
 				: null;
 		axRef.current = ax;
+		// ── IME(한글 등) 조합 — 조합 중에는 앱 키 가로채기·자동완성을 쉬고 xterm 기본 처리(조합 표시·textarea 자리)에 맡긴다 ──
+		const ime = attachIme({
+			term,
+			host: el,
+			// 화면 점검(개발 빌드)에서 window.__rbWkIme = true 로 WKWebView 흉내 조합을 켤 수 있다
+			webkit: IS_WEBKIT || (import.meta.env.DEV && !!(window as { __rbWkIme?: boolean }).__rbWkIme),
+			onComposing: (on) => completer?.composing(on),
+		});
 
 		// ── 셸 통합 ──
 		/** docker exec 로 컨테이너 셸에 들어가는 중 — 그 셸의 출력이 멎으면(프롬프트) 훅을 넣는다. 그 사이 무엇이든 치면 그만둔다 */
@@ -802,6 +814,8 @@ export function TerminalView({
 			.catch((e) => setStat({ label: `셸을 열지 못했습니다: ${typeof e === "object" ? (e as { message?: string }).message : String(e)}` }));
 
 		const onData = term.onData((d) => {
+			// 빈 조합 확정(조합을 지우고 끝냄)은 보낼 것이 없다
+			if (!d) return;
 			// rz/sz 전송 중 — 셸에 글을 보내지 않는다(Ctrl+C 는 전송 멈추기)
 			if (zmb?.active()) {
 				if (d === "\x03") zmb.cancel();
@@ -825,7 +839,7 @@ export function TerminalView({
 			if (inj && !(atPrompt && d.includes("\r"))) inj = null;
 			// 빈칸 템플릿 입력(D25 ①) — 셸로 보내기까지 끝
 			if (ax?.data(d)) return;
-			if (d === "\r") completer?.submitted();
+			if (d === "\r") completer?.submitted(keyDirty ? undefined : keyLine);
 			// 첫 입력(붙여넣기·템플릿처럼 여러 글자도) 직전 커서 = 입력 시작
 			else if (d >= " " && d !== "\x7f") completer?.typed();
 			if (atPrompt && d.includes("\r")) {
@@ -877,6 +891,21 @@ export function TerminalView({
 			if (idRef.current != null) void backend.resize(idRef.current, cols, rows);
 		});
 		term.attachCustomKeyEventHandler((e) => {
+			// ── IME 조합(한글 등) — 앱의 키 가로채기(Tab 목록·흐린 제안·단축키·빈칸 이동)를 모두 건너뛰고 xterm 에 맡긴다 ──
+			const wk = ime.key(e);
+			if (wk !== undefined) return wk;
+			if (ime.composing() || e.isComposing || e.keyCode === 229) return true;
+			if (ime.tail() && e.type === "keydown") {
+				// 조합을 끝낸 키(Windows: Enter·Tab·방향키는 조합을 끝내고 한 번 더 온다) — 확정 글자가 아직 셸로 가지 않았다.
+				// xterm 에 넘기면 확정 글자를 먼저 보내고 그 키를 처리한다. 빈칸 이동(Tab·Esc)만은 확정 글자가 간 뒤에 앱이 처리
+				if (ax?.templating() && (e.key === "Tab" || e.key === "Escape") && !e.ctrlKey && !e.altKey && !e.metaKey) {
+					e.preventDefault();
+					e.stopPropagation();
+					window.setTimeout(() => ax.key(e), 0);
+					return false;
+				}
+				return true;
+			}
 			// 입력 보조(D25) — 빈칸 Tab 이 자동완성 Tab 보다 먼저, Ctrl+Shift+E 풀이
 			if (ax && !ax.key(e)) {
 				e.preventDefault();
@@ -1050,6 +1079,8 @@ export function TerminalView({
 			const th = termTheme(profileIdRef.current);
 			term.options.theme = th;
 			el.style.background = th.background ?? "";
+			el.style.setProperty("--ime-bg", th.background ?? "");
+			el.style.setProperty("--ime-fg", th.foreground ?? "");
 			term.options.fontFamily = termFontFamily();
 			term.options.lineHeight = a.termLine;
 			if (a.termSize !== lookSize) {
@@ -1071,6 +1102,7 @@ export function TerminalView({
 			zmRef.current = null;
 			setZm(null);
 			hi.dispose();
+			ime.dispose();
 			ax?.dispose();
 			axRef.current = null;
 			completer?.dispose();
