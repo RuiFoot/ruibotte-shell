@@ -223,3 +223,48 @@ export function pagedSelect(engine: string, table: string, opts: { where?: strin
 	if (engine === "cubrid" || engine === "altibase") return `${sql} LIMIT ${offset}, ${limit}`;
 	return `${sql} LIMIT ${limit} OFFSET ${offset}`;
 }
+
+/** 인덱스 열 한 줄 — 튜닝 도우미의 인덱스 검사용 */
+export type IndexInfo = { name: string; cols: (string | null)[]; unique: boolean; primary: boolean; partial: boolean };
+
+/**
+ * 표의 인덱스를 열 순서대로 — 행: 인덱스 이름, 열 이름(식이면 NULL), 순번, 고유(1/0), 기본 키(1/0), 부분·필터(1/0).
+ * 포함(INCLUDE) 열은 빼고 키 열만. 지원하지 않는 엔진은 null.
+ */
+export function indexColsSql(engine: string, schema: string | null, table: string): string | null {
+	const s = schema ?? "";
+	if (engine === "postgres")
+		return `SELECT i.relname, a.attname, k.n, CASE WHEN ix.indisunique THEN 1 ELSE 0 END, CASE WHEN ix.indisprimary THEN 1 ELSE 0 END, CASE WHEN ix.indpred IS NULL THEN 0 ELSE 1 END
+FROM pg_index ix JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_namespace ns ON ns.oid = t.relnamespace JOIN pg_class i ON i.oid = ix.indexrelid
+CROSS JOIN LATERAL unnest(ix.indkey::int2[]) WITH ORDINALITY AS k(attnum, n)
+LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0
+WHERE ${schema ? `ns.nspname = ${lit(s)}` : "pg_table_is_visible(t.oid)"} AND t.relname = ${lit(table)} AND k.n <= ix.indnkeyatts
+ORDER BY 1, 3`;
+	if (engine === "mysql" || engine === "mariadb")
+		return `SELECT index_name, column_name, seq_in_index, 1 - non_unique, CASE WHEN index_name = 'PRIMARY' THEN 1 ELSE 0 END, 0 FROM information_schema.statistics WHERE ${schema ? `table_schema = ${lit(s)}` : "table_schema = DATABASE()"} AND table_name = ${lit(table)} ORDER BY index_name, seq_in_index`;
+	if (engine === "mssql")
+		return `SELECT i.name, c.name, ic.key_ordinal, CAST(i.is_unique AS int), CAST(i.is_primary_key AS int), CAST(i.has_filter AS int)
+FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.object_id = OBJECT_ID(${lit(schema ? `${s}.${table}` : table)}) AND ic.key_ordinal > 0 ORDER BY i.name, ic.key_ordinal`;
+	if (engine === "oracle" || engine === "tibero")
+		return `SELECT c.index_name, c.column_name, c.column_position, CASE i.uniqueness WHEN 'UNIQUE' THEN 1 ELSE 0 END,
+ CASE WHEN EXISTS (SELECT 1 FROM all_constraints k WHERE k.owner = i.table_owner AND k.index_name = i.index_name AND k.constraint_type = 'P') THEN 1 ELSE 0 END, 0
+FROM all_ind_columns c JOIN all_indexes i ON i.owner = c.index_owner AND i.index_name = c.index_name
+WHERE c.table_owner = ${schema ? lit(s.toUpperCase()) : "USER"} AND c.table_name = ${lit(table.toUpperCase())} ORDER BY 1, 3`;
+	return null;
+}
+
+/** indexColsSql 결과 → 인덱스 목록 */
+export function parseIndexRows(rows: (string | null)[][]): IndexInfo[] {
+	const by = new Map<string, IndexInfo>();
+	for (const r of rows) {
+		const name = r[0] ?? "";
+		let x = by.get(name);
+		if (!x) {
+			x = { name, cols: [], unique: r[3] === "1" || r[3] === "true", primary: r[4] === "1" || r[4] === "true", partial: r[5] === "1" || r[5] === "true" };
+			by.set(name, x);
+		}
+		x.cols.push(r[1]);
+	}
+	return [...by.values()];
+}

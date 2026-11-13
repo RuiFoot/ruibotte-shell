@@ -16,6 +16,7 @@ mod pty;
 mod route;
 mod secrets;
 mod sessionlog;
+mod sqlmap;
 mod srvtools;
 mod ssh;
 mod store;
@@ -250,6 +251,7 @@ pub fn run() {
             db::db_databases,
             db::db_classify,
             db::db_explain,
+            sqlmap::sql_map,
             db::db_read_csv,
             db::db_save_hex,
             jdbc::jdbc_status,
