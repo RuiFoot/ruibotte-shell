@@ -458,14 +458,33 @@
 .qf-group.dim {
 	opacity: 0.4;
 }
+/* 묶음 머리 — WITH · AS (…) 같은 군말이 먼저 줄고(flex-shrink 큼) 이름은 마지막까지 */
 .qf-group-head {
+	display: flex;
+	align-items: baseline;
+	gap: 4px;
+	min-width: 0;
 	padding: 4px 10px;
 	overflow: hidden;
 	color: var(--text-2);
 	font-family: var(--font-mono);
 	font-size: 10.5px;
-	text-overflow: ellipsis;
 	white-space: nowrap;
+}
+.qg-aux,
+.qg-name {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.qg-aux {
+	flex: 0 1000 auto;
+	color: var(--text-3);
+}
+.qg-name {
+	flex: 0 1 auto;
+	color: var(--text);
+	font-weight: 600;
 }
 .qf-edge .react-flow__edge-path {
 	stroke: var(--text-3);

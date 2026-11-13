@@ -104,13 +104,16 @@ const snip = (text: string, p: Pos | undefined | null, max = 140) => (p ? clip(t
 const isR = (p: Pos | undefined | null): p is R => !!p;
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-function groupLabel(map: QueryMap, sid: number): string {
+/** 묶음 머리 — 좁으면 앞뒤 군말(pre·post)부터 줄이고 이름은 끝까지 남긴다, 전체는 툴팁 */
+type GLabel = { pre: string | null; name: string; post: string | null; full: string };
+function groupLabel(map: QueryMap, sid: number): GLabel {
 	const s = map.scopes[sid];
-	if (s.kind === "cte") return `WITH ${s.name ?? ""} AS (…)`;
-	if (s.kind === "derived") return `FROM (서브쿼리) ${s.name ?? ""}`.trim();
-	if (s.kind === "union") return `갈래 ${map.scopes.filter((x) => x.parent === s.parent && x.kind === "union").findIndex((x) => x.id === sid) + 1}`;
-	if (s.name === "SELECT") return "넣을 행(SELECT)";
-	return s.name ? `${s.name} (서브쿼리)` : "스칼라 서브쿼리";
+	const g = (pre: string | null, name: string, post: string | null): GLabel => ({ pre, name, post, full: [pre, name, post].filter(Boolean).join(" ") });
+	if (s.kind === "cte") return g("WITH", s.name ?? "CTE", "AS (…)");
+	if (s.kind === "derived") return g("FROM (서브쿼리)", s.name ?? "", null);
+	if (s.kind === "union") return g(null, `갈래 ${map.scopes.filter((x) => x.parent === s.parent && x.kind === "union").findIndex((x) => x.id === sid) + 1}`, null);
+	if (s.name === "SELECT") return g(null, "넣을 행(SELECT)", null);
+	return s.name ? g(null, s.name, "(서브쿼리)") : g(null, "스칼라 서브쿼리", null);
 }
 
 /** 문장 하나 → 단계 그래프(결과가 뿌리, 원본 표가 잎) */
@@ -1011,7 +1014,7 @@ type Ui = {
 };
 const UiCtx = createContext<Ui>({ lit: null, cursor: null, picked: null, horizontal: true, hover: () => {}, pickRow: () => {}, pickCol: () => {} });
 type ND = { n: FNode };
-type GD = { label: string; kind: string; sid: number };
+type GD = { label: GLabel; kind: string; sid: number };
 
 function useNodeClass(n: FNode) {
 	const ui = useContext(UiCtx);
@@ -1204,9 +1207,14 @@ const ResultNode = memo(function ResultNode({ data }: NodeProps<Node<ND>>) {
 
 const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<GD>>) {
 	const { lit } = useContext(UiCtx);
+	const { pre, name, post, full } = data.label;
 	return (
 		<div className={`qf-group k-${data.kind}${lit && !lit.nodes.has(`o${data.sid}`) ? " dim" : ""}`}>
-			<div className="qf-group-head">{data.label}</div>
+			<div className="qf-group-head" title={full}>
+				{pre && <span className="qg-aux">{pre}</span>}
+				{name && <b className="qg-name">{name}</b>}
+				{post && <span className="qg-aux">{post}</span>}
+			</div>
 		</div>
 	);
 });
