@@ -64,7 +64,7 @@ html:not([data-backdrop="os"]) .stg-side {
 	gap: 6px;
 	border-radius: var(--r-sm);
 	background: var(--fill);
-	color: var(--text-3);
+	color: var(--text-2);
 }
 .stg-search:focus-within {
 	box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
@@ -79,10 +79,11 @@ html:not([data-backdrop="os"]) .stg-side {
 	font: inherit;
 	font-size: 13px;
 	color: var(--text);
+	caret-color: var(--accent);
 	outline: none;
 }
 .stg-search input::placeholder {
-	color: var(--text-3);
+	color: var(--text-2);
 }
 .stg-search input::-webkit-search-cancel-button {
 	display: none;
@@ -222,7 +223,7 @@ html:not([data-backdrop="os"]) .stg-side {
 	white-space: nowrap;
 }
 .stg-hit small {
-	color: var(--text-3);
+	color: var(--text-2);
 	font-size: 11px;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -230,7 +231,7 @@ html:not([data-backdrop="os"]) .stg-side {
 }
 .stg-none {
 	margin: 18px 8px;
-	color: var(--text-3);
+	color: var(--text-2);
 	font-size: 12px;
 	text-align: center;
 }
@@ -303,7 +304,7 @@ html:not([data-backdrop="os"]) .stg-side {
 }
 .stg-gfoot {
 	margin: 6px 12px 0;
-	color: var(--text-3);
+	color: var(--text-2);
 	font-size: 11.5px;
 	line-height: 1.45;
 }
@@ -413,13 +414,6 @@ html:not([data-backdrop="os"]) .stg-side {
 	color: var(--text-2);
 	white-space: nowrap;
 }
-.btn .stg-kbd {
-	margin-left: 6px;
-	padding: 0 5px;
-	background: transparent;
-	box-shadow: none;
-	color: var(--text-3);
-}
 
 .toggle:disabled {
 	opacity: 0.45;
@@ -451,7 +445,7 @@ html:not([data-backdrop="os"]) .stg-side {
 }
 .stg-about .muted {
 	font-size: 12px;
-	color: var(--text-3);
+	color: var(--text-2);
 }
 
 /* 넓은 조절기(색 구성 격자·단어 목록·미리보기) */
@@ -478,4 +472,41 @@ html:not([data-backdrop="os"]) .stg-side {
 .stg-card > .stg-row.block > .scheme-grid {
 	margin-top: 0;
 	padding: 4px 0;
+}
+
+/* 초점 링 — 둥근 조절기는 둥글게 */
+.stg .toggle:focus-visible {
+	border-radius: 13px;
+}
+.stg .seg button:focus-visible {
+	outline-offset: -1px;
+}
+
+/* 고른 글·입력 커서도 앱 색으로 */
+.stg ::selection {
+	background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.stg .hi-input {
+	caret-color: var(--accent);
+}
+
+/* 하위 화면 들어가기·나오기 — 한 번, 짧게(상태 변화만 알린다). 범주끼리는 macOS 처럼 바로 바꾼다 */
+.stg-col[data-dir="in"] {
+	animation: stg-push-in 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.stg-col[data-dir="out"],
+.stg.narrow .stg-side[data-dir="out"] {
+	animation: stg-push-out 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes stg-push-in {
+	from {
+		opacity: 0;
+		transform: translateX(18px);
+	}
+}
+@keyframes stg-push-out {
+	from {
+		opacity: 0;
+		transform: translateX(-18px);
+	}
 }
