@@ -3,6 +3,10 @@ import { type ReactNode, useCallback, useEffect, useImperativeHandle, useMemo, u
 
 const PAGE = 200;
 const ROW_H = 26;
+/** 열이 이만큼 이상이면 가로로 보이는 열만 그린다(열 100개 × 보이는 행 60 = 6천 칸을 매번 그리지 않게) */
+const COL_VIRT_MIN = 60;
+/** 화면 양옆으로 미리 그려 두는 폭(px) — 가로 스크롤 때 빈칸이 비치지 않게 */
+const COL_OVERSCAN_PX = 480;
 
 export type GridCol = { name: string; kind: string; pk?: boolean; hint?: string };
 export type Cell = string | null;
@@ -163,10 +167,16 @@ export function DataGrid({
 	const added = overlay?.added ?? [];
 	const count = rowCount + added.length;
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: resetKey 가 바뀌면 받은 쪽을 버린다
-	useEffect(() => {
+	// 세대 — resetKey(정렬·다시 실행)가 바뀌면 받아 둔 쪽을 이 그리기에서 바로 버리고 번호를 올린다.
+	// 옛 요청의 늦은 응답은 번호가 달라 새 캐시에 들어가지 못한다(그리는 도중이라 effect 보다 먼저 ensure 가 불려도 옛 쪽을 안 쓴다)
+	const gen = useRef({ key: resetKey, n: 0 });
+	if (gen.current.key !== resetKey) {
+		gen.current = { key: resetKey, n: gen.current.n + 1 };
 		pages.current.clear();
 		loading.current.clear();
+	}
+	// biome-ignore lint/correctness/useExhaustiveDependencies: resetKey 가 바뀌면 고른 것을 푼다
+	useEffect(() => {
 		setSel(null);
 		setRangeEnd(null);
 		setRows(new Set());
@@ -196,6 +206,57 @@ export function DataGrid({
 	const tpl = useMemo(() => ["64px", ...widths.map((w) => `${w}px`)].join(" "), [widths]);
 	const total = 64 + widths.reduce((a, b) => a + b, 0);
 
+	// 열 가상화 — 열이 많을 때만. 칸마다 gridColumn 을 줘서 안 그린 열이 있어도 자리가 어긋나지 않는다
+	const virtCols = columns.length >= COL_VIRT_MIN;
+	const [colRange, setColRange] = useState<[number, number]>([0, 24]);
+	const colOffs = useMemo(() => {
+		const o: number[] = [];
+		let x = 64;
+		for (const w of widths) {
+			o.push(x);
+			x += w;
+		}
+		return o;
+	}, [widths]);
+	const computeRange = useCallback(() => {
+		const el = scroller.current;
+		if (!el || !virtCols) return;
+		const l = el.scrollLeft - COL_OVERSCAN_PX;
+		const r = el.scrollLeft + el.clientWidth + COL_OVERSCAN_PX;
+		let first = 0;
+		while (first < widths.length - 1 && colOffs[first] + widths[first] <= l) first++;
+		let last = first;
+		while (last < widths.length - 1 && colOffs[last + 1] < r) last++;
+		setColRange((prev) => (prev[0] === first && prev[1] === last ? prev : [first, last]));
+	}, [virtCols, widths, colOffs]);
+	useEffect(() => {
+		if (!virtCols) return;
+		computeRange();
+		const el = scroller.current;
+		if (!el) return;
+		const ro = new ResizeObserver(computeRange);
+		ro.observe(el);
+		return () => ro.disconnect();
+	}, [virtCols, computeRange]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: 열 개수가 바뀔 때만
+	const allCols = useMemo(() => columns.map((_, i) => i), [columns.length]);
+	const visCols = useMemo(() => {
+		if (!virtCols) return allCols;
+		const out: number[] = [];
+		for (let i = colRange[0]; i <= Math.min(colRange[1], allCols.length - 1); i++) out.push(i);
+		return out;
+	}, [virtCols, allCols, colRange]);
+	const cstyle = (ci: number) => (virtCols ? { gridColumn: ci + 2 } : undefined);
+	/** 방향키·Tab 으로 고른 열이 화면 밖이면 가로로 따라가기 */
+	const scrollColIntoView = (c: number) => {
+		const el = scroller.current;
+		if (!el || colOffs[c] === undefined) return;
+		const left = colOffs[c];
+		const right = left + widths[c];
+		if (left < el.scrollLeft + 64) el.scrollLeft = Math.max(0, left - 64);
+		else if (right > el.scrollLeft + el.clientWidth) el.scrollLeft = right - el.clientWidth;
+	};
+
 	const v = useVirtualizer({ count, getScrollElement: () => scroller.current, estimateSize: () => ROW_H, overscan: 24 });
 
 	const ensure = useCallback(
@@ -205,7 +266,10 @@ export function DataGrid({
 			const have = pages.current.get(page);
 			if (have && (have.length >= PAGE || page * PAGE + have.length >= rowCount)) return;
 			loading.current.add(page);
+			const g = gen.current.n;
 			void fetchRows(page * PAGE, page * PAGE + PAGE).then((r) => {
+				// 그 사이 resetKey 가 바뀌었으면(정렬·다시 실행) 옛 결과의 행이라 버린다 — 캐시·loading 은 이미 새 세대 것
+				if (g !== gen.current.n) return;
 				pages.current.set(page, r);
 				loading.current.delete(page);
 				if (page === 0 && !fitted.current && !userSized.current) {
@@ -217,6 +281,9 @@ export function DataGrid({
 					if (first !== undefined) pages.current.delete(first);
 				}
 				force((n) => n + 1);
+			}, () => {
+				// 받기 실패 — 같은 세대면 다음 그리기에서 다시 시도할 수 있게 풀어 둔다
+				if (g === gen.current.n) loading.current.delete(page);
 			});
 		},
 		[fetchRows, rowCount, columns],
@@ -324,6 +391,7 @@ export function DataGrid({
 			className="grid-scroll selectable"
 			ref={scroller}
 			tabIndex={0}
+			onScroll={virtCols ? computeRange : undefined}
 			onPaste={(e) => {
 				if (!onPaste || !sel || editing) return;
 				const t = e.clipboardData.getData("text/plain");
@@ -398,6 +466,7 @@ export function DataGrid({
 					setRangeEnd({ r, c });
 					setRows(new Set());
 					v.scrollToIndex(r);
+					scrollColIntoView(c);
 					return;
 				}
 				if (d) {
@@ -408,16 +477,20 @@ export function DataGrid({
 					setRangeEnd(null);
 					setRows(new Set());
 					v.scrollToIndex(r);
+					scrollColIntoView(c);
 				}
 			}}
 		>
 			<div style={{ width: total, minWidth: "100%" }}>
 				<div className="grid-head" style={{ gridTemplateColumns: tpl, width: total }}>
 					<div style={{ textAlign: "right", color: "var(--text-3)" }}>#</div>
-					{columns.map((c, i) => (
+					{visCols.map((i) => {
+						const c = columns[i];
+						return (
 						// biome-ignore lint/suspicious/noArrayIndexKey: 같은 이름 열이 있을 수 있다
 						<div
 							key={`${c.name}-${i}`}
+							style={cstyle(i)}
 							title={`${c.kind}${onSort ? " — 눌러 정렬(오름 → 내림 → 원래대로)" : ""}`}
 							className={`gh${onSort ? " sortable" : ""}`}
 							onClick={(ev) => {
@@ -453,7 +526,8 @@ export function DataGrid({
 								}}
 							/>
 						</div>
-					))}
+						);
+					})}
 				</div>
 				<div style={{ height: v.getTotalSize(), position: "relative" }}>
 					{items.map((it) => {
@@ -490,14 +564,15 @@ export function DataGrid({
 								>
 									{st === "added" ? "+" : r + 1}
 								</div>
-								{columns.map((c, ci) => {
+								{(virtCols && editing && editing.r === r && !visCols.includes(editing.c) ? [...visCols, editing.c].sort((a, b) => a - b) : visCols).map((ci) => {
+									const c = columns[ci];
 									const val = cellAt(r, ci);
 									const isSel = sel?.r === r && sel?.c === ci;
 									const edited = overlay?.cellEdited(r, ci);
 									if (editing && editing.r === r && editing.c === ci && renderEditor) {
 										return (
 											// biome-ignore lint/suspicious/noArrayIndexKey: 열 순서가 곧 정체
-											<div key={ci} className="cell-editing">
+											<div key={ci} className="cell-editing" style={cstyle(ci)}>
 												{renderEditor(r, ci, editing.seed ?? val ?? null, (nv, move) => {
 													setEditing(null);
 													scroller.current?.focus();
@@ -512,6 +587,7 @@ export function DataGrid({
 										<div
 											// biome-ignore lint/suspicious/noArrayIndexKey: 열 순서가 곧 정체
 											key={ci}
+											style={cstyle(ci)}
 											className={`${val === null ? "null" : c.kind === "int" || c.kind === "numeric" ? "num" : ""}${isSel ? " sel" : ""}${inRange(r, ci) ? " in-range" : ""}${edited ? " edited" : ""}`}
 											onMouseDown={(e) => {
 												if (e.button !== 0) return;
