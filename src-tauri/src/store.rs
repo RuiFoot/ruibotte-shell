@@ -954,10 +954,12 @@ pub struct HistoryItem {
 /// 쿼리 기록 하나 — 프로필(scope)마다 최근 2000개만 남긴다
 #[tauri::command]
 pub fn history_add(store: State<'_, Store>, scope: String, item: HistoryItem) -> Result<(), String> {
+    // 암호(IDENTIFIED BY '…' · PASSWORD '…')는 기록 파일에 남기지 않는다
+    let sql = crate::db::mask_sql_secrets(&item.sql);
     let conn = store.conn.lock().unwrap();
     conn.execute(
         "INSERT INTO query_history (scope, sql, ms, rows, ok, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![scope, item.sql, item.ms, item.rows, item.ok as i64, now()],
+        params![scope, sql, item.ms, item.rows, item.ok as i64, now()],
     )
     .map_err(|e| e.to_string())?;
     conn.execute(
