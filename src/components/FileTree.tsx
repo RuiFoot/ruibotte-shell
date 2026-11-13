@@ -186,16 +186,31 @@ export const FileTree = memo(function FileTree({
 			p = up;
 		}
 		void (async () => {
-			// 그 폴더 자신도 펼쳐 안이 보이게(이전 판과 같이)
+			// 그 폴더 자신도 펼쳐 안이 보이게(이전 판과 같이). 읽은 목록에서 다음 칸이 몇 번째인지 알아 그만큼만 그린다
+			const listed = new Map<string, FsEntry[]>();
 			for (const dir of [root, ...chain]) {
 				if (gone) return;
-				if (!nodes[dir]?.entries) await load(dir);
+				const have = nodes[dir]?.entries;
+				if (have) listed.set(dir, have);
+				else {
+					try {
+						const entries = await fs.list(dir);
+						listed.set(dir, entries);
+						setNodes((n) => ({ ...n, [dir]: { entries } }));
+					} catch (e) {
+						setNodes((n) => ({ ...n, [dir]: { error: asSshError(e).message } }));
+					}
+				}
 			}
 			if (gone) return;
 			setOpen((s) => new Set([...s, root, ...chain]));
+			// 조상 폴더는 고른 폴더가 보일 만큼만 더 그린다(모두 펼치지 않는다 — 큰 폴더가 한꺼번에 그려지지 않게)
 			setShown((s) => {
 				const n = { ...s };
-				for (const d of [root, ...chain.slice(0, -1)]) n[d] = Number.MAX_SAFE_INTEGER;
+				[root, ...chain.slice(0, -1)].forEach((d, i) => {
+					const at = listed.get(d)?.findIndex((x) => x.path === chain[i]) ?? -1;
+					if (at >= 0) n[d] = Math.max(n[d] ?? PAGE, at + 20);
+				});
 				return n;
 			});
 			setCur(target);
