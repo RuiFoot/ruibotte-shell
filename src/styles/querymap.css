@@ -129,6 +129,10 @@
 	--qf-union: #5e5ce6;
 	--qf-table: #8e8e93;
 }
+/* 정방향(열이 어디로 가나)은 파랑 — 역방향(어디서 왔나)의 주황과 갈린다 */
+.qmap-panel.lit-fwd {
+	--qf-lit: var(--accent);
+}
 .qmap-panel .react-flow__handle {
 	width: 6px;
 	height: 6px;
@@ -451,6 +455,9 @@
 	border-color: color-mix(in srgb, var(--qf-union) 50%, transparent);
 	background: color-mix(in srgb, var(--qf-union) 5%, transparent);
 }
+.qf-group.dim {
+	opacity: 0.4;
+}
 .qf-group-head {
 	padding: 4px 10px;
 	overflow: hidden;
@@ -480,8 +487,20 @@
 	stroke: var(--qf-lit);
 	stroke-width: 2.4;
 }
-.qf-edge.dim .react-flow__edge-path {
+.qf-edge.dim .react-flow__edge-path,
+.qf-edge.dim .react-flow__edge-textwrapper {
 	opacity: 0.25;
+}
+/* 강조한 선 위 쓰임 표지(조인·상관·조건·출력) — 작게, 선 색으로 */
+.qf-edge.lit .react-flow__edge-text {
+	fill: var(--qf-lit);
+	font-size: 10px;
+	font-weight: 600;
+}
+.qf-edge.lit .react-flow__edge-textbg {
+	fill: var(--surface);
+	stroke: color-mix(in srgb, var(--qf-lit) 55%, transparent);
+	stroke-width: 1;
 }
 .qf-edge .react-flow__edge-text {
 	fill: var(--text-2);

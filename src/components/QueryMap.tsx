@@ -1,4 +1,4 @@
-import { Background, ControlButton, Controls, type Edge, Handle, type Node, type NodeProps, Position, ReactFlow, type ReactFlowInstance } from "@xyflow/react";
+import { Background, ControlButton, Controls, type Edge, Handle, MarkerType, type Node, type NodeProps, Position, ReactFlow, type ReactFlowInstance } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "../styles/querymap.css";
 import { AlertTriangle, ArrowDownWideNarrow, ArrowRightLeft, ChevronDown, Combine, CopyMinus, Funnel, GitMerge, Info, ListTree, Maximize, RefreshCw, Sheet, Sigma, SquareFunction, Stethoscope, Table2 } from "lucide-react";
@@ -689,13 +689,18 @@ function layout(flow: Flow, horizontal: boolean): Laid {
 
 // ── 계보: 결과 열 하나가 어느 표의 어느 열에서 왔나 ──
 
-type Lit = { nodes: Set<string>; edges: Set<string>; cols: Set<string> };
+/** 강조 — dir: back 이면 결과 열이 어디서 왔나, fwd 면 열 하나가 어디로 가나 · labels: 선 위 쓰임 표지 */
+type Lit = { nodes: Set<string>; edges: Set<string>; cols: Set<string>; labels: Map<string, Set<string>>; dir: "back" | "fwd" };
+/** 무엇을 따라가나 — back: 결과·출력 열 k 의 출처, col: 표(또는 표 노릇 하는 묶음) 열의 쓰임, out: 안쪽 묶음 출력 열 k 의 쓰임 */
+type Focus = { dir: "back"; scope: number; k: number } | { dir: "col"; node: string; tid: number; name: string } | { dir: "out"; scope: number; k: number };
+const focusKey = (f: Focus) => (f.dir === "col" ? `c:${f.node}:${f.name.toLowerCase()}` : `${f.dir}:${f.scope}:${f.k}`);
+const sameFocus = (a: Focus | null, b: Focus) => !!a && focusKey(a) === focusKey(b);
 
 function lineage(flow: Flow, snap: Snapshot, sid: number, k: number): Lit {
 	const { map, resolved } = snap;
 	const colTable = resolved?.colTable ?? map.cols.map((c) => c.table);
 	const outs = map.outs ?? [];
-	const L: Lit = { nodes: new Set(), edges: new Set(), cols: new Set() };
+	const L: Lit = { nodes: new Set(), edges: new Set(), cols: new Set(), labels: new Map(), dir: "back" };
 	const up = (from: string, stop: string) => {
 		let n = from;
 		L.nodes.add(n);
@@ -777,6 +782,221 @@ function lineage(flow: Flow, snap: Snapshot, sid: number, k: number): Lit {
 	return L;
 }
 
+/** 열이 쓰인 절 → 선 위 표지 */
+const USE_OF_ROLE: Record<string, string> = { on: "조인", where: "조건", having: "조건", group: "묶음", order: "정렬", select: "출력", set: "출력", insert: "출력" };
+const USE_OF_KIND: Partial<Record<Kind, string>> = { join: "조인", where: "조건", group: "묶음", order: "정렬", distinct: "출력", window: "출력", out: "출력", result: "출력" };
+
+/** 정방향 계보 — 열 하나(원본 표 열 · 안쪽 묶음 출력 열)를 쓰는 모든 곳(조인·조건·묶음·정렬·상관 서브쿼리·출력)을 따라 최종 결과까지 */
+function forward(flow: Flow, snap: Snapshot, start: Exclude<Focus, { dir: "back" }>): Lit {
+	const { map, resolved } = snap;
+	const text = snap.stmt.text;
+	const colTable = resolved?.colTable ?? map.cols.map((c) => c.table);
+	const outs = map.outs ?? [];
+	const L: Lit = { nodes: new Set(), edges: new Set(), cols: new Set(), labels: new Map(), dir: "fwd" };
+	const tag = (edge: string, label: string) => {
+		L.edges.add(edge);
+		const s = L.labels.get(edge) ?? new Set<string>();
+		s.add(label);
+		L.labels.set(edge, s);
+	};
+	/** from 에서 흐름(부모)을 따라 to 까지 — 마지막 선에 표지. 닿지 못하면 두 노드만 켠다 */
+	const path = (from: string, to: string, label: string | null) => {
+		L.nodes.add(from);
+		L.nodes.add(to);
+		if (from === to) return;
+		const es: string[] = [];
+		let n = from;
+		for (let i = 0; i < 400 && n !== to; i++) {
+			const p = flow.parent.get(n);
+			if (!p) return;
+			es.push(`${n}->${p}`);
+			n = p;
+		}
+		if (n !== to) return;
+		for (const e of es) {
+			L.edges.add(e);
+			L.nodes.add(e.slice(e.indexOf("->") + 2));
+		}
+		if (label && es.length) tag(es[es.length - 1], label);
+	};
+	const own = (s: number) => outs.filter((o) => o.scope === s);
+	const within = (outer: number, s: number) => {
+		let c: number | null = s;
+		while (c !== null) {
+			if (c === outer) return true;
+			c = map.scopes[c]?.parent ?? null;
+		}
+		return false;
+	};
+	const outsOf = (s: number): MapOut[] => {
+		const o = own(s);
+		if (o.length) return o;
+		const b = map.scopes.find((x) => x.parent === s && x.kind === "union");
+		return b ? outsOf(b.id) : [];
+	};
+	/** 출력 항목의 이름 — 별칭, 없으면 열 그대로 쓴 식의 열 이름 */
+	const outName = (o: MapOut | undefined): string | null => {
+		if (!o) return null;
+		if (o.name) return o.name;
+		const e = snip(text, o.expr ?? o.pos, 200);
+		return PLAIN_COL.test(e) ? e.slice(e.lastIndexOf(".") + 1).replace(/["`[\]]/g, "") : null;
+	};
+	/** 묶음 안에서 위치를 품은 가장 작은 단계(표 제외) */
+	const useNode = (scope: number, at: Pos): string | null => {
+		if (!at) return null;
+		let best: string | null = null;
+		let bestLen = Number.POSITIVE_INFINITY;
+		for (const n of flow.nodes.values()) {
+			if (n.scope !== scope || n.kind === "table") continue;
+			for (const [a, b] of n.ranges)
+				if (at[0] >= a && at[0] <= b && b - a < bestLen) {
+					best = n.id;
+					bestLen = b - a;
+				}
+		}
+		return best;
+	};
+	const seenCol = new Set<string>();
+	const seenOut = new Set<string>();
+
+	/** 서브쿼리(IN · EXISTS · 스칼라)의 결과가 바깥으로 — 출력 항목이면 그 열로 이어 가고, 조건이면 그 단계에서 멈춘다 */
+	const fromSub = (x: number, depth: number) => {
+		const so = flow.scopeOut.get(x);
+		const sc = map.scopes[x];
+		if (!so || !sc || sc.parent === null) return;
+		L.nodes.add(so);
+		if (sc.kind !== "subquery") return;
+		const P = sc.parent;
+		const hits = own(P)
+			.map((o, k) => ({ o, k }))
+			.filter(({ o }) => o.subs?.includes(x));
+		if (hits.length) {
+			const po = flow.scopeOut.get(P);
+			for (const { k } of hits) {
+				if (po) path(so, po, "출력");
+				toOut(P, k, depth + 1);
+			}
+			return;
+		}
+		const host = flow.parent.get(so);
+		const hn = host ? flow.nodes.get(host) : undefined;
+		if (host && hn) {
+			L.nodes.add(host);
+			tag(`${so}->${host}`, USE_OF_KIND[hn.kind] ?? "조건");
+		}
+	};
+
+	/** 열 하나를 쓰는 곳 — home: 그 표가 놓인 묶음, node: 그 표의 노드 */
+	const useOf = (c: (typeof map.cols)[number], home: number, node: string, depth: number) => {
+		if (c.scope === home) {
+			// 출력 항목에 들었으면 그 출력 열로 이어 간다
+			const list = own(home);
+			const k = list.findIndex((o) => c.id >= o.cols[0] && c.id < o.cols[1]);
+			const so = flow.scopeOut.get(home);
+			if (k >= 0 && so) {
+				path(node, so, "출력");
+				toOut(home, k, depth + 1);
+				return;
+			}
+			const u = useNode(home, c.pos) ?? so;
+			if (u) path(node, u, USE_OF_ROLE[c.role] ?? "조건");
+			return;
+		}
+		// 안쪽 서브쿼리에서 바깥 표를 부른다(상관) — 바로 아래 묶음을 찾는다
+		const chain: number[] = [];
+		let s: number | null = c.scope;
+		while (s !== null && s !== home) {
+			chain.push(s);
+			s = map.scopes[s]?.parent ?? null;
+		}
+		if (s !== home || !chain.length) return;
+		const x = chain[chain.length - 1];
+		const xo = flow.scopeOut.get(x);
+		for (const cs of chain) {
+			const to = flow.scopeOut.get(cs);
+			const e = flow.cross.find((cr) => cr.kind === "corr" && cr.from === node && cr.to === to);
+			if (e && to) {
+				tag(`${node}->${to}`, "상관");
+				L.nodes.add(to);
+			}
+		}
+		L.nodes.add(node);
+		const u = useNode(c.scope, c.pos) ?? flow.scopeOut.get(c.scope);
+		if (u && xo) path(u, xo, null);
+		fromSub(x, depth + 1);
+	};
+
+	/** 표(또는 표 노릇 하는 묶음 출력)의 열 name — 그 열을 쓰는 모든 곳 */
+	const fromCol = (tid: number, name: string, node: string, depth: number) => {
+		const key = `${tid}:${name.toLowerCase()}`;
+		if (seenCol.has(key) || depth > 14) return;
+		seenCol.add(key);
+		const t = map.tables[tid];
+		if (!t) return;
+		const nm = name.toLowerCase();
+		L.nodes.add(node);
+		L.cols.add(`${node}:${nm}`);
+		for (const c of map.cols) if (colTable[c.id] === tid && c.name.toLowerCase() === nm) useOf(c, t.scope, node, depth);
+		// * · t.* 로 그대로 내보내는 곳
+		const so = flow.scopeOut.get(t.scope);
+		own(t.scope).forEach((o, k) => {
+			if (o.star === undefined || !so) return;
+			if (o.star && o.star.toLowerCase() !== (t.alias ?? t.name).toLowerCase() && o.star.toLowerCase() !== t.name.toLowerCase()) return;
+			path(node, so, "출력");
+			toOut(t.scope, k, depth + 1, name);
+		});
+	};
+
+	/** 묶음 s 의 출력 열 k — 바깥에서 그 열을 쓰는 곳으로(nm: * 로 나온 열의 이름) */
+	const toOut = (s: number, k: number, depth: number, nm?: string) => {
+		const key = `${s}:${k}:${nm ?? ""}`;
+		if (seenOut.has(key) || depth > 14) return;
+		seenOut.add(key);
+		const so = flow.scopeOut.get(s);
+		const sc = map.scopes[s];
+		if (!so || !sc) return;
+		L.nodes.add(so);
+		if (so === "result") L.cols.add(`row:${s}:${k}`);
+		else if (!nm) L.cols.add(`${so}:#${k}`);
+		if (sc.kind === "main" || sc.parent === null) return;
+		const P = sc.parent;
+		const po = flow.scopeOut.get(P);
+		if (sc.kind === "union") {
+			if (po) path(so, po, null);
+			toOut(P, k, depth + 1, nm);
+			return;
+		}
+		if (sc.kind === "subquery") {
+			// INSERT … SELECT — 넣을 행의 k 번째 열이 넣는 열 k 로
+			if (sc.name === "SELECT" && map.scopes[P]?.kind === "main") {
+				if (po) path(so, po, "출력");
+				L.cols.add(`row:${P}:${k}`);
+				L.cols.add(`row:${s}:${k}`);
+				return;
+			}
+			fromSub(s, depth);
+			return;
+		}
+		// FROM (서브쿼리) · CTE — 바깥에서 그 이름으로 쓰는 곳
+		const name = nm ?? outName(outsOf(s)[k]);
+		if (!name) return;
+		for (const t of map.tables) {
+			if (!(t.derived === s || (t.cte === s && !within(s, t.scope)))) continue;
+			const tn = flow.tableNode.get(t.id);
+			if (!tn) continue;
+			if (tn !== so) {
+				L.edges.add(`${so}->${tn}`);
+				L.nodes.add(tn);
+			}
+			fromCol(t.id, name, tn, depth + 1);
+		}
+	};
+
+	if (start.dir === "col") fromCol(start.tid, start.name, start.node, 0);
+	else toOut(start.scope, start.k, 0);
+	return L;
+}
+
 // ── 그리기 ─────────────────────────────────────────────────
 
 type Ui = {
@@ -784,7 +1004,7 @@ type Ui = {
 	cursor: string | null;
 	picked: string | null;
 	horizontal: boolean;
-	hover: (scope: number, k: number | null) => void;
+	hover: (f: Focus | null) => void;
 	pickRow: (n: FNode, row: OutRow) => void;
 	pickCol: (n: FNode, c: ColRow) => void;
 };
@@ -849,11 +1069,13 @@ const TableNode = memo(function TableNode({ data }: NodeProps<Node<ND>>) {
 								type="button"
 								key={c.name}
 								className={`qm-col${c.pk ? " pk" : ""}${c.fk ? " fk" : ""}${c.missing ? " missing" : ""}${/[WGO]/.test(c.roles) ? " hot" : ""}${on ? " lit" : ""}`}
+								onMouseEnter={() => n.table !== undefined && ui.hover({ dir: "col", node: n.id, tid: n.table, name: c.name })}
+								onMouseLeave={() => ui.hover(null)}
 								onClick={(e) => {
 									e.stopPropagation();
 									ui.pickCol(n, c);
 								}}
-								title={`${c.name}${c.type ? ` · ${c.type}` : ""}${c.pk ? " · PK" : ""}${c.fk ? " · FK" : ""}${c.missing ? " · 표에 없는 열" : ""} — ${[...c.roles].map((r) => ROLE_TIP[r]).join(", ")}`}
+								title={`${c.name}${c.type ? ` · ${c.type}` : ""}${c.pk ? " · PK" : ""}${c.fk ? " · FK" : ""}${c.missing ? " · 표에 없는 열" : ""} — ${[...c.roles].map((r) => ROLE_TIP[r]).join(", ")}\n올리면 이 열이 어디로 가는지, 누르면 고정하고 편집기에서 그 열`}
 							>
 								<span className="qm-cname">
 									{c.pk ? "🔑 " : c.fk ? "↗ " : ""}
@@ -913,13 +1135,13 @@ function Rows({ n, big }: { n: FNode; big: boolean }) {
 						type="button"
 						key={r.k}
 						className={`qf-row${on ? " lit" : ""}`}
-						onMouseEnter={() => ui.hover(n.scope, r.k)}
-						onMouseLeave={() => ui.hover(n.scope, null)}
+						onMouseEnter={() => ui.hover({ dir: big ? "back" : "out", scope: n.scope, k: r.k })}
+						onMouseLeave={() => ui.hover(null)}
 						onClick={(e) => {
 							e.stopPropagation();
 							ui.pickRow(n, r);
 						}}
-						title={`${r.label}${r.hint ? ` ← ${r.hint}` : ""} — 올리면 어디서 왔는지, 누르면 편집기에서 그 항목`}
+						title={`${r.label}${r.hint ? ` ← ${r.hint}` : ""} — ${big ? "올리면 어디서 왔는지" : "올리면 이 열이 어디로 가는지"}, 누르면 고정하고 편집기에서 그 항목`}
 					>
 						<span className="qf-rname">{r.label}</span>
 						{r.hint && <span className="qf-rhint">{r.hint}</span>}
@@ -980,8 +1202,9 @@ const ResultNode = memo(function ResultNode({ data }: NodeProps<Node<ND>>) {
 });
 
 const GroupNode = memo(function GroupNode({ data }: NodeProps<Node<GD>>) {
+	const { lit } = useContext(UiCtx);
 	return (
-		<div className={`qf-group k-${data.kind}`}>
+		<div className={`qf-group k-${data.kind}${lit && !lit.nodes.has(`o${data.sid}`) ? " dim" : ""}`}>
 			<div className="qf-group-head">{data.label}</div>
 		</div>
 	);
@@ -1036,6 +1259,8 @@ function draw(prep: Prepared, horizontal: boolean): Drawn {
 }
 
 const mapWarnsOf = (snap: Snapshot) => snap.findings.filter((f) => f.layer === "map");
+/** 강조한 선 끝의 화살표 — 색은 칸의 --qf-lit(역방향 주황 · 정방향 파랑)를 따른다 */
+const LIT_ARROW = { type: MarkerType.ArrowClosed, color: "var(--qf-lit)", width: 11, height: 11 } as const;
 
 /** 접었을 때 보이는 칩 줄 수 */
 const BAND_ROWS = 2;
@@ -1164,17 +1389,20 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	const drawnRef = useRef(drawn);
 	drawnRef.current = drawn;
 
-	const [hover, setHover] = useState<{ scope: number; k: number } | null>(null);
-	const [pinned, setPinned] = useState<{ scope: number; k: number } | null>(null);
+	const [hover, setHover] = useState<Focus | null>(null);
+	const [pinned, setPinned] = useState<Focus | null>(null);
 	const [picked, setPicked] = useState<string | null>(null);
 	const [cursor, setCursor] = useState<string | null>(null);
-	const focusRow = hover ?? pinned;
+	const focus = hover ?? pinned;
 	const lit = useMemo(() => {
-		if (!focusRow || !drawn || !snap) return null;
-		const L = lineage(drawn.flow, snap, focusRow.scope, focusRow.k);
-		L.cols.add(`row:${focusRow.scope}:${focusRow.k}`);
+		if (!focus || !drawn || !snap) return null;
+		if (focus.dir !== "back") return forward(drawn.flow, snap, focus);
+		const L = lineage(drawn.flow, snap, focus.scope, focus.k);
+		L.cols.add(`row:${focus.scope}:${focus.k}`);
 		return L;
-	}, [focusRow, drawn, snap]);
+	}, [focus, drawn, snap]);
+	/** 띠 칩의 고정 표시 — 결과 열(역방향)을 고정했을 때만 */
+	const pinnedBack = pinned?.dir === "back" ? pinned : null;
 
 	// 새 그림(다른 문장·구조)이면 고른 것·계보·편집기 강조를 버린다
 	// biome-ignore lint/correctness/useExhaustiveDependencies: 그림이 바뀔 때만
@@ -1321,16 +1549,22 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 			cursor,
 			picked,
 			horizontal,
-			hover: (scope, k) => setHover(k === null ? null : { scope, k }),
+			hover: setHover,
 			pickRow: (n, row) => {
-				setPinned((p) => (p && p.scope === n.scope && p.k === row.k ? null : { scope: n.scope, k: row.k }));
+				// 결과 열은 어디서 왔나(역방향), 안쪽 묶음 출력 열은 어디로 가나(정방향)
+				const f: Focus = { dir: n.kind === "result" ? "back" : "out", scope: n.scope, k: row.k };
+				setPinned((p) => (sameFocus(p, f) ? null : f));
 				pick(`${n.id}#${row.k}`, row.pos ? [row.pos] : n.ranges);
 			},
 			pickCol: (n, c) => {
 				const s = snapRef.current;
 				if (!s) return;
-				const colTable = s.resolved?.colTable ?? s.map.cols.map((x) => x.table);
 				const tid = n.table;
+				if (tid !== undefined) {
+					const f: Focus = { dir: "col", node: n.id, tid, name: c.name };
+					setPinned((p) => (sameFocus(p, f) ? null : f));
+				}
+				const colTable = s.resolved?.colTable ?? s.map.cols.map((x) => x.table);
 				const ranges = s.map.cols.filter((x) => colTable[x.id] === tid && x.name.toLowerCase() === c.name.toLowerCase()).map((x) => x.pos).filter(isR);
 				pick(`${n.id}:${c.name}`, ranges.length ? ranges : n.ranges);
 			},
@@ -1339,10 +1573,11 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	);
 
 	// 띠 — 칩에 올리면 계보, 누르면 고정 + 편집기에서 그 항목, 제목은 결과 노드로
-	const bandHover = useCallback((c: FinalChip | null) => setHover(c ? { scope: c.scope, k: c.k } : null), []);
+	const bandHover = useCallback((c: FinalChip | null) => setHover(c ? { dir: "back", scope: c.scope, k: c.k } : null), []);
 	const bandPick = useCallback(
 		(c: FinalChip) => {
-			if (c.trace) setPinned((p) => (p && p.scope === c.scope && p.k === c.k ? null : { scope: c.scope, k: c.k }));
+			const f: Focus = { dir: "back", scope: c.scope, k: c.k };
+			if (c.trace) setPinned((p) => (sameFocus(p, f) ? null : f));
 			pick(`final#${c.scope}:${c.k}`, c.pos ? [c.pos] : []);
 		},
 		[pick],
@@ -1368,13 +1603,26 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	const edges = useMemo(() => {
 		if (!drawn) return [];
 		if (!lit) return drawn.edges;
-		return drawn.edges.map((e) => ({ ...e, className: `${e.className}${lit.edges.has(e.id) ? " lit" : " dim"}`, animated: lit.edges.has(e.id) }));
+		// 흐르는 선만 진하게 + 끝에 화살표(흐름 방향 = 결과 쪽), 정방향이면 선 위에 쓰임 표지
+		return drawn.edges.map((e): Edge => {
+			if (!lit.edges.has(e.id)) return { ...e, className: `${e.className} dim` };
+			const tags = lit.labels.get(e.id);
+			return {
+				...e,
+				className: `${e.className} lit${tags ? " tagged" : ""}`,
+				label: tags ? [...tags].join(" · ") : e.label,
+				labelBgPadding: [5, 2],
+				labelBgBorderRadius: 5,
+				markerEnd: LIT_ARROW,
+				zIndex: 1,
+			};
+		});
 	}, [drawn, lit]);
 
 	const others = (snap?.findings ?? []).filter((f) => f.layer !== "map").length;
 	return (
-		<div className="panel-fill qmap-panel">
-			{snap && prep && drawn && drawn.nodes.length > 0 && <ResultBand final={prep.final} lit={lit} pinned={pinned} onTitle={bandTitle} onHover={bandHover} onPick={bandPick} />}
+		<div className={`panel-fill qmap-panel${lit ? ` lit-${lit.dir}` : ""}`}>
+			{snap && prep && drawn && drawn.nodes.length > 0 && <ResultBand final={prep.final} lit={lit} pinned={pinnedBack} onTitle={bandTitle} onHover={bandHover} onPick={bandPick} />}
 			<div className={`qm-host${snap?.stale ? " stale" : ""}`} ref={host}>
 				{snap && drawn && drawn.nodes.length > 0 ? (
 					<UiCtx.Provider value={ui}>
@@ -1440,7 +1688,7 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 				<span className="qm-legend" title="표 안의 열 — 어디에 쓰였나">
 					<i className="r-W">W</i> WHERE <i className="r-J">J</i> 조인 <i className="r-G">G</i> GROUP <i className="r-O">O</i> ORDER <i className="r-S">S</i> SELECT
 				</span>
-				<span className="qf-hint">결과 열에 올리면 어디서 왔는지 · 단계를 누르면 편집기에서 그 절</span>
+				<span className="qf-hint">결과 열에 올리면 어디서 왔는지 · 표 열에 올리면 어디로 가는지 · 누르면 고정</span>
 				{snap?.note && <span title={snap.note}>{snap.note}</span>}
 				{state.busy && <span>맞추는 중…</span>}
 				<span style={{ marginLeft: "auto" }} />
