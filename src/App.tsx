@@ -21,7 +21,7 @@ import type { DbConnectOk } from "./components/DbConnectDialog";
 import { askText } from "./lib/ask";
 import { checkNow, installNow, startUpdater, useUpdate } from "./lib/updater";
 import { CommandPalette } from "./components/CommandPalette";
-import { type Command, OPEN_PALETTE_EVENT, requestSettingsSection, SETTINGS_SECTIONS, type SettingsSection, useCommands } from "./lib/commands";
+import { type Command, OPEN_PALETTE_EVENT, OPEN_SETTINGS_EVENT, requestSettingsSection, SETTINGS_SECTIONS, type SettingsSection, useCommands } from "./lib/commands";
 import { type AppTheme, getAppearance, loadAppearance, setAppearance, TERM_SCHEMES } from "./lib/theme";
 
 // 무거운 칸(xterm·편집기·표·사전)은 처음 열 때 받는다 — 첫 화면(홈)은 가볍게
@@ -787,11 +787,26 @@ export function App() {
 	const openImport = useCallback(() => setImporting(true), []);
 	const openExport = useCallback(() => setExporting(true), []);
 
-	/** 설정의 그 묶음으로 */
+	/** 설정의 그 범주(·하위 화면·줄)로 */
 	const gotoSettings = (id: SettingsSection) => {
 		requestSettingsSection(id);
 		open("settings", "설정", true);
 	};
+	// 다른 화면이 openSettings("terminal") 로 부르면 설정 탭을 앞으로(갈 곳은 설정 화면이 가져간다)
+	useEffect(() => {
+		const on = () => open("settings", "설정", true);
+		window.addEventListener(OPEN_SETTINGS_EVENT, on);
+		return () => window.removeEventListener(OPEN_SETTINGS_EVENT, on);
+	}, [open]);
+	/** 설정 화면에서 여는 다른 화면 */
+	const onSettingsOpen = useCallback(
+		(w: "keys" | "connections" | "import") => {
+			if (w === "keys") open("keys", "키 관리", true);
+			else if (w === "connections") open("connections", "연결 관리", true);
+			else setImporting(true);
+		},
+		[open],
+	);
 	const focusHomeSearch = () => {
 		open("home", "홈", true);
 		requestAnimationFrame(() => document.getElementById("home-search")?.focus());
@@ -843,7 +858,7 @@ export function App() {
 			a("export", "연결 내보내기", () => setExporting(true), { hint: "ssh config 로", keywords: "export" }),
 			a("sidebar", sbRail ? "사이드바 펴기" : "사이드바 접기", () => setSbManual(!sbRail), { keys: "Mod+B" }),
 			a("settings", "설정", () => open("settings", "설정", true), { keywords: "settings 환경" }),
-			...SETTINGS_SECTIONS.map((x) => a(`settings.${x.id}`, `설정 › ${x.label}`, () => gotoSettings(x.id), { keywords: x.keywords })),
+			...SETTINGS_SECTIONS.map((x) => a(`settings.${x.id}`, `설정 › ${x.label}`, () => gotoSettings(x.path), { keywords: x.keywords })),
 			a("update", "업데이트 확인", () => {
 				void checkNow(true);
 				gotoSettings("update");
@@ -1016,7 +1031,7 @@ export function App() {
 
 				<div className="content">
 					{tabs.map((t) => (
-						<section key={t.id} className={`pane${t.kind === "home" || t.kind === "settings" ? " home" : ""}`} hidden={t.id !== active}>
+						<section key={t.id} className={`pane${t.kind === "home" ? " home" : t.kind === "settings" ? " settings-host" : ""}`} hidden={t.id !== active}>
 							{t.kind === "home" && (
 								<HomePane
 									profiles={profiles}
@@ -1065,7 +1080,7 @@ export function App() {
 									/>
 								)}
 								{t.kind === "grid" && <ResultGridPane />}
-								{t.kind === "settings" && <SettingsPane info={info} />}
+								{t.kind === "settings" && <SettingsPane info={info} onOpen={onSettingsOpen} />}
 								{t.kind === "keys" && <KeysPane conns={keyConns} />}
 								{t.kind === "connections" && <ConnectionsPane profiles={profiles} reload={reload} onConnect={connect} onImport={openImport} onExport={openExport} />}
 								{t.kind === "dict" && <CommandDictionaryPane />}

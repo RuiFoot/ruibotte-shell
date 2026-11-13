@@ -3,6 +3,7 @@ import { Activity } from "lucide-react";
 import { useCallback, useState, useSyncExternalStore } from "react";
 import { api } from "../lib/ipc";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
+import { onSettingLive, setSettingLive } from "../lib/settingsBus";
 
 type Ticks = { busy: number; iowait: number; total: number };
 type Lite = {
@@ -34,6 +35,8 @@ const everySubs = new Set<() => void>();
 function loadEvery() {
 	if (everyLoaded) return;
 	everyLoaded = true;
+	// 설정 › SSH·보안 에서 바꿔도 열린 표시가 따라간다
+	onSettingLive([KEY], (_, v) => v in LABEL && setEveryGlobal(v as Every, false));
 	void api
 		.settingGet(KEY)
 		.then((v) => {
@@ -44,7 +47,7 @@ function loadEvery() {
 function setEveryGlobal(v: Every, save = true) {
 	if (v === everyNow) return;
 	everyNow = v;
-	if (save) void api.settingSet(KEY, v).catch(() => undefined);
+	if (save) setSettingLive(KEY, v);
 	for (const f of everySubs) f();
 	for (const p of pollers.values()) p.restart();
 }

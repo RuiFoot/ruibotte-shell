@@ -54,6 +54,7 @@ import { ctxContainer } from "../lib/shellCtx";
 import type { SudoCtx } from "./panels/common";
 import { type Command, useCommands } from "../lib/commands";
 import { FORMS } from "../lib/cmdAssist";
+import { shortcutRows } from "../lib/shortcuts";
 
 // 처음 열 때 읽는 칸들 — 작업대를 여는 데 편집기(CodeMirror)·마크다운·표·비교 코드를 같이 읽지 않게
 const EditorView_ = lazy(() => import("./Editor").then((m) => ({ default: m.EditorView_ })));
@@ -2277,52 +2278,7 @@ useEffect(() => activeStore.set(activeStore.panel, active), [active, activeStore
 /** F1 — 단축키 모음 */
 function ShortcutHelp({ locked, onClose }: { locked: boolean; onClose: () => void }) {
 	const mac = document.documentElement.dataset.os === "macos";
-	const rows: [string, string][] = [
-		["앱", ""],
-		[mac ? "⌘⇧P" : "Ctrl+Shift+P", "명령 팔레트 — 서버·탭·작업대 동작·설정을 한 칸에서 찾아 실행(초성도)"],
-		[mac ? "⌘T" : "Ctrl+T", "내 PC 터미널"],
-		[mac ? "⌘W · ⇧⌘W" : "Ctrl+W · Ctrl+Shift+W", "편집기 칸 닫기(편집기 밖이면 서버 탭) · 서버 탭 닫기"],
-		[mac ? "⌘K" : "Ctrl+K", "홈에서 연결 찾기"],
-		[mac ? "⌘B" : "Ctrl+B", "사이드바 접기·펴기"],
-		["작업대", ""],
-		["Alt+1 · 2 · 3", "트리 · 문서 · 터미널로"],
-		["Ctrl+`", "터미널 칸 숨기기·보이기"],
-		["Alt+O", "파일 빠른 열기(이름으로 찾기 · /경로 바로 열기)"],
-		["Alt+Shift+= · Alt+Shift+-", "터미널 오른쪽 · 아래로 나누기(배치가 잠겨 있으면 막힘)"],
-		["Alt+Shift+← ↑ → ↓", "칸 사이 이동(편집기 안에서는 편집기 몫이라 Alt+1·2·3 으로)"],
-		["Alt+M", "초점이 있는 칸 최대화 · 되돌리기"],
-		["Ctrl+Shift+F", "파일 내용 찾기(grep — 결과를 누르면 그 줄로). 터미널 안에서는 터미널 찾기"],
-		["Ctrl+Alt+L", `배치 잠그기·풀기 — 지금 ${locked ? "잠김(칸 끌기·나누기·크기 바꾸기·구조 칸 닫기 막음)" : "풀림"}`],
-		["F1", "이 도움말(터미널 안에서는 셸 프로그램 몫 — 명령 팔레트에서 '단축키')"],
-		["파일 트리", ""],
-		["↑ ↓ ← → · Enter", "옮기기 · 접고 펴기 · 열기"],
-		["F2 · Del", "이름 바꾸기 · 지우기"],
-		["Alt+← · Alt+→ · Backspace", "뒤로 · 앞으로 · 위 폴더(마우스 옆 단추도)"],
-		["편집기", ""],
-		["Ctrl+S", "저장"],
-		["Ctrl+F · Ctrl+G", "찾기·바꾸기 · 줄로 가기"],
-		["Ctrl+/ · Ctrl+D", "주석 · 같은 낱말 더 고르기"],
-		["Alt+누르기 · Alt+끌기", "커서 더하기 · 사각 선택"],
-		["Ctrl+Space", "자동완성 열기"],
-		["터미널", ""],
-		["Tab", "셸 완성(서버 bash) — 설정 › 터미널 › Tab 키 = 앱 목록이면 앱 목록"],
-		["Ctrl+Space", "앱 자동완성 목록 열기(명령·옵션 설명·경로·지난 명령)"],
-		["↑↓ · Tab · Enter · Esc", "목록에서 고르기 · 넣기 · 넣기 · 닫기"],
-		["→", "흐린 제안 받기"],
-		["Ctrl+↑ · Ctrl+↓", "이전 · 다음 명령으로"],
-		["Ctrl+C", "고른 글이 있으면 복사(고르기 풀림), 없으면 ^C 중단 — macOS 는 ⌘C"],
-		["Ctrl+V", "붙여넣기(여러 줄이면 확인) — 설정에서 서버로 ^V 보내기로 바꿀 수 있음, macOS 는 ⌘V"],
-		["Ctrl+Shift+C · V · F", "늘 복사 · 붙여넣기 · 터미널 찾기"],
-		["Ctrl+누르기", "출력의 경로를 편집기로 열기"],
-		["Ctrl+= · − · 0", "글자 크기"],
-		["Alt+P", "스니펫·명령어 사전"],
-		["명령 입력 보조(리눅스 셸)", ""],
-		["입력 줄 위 한 줄(설정에서 켜기)", "치는 명령의 자리(sed [옵션] 스크립트 [파일…]) — 지금 자리 굵게, 옵션이면 그 뜻"],
-		["Tab · Shift+Tab", "빈칸 템플릿에서 다음 · 이전 빈칸(처음 친 글자가 기본값을 바꿈)"],
-		["Esc · Enter · 마지막 빈칸에서 Tab", "빈칸 끝내고 일반 입력으로(Enter 는 그대로 실행)"],
-		["Ctrl+Shift+E", "명령 풀이 — 고른 글자(없으면 입력 줄)를 조각마다"],
-		["우클릭 › 명령 만들기…", "칸을 채워 명령 만들기(팔레트에서 \"명령 만들기\"로 찾기) — 입력 줄에만 넣음"],
-	];
+	const rows = shortcutRows(mac, locked);
 	return (
 		<div className="scrim" onMouseDown={(e) => e.target === e.currentTarget && onClose()} onKeyDown={(e) => e.key === "Escape" && onClose()}>
 			<div className="sheet" style={{ width: "min(560px, calc(100vw - 32px))" }}>
