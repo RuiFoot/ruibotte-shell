@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { AUTO_SAVE_DEFAULT, type AutoSave, loadAutoSave, onAutoSave, setAutoSave as storeAutoSave } from "../../lib/autoSave";
-import { openPalette } from "../../lib/commands";
 import { shortcutRows } from "../../lib/shortcuts";
 import { PREF_KEYS } from "../../lib/termPrefs";
 import { Select } from "../Select";
@@ -212,13 +211,6 @@ export function ShortcutsPage(_: PageProps) {
 	});
 	return (
 		<>
-			<Group>
-				<Row id="shortcuts.palette" label="명령 팔레트" sub="서버·탭·작업대 동작·설정을 한 칸에서 찾아 실행합니다(초성도)">
-					<button type="button" className="btn" onClick={() => openPalette()}>
-						열기 <kbd className="stg-kbd">{mac ? "⌘⇧P" : "Ctrl+Shift+P"}</kbd>
-					</button>
-				</Row>
-			</Group>
 			{groups.map((g) => (
 				<Group key={g.title} title={g.title}>
 					{g.items.map(([k, v, i]) => (

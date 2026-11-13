@@ -69,6 +69,10 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 	/** 좁은 창에서 범주 목록을 보이는 중 */
 	const [listMode, setListMode] = useState(true);
 	const [msg, setMsg] = useState("");
+	/** 하위 화면·좁은 창 본문으로 들어가면 in, 나오면 out — 한 번 미끄러지는 표시 */
+	const [dir, setDir] = useState<"in" | "out" | null>(null);
+	const narrowRef = useRef(false);
+	narrowRef.current = narrow;
 	/** 그린 뒤 할 일 — 줄 강조·초점 */
 	const after = useRef<{ flash?: string; focus?: "content" | "search" | `row:${string}` | `cat:${string}`; top?: boolean } | null>(null);
 	const [seq, setSeq] = useState(0);
@@ -85,7 +89,9 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 		if (!isCat(c)) return;
 		setCat(c);
 		rememberCat(c);
-		setSub(s && SUBS[`${c}/${s}`] ? s : null);
+		const hasSub = !!(s && SUBS[`${c}/${s}`]);
+		setSub(hasSub ? s : null);
+		setDir(hasSub || narrowRef.current ? "in" : null);
 		setListMode(false);
 		setMsg("");
 		after.current = { flash: row || undefined, focus, top: !row };
@@ -167,10 +173,12 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 		if (sub) {
 			const link = SUB_LINK[`${cat}/${sub}`];
 			setSub(null);
+			setDir("out");
 			after.current = { focus: link ? `row:${link}` : "content" };
 			bump();
 		} else if (narrow) {
 			setListMode(true);
+			setDir("out");
 			// 검색 중이면 사이드바는 결과 목록이라 범주 단추가 없다 — 검색 칸으로
 			after.current = { focus: q.trim() ? "search" : `cat:${cat}` };
 			bump();
@@ -281,7 +289,7 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 	return (
 		<div className={`stg${narrow ? " narrow" : ""}`} ref={root}>
 			{showSide && (
-				<aside className="stg-side" aria-label="설정">
+				<aside className="stg-side" aria-label="설정" data-dir={narrow && dir === "out" ? "out" : undefined}>
 					<p className="stg-sr" role="status">
 						{hits ? (hits.length ? `결과 ${hits.length}개` : "결과 없음") : ""}
 					</p>
@@ -351,7 +359,7 @@ export function SettingsPane({ info, onOpen }: { info: AppInfo | null; onOpen: P
 			)}
 			{showMain && (
 				<main className="stg-main" ref={mainRef} onKeyDown={onMainKey} aria-label={subLabel ?? c.label}>
-					<div className="stg-col">
+					<div className="stg-col" key={`${c.id}/${sub ?? ""}`} data-dir={dir ?? undefined}>
 						<header className="stg-head">
 							{(sub || narrow) && (
 								<button type="button" className="stg-back" onClick={back}>
