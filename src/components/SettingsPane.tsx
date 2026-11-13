@@ -332,6 +332,7 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 		void localShells().then((l) => setShellList(l ?? []));
 	}, []);
 	const [autostart, setAutostart] = useState<boolean | null>(null);
+	const [autoRestore, setAutoRestore] = useSetting("session.autoRestore", "0");
 	const [msg, setMsg] = useState("");
 	const [autoSave, setAutoSave] = useState<AutoSave>(AUTO_SAVE_DEFAULT);
 	// 명령 팔레트에서 "설정 › 화면" 등으로 바로 — 그 묶음 제목으로 스크롤하고 잠깐 강조
@@ -594,6 +595,9 @@ export function SettingsPane({ info }: { info: AppInfo | null }) {
 
 			{h4("start", "시작")}
 			<div className="set-group">
+				<Row label="켤 때 지난 연결 다시 열기" sub="앱을 끌 때 열려 있던 SSH·DB 탭을 그때 쓴 계정으로 차례로 다시 엽니다 — 암호·지문을 물어야 하면 접속 창이 하나씩 뜹니다">
+					<Toggle on={autoRestore === "1"} label="켤 때 지난 연결 다시 열기" onChange={(v) => setAutoRestore(v ? "1" : "0")} />
+				</Row>
 				<Row label="로그인할 때 자동 실행" sub={autostart === null ? "이 환경에서는 바꿀 수 없어요" : undefined}>
 					<Toggle
 						on={!!autostart}

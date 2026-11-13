@@ -10,6 +10,30 @@ const LEVEL_NAME: Record<LegacyLevel, string> = {
 	weakest: "최후 — ssh-dss·group1-sha1·3des 까지",
 };
 
+/** 프로필 값으로 접속 요청 — 접속 창과 조용한 다시 연결(저장한 자격)이 함께 쓴다 */
+export function sshConnectWith(prof: Profile, o: { secret?: string | null; trust?: string | null; save?: boolean; route?: number | null } = {}): Promise<ConnectOk> {
+	return api.sshConnect({
+		profileId: prof.id,
+		accountId: prof.accountId,
+		host: prof.host,
+		port: prof.port,
+		username: prof.username,
+		auth: prof.auth,
+		keyPath: prof.keyPath,
+		secret: o.secret || null,
+		legacy: prof.legacy,
+		trustFingerprint: o.trust ?? null,
+		saveSecret: o.save ?? false,
+		jumpId: prof.jumpId ?? null,
+		routeId: o.route ?? null,
+	});
+}
+
+/** 사람이 답해야 하는 오류(지문·구형 호환·암호) — 조용히 다시 시도하지 않고 접속 창으로 */
+export function needsHuman(e: SshError): boolean {
+	return e.code === "HOSTKEY_UNKNOWN" || e.code === "HOSTKEY_MISMATCH" || e.code === "NEGOTIATION" || e.code === "NEED_SECRET" || e.code === "AUTH_FAILED";
+}
+
 type Step =
 	| { s: "connecting" }
 	| { s: "secret"; error?: string }
@@ -25,15 +49,21 @@ export function ConnectDialog({
 	onConnected,
 	onCancel,
 	onProfileChanged,
+	queued = 0,
+	initialError,
 }: {
 	profile: Profile;
+	/** 이 창 뒤에 기다리는 접속 수(절전 복귀·지난 연결 다시 열기) */
+	queued?: number;
+	/** 조용한 다시 연결이 인증에서 막혔을 때 — 바로 암호 칸을 이 안내와 함께(저장한 암호는 백엔드가 이미 지웠다) */
+	initialError?: string;
 	onConnected: (ok: ConnectOk, p: Profile) => void;
 	onCancel: () => void;
 	onProfileChanged: () => void;
 }) {
 	const [p, setP] = useState(profile);
-	const needsSecretFirst = p.auth === "password" && !p.secretSaved;
-	const [step, setStep] = useState<Step>(needsSecretFirst ? { s: "secret" } : { s: "connecting" });
+	const needsSecretFirst = (p.auth === "password" && !p.secretSaved) || initialError != null;
+	const [step, setStep] = useState<Step>(needsSecretFirst ? { s: "secret", error: initialError } : { s: "connecting" });
 	const [secret, setSecret] = useState("");
 	// 내 PC 전용 앱이라 기본은 저장(사용자가 끌 수 있음)
 	const [save, setSave] = useState(true);
@@ -42,28 +72,28 @@ export function ConnectDialog({
 	const route = useRef<number | null>(null);
 	const started = useRef(false);
 	const [diag, setDiag] = useState(false);
+	// 창이 닫힌 뒤(취소·Esc·탭 닫기) 끝난 접속은 버린다 — 상태를 바꾸지 않고, 붙은 연결은 끊어 둔다(아무 탭에도 안 붙은 연결이 남지 않게)
+	const alive = useRef(true);
+	useEffect(() => {
+		alive.current = true;
+		return () => {
+			alive.current = false;
+		};
+	}, []);
 
 	const run = useCallback(
 		async (prof: Profile, sec: string | null) => {
 			setStep({ s: "connecting" });
 			try {
-				const ok = await api.sshConnect({
-					profileId: prof.id,
-					accountId: prof.accountId,
-					host: prof.host,
-					port: prof.port,
-					username: prof.username,
-					auth: prof.auth,
-					keyPath: prof.keyPath,
-					secret: sec || null,
-					legacy: prof.legacy,
-					trustFingerprint: trust.current,
-					saveSecret: save,
-					jumpId: prof.jumpId ?? null,
-					routeId: route.current,
-				});
+				// 저장 안 한 임시 접속(빠른 접속)은 계정이 없어 암호를 저장할 곳이 없다
+				const ok = await sshConnectWith(prof, { secret: sec, trust: trust.current, save: save && prof.id != null, route: route.current });
+				if (!alive.current) {
+					void api.sshDisconnect(ok.connId).catch(() => {});
+					return;
+				}
 				onConnected(ok, prof);
 			} catch (raw) {
+				if (!alive.current) return;
 				const e = asSshError(raw);
 				if (e.code === "HOSTKEY_UNKNOWN" || e.code === "HOSTKEY_MISMATCH") {
 					route.current = e.routeId ?? null;
@@ -91,9 +121,13 @@ export function ConnectDialog({
 
 	async function enableLevel(level: LegacyLevel) {
 		const next = { ...p, legacy: level };
-		await api.profileSave(next);
+		// 임시 접속은 저장하지 않는다(저장하면 몰래 새 서버가 생긴다) — 이번 접속에만 쓴다
+		if (p.id != null) {
+			await api.profileSave(next);
+			if (!alive.current) return;
+			onProfileChanged();
+		}
 		setP(next);
-		onProfileChanged();
 		void run(next, secret);
 	}
 
@@ -104,6 +138,7 @@ export function ConnectDialog({
 			<div className="sheet" onKeyDown={(e) => e.key === "Escape" && onCancel()}>
 				<h3 style={{ marginBottom: 4 }}>{p.name}</h3>
 				<p style={{ margin: "0 0 16px", color: "var(--text-2)", fontFamily: "var(--font-mono)", fontSize: 12 }}>{title}</p>
+				{queued > 0 && <p className="cd-hint">이어서 접속할 연결 {queued}개가 기다립니다 — 이 창을 닫으면 다음으로 넘어갑니다.</p>}
 
 				{step.s === "connecting" && <p style={{ color: "var(--text-2)" }}>접속 중…</p>}
 				{(step.s === "hostkey" || step.s === "negotiation") && step.e.routeLabel && <p className="cd-route">경로: {step.e.routeLabel}</p>}
@@ -198,9 +233,9 @@ export function ConnectDialog({
 							<button type="button" className="btn" onClick={onCancel}>
 								취소
 							</button>
-							{step.e.suggest && p.id != null && (
+							{step.e.suggest && (
 								<button type="button" className="btn primary" onClick={() => void enableLevel(step.e.suggest as LegacyLevel)}>
-									켜고 다시 접속
+									{p.id != null ? "켜고 다시 접속" : "이번만 켜고 다시 접속"}
 								</button>
 							)}
 						</div>

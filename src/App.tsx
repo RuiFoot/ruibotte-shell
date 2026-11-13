@@ -1,22 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { BookOpen, Command as CommandIcon, ListTree, PanelLeftClose, PanelLeftOpen, ChevronDown, ChevronRight, Database, Download, Settings as SettingsIcon, FileDown, FileUp, Folder, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Search, Server, Square, SquareTerminal, Table2, Unplug, X, Star, Pin, ArrowLeftRight, Route } from "lucide-react";
-import { lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BookOpen, Command as CommandIcon, ListTree, PanelLeftClose, PanelLeftOpen, Database, Download, Settings as SettingsIcon, House, KeyRound, Minus, Pencil, Play, Plus, RotateCcw, Save, Server, Square, SquareTerminal, Table2, Unplug, X, ArrowLeftRight, Route } from "lucide-react";
+import { lazy, memo, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import iconUrl from "../assets/icon.svg?url";
-import { ConnectDialog } from "./components/ConnectDialog";
-import { Select } from "./components/Select";
+import { ConnectDialog, needsHuman, sshConnectWith } from "./components/ConnectDialog";
 import { confirmOpenTx } from "./lib/dbTx";
 import { CLOSE_DOC_EVENT, confirmDiscard, dirtyTitles } from "./lib/dirty";
 import { ConnectionsPane } from "./components/ConnectionsPane";
 import { KeysPane } from "./components/KeysPane";
 import { ContextMenu, type MenuItem } from "./components/ContextMenu";
-import { DbConnectDialog, type DbConnectOk } from "./components/DbConnectDialog";
+import { DbConnectDialog } from "./components/DbConnectDialog";
+import { HomePane, LEVEL_BADGE, type QuickSpec } from "./components/HomePane";
 import { ExportSheet, ImportSheet } from "./components/ImportSheet";
 import { blankProfile, ProfileSheet } from "./components/ProfileSheet";
 import { routeTitle, routeWorthShowing } from "./components/RouteChip";
-import { agoMs, ServerCard } from "./components/ServerCard";
-import { type Account, accountName, type AppInfo, api, type ConnectOk, defaultAccount, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm, withAccount } from "./lib/ipc";
+import { ServerCard } from "./components/ServerCard";
+import { type Account, accountName, type AppInfo, api, asSshError, type ConnectOk, defaultAccount, directArgs, localFs, localTerm, type Profile, runningTransfers, sshFs, sshTerm, transferArgs, withAccount } from "./lib/ipc";
+import type { DbConnectOk } from "./components/DbConnectDialog";
 import { askText } from "./lib/ask";
 import { checkNow, installNow, startUpdater, useUpdate } from "./lib/updater";
 import { CommandPalette } from "./components/CommandPalette";
@@ -32,8 +33,15 @@ const CommandDictionaryPane = lazy(() => import("./components/CommandDictionary"
 
 type TabKind = "home" | "local" | "ssh" | "db" | "grid" | "dict" | "settings" | "connections" | "keys";
 type DbInfo = { ok: DbConnectOk; profile: Profile; readOnly: boolean };
-type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean };
+/** retry: 조용히 다시 잇는 중(몇 번째) · lastError: 조용한 다시 연결이 다 실패한 까닭 */
+type SshInfo = { ok: ConnectOk; profile: Profile; closed?: boolean; retry?: number; lastError?: string };
 type Tab = { id: string; kind: TabKind; title: string; ssh?: SshInfo; db?: DbInfo; color?: string | null };
+/** 접속 창 대기열 한 칸 — tabId: 그 탭을 다시 연결, besideOf: 그 탭 옆 칸에 열 "다른 서버" */
+type ConnReq = { key: string; seq: number; p: Profile; tabId?: string; besideOf?: string; error?: string };
+type DbReq = { key: string; seq: number; p: Profile };
+type PeerInfo = { conn: number; label: string; home: string; target?: { user: string; host: string; port: number } };
+type Focus = boolean | "later";
+type Backend = { fs: ReturnType<typeof localFs>; term: typeof localTerm; local?: ReturnType<typeof localFs> };
 
 const TAB_ICON: Record<TabKind, ReactNode> = {
 	home: <House size={14} />,
@@ -70,18 +78,32 @@ const KIND_LABEL: Record<TabKind, string> = {
 	connections: "연결 관리",
 	keys: "키 관리",
 };
-const LEVEL_BADGE: Record<string, string> = { rsa: "구형 SSH · RSA", sha1: "구형 SSH · SHA-1", weakest: "구형 SSH · 최후" };
 
 // 탭 번호는 겹치면 안 된다 — 모듈이 다시 읽혀(개발 중 새로 고침) 숫자가 처음으로 돌아가도 겹치지 않게 무작위 꼬리를 붙인다
 let seq = 0;
 const newTab = (kind: TabKind, title: string, extra?: Partial<Tab>): Tab => ({ id: `${kind}-${++seq}-${Math.random().toString(36).slice(2, 7)}`, kind, title, ...extra });
+let reqSeq = 0;
+const noop = () => {};
+const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+/** 끊긴 뒤 조용히 다시 잇는 간격(저장한 자격으로) — 다 실패하면 탭 띠에 까닭을 남긴다 */
+const RETRY_DELAYS = [2000, 4000, 8000];
+/** 절전 복귀 감지 — 이 주기 타이머가 1분 넘게 늦으면 깨어난 것으로 본다 */
+const TICK_MS = 15000;
+/** 물을 것 없이(저장한 암호·키·에이전트) 다시 이을 수 있는 연결 */
+const canRetrySilently = (s: SshInfo) => !!(s.profile.secretSaved || s.ok.usedSavedSecret || s.profile.auth !== "password");
+/** Ctrl+Shift+T 로 다시 열 닫은 탭 수 */
+const CLOSED_KEEP = 10;
 
-function greeting(): string {
-	const h = new Date().getHours();
-	if (h < 6) return "늦은 밤이에요";
-	if (h < 12) return "좋은 아침이에요";
-	if (h < 18) return "좋은 오후예요";
-	return "좋은 저녁이에요";
+function quickTitle(p: Profile) {
+	const a = defaultAccount(p);
+	return `${a ? `${accountName(a)}${a.label?.trim() ? `(${a.username})` : ""} 계정` : "기본 계정"}으로 바로 접속${(p.accounts?.length ?? 0) > 1 ? ` — 계정 ${p.accounts?.length}개 중` : ""}`;
+}
+
+/** 늘 같은 참조인 콜백 — 부를 때는 마지막 렌더의 함수를 부른다(memo 한 칸에 넘기는 콜백용) */
+function useStable<A extends unknown[], R>(fn: (...a: A) => R): (...a: A) => R {
+	const r = useRef(fn);
+	r.current = fn;
+	return useCallback((...a: A) => r.current(...a), []);
 }
 
 export function App() {
@@ -91,18 +113,29 @@ export function App() {
 	const [active, setActive] = useState(tabs[0].id);
 	const [profiles, setProfiles] = useState<Profile[]>([]);
 	const [sheet, setSheet] = useState<Profile | null>(null);
-	/** besideOf: 그 탭 작업대에서 "다른 서버" 로 고른 연결 — 새 탭은 만들되 그 탭에 머물고 옆 칸에 연다 */
-	const [connecting, setConnecting] = useState<{ p: Profile; tabId?: string; besideOf?: string } | null>(null);
+	/**
+	 * 접속 창 대기열 — 한 번에 하나만 보이고 차례로 연다(절전 복귀·"다시 열기"로 암호·지문을 물을 탭이 여럿이어도 모두).
+	 * 대기열의 참값은 ref(같은 틱에 여러 번 넣어도 겹침 거르기가 맞게), 상태는 화면용 거울
+	 */
+	const [connQ, setConnQ] = useState<ConnReq[]>([]);
+	const connQRef = useRef<ConnReq[]>([]);
+	const editQ = useCallback((f: (q: ConnReq[]) => ConnReq[]) => {
+		connQRef.current = f(connQRef.current);
+		setConnQ(connQRef.current);
+	}, []);
 	/** 서버 카드(누르면 계정 고르기) — 서버 번호 */
 	const [cardId, setCardId] = useState<number | null>(null);
-	const [dbConnecting, setDbConnecting] = useState<Profile | null>(null);
+	const [dbQ, setDbQ] = useState<DbReq[]>([]);
+	const dbQRef = useRef<DbReq[]>([]);
+	const editDbQ = useCallback((f: (q: DbReq[]) => DbReq[]) => {
+		dbQRef.current = f(dbQRef.current);
+		setDbQ(dbQRef.current);
+	}, []);
 	const [importing, setImporting] = useState(false);
 	const [exporting, setExporting] = useState(false);
-	const [q, setQ] = useState("");
 	/** 시트를 다시 열 때(복제 등) 새로 그리게 */
 	const [sheetKey, setSheetKey] = useState(0);
 	const [pmenu, setPmenu] = useState<{ x: number; y: number; p: Profile } | null>(null);
-	const [folded, setFolded] = useState<Set<string>>(new Set());
 	const upd = useUpdate();
 	/** 명령 팔레트(열려 있으면 처음 찾는 말) */
 	const [palette, setPalette] = useState<string | null>(null);
@@ -110,30 +143,6 @@ export function App() {
 	useEffect(() => {
 		void loadAppearance();
 	}, []);
-
-	// 지난번 열려 있던 연결(앱을 다시 켜면 홈에서 한 번에 다시 열기)
-	// 지난번 열려 있던 연결(서버 + 그때 쓴 계정) — 앱을 다시 켜면 홈에서 한 번에 다시 열기
-	const [lastSession, setLastSession] = useState<SessionItem[]>([]);
-	const sessionLoaded = useRef(false);
-	useEffect(() => {
-		void api.settingGet("session.open").then((v) => {
-			setLastSession(parseSession(v));
-			sessionLoaded.current = true;
-		});
-	}, []);
-	useEffect(() => {
-		if (!sessionLoaded.current) return;
-		const items: SessionItem[] = [];
-		for (const t of tabs) {
-			const p = t.ssh?.profile ?? t.db?.profile;
-			if (p?.id == null) continue;
-			if (!items.some((x) => x.p === p.id && x.a === p.accountId)) items.push({ p: p.id, a: p.accountId });
-		}
-		if (items.length) {
-			setLastSession([]);
-			void api.settingSet("session.open", JSON.stringify(items));
-		} else if (!lastSession.length) void api.settingSet("session.open", "[]");
-	}, [tabs, lastSession.length]);
 
 	const reload = useCallback(() => {
 		void api.profilesList().then(setProfiles);
@@ -153,38 +162,109 @@ export function App() {
 	// 상태 갱신 함수 안에서 다른 setState 를 부르지 않는다(StrictMode 두 번 실행) — 지금 탭은 ref 로 읽는다
 	const tabsRef = useRef(tabs);
 	tabsRef.current = tabs;
+	const activeRef = useRef(active);
+	activeRef.current = active;
 
-	const open = useCallback((kind: TabKind, title: string, single = false, extra?: Partial<Tab>) => {
-		const same = single ? tabsRef.current.find((t) => t.kind === kind) : undefined;
-		if (same) {
-			setActive(same.id);
-			return;
-		}
-		const t = newTab(kind, title, extra);
-		setTabs((ts) => [...ts, t]);
-		setActive(t.id);
+	/** 대기열이 남은 동안 붙은 탭 — 대기열이 다 빈 뒤에 옮긴다(옮긴 탭의 터미널이 다음 접속 창의 암호 칸 포커스를 뺏지 않게) */
+	const pendingFocus = useRef<string | null>(null);
+	/** focus: true 지금 옮김 · "later" 대기열이 빈 뒤 · false 옮기지 않음 */
+	const focusTab = useCallback((id: string, focus: Focus) => {
+		if (focus === true) {
+			pendingFocus.current = null;
+			setActive(id);
+		} else if (focus === "later") pendingFocus.current = id;
 	}, []);
-
-	const close = useCallback(
-		(id: string) => {
-			const ts = tabsRef.current;
-			if (ts.length === 1) return;
-			if (!confirmDiscard(dirtyTitles(id), "이 탭을 닫으면")) return;
-			const t = ts.find((x) => x.id === id);
-			if (t?.db && !confirmOpenTx([t.db.ok.connId], "이 탭을 닫으면")) return;
-			if (t?.ssh) void api.sshDisconnect(t.ssh.ok.connId);
-			if (t?.db) void invoke("db_disconnect", { conn: t.db.ok.connId });
-			const i = ts.findIndex((x) => x.id === id);
-			const next = ts.filter((x) => x.id !== id);
-			setTabs(next);
-			if (id === active) setActive(next[Math.max(0, i - 1)].id);
+	const open = useCallback(
+		(kind: TabKind, title: string, single = false, extra?: Partial<Tab>, focus: Focus = true) => {
+			const same = single ? tabsRef.current.find((t) => t.kind === kind) : undefined;
+			if (same) {
+				setActive(same.id);
+				return;
+			}
+			const t = newTab(kind, title, extra);
+			setTabs((ts) => [...ts, t]);
+			focusTab(t.id, focus);
 		},
-		[active],
+		[focusTab],
 	);
 
+	/** 그 탭 SSH 상태 일부만 바꾼다(다른 탭 객체는 그대로 — 숨은 탭이 다시 그려지지 않게) */
+	const patchSsh = useCallback((tabId: string, patch: Partial<SshInfo>) => {
+		setTabs((ts) => ts.map((t) => (t.id === tabId && t.ssh ? { ...t, ssh: { ...t.ssh, ...patch } } : t)));
+	}, []);
+
+	// 원격·내 PC 백엔드는 탭마다 한 번만 만든다(다시 그릴 때 셸이 다시 열리지 않게)
+	const backends = useRef(new Map<string, Backend>());
+	const peerCache = useRef(new Map<string, { key: string; list: PeerInfo[] }>());
+	const backendFor = (t: Tab) => {
+		let b = backends.current.get(t.id);
+		if (!b) {
+			b = t.ssh
+				? { fs: sshFs(t.ssh.ok.connId, t.ssh.profile.name, t.ssh.ok.home), term: sshTerm(t.ssh.ok.connId), local: localFs(localHome) }
+				: { fs: localFs(localHome), term: localTerm };
+			backends.current.set(t.id, b);
+		}
+		return b;
+	};
+
+	// ── 끊긴 연결 정리·조용한 다시 연결 ──
+	/** 앱이 스스로 끊은(다시 연결로 바뀐·죽은 것으로 본) 연결 — 그 ssh-closed 는 무시한다 */
+	const retired = useRef(new Set<number>());
+	/** 끊을 옛 연결 — 작업대가 새 연결로 다시 그려진 뒤(커밋 뒤 효과)에 끊는다 */
+	const retireQ = useRef<number[]>([]);
+	const retire = useCallback((conn: number) => {
+		retired.current.add(conn);
+		retireQ.current.push(conn);
+	}, []);
+	useEffect(() => {
+		if (!retireQ.current.length) return;
+		for (const c of retireQ.current.splice(0)) void api.sshDisconnect(c).catch(noop);
+	}, [tabs]);
+	/** 조용히 다시 잇는 중인 탭 — 취소 표시 */
+	const auto = useRef(new Map<string, { cancelled: boolean }>());
+	const stopAuto = useCallback((tabId: string) => {
+		const a = auto.current.get(tabId);
+		if (!a) return false;
+		a.cancelled = true;
+		auto.current.delete(tabId);
+		return true;
+	}, []);
+
+	/** 접속 창 대기열에 넣는다 — 같은 탭(또는 같은 서버·계정의 새 연결)이 이미 기다리면 넣지 않는다 */
+	const enqueue = useCallback(
+		(r: Omit<ConnReq, "key" | "seq">) => {
+			if (r.tabId && stopAuto(r.tabId)) patchSsh(r.tabId, { retry: undefined });
+			const q = connQRef.current;
+			// 저장한 서버는 서버·계정으로, 임시 접속은 주소·계정으로 같은 것을 거른다
+			const same = (x: ConnReq) => (r.p.id != null ? x.p.id === r.p.id && x.p.accountId === r.p.accountId : x.p.id == null && x.p.host === r.p.host && x.p.port === r.p.port && x.p.username === r.p.username);
+			const dup = r.tabId ? q.some((x) => x.tabId === r.tabId) : q.some((x) => !x.tabId && x.besideOf === r.besideOf && same(x));
+			if (dup) return;
+			const n = ++reqSeq;
+			editQ((qq) => [...qq, { ...r, key: `c${n}`, seq: n }]);
+		},
+		[editQ, patchSsh, stopAuto],
+	);
+	const dequeue = useCallback((key: string) => editQ((q) => q.filter((x) => x.key !== key)), [editQ]);
+	/** 접속 창에서 붙었을 때 — 기다리는 창이 더 있으면 탭 옮기기는 미룬다 */
+	const holdFocus = useCallback((): Focus => (connQRef.current.length + dbQRef.current.length ? "later" : true), []);
+	useEffect(() => {
+		if (connQ.length || dbQ.length || !pendingFocus.current) return;
+		const id = pendingFocus.current;
+		pendingFocus.current = null;
+		if (tabsRef.current.some((t) => t.id === id)) setActive(id);
+	}, [connQ, dbQ]);
+	const dbEnqueue = useCallback(
+		(p: Profile) => {
+			if (p.id != null && dbQRef.current.some((x) => x.p.id === p.id && x.p.accountId === p.accountId)) return;
+			const n = ++reqSeq;
+			editDbQ((q) => [...q, { key: `d${n}`, seq: n, p }]);
+		},
+		[editDbQ],
+	);
+
+	/** 접속 성공 — focus: 그 탭으로 옮길지(조용한 다시 연결은 지금 보는 탭을 뺏지 않는다) */
 	const onConnected = useCallback(
-		(ok: ConnectOk, p: Profile, tabId?: string, besideOf?: string) => {
-			setConnecting(null);
+		(ok: ConnectOk, p: Profile, tabId?: string, besideOf?: string, focus: Focus = true) => {
 			reload();
 			if (besideOf && tabsRef.current.some((t) => t.id === besideOf)) {
 				const t = newTab("ssh", tabTitle({ ...p, username: ok.username || p.username }), { ssh: { ok, profile: p }, color: p.color });
@@ -193,26 +273,185 @@ export function App() {
 				return;
 			}
 			if (tabId) {
-				// 다시 연결 — 같은 탭에 새 연결(작업대는 새로 그려지고 배치는 저장본 그대로)
+				const cur = tabsRef.current.find((t) => t.id === tabId);
+				if (!cur?.ssh) {
+					// 기다리는 사이 탭을 닫았다 — 붙은 연결은 버린다
+					void api.sshDisconnect(ok.connId).catch(noop);
+					return;
+				}
+				stopAuto(tabId);
+				// 다시 연결 — 같은 탭에 새 연결(작업대는 새로 그려지고 배치는 저장본 그대로). 옛 연결(점프 세션·SFTP)은 작업대가 바뀐 뒤 끊는다
+				if (cur.ssh.ok.connId !== ok.connId) retire(cur.ssh.ok.connId);
 				backends.current.delete(tabId);
 				setTabs((ts) => ts.map((t) => (t.id === tabId ? { ...t, ssh: { ok, profile: p } } : t)));
-				setActive(tabId);
+				focusTab(tabId, focus);
 				return;
 			}
-			open("ssh", tabTitle({ ...p, username: ok.username || p.username }), false, { ssh: { ok, profile: p }, color: p.color });
+			open("ssh", tabTitle({ ...p, username: ok.username || p.username }), false, { ssh: { ok, profile: p }, color: p.color }, focus);
 		},
-		[open, reload],
+		[focusTab, open, reload, retire, stopAuto],
 	);
 
-	// 연결 끊김 — 탭에 표시하고, 저장한 암호가 있으면 바로 다시 연결을 시도
+	/** 끊긴 탭을 저장한 자격으로 조용히 다시 잇는다(2·4·8초 뒤 세 번) — 사람이 답할 단계면 바로 접속 창 */
+	const autoReconnect = useStable(async (tabId: string) => {
+		if (auto.current.has(tabId) || connQRef.current.some((x) => x.tabId === tabId)) return;
+		const tok = { cancelled: false };
+		auto.current.set(tabId, tok);
+		let lastError = "";
+		for (let i = 0; i < RETRY_DELAYS.length; i++) {
+			patchSsh(tabId, { retry: i + 1, lastError: undefined });
+			await sleep(RETRY_DELAYS[i]);
+			if (tok.cancelled) return;
+			const t = tabsRef.current.find((x) => x.id === tabId);
+			if (!t?.ssh) {
+				auto.current.delete(tabId);
+				return;
+			}
+			const prof = t.ssh.profile;
+			try {
+				const ok = await sshConnectWith(prof);
+				if (tok.cancelled || !tabsRef.current.some((x) => x.id === tabId)) {
+					void api.sshDisconnect(ok.connId).catch(noop);
+					return;
+				}
+				auto.current.delete(tabId);
+				onConnected(ok, prof, tabId, undefined, false);
+				return;
+			} catch (raw) {
+				if (tok.cancelled) return;
+				const e = asSshError(raw);
+				if (needsHuman(e)) {
+					auto.current.delete(tabId);
+					patchSsh(tabId, { retry: undefined });
+					// 인증에서 막혔으면 저장한 암호는 백엔드가 지웠다 — 창은 다시 붙어 보지 말고 그 안내와 함께 암호 칸부터
+					const auth = e.code === "AUTH_FAILED" || e.code === "NEED_SECRET";
+					enqueue(auth ? { p: { ...prof, secretSaved: false }, tabId, error: e.message } : { p: prof, tabId });
+					return;
+				}
+				lastError = e.message;
+			}
+		}
+		auto.current.delete(tabId);
+		patchSsh(tabId, { retry: undefined, lastError: lastError || "다시 잇지 못했습니다" });
+	});
+
+	/** 그 연결이 죽었다 — 탭에 표시하고, 물을 것 없이 이을 수 있으면 조용히 다시 잇는다 */
+	const markDead = useStable((conn: number) => {
+		const t = tabsRef.current.find((x) => x.ssh?.ok.connId === conn);
+		if (!t?.ssh || t.ssh.closed) return;
+		patchSsh(t.id, { closed: true });
+		if (canRetrySilently(t.ssh)) void autoReconnect(t.id);
+	});
 	useEffect(() => {
 		const un = listen<{ conn: number }>("ssh-closed", (e) => {
-			const t = tabsRef.current.find((x) => x.ssh?.ok.connId === e.payload.conn);
-			if (!t?.ssh) return;
-			setTabs((ts) => ts.map((x) => (x.id === t.id && x.ssh ? { ...x, ssh: { ...x.ssh, closed: true } } : x)));
-			if (t.ssh.profile.secretSaved || t.ssh.ok.usedSavedSecret || t.ssh.profile.auth !== "password") setConnecting({ p: t.ssh.profile, tabId: t.id });
+			if (retired.current.delete(e.payload.conn)) return;
+			markDead(e.payload.conn);
 		});
 		return () => void un.then((f) => f());
+	}, [markDead]);
+
+	// 절전 복귀·창 다시 보임·망 복구 — 열린 SSH 탭마다 가벼운 요청(sftp realpath ".")으로 살아 있는지 찔러 본다
+	const probing = useRef(new Set<number>());
+	const probe = useStable(async (tabId: string, conn: number) => {
+		if (probing.current.has(conn)) return;
+		probing.current.add(conn);
+		try {
+			const ping = invoke<string>("sftp_realpath", { conn, path: "." }).then(
+				() => true,
+				() => false,
+			);
+			// 3초 안에 답이 없으면 20초 더 기다린다 — 절전 복귀 직후 망이 올라오는 중이면 살아날 세션을 죽은 것으로 보아 끊지 않게.
+			// 거절(연결 없음·채널 닫힘)은 바로 죽음, 23초 넘게 아무 답이 없고 망은 붙어 있으면 반쯤 열린 TCP 로 보고 다시 잇는다
+			let alive = await Promise.race([ping, sleep(3000).then(() => null)]);
+			if (alive === null) alive = await Promise.race([ping, sleep(20000).then(() => null)]);
+			if (alive) return;
+			if (alive === null && !navigator.onLine) return;
+			const t = tabsRef.current.find((x) => x.id === tabId);
+			if (!t?.ssh || t.ssh.ok.connId !== conn || t.ssh.closed) return;
+			retire(conn);
+			markDead(conn);
+		} finally {
+			probing.current.delete(conn);
+		}
+	});
+	useEffect(() => {
+		let last = Date.now();
+		let lastProbe = 0;
+		const probeAll = () => {
+			const now = Date.now();
+			if (now - lastProbe < 5000) return;
+			lastProbe = now;
+			if (!navigator.onLine) return;
+			for (const t of tabsRef.current) if (t.ssh && !t.ssh.closed && !auto.current.has(t.id)) void probe(t.id, t.ssh.ok.connId);
+		};
+		const iv = window.setInterval(() => {
+			const now = Date.now();
+			if (now - last > TICK_MS + 60000) probeAll();
+			last = now;
+		}, TICK_MS);
+		const onVis = () => {
+			if (document.visibilityState === "visible") probeAll();
+		};
+		// 망이 돌아오면 — 산 연결은 찔러 보고, 다시 잇기를 다 실패한 탭은 한 번 더 조용히
+		const onOnline = () => {
+			probeAll();
+			for (const t of tabsRef.current) {
+				if (t.ssh?.closed && !auto.current.has(t.id) && !connQRef.current.some((x) => x.tabId === t.id) && canRetrySilently(t.ssh)) void autoReconnect(t.id);
+			}
+		};
+		document.addEventListener("visibilitychange", onVis);
+		window.addEventListener("online", onOnline);
+		return () => {
+			window.clearInterval(iv);
+			document.removeEventListener("visibilitychange", onVis);
+			window.removeEventListener("online", onOnline);
+		};
+	}, [probe, autoReconnect]);
+
+	/** 닫은 SSH·DB 탭(접속 정보만, 최근 것 먼저) — Ctrl+Shift+T */
+	const closedTabs = useRef<{ kind: "ssh" | "db"; p: Profile }[]>([]);
+	const close = useCallback(
+		(id: string) => {
+			const ts = tabsRef.current;
+			if (ts.length === 1) return;
+			const t = ts.find((x) => x.id === id);
+			// DB 작업대는 반영 전 표 편집을 owner `db:<연결 번호>` 로 올린다
+			if (!confirmDiscard([...dirtyTitles(id), ...(t?.db ? dirtyTitles(`db:${t.db.ok.connId}`) : [])], "이 탭을 닫으면")) return;
+			if (t?.db && !confirmOpenTx([t.db.ok.connId], "이 탭을 닫으면")) return;
+			stopAuto(id);
+			if (connQRef.current.some((x) => x.tabId === id || x.besideOf === id)) editQ((q) => q.filter((x) => x.tabId !== id && x.besideOf !== id));
+			if (t?.ssh) {
+				const conn = t.ssh.ok.connId;
+				void api.sshDisconnect(conn).catch(noop);
+				// 이 연결로 시작한 전송의 "다시" 조건 — 연결이 없어지면 쓸 데가 없다
+				for (const [k, v] of transferArgs) if (v.conn === conn) transferArgs.delete(k);
+				for (const [k, v] of directArgs) if (v.fromConn === conn || v.toConn === conn) directArgs.delete(k);
+			}
+			if (t?.db) void invoke("db_disconnect", { conn: t.db.ok.connId });
+			const sp = t?.ssh?.profile ?? t?.db?.profile;
+			if (t && sp && (t.kind === "ssh" || t.kind === "db")) closedTabs.current = [{ kind: t.kind, p: sp }, ...closedTabs.current].slice(0, CLOSED_KEEP);
+			backends.current.delete(id);
+			peerCache.current.delete(id);
+			const i = ts.findIndex((x) => x.id === id);
+			const next = ts.filter((x) => x.id !== id);
+			setTabs((cur) => cur.filter((x) => x.id !== id));
+			if (id === activeRef.current) setActive(next[Math.max(0, i - 1)].id);
+		},
+		[editQ, stopAuto],
+	);
+	const reopenClosed = useCallback(() => {
+		const [c, ...rest] = closedTabs.current;
+		if (!c) return;
+		closedTabs.current = rest;
+		if (c.kind === "ssh") enqueue({ p: c.p });
+		else dbEnqueue(c.p);
+	}, [enqueue, dbEnqueue]);
+	/** 다음·이전(dir) 또는 n번째 탭 */
+	const stepTab = useCallback((dir: number) => {
+		const ts = tabsRef.current;
+		const i = ts.findIndex((t) => t.id === activeRef.current);
+		const t = ts[(i + dir + ts.length) % ts.length];
+		if (t) setActive(t.id);
 	}, []);
 
 	// 단축키: ⌘/Ctrl+T 새 로컬 터미널, ⌘/Ctrl+W 문서 칸(없으면 탭) 닫기, ⌘/Ctrl+Shift+W 탭 닫기, ⌘/Ctrl+K 찾기
@@ -232,7 +471,7 @@ export function App() {
 					window.dispatchEvent(ev);
 					if (ev.defaultPrevented) return;
 				}
-				close(active);
+				close(activeRef.current);
 			} else if (k === "k") {
 				e.preventDefault();
 				open("home", "홈", true);
@@ -241,7 +480,46 @@ export function App() {
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	}, [info?.os, open, close, active]);
+	}, [info?.os, open, close]);
+
+	// 탭 옮기기: Ctrl+Tab / Ctrl+Shift+Tab(맥도 Ctrl, ⌘⇧[ ] 도), ⌘/Ctrl+1~8 n번째·9 마지막, ⌘/Ctrl+Shift+T 닫은 탭 다시 열기
+	// 터미널(xterm)·편집기가 받기 전에 잡는다 — Ctrl+Tab 이 셸에 Tab 으로, Ctrl+숫자가 제어 문자로 가지 않게
+	useEffect(() => {
+		const mac = info?.os === "macos";
+		const onKey = (e: KeyboardEvent) => {
+			if (e.altKey || e.isComposing) return;
+			// 접속 창·시트·팔레트가 떠 있으면 뒤의 탭을 바꾸지 않는다(바뀐 탭의 터미널이 포커스를 가져가 암호가 셸로 갈 수 있다)
+			if (document.querySelector(".scrim")) return;
+			let hit = false;
+			if (e.ctrlKey && !e.metaKey && e.key === "Tab") {
+				stepTab(e.shiftKey ? -1 : 1);
+				hit = true;
+			} else {
+				const mod = mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+				if (!mod) return;
+				if (!e.shiftKey && /^Digit[1-9]$/.test(e.code)) {
+					const ts = tabsRef.current;
+					const n = Number(e.code.slice(5));
+					const t = n === 9 ? ts[ts.length - 1] : ts[n - 1];
+					if (t) setActive(t.id);
+					hit = true;
+				} else if (e.shiftKey && e.code === "KeyT") {
+					// 누르고 있어도 한 번만(닫은 탭이 줄줄이 열리지 않게)
+					if (!e.repeat) reopenClosed();
+					hit = true;
+				} else if (mac && e.shiftKey && (e.code === "BracketLeft" || e.code === "BracketRight")) {
+					stepTab(e.code === "BracketLeft" ? -1 : 1);
+					hit = true;
+				}
+			}
+			if (hit) {
+				e.preventDefault();
+				e.stopPropagation();
+			}
+		};
+		window.addEventListener("keydown", onKey, { capture: true });
+		return () => window.removeEventListener("keydown", onKey, { capture: true });
+	}, [info?.os, stepTab, reopenClosed]);
 
 	// 명령 팔레트: Ctrl+Shift+P(맥 ⌘⇧P) — 터미널(xterm)·편집기에 가기 전에 잡는다(셸에 ^P 가 가지 않게)
 	useEffect(() => {
@@ -261,67 +539,13 @@ export function App() {
 		};
 	}, [info?.os]);
 
-	// 내 연결 조회 — 종류·묶음 거르기·정렬, 지금 조회를 시작 화면으로 고정, 묶음 고정(맨 위·펼침)
-	const [kindF, setKindF] = useState<"all" | "ssh" | "db" | "fav">("all");
-	const [groupF, setGroupF] = useState<string | null>(null);
-	const [sortBy, setSortBy] = useState<"fav" | "name" | "recent" | "host">("fav");
-	const [pinnedGroups, setPinnedGroups] = useState<string[]>([]);
-	const [viewPinned, setViewPinned] = useState(false);
-	useEffect(() => {
-		void api.settingGet("home.view").then((v) => {
-			if (!v) return;
-			try {
-				const o = JSON.parse(v) as { q?: string; kind?: typeof kindF; group?: string | null; sort?: typeof sortBy };
-				setQ(o.q ?? "");
-				setKindF(o.kind ?? "all");
-				setGroupF(o.group ?? null);
-				setSortBy(o.sort ?? "fav");
-				setViewPinned(true);
-			} catch {
-				// 무시
-			}
-		});
-		void api.settingGet("home.pinnedGroups").then((v) => {
-			try {
-				setPinnedGroups(v ? (JSON.parse(v) as string[]) : []);
-			} catch {
-				setPinnedGroups([]);
-			}
-		});
-	}, []);
-	const togglePinGroup = (g: string) => {
-		const next = pinnedGroups.includes(g) ? pinnedGroups.filter((x) => x !== g) : [...pinnedGroups, g];
-		setPinnedGroups(next);
-		void api.settingSet("home.pinnedGroups", JSON.stringify(next));
-	};
-	const pinView = (on: boolean) => {
-		setViewPinned(on);
-		void api.settingSet("home.view", on ? JSON.stringify({ q, kind: kindF, group: groupF, sort: sortBy }) : "");
-	};
-	const allGroups = useMemo(() => [...new Set(profiles.map((p) => p.groupName?.trim()).filter((g): g is string => !!g))].sort((a, b) => a.localeCompare(b, "ko")), [profiles]);
-	const filtered = useMemo(() => {
-		const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
-		let list = profiles.filter((p) => {
-			if (kindF === "ssh" && p.kind !== "ssh") return false;
-			if (kindF === "db" && p.kind !== "db") return false;
-			if (kindF === "fav" && !p.favorite) return false;
-			if (groupF !== null && (p.groupName?.trim() || "") !== groupF) return false;
-			if (!words.length) return true;
-			const hay = [p.name, p.host, p.username, p.engine, p.groupName, p.memo, p.database, `${p.host}:${p.port}`].filter(Boolean).join(" ").toLowerCase();
-			return words.every((w) => hay.includes(w));
-		});
-		list = [...list].sort((a, b) => {
-			if (sortBy === "name") return a.name.localeCompare(b.name, "ko");
-			if (sortBy === "host") return a.host.localeCompare(b.host) || a.port - b.port;
-			if (sortBy === "recent") return (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0);
-			return Number(b.favorite) - Number(a.favorite) || (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0) || a.name.localeCompare(b.name, "ko");
-		});
-		return list;
-	}, [profiles, q, kindF, groupF, sortBy]);
-	const editProfile = (p: Profile) => {
+	/** 저장 안 한 임시 접속 탭에서 「저장」을 눌렀을 때 — 저장하면 그 탭이 저장한 서버를 가리키게 */
+	const saveFor = useRef<string | null>(null);
+	const editProfile = useStable((p: Profile) => {
+		saveFor.current = null;
 		setSheetKey((k) => k + 1);
 		setSheet(p);
-	};
+	});
 	const profileMenu = (p: Profile): MenuItem[] => [
 		{ label: "서버 카드(계정 고르기)…", run: () => { if (p.id != null) setCardId(p.id); } },
 		...(p.accounts ?? []).map((a) => ({ label: `${accountName(a)}${a.label?.trim() ? ` (${a.username})` : ""} 계정으로 접속${a.isDefault ? " ★" : ""}`, run: () => connectAs(p, a) })),
@@ -338,17 +562,6 @@ export function App() {
 			},
 		},
 	];
-	/** 묶음별로 — 이름순, 묶지 않은 것은 맨 뒤 */
-	const grouped = (list: Profile[]) => {
-		const m = new Map<string, Profile[]>();
-		for (const p of list) {
-			const g = p.groupName?.trim() || "";
-			m.set(g, [...(m.get(g) ?? []), p]);
-		}
-		// 고정한 묶음 먼저(고정한 순서), 그다음 이름순, 묶지 않음은 맨 뒤
-		const rank = (g: string) => (pinnedGroups.includes(g) ? pinnedGroups.indexOf(g) : 1000);
-		return [...m.entries()].sort(([a], [b]) => rank(a) - rank(b) || (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, "ko")));
-	};
 	// 사이드바: 즐겨찾기(★) + 즐겨찾기가 아닌 최근 5개 — 나머지는 연결 관리·홈에서
 	const favs = profiles.filter((p) => p.favorite).sort((a, b) => a.name.localeCompare(b.name, "ko"));
 	const recent = profiles
@@ -385,7 +598,6 @@ export function App() {
 		</div>
 	);
 	const isWin = info?.os === "windows";
-	const sessionProfiles = lastSession.map((x) => ({ x, p: profiles.find((p) => p.id === x.p) })).filter((y): y is { x: SessionItem; p: Profile } => !!y.p);
 	const mod = info?.os === "macos" ? "⌘" : "Ctrl+";
 	// 렌더마다 새 객체라 [win] 효과가 매번 닫기·전송 듣기를 풀었다 다시 걸었다 — 한 번만
 	const win = useMemo(() => getCurrentWindow(), []);
@@ -432,11 +644,21 @@ export function App() {
 		return () => window.removeEventListener("keydown", onKey);
 	}, [sbRail]);
 
+	/** 그 계정으로(안 주면 기본 계정) 접속 */
+	const connectAs = useStable((p: Profile, a?: Account) => {
+		const eff = withAccount(p, a ?? defaultAccount(p));
+		setCardId(null);
+		if (p.kind === "db") {
+			dbEnqueue(eff);
+			return;
+		}
+		enqueue({ p: eff });
+	});
 	/**
 	 * 서버를 누르면 — 계정이 하나뿐이고 더 물을 것이 없으면(암호 저장됨·키·에이전트) 바로 접속,
 	 * 아니면 서버 카드(서버 정보·계정 고르기). 카드는 우클릭 › 서버 카드로 언제든 연다
 	 */
-	const connect = (p: Profile) => {
+	const connect = useStable((p: Profile) => {
 		if (p.id == null) return;
 		const accts = p.accounts ?? [];
 		const only = accts.length === 1 ? accts[0] : undefined;
@@ -445,19 +667,26 @@ export function App() {
 			return;
 		}
 		setCardId(p.id);
-	};
-	/** 그 계정으로(안 주면 기본 계정) 접속 */
-	const connectAs = (p: Profile, a?: Account) => {
-		const eff = withAccount(p, a ?? defaultAccount(p));
-		setCardId(null);
-		if (p.kind === "db") {
-			setDbConnecting(eff);
+	});
+	/** 빠른 접속(홈 검색 칸 user@host:port) — 저장한 서버와 같으면 그 서버로, 아니면 저장하지 않은 임시 접속 */
+	const onQuick = useStable(async (s: QuickSpec) => {
+		const host = s.host.toLowerCase();
+		const same = profiles.find((p) => p.kind === "ssh" && p.id != null && p.host.toLowerCase() === host && p.port === s.port && (!s.user || p.accounts?.some((a) => a.username === s.user)));
+		if (same) {
+			if (s.user) connectAs(same, same.accounts?.find((a) => a.username === s.user));
+			else connect(same);
 			return;
 		}
-		setConnecting({ p: eff });
-	};
+		let user = s.user;
+		if (!user) {
+			const v = await askText({ title: `${s.host}${s.port !== 22 ? `:${s.port}` : ""} 에 접속할 계정`, message: "저장하지 않고 바로 접속합니다 — 접속한 뒤 작업대의 「저장」으로 연결 목록에 넣을 수 있습니다.", placeholder: "사용자 이름", okLabel: "접속" });
+			if (!v?.trim()) return;
+			user = v.trim();
+		}
+		enqueue({ p: { ...blankProfile("ssh"), name: s.host, host: s.host, port: s.port, username: user, favorite: false, color: null } });
+	});
 	/** 작업대의 "다른 서버" — 저장한 서버를 골라 연결하고, 그 탭에 머문 채 옆 칸에 트리를 연다 */
-	const connectBeside = async (tabId: string) => {
+	const connectBeside = useStable(async (tabId: string) => {
 		const list = profiles.filter((p) => p.kind !== "db" && p.id != null);
 		if (!list.length) {
 			alert("저장한 서버가 없습니다 — 왼쪽 목록에서 서버를 먼저 추가하세요");
@@ -471,13 +700,92 @@ export function App() {
 		});
 		const p = list.find((x) => String(x.id) === pick);
 		if (!p) return;
-		setConnecting({ p: withAccount(p, defaultAccount(p)), besideOf: tabId });
-	};
-	const quickTitle = (p: Profile) => {
-		const a = defaultAccount(p);
-		return `${a ? `${accountName(a)}${a.label?.trim() ? `(${a.username})` : ""} 계정` : "기본 계정"}으로 바로 접속${(p.accounts?.length ?? 0) > 1 ? ` — 계정 ${p.accounts?.length}개 중` : ""}`;
-	};
+		enqueue({ p: withAccount(p, defaultAccount(p)), besideOf: tabId });
+	});
+	/** 끊긴 탭 "다시 연결" — 조용한 다시 잇기를 멈추고 접속 창으로 */
+	const reconnectTab = useStable((tabId: string) => {
+		const t = tabsRef.current.find((x) => x.id === tabId);
+		if (t?.ssh) enqueue({ p: t.ssh.profile, tabId });
+	});
+	const saveTemp = useStable((tabId: string) => {
+		const t = tabsRef.current.find((x) => x.id === tabId);
+		if (!t?.ssh) return;
+		editProfile({ ...t.ssh.profile, username: t.ssh.ok.username || t.ssh.profile.username, favorite: true, color: blankProfile("ssh").color });
+		saveFor.current = tabId;
+	});
 	const card = cardId != null ? profiles.find((p) => p.id === cardId) : undefined;
+
+	// ── 지난 세션: 홈의 "다시 열기", 설정 "켤 때 지난 연결 다시 열기"면 저절로 ──
+	const [lastSession, setLastSession] = useState<SessionItem[]>([]);
+	const sessionLoaded = useRef(false);
+	/** 접속 창 대기열로 차례로(그때 쓴 계정으로, 지워졌으면 기본 계정) */
+	const resumeSession = useStable((items: SessionItem[], list: Profile[]) => {
+		setLastSession([]);
+		for (const x of items) {
+			const p = list.find((y) => y.id === x.p);
+			if (p) connectAs(p, p.accounts?.find((y) => y.id === x.a));
+		}
+	});
+	const restoredOnce = useRef(false);
+	useEffect(() => {
+		void Promise.all([api.settingGet("session.open"), api.settingGet("session.autoRestore")]).then(async ([v, ar]) => {
+			if (restoredOnce.current) return;
+			restoredOnce.current = true;
+			const items = parseSession(v);
+			if (ar === "1" && items.length) {
+				const list = await api.profilesList();
+				setProfiles(list);
+				sessionLoaded.current = true;
+				resumeSession(items, list);
+				return;
+			}
+			setLastSession(items);
+			sessionLoaded.current = true;
+		});
+	}, [resumeSession]);
+	useEffect(() => {
+		if (!sessionLoaded.current) return;
+		const items: SessionItem[] = [];
+		const add = (p?: Profile) => {
+			if (p?.id == null) return;
+			if (!items.some((x) => x.p === p.id && x.a === p.accountId)) items.push({ p: p.id, a: p.accountId });
+		};
+		for (const t of tabs) add(t.ssh?.profile ?? t.db?.profile);
+		// 아직 대기열에서 기다리는 연결도(복원 도중 앱을 꺼도 나머지를 잃지 않게)
+		for (const x of connQ) if (!x.tabId && !x.besideOf) add(x.p);
+		for (const x of dbQ) add(x.p);
+		if (items.length) {
+			setLastSession([]);
+			void api.settingSet("session.open", JSON.stringify(items));
+		} else if (!lastSession.length) void api.settingSet("session.open", "[]");
+	}, [tabs, connQ, dbQ, lastSession.length]);
+	const resumeLabel = useMemo(
+		() =>
+			lastSession
+				.map((x) => {
+					const p = profiles.find((y) => y.id === x.p);
+					if (!p) return "";
+					const a = p.accounts?.find((y) => y.id === x.a) ?? defaultAccount(p);
+					return a ? `${a.username}@${p.name}` : p.name;
+				})
+				.filter(Boolean)
+				.join(", "),
+		[lastSession, profiles],
+	);
+	const onResume = useStable(() => resumeSession(lastSession, profiles));
+	const onDismissResume = useCallback(() => setLastSession([]), []);
+	const onHomeOpen = useCallback(
+		(w: "local" | "dict" | "connections") => {
+			if (w === "local") open("local", "내 PC");
+			else if (w === "dict") open("dict", "명령어 사전", true);
+			else open("connections", "연결 관리", true);
+		},
+		[open],
+	);
+	const onNewProfile = useCallback((k: "ssh" | "db") => setSheet(blankProfile(k)), []);
+	const onMenuAt = useCallback((x: number, y: number, p: Profile) => setPmenu({ x, y, p }), []);
+	const openImport = useCallback(() => setImporting(true), []);
+	const openExport = useCallback(() => setExporting(true), []);
 
 	/** 설정의 그 묶음으로 */
 	const gotoSettings = (id: SettingsSection) => {
@@ -520,9 +828,12 @@ export function App() {
 		const a = (id: string, title: string, run: () => void, extra?: Partial<Command>): Command => ({ id: `app.${id}`, group: "app", title, run, ...extra });
 		out.push(
 			a("home", "홈", () => open("home", "홈", true)),
-			a("homeSearch", "홈에서 연결 찾기", focusHomeSearch, { keys: "Mod+K" }),
+			a("homeSearch", "홈에서 연결 찾기", focusHomeSearch, { keys: "Mod+K", keywords: "빠른 접속 user@host quick connect" }),
 			a("local", "내 PC 터미널 새로 열기", () => open("local", "내 PC"), { keys: "Mod+T", keywords: "로컬 터미널 셸 local" }),
 			a("closeTab", "지금 탭 닫기", () => close(active), { keys: "Mod+W", disabled: tabsRef.current.length <= 1 }),
+			a("nextTab", "다음 탭", () => stepTab(1), { keys: "Ctrl+Tab", keywords: "탭 옮기기 next tab" }),
+			a("prevTab", "이전 탭", () => stepTab(-1), { keys: "Ctrl+Shift+Tab", keywords: "탭 옮기기 previous tab" }),
+			a("reopenTab", "닫은 탭 다시 열기", reopenClosed, { keys: "Mod+Shift+T", keywords: "되살리기 reopen closed tab", disabled: !closedTabs.current.length }),
 			a("connections", "연결 관리", () => open("connections", "연결 관리", true), { keywords: "서버 목록 프로필" }),
 			a("keys", "키 관리", () => open("keys", "키 관리", true), { keywords: "ssh key 공개키 ppk" }),
 			a("dict", "명령어 사전", () => open("dict", "명령어 사전", true), { keywords: "리눅스 명령 도움말" }),
@@ -552,18 +863,25 @@ export function App() {
 		return out;
 	});
 
-	// 원격·내 PC 백엔드는 탭마다 한 번만 만든다(다시 그릴 때 셸이 다시 열리지 않게)
-	const backends = useRef(new Map<string, { fs: ReturnType<typeof localFs>; term: typeof localTerm; local?: ReturnType<typeof localFs> }>());
-	const backendFor = (t: Tab) => {
-		let b = backends.current.get(t.id);
-		if (!b) {
-			b = t.ssh
-				? { fs: sshFs(t.ssh.ok.connId, t.ssh.profile.name, t.ssh.ok.home), term: sshTerm(t.ssh.ok.connId), local: localFs(localHome) }
-				: { fs: localFs(localHome), term: localTerm };
-			backends.current.set(t.id, b);
+	/** 다른 서버 칸 목록 — 탭마다, 내용이 같으면 지난 배열을 그대로(작업대가 다시 그려지지 않게) */
+	const peersFor = (t: Tab): PeerInfo[] => {
+		const list: PeerInfo[] = [];
+		for (const x of tabs) {
+			if (!x.ssh || x.id === t.id || x.ssh.closed) continue;
+			const user = x.ssh.ok.username || x.ssh.profile.username;
+			list.push({ conn: x.ssh.ok.connId, label: tabTitle({ ...x.ssh.profile, username: user }), home: x.ssh.ok.home ?? "/", target: { user, host: x.ssh.profile.host, port: x.ssh.profile.port } });
 		}
-		return b;
+		const key = JSON.stringify(list);
+		const c = peerCache.current.get(t.id);
+		if (c && c.key === key) return c.list;
+		peerCache.current.set(t.id, { key, list });
+		return list;
 	};
+	const keyConns = useMemo(() => tabs.filter((x) => x.ssh && !x.ssh.closed).map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.title })), [tabs]);
+	// SSH·DB 접속 창은 한 줄로 — 먼저 들어온 것부터(이미 뜬 창은 나중 것에 밀려 사라지지 않는다)
+	const connHead = connQ[0] && (!dbQ[0] || connQ[0].seq < dbQ[0].seq) ? connQ[0] : undefined;
+	const dbHead = connHead ? undefined : dbQ[0];
+	const waiting = connQ.length + dbQ.length - 1;
 
 	return (
 		<div className="app" data-sb={sbRail ? "rail" : "open"}>
@@ -634,18 +952,19 @@ export function App() {
 			<main className="main">
 				<div className="titlebar" data-tauri-drag-region>
 					<div className="tabs" role="tablist">
-						{tabs.map((t) => (
+						{tabs.map((t, i) => (
 							<button
 								key={t.id}
 								type="button"
 								role="tab"
 								className="tab"
 								aria-selected={t.id === active}
+								title={i < 8 ? `${t.title} (${mod}${i + 1})` : t.title}
 								onClick={() => setActive(t.id)}
 								onAuxClick={(e) => e.button === 1 && close(t.id)}
 								style={t.color ? { boxShadow: t.id === active ? `inset 0 -2px 0 ${t.color}, var(--shadow-card)` : `inset 0 -2px 0 ${t.color}` } : undefined}
 							>
-								{TAB_ICON[t.kind]}
+								{t.ssh?.retry ? <RotateCcw size={14} className="spin" aria-label="다시 잇는 중" /> : t.ssh?.closed ? <Unplug size={14} aria-label="끊김" /> : TAB_ICON[t.kind]}
 								<span>{t.title}</span>
 								{t.db?.profile.sshTunnelProfileId ? (
 									<span className="tab-via" title={`SSH 경유 — ${profiles.find((x) => x.id === t.db?.profile.sshTunnelProfileId)?.name ?? "SSH 서버"} 를 거쳐 접속`}>
@@ -699,269 +1018,39 @@ export function App() {
 					{tabs.map((t) => (
 						<section key={t.id} className={`pane${t.kind === "home" || t.kind === "settings" ? " home" : ""}`} hidden={t.id !== active}>
 							{t.kind === "home" && (
-								<div className="home-inner">
-									<h1>{greeting()}</h1>
-									<p className="sub">어디에 접속할까요?</p>
-										{sessionProfiles.length > 0 && (
-											<div className="resume-bar">
-												<span>
-													지난번에 열려 있던 연결 —{" "}
-													{sessionProfiles
-														.map(({ x, p }) => {
-															const a = p.accounts?.find((y) => y.id === x.a) ?? defaultAccount(p);
-															return a ? `${a.username}@${p.name}` : p.name;
-														})
-														.join(", ")}
-												</span>
-											<button
-												type="button"
-												className="btn primary"
-												onClick={() => {
-														const list = sessionProfiles;
-														setLastSession([]);
-														// 하나씩(암호 창이 겹치지 않게), 그때 쓴 계정으로(지워졌으면 기본 계정)
-														list.forEach(({ x, p }, i) => window.setTimeout(() => connectAs(p, p.accounts?.find((y) => y.id === x.a)), i * 400));
-												}}
-											>
-												다시 열기
-											</button>
-											<button type="button" className="btn ghost" onClick={() => setLastSession([])}>
-												닫기
-											</button>
-										</div>
-									)}
-									<label className="search">
-										<Search size={17} />
-										<input id="home-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="서버·데이터베이스 찾기" spellCheck={false} />
-										<kbd>{mod}K</kbd>
-									</label>
-									<div className="quick">
-										<QuickCard color="#0a84ff" icon={<Server size={18} />} title="SSH 서버" desc="터미널·파일·편집기" onClick={() => setSheet(blankProfile("ssh"))} />
-										<QuickCard color="#30d158" icon={<Database size={18} />} title="데이터베이스" desc="PostgreSQL·MariaDB·MySQL" onClick={() => setSheet(blankProfile("db"))} />
-										<QuickCard color="#5e5ce6" icon={<SquareTerminal size={18} />} title="내 PC 터미널" desc={`이 PC 폴더·셸 (${mod}T)`} onClick={() => open("local", "내 PC")} />
-										<QuickCard color="#ff9f0a" icon={<BookOpen size={18} />} title="명령어 사전" desc="358개 리눅스 명령 한국어" onClick={() => open("dict", "명령어 사전", true)} />
-									</div>
-									<div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-										<h2 style={{ margin: 0, flex: 1 }}>
-											내 연결 <small className="count">{filtered.length === profiles.length ? profiles.length : `${filtered.length} / ${profiles.length}`}</small>
-										</h2>
-										<button type="button" className="btn ghost" onClick={() => open("connections", "연결 관리", true)} title="연결 만들기·고치기·지우기·묶음 — 한 화면에서">
-											<ListTree size={14} /> 연결 관리
-										</button>
-										<button type="button" className="btn ghost" onClick={() => setImporting(true)} title="~/.ssh/config·PuTTY 에서">
-											<FileDown size={14} /> 가져오기
-										</button>
-										<button type="button" className="btn ghost" onClick={() => setExporting(true)} title="ssh config 로">
-											<FileUp size={14} /> 내보내기
-										</button>
-									</div>
-									<div className="find-bar">
-										<div className="seg tiny" role="group">
-											{(
-												[
-													["all", "전체"],
-													["ssh", "SSH"],
-													["db", "DB"],
-													["fav", "즐겨찾기"],
-												] as const
-											).map(([k, l]) => (
-												<button key={k} type="button" aria-pressed={kindF === k} onClick={() => setKindF(k)}>
-													{k === "fav" && <Star size={11} className="ic-inline" aria-hidden />}
-													{l}
-												</button>
-											))}
-										</div>
-										{allGroups.length > 0 && (
-											<div className="chips" style={{ margin: 0 }}>
-												{allGroups.map((g) => (
-													<button key={g} type="button" className={`chip${groupF === g ? " on" : ""}`} onClick={() => setGroupF(groupF === g ? null : g)}>
-														{pinnedGroups.includes(g) && <Pin size={11} className="ic-inline" aria-label="고정" />}
-														{g}
-													</button>
-												))}
-											</div>
-										)}
-										<span style={{ flex: 1 }} />
-										<Select<"fav" | "name" | "recent" | "host">
-											size="sm"
-											value={sortBy}
-											onChange={setSortBy}
-											title="정렬"
-											options={[
-												{ value: "fav", label: "즐겨찾기·최근 순" },
-												{ value: "recent", label: "최근 접속 순" },
-												{ value: "name", label: "이름 순" },
-												{ value: "host", label: "주소 순" },
-											]}
-										/>
-										<button
-											type="button"
-											className={`btn ghost${viewPinned ? " on" : ""}`}
-											title={viewPinned ? "시작 화면 고정 풀기" : "지금 조회(검색어·종류·묶음·정렬)를 앱을 켤 때 그대로 보이게 고정"}
-											onClick={() => pinView(!viewPinned)}
-										>
-											<Pin size={12} className="ic-inline" aria-hidden /> {viewPinned ? "고정됨" : "이 조회 고정"}
-										</button>
-										{(q || kindF !== "all" || groupF !== null) && (
-											<button
-												type="button"
-												className="btn ghost"
-												onClick={() => {
-													setQ("");
-													setKindF("all");
-													setGroupF(null);
-												}}
-											>
-												모두 보기
-											</button>
-										)}
-									</div>
-									{filtered.length ? (
-										grouped(filtered).map(([g, items]) => (
-											<section key={g || "-"} className="pgroup">
-												{(g || grouped(filtered).length > 1) && (
-													<button type="button" className="pgroup-head" onClick={() => setFolded((f) => { const n = new Set(f); if (n.has(g)) n.delete(g); else n.add(g); return n; })}>
-														{folded.has(g) ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-														<Folder size={13} /> {g || "묶지 않음"} <small>{items.length}</small>
-														{g && (
-															<span
-																role="button"
-																tabIndex={-1}
-																className={`pin${pinnedGroups.includes(g) ? " on" : ""}`}
-																title={pinnedGroups.includes(g) ? "고정 풀기" : "이 묶음 고정(맨 위·늘 펼침)"}
-																onClick={(e) => {
-																	e.stopPropagation();
-																	togglePinGroup(g);
-																}}
-															>
-																<Pin size={12} aria-hidden />
-															</span>
-														)}
-													</button>
-												)}
-												{(!folded.has(g) || pinnedGroups.includes(g)) && (
-													<div className="plist">
-														{items.map((p) => (
-															<div
-																key={p.id}
-																className="pcard"
-																	title={`${p.memo ? `${p.memo}\n` : ""}눌러 서버 정보·계정 고르기`}
-																role="button"
-																tabIndex={0}
-																onClick={() => connect(p)}
-																onKeyDown={(e) => e.key === "Enter" && connect(p)}
-																onContextMenu={(e) => {
-																	e.preventDefault();
-																	setPmenu({ x: e.clientX, y: e.clientY, p });
-																}}
-															>
-																<span style={{ width: 10, height: 10, borderRadius: "50%", flex: "none", background: p.color ?? "var(--accent)" }} />
-																<div className="meta">
-																	<b>
-																		<button
-																			type="button"
-																			className={`star${p.favorite ? " on" : ""}`}
-																			title={p.favorite ? "즐겨찾기 빼기" : "즐겨찾기(목록 맨 위)"}
-																			onClick={(e) => {
-																				e.stopPropagation();
-																				void api.profileSave({ ...p, favorite: !p.favorite }).then(reload);
-																			}}
-																		>
-																			<Star size={13} fill={p.favorite ? "currentColor" : "none"} aria-hidden />
-																		</button>
-																		<span className="nm">{p.name}</span>
-																	</b>
-																	<small>
-																			{p.legacy !== "off" && <span className="badge warn pc-legacy">{LEVEL_BADGE[p.legacy]}</span>}
-																			{p.secretSaved && <KeyRound size={10} style={{ marginRight: 4, verticalAlign: -1 }} />}
-																			{p.kind === "db" ? `${p.engine} · ` : ""}
-																			{p.username ? `${p.username}@` : ""}
-																			{p.host}:{p.port}
-																			{(p.accounts?.length ?? 0) > 1 && <span className="last-used"> · 계정 {p.accounts?.length}</span>}
-																			{p.lastUsedAt ? <span className="last-used"> · {agoMs(p.lastUsedAt)}</span> : null}
-																	</small>
-																	{p.memo && <small className="memo">{p.memo}</small>}
-																</div>
-																<button
-																	type="button"
-																		className="btn pc-connect"
-																		title={quickTitle(p)}
-																		onClick={(e) => {
-																			e.stopPropagation();
-																			connectAs(p);
-																		}}
-																>
-																	<Play size={12} /> 접속
-																</button>
-																<button
-																	type="button"
-																	className="btn ghost icon"
-																	aria-label="설정"
-																	title="설정(고치기·복제·지우기) — 우클릭 메뉴도 있습니다"
-																	onClick={(e) => {
-																		e.stopPropagation();
-																		editProfile(p);
-																	}}
-																>
-																	<Pencil size={13} />
-																</button>
-															</div>
-														))}
-													</div>
-												)}
-											</section>
-										))
-									) : (
-										<div className="empty">{q ? "맞는 연결이 없습니다." : "저장한 연결이 없습니다. 위에서 SSH 서버나 데이터베이스를 추가하세요."}</div>
-									)}
-								</div>
+								<HomePane
+									profiles={profiles}
+									mod={mod}
+									resumeLabel={resumeLabel}
+									onResume={onResume}
+									onDismissResume={onDismissResume}
+									onConnect={connect}
+									onConnectAs={connectAs}
+									onQuick={onQuick}
+									onMenu={onMenuAt}
+									onEdit={editProfile}
+									onNew={onNewProfile}
+									onOpen={onHomeOpen}
+									onImport={openImport}
+									onExport={openExport}
+									reload={reload}
+									quickTitle={quickTitle}
+								/>
 							)}
 							<Suspense fallback={null}>
 								{t.kind === "local" && localHome && (
 									<Workbench ownerId={t.id} fs={backendFor(t).fs} term={backendFor(t).term} active={t.id === active} label="내 PC 셸" layoutKey="layout.local" />
 								)}
-								{t.kind === "ssh" && t.ssh?.closed && (
-									<div className="closed-banner">
-										<Unplug size={15} /> 연결이 끊겼습니다. 다시 연결하면 열려 있던 파일을 다시 엽니다 — 저장 안 한 고친 내용은 초안으로 남아 열 때 되살릴 수 있습니다.
-										<button type="button" className="btn primary" onClick={() => t.ssh && setConnecting({ p: t.ssh.profile, tabId: t.id })}>
-											<RotateCcw size={13} /> 다시 연결
-										</button>
-									</div>
-								)}
 								{t.kind === "ssh" && t.ssh && (
-									<Workbench
-										ownerId={t.id}
-										key={t.ssh.ok.connId}
-										fs={backendFor(t).fs}
-										local={backendFor(t).local}
-										term={backendFor(t).term}
-										layoutKey="layout.ssh"
-										server={t.ssh.profile.id != null ? { profileId: t.ssh.profile.id, conn: t.ssh.ok.connId, tmux: !!profiles.find((x) => x.id === t.ssh?.profile.id)?.tmux, name: t.ssh.profile.name } : undefined}
-											sudo={{ mode: t.ssh.ok.sudo ?? "ask", user: t.ssh.ok.sudoUser ?? "root" }}
-											peers={tabs
-											.filter((x) => x.ssh && x.id !== t.id && !x.ssh.closed)
-												.map((x) => ({
-												conn: x.ssh?.ok.connId as number,
-												label: x.ssh ? tabTitle({ ...x.ssh.profile, username: x.ssh.ok.username || x.ssh.profile.username }) : "",
-												home: x.ssh?.ok.home ?? "/",
-												target: x.ssh ? { user: x.ssh.ok.username || x.ssh.profile.username, host: x.ssh.profile.host, port: x.ssh.profile.port } : undefined,
-											}))}
-										onConnectOther={() => void connectBeside(t.id)}
-											syncInfo={{ user: t.ssh.ok.username || t.ssh.profile.username, host: t.ssh.profile.host, port: t.ssh.profile.port }}
-											active={t.id === active}
-											label={`${t.ssh.ok.username || t.ssh.profile.username}@${t.ssh.profile.host}`}
-										startPath={t.ssh.profile.defaultPath ?? undefined}
-										badge={
-											t.ssh.profile.legacy !== "off" ? (
-												<span className="badge warn" title="이 서버에는 오래된 알고리즘을 허용했습니다">
-													{LEVEL_BADGE[t.ssh.profile.legacy]}
-												</span>
-											) : (
-												<span className="badge" title={t.ssh.ok.fingerprint}>
-													{t.ssh.ok.algorithm}
-												</span>
-											)
-										}
+									<SshTab
+										t={t}
+										active={t.id === active}
+										tmux={!!profiles.find((x) => x.id === t.ssh?.profile.id)?.tmux}
+										peers={peersFor(t)}
+										backend={backendFor(t)}
+										onConnectOther={connectBeside}
+										onReconnect={reconnectTab}
+										onSave={saveTemp}
 									/>
 								)}
 								{t.kind === "db" && t.db && (
@@ -977,16 +1066,8 @@ export function App() {
 								)}
 								{t.kind === "grid" && <ResultGridPane />}
 								{t.kind === "settings" && <SettingsPane info={info} />}
-								{t.kind === "keys" && (
-									<KeysPane
-										conns={tabs
-											.filter((x) => x.ssh && !x.ssh.closed)
-											.map((x) => ({ conn: x.ssh?.ok.connId as number, label: x.title }))}
-									/>
-								)}
-								{t.kind === "connections" && (
-									<ConnectionsPane profiles={profiles} reload={reload} onConnect={connect} onImport={() => setImporting(true)} onExport={() => setExporting(true)} />
-								)}
+								{t.kind === "keys" && <KeysPane conns={keyConns} />}
+								{t.kind === "connections" && <ConnectionsPane profiles={profiles} reload={reload} onConnect={connect} onImport={openImport} onExport={openExport} />}
 								{t.kind === "dict" && <CommandDictionaryPane />}
 							</Suspense>
 						</section>
@@ -999,10 +1080,20 @@ export function App() {
 					key={sheetKey}
 					others={profiles}
 					initial={sheet}
-					onClose={() => setSheet(null)}
-					onSaved={() => {
+					onClose={() => {
+						saveFor.current = null;
 						setSheet(null);
-						reload();
+					}}
+					onSaved={(id) => {
+						setSheet(null);
+						const tabId = saveFor.current;
+						saveFor.current = null;
+						void api.profilesList().then((list) => {
+							setProfiles(list);
+							const sp = tabId ? list.find((x) => x.id === id) : undefined;
+							// 임시 접속 탭 — 저장한 서버(기본 계정)를 가리키게(다음 다시 연결·지난 세션·tmux 가 그 서버를 따른다)
+							if (tabId && sp) setTabs((ts) => ts.map((t) => (t.id === tabId && t.ssh && t.ssh.profile.id == null ? { ...t, color: sp.color, ssh: { ...t.ssh, profile: withAccount(sp, defaultAccount(sp)) } } : t)));
+						});
 					}}
 					onDeleted={() => {
 						setSheet(null);
@@ -1028,25 +1119,32 @@ export function App() {
 				/>
 			)}
 			{pmenu && <ContextMenu x={pmenu.x} y={pmenu.y} items={profileMenu(pmenu.p)} onClose={() => setPmenu(null)} />}
-			{connecting && (
+			{connHead && (
 				<ConnectDialog
-					// 연결할 탭·서버가 바뀌면 새 창으로(앞 창의 상태·시작 표시가 남아 다른 탭에 붙지 않게)
-					key={`${connecting.tabId ?? "new"}:${connecting.p.id}`}
-					profile={connecting.p}
-					onConnected={(ok, p) => onConnected(ok, p, connecting.tabId, connecting.besideOf)}
-					onCancel={() => setConnecting(null)}
+					// 대기열 칸마다 새 창으로(앞 창의 상태·시작 표시가 남아 다른 탭에 붙지 않게)
+					key={connHead.key}
+					profile={connHead.p}
+					queued={waiting}
+					initialError={connHead.error}
+					onConnected={(ok, p) => {
+						dequeue(connHead.key);
+						onConnected(ok, p, connHead.tabId, connHead.besideOf, holdFocus());
+					}}
+					onCancel={() => dequeue(connHead.key)}
 					onProfileChanged={reload}
 				/>
 			)}
-			{dbConnecting && (
+			{/* DB 접속 창도 차례로 — SSH 접속 창이 다 끝난 뒤(창이 겹쳐 뜨지 않게) */}
+			{dbHead && (
 				<DbConnectDialog
-					profile={dbConnecting}
-					onCancel={() => setDbConnecting(null)}
+					key={dbHead.key}
+					profile={dbHead.p}
+					onCancel={() => editDbQ((q) => q.filter((x) => x.key !== dbHead.key))}
 					onConnected={(ok, readOnly) => {
-						const p = dbConnecting;
-						setDbConnecting(null);
+						const p = dbHead.p;
+						editDbQ((q) => q.filter((x) => x.key !== dbHead.key));
 						reload();
-							open("db", tabTitle(p), false, { db: { ok, profile: p, readOnly }, color: p.color });
+						open("db", tabTitle(p), false, { db: { ok, profile: p, readOnly }, color: p.color }, holdFocus());
 					}}
 				/>
 			)}
@@ -1065,16 +1163,97 @@ export function App() {
 	);
 }
 
-function QuickCard(props: { color: string; icon: ReactNode; title: string; desc: string; onClick: () => void }) {
-	return (
-		<button type="button" className="qcard" onClick={props.onClick}>
-			<span className="ic" style={{ background: props.color }}>
-				{props.icon}
-			</span>
-			<span className="qtext">
-				<b>{props.title}</b>
-				<small>{props.desc}</small>
-			</span>
-		</button>
+/**
+ * SSH 탭 한 칸 — 끊김 띠 + 작업대. 작업대에 넘기는 객체·콜백은 여기서 안정된 참조로 만든다
+ * (앱이 다시 그려져도 이 탭의 연결·프로필이 그대로면 숨은 작업대가 다시 그려지지 않게)
+ */
+const SshTab = memo(function SshTab({
+	t,
+	active,
+	tmux,
+	peers,
+	backend,
+	onConnectOther,
+	onReconnect,
+	onSave,
+}: {
+	t: Tab;
+	active: boolean;
+	tmux: boolean;
+	peers: PeerInfo[];
+	backend: Backend;
+	onConnectOther: (tabId: string) => void;
+	onReconnect: (tabId: string) => void;
+	onSave: (tabId: string) => void;
+}) {
+	const s = t.ssh as SshInfo;
+	const { ok, profile } = s;
+	const tabId = t.id;
+	const user = ok.username || profile.username;
+	const server = useMemo(() => (profile.id != null ? { profileId: profile.id, conn: ok.connId, tmux, name: profile.name } : undefined), [profile.id, profile.name, ok.connId, tmux]);
+	const sudo = useMemo(() => ({ mode: ok.sudo ?? "ask", user: ok.sudoUser ?? "root" }), [ok.sudo, ok.sudoUser]);
+	const syncInfo = useMemo(() => ({ user, host: profile.host, port: profile.port }), [user, profile.host, profile.port]);
+	const other = useCallback(() => void onConnectOther(tabId), [onConnectOther, tabId]);
+	const temp = profile.id == null;
+	const badge = useMemo(
+		() => (
+			<>
+				{profile.legacy !== "off" ? (
+					<span className="badge warn" title="이 서버에는 오래된 알고리즘을 허용했습니다">
+						{LEVEL_BADGE[profile.legacy]}
+					</span>
+				) : (
+					<span className="badge" title={ok.fingerprint}>
+						{ok.algorithm}
+					</span>
+				)}
+				{temp && (
+					<button type="button" className="btn ghost tiny" title="저장하지 않은 임시 접속 — 연결 목록에 저장" onClick={() => onSave(tabId)}>
+						<Save size={12} /> 저장
+					</button>
+				)}
+			</>
+		),
+		[profile.legacy, ok.fingerprint, ok.algorithm, temp, onSave, tabId],
 	);
-}
+	return (
+		<>
+			{s.closed && (
+				<div className="closed-banner" role="status">
+					{s.retry ? (
+						<>
+							<RotateCcw size={15} className="spin" /> 연결이 끊겨 다시 잇는 중… ({s.retry}/{RETRY_DELAYS.length}) — 붙으면 열려 있던 파일을 다시 엽니다.
+							<button type="button" className="btn" onClick={() => onReconnect(tabId)}>
+								지금 다시 연결
+							</button>
+						</>
+					) : (
+						<>
+							<Unplug size={15} /> 연결이 끊겼습니다{s.lastError ? ` — ${s.lastError}` : ""}. 다시 연결하면 열려 있던 파일을 다시 엽니다 — 저장 안 한 고친 내용은 초안으로 남아 열 때 되살릴 수 있습니다.
+							<button type="button" className="btn primary" onClick={() => onReconnect(tabId)}>
+								<RotateCcw size={13} /> 다시 연결
+							</button>
+						</>
+					)}
+				</div>
+			)}
+			<Workbench
+				ownerId={tabId}
+				key={ok.connId}
+				fs={backend.fs}
+				local={backend.local}
+				term={backend.term}
+				layoutKey="layout.ssh"
+				server={server}
+				sudo={sudo}
+				peers={peers}
+				onConnectOther={other}
+				syncInfo={syncInfo}
+				active={active}
+				label={`${user}@${profile.host}`}
+				startPath={profile.defaultPath ?? undefined}
+				badge={badge}
+			/>
+		</>
+	);
+});
