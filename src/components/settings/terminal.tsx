@@ -112,6 +112,8 @@ function TermMain({ hiOn, words, logOn, go }: { hiOn: boolean; words: number; lo
 	const [tabList, setTabList] = useTermSetting(PREF_KEYS.tabList, "1");
 	const [sigHint, setSigHint] = useTermSetting(PREF_KEYS.sigHint, "0");
 	const [ctrlVSend, setCtrlVSend] = useTermSetting(PREF_KEYS.ctrlVSend, "0");
+	const [noWrap, setNoWrap] = useSetting("term.noWrap", "0");
+	const [noWrapHint, setNoWrapHint] = useSetting("term.noWrapHint", "1");
 	const [shellList, setShellList] = useState<ShellInfo[]>([]);
 	useEffect(() => {
 		void localShells().then((l) => setShellList(l ?? []));
@@ -178,6 +180,14 @@ function TermMain({ hiOn, words, logOn, go }: { hiOn: boolean; words: number; lo
 				</Row>
 			</Group>
 			<Group title="출력" foot="rz/sz 파일 주고받기는 설정 › 파일·전송 에 있습니다.">
+				<Row id="term.noWrap">
+					<Toggle on={noWrap === "1"} label="긴 줄 접지 않기(가로 스크롤)" onChange={(v) => setNoWrap(v ? "1" : "0")} />
+				</Row>
+				{noWrap !== "1" && (
+					<Row id="term.noWrapHint">
+						<Toggle on={noWrapHint !== "0"} label="접힌 줄 알림" onChange={(v) => setNoWrapHint(v ? "1" : "0")} />
+					</Row>
+				)}
 				<LinkRow id="term.highlight" label="로그 단어 색칠" sub="ERROR·WARN·INFO 와 내 단어에 색" value={hiOn ? (words ? `켬 · 내 단어 ${words}개` : "켬") : "끔"} onClick={() => go("words")} />
 				<LinkRow id="term.log.auto" label="터미널 기록" sub="터미널 출력을 파일로 남기기" value={logOn ? "새 터미널마다" : "직접 켤 때만"} onClick={() => go("log")} />
 			</Group>

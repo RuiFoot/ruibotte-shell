@@ -103,6 +103,14 @@ export const ROWS: Record<string, RowMeta> = {
 		kw: "paste 붙여넣기 ctrl+c 복사",
 	},
 	"term.copyOnSelect": { cat: "terminal", group: "복사·붙여넣기", label: "고르면 바로 복사", desc: "터미널에서 끌어 고른 글을 곧바로 클립보드로(리눅스 터미널처럼)", kw: "copy 선택 클립보드" },
+	"term.noWrap": {
+		cat: "terminal",
+		group: "출력",
+		label: "긴 줄 접지 않기(가로 스크롤)",
+		desc: "docker ps 같은 긴 줄을 접지 않고 옆으로 밀어 봅니다(Shift+휠). 열린 터미널에 바로 적용되고, 터미널에서 Alt+Z 로 그 터미널만 바꿀 수 있습니다. vim·less 같은 전체 화면 프로그램 중에는 칸 폭에 맞춥니다",
+		kw: "nowrap wrap 줄 바꿈 가로 스크롤 alt+z",
+	},
+	"term.noWrapHint": { cat: "terminal", group: "출력", label: "접힌 줄 알림", desc: "긴 줄이 처음 접히면 터미널마다 한 번 Alt+Z 를 알립니다", kw: "nowrap 알림 힌트" },
 	"term.highlight": {
 		cat: "terminal",
 		sub: "words",

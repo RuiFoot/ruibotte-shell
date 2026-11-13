@@ -20,6 +20,7 @@ import { DANGER, setActiveTerminal } from "../lib/activeTerm";
 import { revealLogDir, SessionRecorder } from "../lib/sessionLog";
 import { attachHighlighter } from "../lib/termHighlight";
 import { loadTermPrefs, TERM_PREFS_EVENT } from "../lib/termPrefs";
+import { onSettingLive } from "../lib/settingsBus";
 import { getAppearance, onAppearance, termFontFamily, termTheme } from "../lib/theme";
 import { createZmodem, type ZmodemBridge, type ZmProgress } from "../lib/zmodemTerm";
 import { Select } from "./Select";
@@ -179,35 +180,45 @@ export function TerminalView({
 	/** 복사·붙여넣기 짧은 알림(성공 1.5초, 실패 5초) */
 	const [clipNote, setClipNote] = useState<{ text: string; ok: boolean } | null>(null);
 	const clipTimer = useRef<number | undefined>(undefined);
-	const noteClip = (text: string, ok: boolean) => {
+	const noteClip = (text: string, ok: boolean, ms?: number) => {
 		window.clearTimeout(clipTimer.current);
 		setClipNote({ text, ok });
-		clipTimer.current = window.setTimeout(() => setClipNote(null), ok ? 1500 : 5000);
+		clipTimer.current = window.setTimeout(() => setClipNote(null), ms ?? (ok ? 1500 : 5000));
 	};
 	useEffect(() => () => window.clearTimeout(clipTimer.current), []);
 	const noteClipRef = useRef(noteClip);
 	noteClipRef.current = noteClip;
+	const setWideOn = (on: boolean) => {
+		if (on === wideRef.current) return;
+		wideRef.current = on;
+		setWide(on);
+	};
 	const toggleWide = () => {
 		const next = !wideRef.current;
-		wideRef.current = next;
-		setWide(next);
-		// 마지막으로 고른 쪽이 새 터미널의 기본이 된다
+		setWideOn(next);
+		// 마지막으로 고른 쪽이 새 터미널의 기본이 된다(열린 다른 터미널은 그대로 — 설정 화면 스위치만 모두에 바로 적용)
 		void api.settingSet("term.noWrap", next ? "1" : "0");
 		noteClip(next ? "줄 바꾸지 않음 — Shift+휠로 옆으로 · Alt+Z 로 되돌리기(새 터미널도 이대로)" : "줄 바꿈으로 되돌림(새 터미널도 이대로)", true);
 	};
-	// 기본은 줄 바꾸지 않기(긴 줄 — docker ps 등 — 을 옆으로 밀어 본다). 끄려면 Alt+Z(그 선택이 기억된다)
+	/** 접힌 줄 알림(긴 줄이 처음 접히면 이 터미널에서 한 번) — 설정 term.noWrapHint 가 "0" 이면 끔 */
+	const wrapHintRef = useRef(true);
+	// 기본은 줄 바꿈(값이 없으면 끔) — 줄 바꾸지 않기는 Alt+Z·메뉴·설정에서 켜고, 그 선택이 기억된다.
+	// (320열로 서식된 man/less·화면 밖 진행률 막대·스크롤백 메모리 약 2.7배 때문에 기본으로 두지 않는다)
 	useEffect(() => {
 		let gone = false;
 		void api.settingGet("term.noWrap").then((v) => {
-			if (gone) return;
-			const on = v !== "0";
-			if (on !== wideRef.current) {
-				wideRef.current = on;
-				setWide(on);
-			}
+			if (!gone) setWideOn(v === "1");
+		});
+		void api.settingGet("term.noWrapHint").then((v) => {
+			if (!gone) wrapHintRef.current = v !== "0";
+		});
+		const off = onSettingLive(["term.noWrap", "term.noWrapHint"], (k, v) => {
+			if (k === "term.noWrap") setWideOn(v === "1");
+			else wrapHintRef.current = v !== "0";
 		});
 		return () => {
 			gone = true;
+			off();
 		};
 	}, []);
 	const toggleWideRef = useRef(toggleWide);
@@ -519,6 +530,19 @@ export function TerminalView({
 			setAltScreen(alt);
 			if (!alt && host.current) host.current.scrollLeft = 0;
 			refit();
+		});
+		// 접힌 줄 알림 — 셸 출력에서 긴 줄이 처음 접히면(줄 바꿈 모드) 이 터미널에서 한 번만 Alt+Z 를 알린다.
+		// 줄이 접히면 다음 줄머리(isWrapped)가 생기므로 줄 넘김마다 바로 앞 줄만 본다(대체 화면·전체 화면 프로그램 중에는 보지 않음)
+		let wrapHinted = false;
+		const onWrapFeed = term.onLineFeed(() => {
+			if (wrapHinted || wideRef.current || !wrapHintRef.current) return;
+			const buf = term.buffer.active;
+			if (buf.type !== "normal") return;
+			const y = buf.baseY + buf.cursorY;
+			if (!buf.getLine(y - 1)?.isWrapped && !buf.getLine(y)?.isWrapped) return;
+			wrapHinted = true;
+			onWrapFeed.dispose();
+			noteClipRef.current("긴 줄이 접혔습니다 — Alt+Z 로 접지 않고 옆으로 보기", true, 5000);
 		});
 		refit();
 		termRef.current = term;
@@ -1165,6 +1189,7 @@ export function TerminalView({
 			onCur.dispose();
 			onData.dispose();
 			onResize.dispose();
+			onWrapFeed.dispose();
 			if (idRef.current != null) void backend.close(idRef.current);
 			idRef.current = null;
 			term.dispose();
