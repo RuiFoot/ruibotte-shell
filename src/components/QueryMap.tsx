@@ -1271,6 +1271,8 @@ const mapWarnsOf = (snap: Snapshot) => snap.findings.filter((f) => f.layer === "
 /** 흐름 방향 — 자동은 칸 모양에 더 크게 들어가는 쪽 */
 type Dir = "auto" | "h" | "v";
 const DIR_KEY = "querymap.dir";
+/** 처음 설치·설정 값 없음 — 왼쪽 → 오른쪽 */
+const DIR_DEFAULT: Dir = "h";
 const DIRS: [Dir, typeof Table2, string, string][] = [
 	["auto", WandSparkles, "자동", "흐름 방향 자동(칸 모양 따라)"],
 	["v", ArrowDown, "위→아래", "흐름 방향 위 → 아래(결과가 아래)"],
@@ -1397,8 +1399,8 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 	const host = useRef<HTMLDivElement>(null);
 	const conn = deps.conn;
 	const [size, setSize] = useState({ w: 0, h: 0 });
-	const [dirPref, setDirPref] = useState<Dir>("auto");
-	// 고른 방향은 기억한다(기본 자동)
+	const [dirPref, setDirPref] = useState<Dir>(DIR_DEFAULT);
+	// 고른 방향은 기억한다(값이 없으면 왼→오른)
 	useEffect(() => {
 		let live = true;
 		void api
