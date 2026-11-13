@@ -11,7 +11,8 @@ export type Pos = [number, number] | null;
 /** 단계의 입력 — 표 하나 또는 앞 조인 */
 export type MapIn = { t: number } | { j: number };
 /** range: 편집기 강조 범위(서브쿼리는 괄호까지, CTE 는 WITH 이름 AS (…)) · src: FROM 을 다 읽은 결과 */
-export type MapScope = { id: number; kind: "main" | "cte" | "derived" | "subquery" | "union"; name: string | null; parent: number | null; pos: Pos; range?: Pos; src?: MapIn };
+/** limit·offset: 숫자로 쓴 LIMIT·TOP·FETCH·OFFSET(자리표시자면 없음) */
+export type MapScope = { id: number; kind: "main" | "cte" | "derived" | "subquery" | "union"; name: string | null; parent: number | null; pos: Pos; range?: Pos; src?: MapIn; limit?: number; offset?: number };
 /** span: 이름 + 별칭 */
 export type MapTable = { id: number; scope: number; schema: string | null; name: string; alias: string | null; cte: number | null; derived: number | null; virt: boolean; target: boolean; qualText: string; pos: Pos; span?: Pos };
 export type MapPair = { a: number; b: number; op: string };
@@ -20,7 +21,8 @@ export type MapJoin = { scope: number; left: number | null; right: number | null
 /** 묶음의 절 — select · distinct · from · where · group · having · window · order · limit · setop · target · set */
 export type MapClause = { scope: number; kind: string; pos: Pos };
 /** SELECT 목록 한 항목 — cols: 쓴 열 id [시작, 끝)(scope 로 거른다) · star: * 이면 "", t.* 이면 "t" */
-export type MapOut = { scope: number; name?: string; pos: Pos; cols: [number, number]; subs?: number[]; agg?: boolean; win?: boolean; star?: string };
+/** expr: 식만(별칭 빼고) — UPDATE 는 SET 항목(name = 바뀌는 열, expr = 값) */
+export type MapOut = { scope: number; name?: string; pos: Pos; expr?: Pos; cols: [number, number]; subs?: number[]; agg?: boolean; win?: boolean; star?: string };
 export type MapCol = { id: number; scope: number; table: number | null; qual: string | null; name: string; role: string; pred: string | null; wrapped: string | null; pos: Pos };
 export type MapFact = {
 	kind: string;

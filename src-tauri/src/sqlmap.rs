@@ -6,7 +6,7 @@ use serde::Serialize;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator, LimitClause,
     ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableFactor, TableObject,
-    TableWithJoins, UpdateTableFromKind, Value, Visit, Visitor,
+    TableWithJoins, TopQuantity, UpdateTableFromKind, Value, Visit, Visitor,
 };
 use sqlparser::dialect::{Dialect, GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
@@ -62,6 +62,12 @@ pub struct Scope {
     /// FROM 을 다 읽은 결과(마지막 조인 또는 표 하나)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub src: Option<In>,
+    /// 내놓는 행의 상한(LIMIT·TOP·FETCH) — 숫자로 쓴 것만(자리표시자·식·PERCENT 는 없음)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    /// 건너뛰는 행(OFFSET) — 숫자로 쓴 것만
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<f64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -82,6 +88,9 @@ pub struct OutCol {
     pub name: Option<String>,
     /// 항목 전체(식 + 별칭)
     pub pos: Pos,
+    /// 식만(별칭 빼고) — UPDATE 는 SET 의 값 쪽. * 는 없음
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr: Pos,
     /// 이 항목이 쓴 열 id [시작, 끝) — 그 안의 서브쿼리 열도 섞여 있으니 scope 로 거른다
     pub cols: [u32; 2],
     /// 이 항목 안의 스칼라 서브쿼리 묶음
@@ -676,6 +685,14 @@ fn lit_kind(e: &Expr) -> Option<(&'static str, String)> {
     }
 }
 
+/// 숫자 상수(LIMIT 20 · TOP (10) …) — 자리표시자·식이면 없음
+fn num_lit(e: &Expr) -> Option<f64> {
+    match lit_kind(e) {
+        Some(("num", n)) => n.parse().ok(),
+        _ => None,
+    }
+}
+
 /// 집계 함수(창 없이 쓰면 묶음 전체를 접는다)
 fn is_agg(name: &str) -> bool {
     matches!(
@@ -752,8 +769,32 @@ impl Visitor for Scan {
 impl Builder {
     fn scope(&mut self, kind: &'static str, name: Option<String>, parent: Option<u32>, pos: Pos) -> u32 {
         let id = self.scopes.len() as u32;
-        self.scopes.push(Scope { id, kind, name, parent, pos, range: None, src: None });
+        self.scopes.push(Scope { id, kind, name, parent, pos, range: None, src: None, limit: None, offset: None });
         id
+    }
+
+    /// 식 하나의 원문 범위 — 함수 이름에서 끊긴 끝(`COUNT`)은 `(…)` 까지, 서브쿼리는 괄호까지
+    fn expr_pos(&self, e: &Expr) -> Pos {
+        let p = self.pos.span(e.span()).map(|[a, b]| [a, self.pos.call_end(b)]);
+        // TRIM(x) · CAST(x AS t) 처럼 위치가 괄호 속 식만 가리키면 앞의 함수 이름부터 닫는 괄호까지
+        if let Some([a, _]) = p {
+            let u = &self.pos.units;
+            let i = self.pos.skip_back(a as usize);
+            if i > 0 && u[i - 1] == u16::from(b'(') {
+                let k = self.pos.skip_back(i - 1);
+                let mut w = k;
+                while w > 0 && is_word(u[w - 1]) {
+                    w -= 1;
+                }
+                let kw = matches!(self.pos.word(w, k).as_str(), "select" | "distinct" | "all" | "set" | "when" | "then" | "else" | "and" | "or" | "not" | "in" | "exists" | "on" | "by" | "as" | "case" | "any" | "some");
+                if w < k && !kw {
+                    if let Some(end) = self.pos.match_paren(i - 1) {
+                        return Some([w as u32, end as u32]);
+                    }
+                }
+            }
+        }
+        self.pos.wrap_paren(p).map(|[a, b]| [a, self.pos.balance(a, b)])
     }
 
     /// 괄호로 감싼 서브쿼리 묶음 — 강조 범위는 괄호까지
@@ -832,19 +873,27 @@ impl Builder {
                     let p = self.pos.kw(a.span().union(&b.span()), &["set"], 1);
                     self.clause(s, "set", p);
                 }
+                // SET 한 항목씩 — 바뀌는 열(이름)과 그 값(식)을 출력 열처럼 내놓는다(최종 결과 띠·계보)
                 for a in &u.assignments {
+                    let (c0, s0) = (self.cols.len() as u32, self.scopes.len() as u32);
                     let names: Vec<&ObjectName> = match &a.target {
                         AssignmentTarget::ColumnName(n) => vec![n],
                         AssignmentTarget::Tuple(v) => v.iter().collect(),
                     };
+                    let mut first = None;
                     for n in names {
                         let parts = name_parts(n);
                         if let Some(last) = parts.last() {
                             let qual = (parts.len() > 1).then(|| ident_name(parts[parts.len() - 2]));
+                            first.get_or_insert_with(|| ident_name(last));
                             self.push_col(s, None, qual, ident_name(last), "set", None, None, last.span);
                         }
                     }
                     self.collect(&a.value, s, "set", None, None);
+                    let pos = self.pos.span(a.span()).map(|[x, y]| [x, self.pos.balance(x, y)]);
+                    let expr = self.expr_pos(&a.value);
+                    let subs: Vec<u32> = (s0..self.scopes.len() as u32).filter(|&k| self.scopes[k as usize].parent == Some(s)).collect();
+                    self.outs.push(OutCol { scope: s, name: first, pos, expr, cols: [c0, self.cols.len() as u32], subs, agg: false, win: false, star: None });
                 }
                 match &u.selection {
                     Some(w) => {
@@ -936,6 +985,16 @@ impl Builder {
             Some([self.pos.back_kw(a, &["first", "next", "fetch"], 2), self.pos.fwd_kw(b, &["percent", "rows", "row", "only", "with", "ties"], 4)])
         });
         self.clause(s, "limit", upos(lp, fp));
+        // 행 수 — 최종 결과 띠가 "최대 n행 · m행 건너뜀" 으로 쓴다
+        let (lim, off) = match &q.limit_clause {
+            Some(LimitClause::LimitOffset { limit, offset, .. }) => (limit.as_ref().and_then(num_lit), offset.as_ref().and_then(|o| num_lit(&o.value))),
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => (num_lit(limit), num_lit(offset)),
+            None => (None, None),
+        };
+        let lim = lim.or_else(|| q.fetch.as_ref().filter(|f| !f.percent).and_then(|f| f.quantity.as_ref()).and_then(num_lit));
+        let sc = &mut self.scopes[s as usize];
+        sc.limit = lim.or(sc.limit);
+        sc.offset = off.or(sc.offset);
         let mut limited = q.fetch.is_some();
         match &q.limit_clause {
             Some(LimitClause::LimitOffset { limit, offset, .. }) => {
@@ -1002,8 +1061,15 @@ impl Builder {
     }
 
     fn select(&mut self, sel: &Select, s: u32) {
-        if sel.top.is_some() {
+        if let Some(t) = &sel.top {
             self.limited.push(s);
+            if !t.percent {
+                self.scopes[s as usize].limit = match &t.quantity {
+                    Some(TopQuantity::Constant(n)) => Some(*n as f64),
+                    Some(TopQuantity::Expr(e)) => num_lit(e),
+                    None => None,
+                };
+            }
         }
         for item in &sel.projection {
             if let SelectItem::ExprWithAlias { alias, .. } = item {
@@ -1035,9 +1101,11 @@ impl Builder {
         for item in &sel.projection {
             let (c0, s0) = (self.cols.len() as u32, self.scopes.len() as u32);
             let mut pos = self.pos.span(item.span());
+            let mut expr: Pos = None;
             let (mut agg, mut win) = (false, false);
             let (name, star) = match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } | SelectItem::ExprWithAliases { expr: e, .. } => {
+                    expr = self.expr_pos(e);
                     self.collect(e, s, "select", None, None);
                     let mut f = Funcs::default();
                     let _ = e.visit(&mut f);
@@ -1047,6 +1115,7 @@ impl Builder {
                             let wp = self.pos.span(sp).map(|[a, b]| [a, self.pos.over_end(self.pos.call_end(b))]);
                             self.clause(s, "window", wp);
                             pos = upos(pos, wp);
+                            expr = upos(expr, wp);
                         } else if is_agg(&fname) {
                             agg = true;
                         }
@@ -1077,9 +1146,10 @@ impl Builder {
             };
             // 함수 끝 ) 를 빼먹은 위치 바로잡기
             pos = pos.map(|[a, b]| [a, self.pos.balance(a, b)]);
+            expr = expr.map(|[a, b]| [a, self.pos.balance(a, b)]);
             list = upos(list, pos);
             let subs: Vec<u32> = (s0..self.scopes.len() as u32).filter(|&k| self.scopes[k as usize].parent == Some(s)).collect();
-            self.outs.push(OutCol { scope: s, name, pos, cols: [c0, self.cols.len() as u32], subs, agg, win, star });
+            self.outs.push(OutCol { scope: s, name, pos, expr, cols: [c0, self.cols.len() as u32], subs, agg, win, star });
         }
         self.clause(s, "select", list);
         self.mods_clause(sel, s);
@@ -2058,6 +2128,65 @@ mod tests {
         assert_eq!(o.subs.len(), 1);
         assert_eq!(text(sql, m.scopes[o.subs[0] as usize].range), "(SELECT COUNT(*) FROM board_file f WHERE f.board_id = bd.id)");
         assert!(!o.agg, "서브쿼리 속 COUNT 는 바깥 집계가 아니다");
+    }
+
+    // ── 최종 결과 띠(식만의 위치·행 수 상한·SET 항목) ──
+
+    #[test]
+    fn final_expr_without_alias() {
+        let sql = "SELECT a.title, b.hit AS bak_hit, COUNT(*) n, CASE WHEN a.hit > 9 THEN 'y' END AS hot, ROW_NUMBER() OVER (ORDER BY a.id) AS rn, (SELECT 1 FROM t) AS s, * FROM article a, b";
+        let m = build(sql, "postgres");
+        assert!(m.ok, "{:?}", m.error);
+        let ex: Vec<String> = m.outs.iter().filter(|o| o.scope == 0 && o.star.is_none()).map(|o| text(sql, o.expr)).collect();
+        assert_eq!(ex, vec!["a.title", "b.hit", "COUNT(*)", "CASE WHEN a.hit > 9 THEN 'y' END", "ROW_NUMBER() OVER (ORDER BY a.id)", "(SELECT 1 FROM t)"]);
+        assert!(m.outs.iter().find(|o| o.star.is_some()).unwrap().expr.is_none());
+        // 파서 위치가 괄호 속만 가리키는 특수 함수 · 괄호로 감싼 항목
+        let sql = "SELECT TRIM(a.title) AS t, CAST(a.hit AS CHAR) h, (a.hit + 1) AS n FROM article a";
+        let m = build(sql, "mysql");
+        let ex: Vec<String> = m.outs.iter().map(|o| text(sql, o.expr)).collect();
+        assert_eq!(ex, vec!["TRIM(a.title)", "CAST(a.hit AS CHAR)", "(a.hit + 1)"]);
+    }
+
+    #[test]
+    fn final_limit_offset_values() {
+        let lim = |sql: &str, eng: &str| {
+            let m = build(sql, eng);
+            assert!(m.ok, "{:?}", m.error);
+            (m.scopes[0].limit, m.scopes[0].offset)
+        };
+        assert_eq!(lim("SELECT id FROM t LIMIT 20 OFFSET 40", "postgres"), (Some(20.0), Some(40.0)));
+        assert_eq!(lim("SELECT id FROM t LIMIT 40, 20", "mysql"), (Some(20.0), Some(40.0)));
+        assert_eq!(lim("SELECT id FROM t LIMIT 50", "mysql"), (Some(50.0), None));
+        assert_eq!(lim("SELECT TOP (10) id FROM t", "mssql"), (Some(10.0), None));
+        assert_eq!(lim("SELECT TOP 5 id FROM t", "mssql"), (Some(5.0), None));
+        assert_eq!(lim("SELECT TOP 5 PERCENT id FROM t", "mssql"), (None, None));
+        assert_eq!(lim("SELECT id FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY", "mssql"), (Some(5.0), Some(10.0)));
+        // 자리표시자는 숫자가 아니다
+        assert_eq!(lim("SELECT id FROM t LIMIT ? OFFSET ?", "mysql"), (None, None));
+        assert_eq!(lim("SELECT id FROM t", "mysql"), (None, None));
+        // UNION 전체에 걸린 LIMIT 은 바깥 묶음 것
+        let m = build("SELECT id FROM a UNION ALL SELECT id FROM b LIMIT 7", "postgres");
+        assert_eq!(m.scopes[0].limit, Some(7.0));
+        assert!(m.scopes.iter().filter(|s| s.kind == "union").all(|s| s.limit.is_none()));
+    }
+
+    #[test]
+    fn final_update_set_items() {
+        let sql = "UPDATE users SET name = 'x', age = age + 1, team = (SELECT MAX(t.id) FROM teams t) WHERE id = 3";
+        let m = build(sql, "postgres");
+        assert!(m.ok, "{:?}", m.error);
+        let o: Vec<&OutCol> = m.outs.iter().filter(|o| o.scope == 0).collect();
+        assert_eq!(o.iter().map(|o| o.name.as_deref()).collect::<Vec<_>>(), vec![Some("name"), Some("age"), Some("team")]);
+        assert_eq!(text(sql, o[1].pos), "age = age + 1");
+        assert_eq!(text(sql, o[1].expr), "age + 1");
+        assert_eq!(text(sql, o[2].expr), "(SELECT MAX(t.id) FROM teams t)");
+        assert_eq!(o[2].subs.len(), 1);
+        // 그 항목이 쓴 열 — 바뀌는 열 자신과 값에 쓴 열
+        let cols: Vec<&str> = (o[1].cols[0]..o[1].cols[1]).map(|i| m.cols[i as usize].name.as_str()).collect();
+        assert_eq!(cols, vec!["age", "age"]);
+        // DELETE 는 내놓는 열이 없다
+        let m = build("DELETE FROM users WHERE id = 3", "postgres");
+        assert!(m.outs.is_empty());
     }
 
     /// 목업(src/dev/mock.ts) 예시 만들기 — `cargo test --lib dump_mock_maps -- --ignored --nocapture`
