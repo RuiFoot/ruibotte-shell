@@ -169,6 +169,7 @@ export type SshError = {
 		| "CLOSED"
 		| "SFTP"
 		| "CONFLICT"
+		| "SIZE_MISMATCH"
 		| "ENCODING"
 		| "OTHER";
 	message: string;
@@ -326,7 +327,7 @@ export type FsBackend = {
 	sep: "/";
 	list(path: string): Promise<FsEntry[]>;
 	read(path: string, encoding?: string): Promise<FileText>;
-	write(path: string, text: string, meta: TextMeta, expectMtime?: number | null): Promise<Saved>;
+	write(path: string, text: string, meta: TextMeta, expectMtime?: number | null, /** 파일을 연 때의 크기 — 쓴 뒤 크기가 다르면 SIZE_MISMATCH */ expectSize?: number | null): Promise<Saved>;
 	mkdir(path: string): Promise<void>;
 	touch(path: string): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
@@ -354,6 +355,8 @@ export type TransferProgress = {
 	state: "running" | "done" | "error" | "cancelled";
 	error?: string | null;
 	ms: number;
+	/** 출발 연결(그 서버 작업대 탭이 아니면 이벤트를 무시한다) */
+	conn?: number;
 	/** 받는 서버 연결(서버 → 서버) — 끝나면 그 서버 트리를 새로 읽는다 */
 	destConn?: number;
 };
@@ -418,7 +421,7 @@ export function localFs(home: string): FsBackend {
 		sep: "/",
 		list: (path) => invoke("local_list", { path }),
 		read: (path, encoding) => invoke("local_read_text", { path, encoding }),
-		write: (path, text, meta, expectMtime) => invoke("local_write_text", { path, text, meta, expectMtime }),
+		write: (path, text, meta, expectMtime, expectSize) => invoke("local_write_text", { path, text, meta, expectMtime, expectSize }),
 		mkdir: (path) => invoke("local_mkdir", { path }),
 		touch: (path) => invoke("local_touch", { path }),
 		rename: (from, to) => invoke("local_rename", { from, to }),
@@ -454,7 +457,7 @@ export function sshFs(conn: number, label: string, home: string): FsBackend {
 		sep: "/",
 		list: (path) => invoke("sftp_list", { conn, path }),
 		read: (path, encoding) => invoke("sftp_read_text", { conn, path, encoding }),
-		write: (path, text, meta, expectMtime) => invoke("sftp_write_text", { conn, path, text, meta, expectMtime }),
+		write: (path, text, meta, expectMtime, expectSize) => invoke("sftp_write_text", { conn, path, text, meta, expectMtime, expectSize }),
 		mkdir: (path) => invoke("sftp_mkdir", { conn, path }),
 		touch: (path) => invoke("sftp_touch", { conn, path }),
 		rename: (from, to) => invoke("sftp_rename", { conn, from, to }),
@@ -474,7 +477,7 @@ export function sshSudoFs(conn: number, label: string, home: string, sudoUser = 
 		sep: "/",
 		list: (path) => invoke("sudo_list", { conn, path }),
 		read: (path, encoding) => invoke("sudo_read_text", { conn, path, encoding }),
-		write: (path, text, meta, expectMtime) => invoke("sudo_write_text", { conn, path, text, meta, expectMtime }),
+		write: (path, text, meta, expectMtime, expectSize) => invoke("sudo_write_text", { conn, path, text, meta, expectMtime, expectSize }),
 		mkdir: (path) => op("mkdir", path),
 		touch: (path) => op("touch", path),
 		rename: (from, to) => op("rename", from, to),
@@ -494,7 +497,7 @@ export function containerFs(conn: number, ctr: string, home = "/"): FsBackend {
 		sep: "/",
 		list: (path) => invoke("ctr_list", { conn, ctr, path }),
 		read: (path, encoding) => invoke("ctr_read_text", { conn, ctr, path, encoding }),
-		write: (path, text, meta, expectMtime) => invoke("ctr_write_text", { conn, ctr, path, text, meta, expectMtime }),
+		write: (path, text, meta, expectMtime, expectSize) => invoke("ctr_write_text", { conn, ctr, path, text, meta, expectMtime, expectSize }),
 		mkdir: (path) => op("mkdir", path),
 		touch: (path) => op("touch", path),
 		rename: (from, to) => op("rename", from, to),

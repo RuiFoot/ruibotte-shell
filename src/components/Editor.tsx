@@ -1,8 +1,8 @@
 import { defaultKeymap, history, historyKeymap, indentWithTab, selectAll, toggleComment } from "@codemirror/commands";
 import { bracketMatching, foldGutter, indentOnInput } from "@codemirror/language";
-import { diff as textDiff, MergeView } from "@codemirror/merge";
+import { MergeView } from "@codemirror/merge";
 import { gotoLine, highlightSelectionMatches, openSearchPanel, search, searchKeymap } from "@codemirror/search";
-import { Annotation, Compartment, EditorState, type Text } from "@codemirror/state";
+import { Annotation, ChangeSet, Compartment, EditorState, Text } from "@codemirror/state";
 import { drawSelection, EditorView, highlightActiveLine, highlightActiveLineGutter, highlightWhitespace, keymap, lineNumbers } from "@codemirror/view";
 import { jsonParseLinter } from "@codemirror/lang-json";
 import { linter, lintGutter } from "@codemirror/lint";
@@ -34,7 +34,8 @@ const theme = EditorView.theme({
 	".cm-panels": { backgroundColor: "var(--surface-2)", color: "var(--text)" },
 });
 
-type Status = { text: string; tone?: "ok" | "err" | "warn"; conflict?: boolean };
+/** retry: 저장에 실패해 본문·초안은 그대로 두었다 — "다시 저장"(force: 쓰고 난 뒤 크기가 달라 서버 파일이 이미 바뀌었을 때) */
+type Status = { text: string; tone?: "ok" | "err" | "warn"; conflict?: boolean; retry?: "plain" | "force" };
 
 /** 파일을 불러와 문서를 채운 트랜잭션 — 고침으로 치지 않는다 */
 const LOADED = Annotation.define<boolean>();
@@ -54,17 +55,23 @@ function setMinimapPref(on: boolean) {
 
 const normalize = (t: string) => t.replace(/\r\n?/g, "\n");
 
-/** 바뀐 줄 수(대략) — 바뀐 덩어리가 걸친 줄을 센다 */
-function changedLines(a: string, b: string): number {
-	if (a === b) return 0;
+/** 바뀐 줄 수(대략) — 연 때(base) 에서 지금(doc) 까지 쌓은 변경(ChangeSet)이 걸친 줄을 센다. 전체 문자열 비교 없이 변경 덩어리 수만큼만 든다 */
+function changedLines(base: Text, doc: Text, ch: ChangeSet | null): number {
+	if (!ch || ch.empty) return 0;
 	let n = 0;
-	for (const c of textDiff(a, b)) {
-		const seg = b.slice(c.fromB, c.toB);
-		const old = a.slice(c.fromA, c.toA);
-		n += Math.max(1, Math.max(seg.split("\n").length, old.split("\n").length));
-	}
+	ch.iterChangedRanges((fromA, toA, fromB, toB) => {
+		const a = base.lineAt(toA).number - base.lineAt(fromA).number + 1;
+		const b = doc.lineAt(toB).number - doc.lineAt(fromB).number + 1;
+		n += Math.max(1, a, b);
+	});
 	return n;
 }
+
+/** 같은 글인지 — 길이가 다르면 바로 아니고, 같을 때만 줄 단위로 비교 */
+const sameDoc = (a: Text, b: Text) => a === b || (a.length === b.length && a.eq(b));
+
+/** 초안을 쓰는 주기 — 문서가 클수록 느리게(멈출 때마다 전체 문자열을 만들고 DB 에 쓰므로) */
+const draftDelay = (len: number) => (len > 1_000_000 ? 3000 : len > 200_000 ? 1500 : 800);
 
 /**
  * 파일 편집기 — 원래 인코딩·줄 끝·BOM 을 지켜 저장, 열고 나서 바뀐 파일은 덮어쓰지 않음.
@@ -128,6 +135,12 @@ export function EditorView_({
 	const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 	const [showWs, setShowWs] = useState(false);
 	const original = useRef("");
+	/** 연 때(또는 마지막으로 저장한 때)의 문서와 그 뒤 쌓은 변경 — 초안 주기마다 전체를 비교하지 않으려고 */
+	const origDoc = useRef<Text>(Text.empty);
+	const accum = useRef<ChangeSet | null>(null);
+	/** 저장을 시작한 뒤 쌓은 변경(저장하는 사이 더 고친 것) */
+	const sinceSave = useRef<ChangeSet | null>(null);
+	const lastDraftDoc = useRef<Text | null>(null);
 	// sudo 를 켜고 끄면 fs 가 바뀐다(이름에 "(sudo)") — 초안 열쇠와 다시 읽기는 그와 상관없이 같은 파일로 본다
 	const draftKey = `draft.${fs.side}:${fs.label.replace(/ \(sudo[^)]*\)$/, "")}:${path}`;
 	const fsRef = useRef(fs);
@@ -170,6 +183,10 @@ export function EditorView_({
 						effects: ro.current.reconfigure(EditorState.readOnly.of(f.binary || f.tooLarge || f.meta.guessed)),
 					});
 					loadedRef.current = true;
+					origDoc.current = v.state.doc;
+					accum.current = null;
+					sinceSave.current = null;
+					lastDraftDoc.current = null;
 					goLine();
 				}
 				const ms = Math.round(performance.now() - t0);
@@ -253,6 +270,9 @@ export function EditorView_({
 						// 파일을 불러와 채운 것만 빼고 모든 변경이 고침이다(주석 켜기·들여쓰기처럼 userEvent 가 없는 명령도)
 						if (u.docChanged) docRef.current = u.state.doc;
 						if (u.docChanged && !u.transactions.some((t) => t.annotation(LOADED))) {
+							accum.current = accum.current ? accum.current.compose(u.changes) : u.changes;
+							sinceSave.current = sinceSave.current ? sinceSave.current.compose(u.changes) : u.changes;
+							scheduleDraft.current();
 							setDirty(true);
 							// 자동 저장이 실패해 멈춰 있었으면 사람이 다시 고친 지금부터 다시 시도한다
 							setAutoState((a) => (a?.s === "failed" ? null : a));
@@ -303,8 +323,7 @@ export function EditorView_({
 		// 칸이 사라질 때는 편집기가 먼저 정리되므로 마지막 문서(Text 참조)를 따로 들고 있다
 		const doc = docRef.current;
 		if (!doc || !dirty || readOnly) return;
-		const now = doc.toString();
-		if (now !== original.current) void api.settingSet(draftKey, now);
+		if (!sameDoc(doc, origDoc.current)) void api.settingSet(draftKey, doc.toString());
 	};
 	useEffect(() => {
 		const off = onDraftFlush(() => flushDraft.current());
@@ -317,22 +336,35 @@ export function EditorView_({
 		if (active) requestAnimationFrame(() => view.current?.focus());
 	}, [active]);
 
-	// 고친 동안: 바뀐 줄 수와 초안(0.8초 멈추면)
-	useEffect(() => {
+	// 고친 동안: 바뀐 줄 수와 초안(멈추면 — 문서가 클수록 늦게). 고칠 때마다 타이머를 다시 걸고(updateListener), 렌더마다 다시 걸지 않는다
+	const draftKeyRef = useRef(draftKey);
+	draftKeyRef.current = draftKey;
+	const scheduleDraft = useRef(() => {});
+	scheduleDraft.current = () => {
 		window.clearTimeout(draftTimer.current);
-		if (!dirty) {
-			setChanged(0);
-			return;
-		}
+		const v = view.current;
+		if (!v) return;
 		draftTimer.current = window.setTimeout(() => {
-			const now = view.current?.state.doc.toString() ?? "";
-			setChanged(changedLines(original.current, now));
-			void api.settingSet(draftKey, now === original.current ? "" : now);
+			const cur = view.current;
+			if (!cur) return;
+			const doc = cur.state.doc;
+			const same = sameDoc(doc, origDoc.current);
+			setChanged(same ? 0 : changedLines(origDoc.current, doc, accum.current));
+			if (doc !== lastDraftDoc.current) {
+				lastDraftDoc.current = doc;
+				void api.settingSet(draftKeyRef.current, same ? "" : doc.toString());
+			}
 			// 되돌리기로 연 때와 똑같아졌으면 고친 것이 아니다(형식만 바꾼 것은 남긴다)
-			if (now === original.current && !metaChangedRef.current) setDirty(false);
-		}, 800);
-		return () => window.clearTimeout(draftTimer.current);
-	});
+			if (same && !metaChangedRef.current) setDirty(false);
+		}, draftDelay(v.state.doc.length));
+	};
+	useEffect(() => {
+		if (!dirty) {
+			window.clearTimeout(draftTimer.current);
+			setChanged(0);
+		} else scheduleDraft.current();
+	}, [dirty]);
+	useEffect(() => () => window.clearTimeout(draftTimer.current), []);
 
 	const saving = useRef(false);
 	const metaChangedRef = useRef(false);
@@ -344,16 +376,23 @@ export function EditorView_({
 			// 자동 저장은 조용히 — 상태 줄 글은 그대로 두고 스위치에만 "저장 중…·자동 저장됨 시각"
 			if (quiet) setAutoState({ s: "saving" });
 			else setStatus({ text: "저장 중…" });
-			const text = v.state.doc.toString();
+			const docAt = v.state.doc;
+			const text = docAt.toString();
+			sinceSave.current = null;
 			try {
-				const saved = await fsRef.current.write(path, text, saveMeta, force ? null : file.mtime);
+				// 연 때의 수정 시각·크기를 같이 넘긴다 — 서버가 그사이 바뀌었거나 쓴 뒤 크기가 다르면 거절·알림
+				const saved = await fsRef.current.write(path, text, saveMeta, force ? null : file.mtime, force ? null : file.size);
 				setFile({ ...file, size: saved.size, mtime: saved.mtime, meta: saveMeta });
 				original.current = text;
+				origDoc.current = docAt;
+				accum.current = sinceSave.current;
 				// 저장하는 사이 더 고쳤으면 고친 상태로 남긴다(다음 자동 저장이 이어서)
-				const now = view.current?.state.doc.toString() ?? text;
-				setDirty(now !== text);
-				setChanged(now !== text ? changedLines(text, now) : 0);
-				void api.settingSet(draftKey, now === text ? "" : now);
+				const nowDoc = view.current?.state.doc ?? docAt;
+				const edited = !sameDoc(nowDoc, docAt);
+				setDirty(edited);
+				setChanged(edited ? changedLines(docAt, nowDoc, accum.current) : 0);
+				lastDraftDoc.current = nowDoc;
+				void api.settingSet(draftKey, edited ? nowDoc.toString() : "");
 				const at = new Date().toLocaleTimeString("ko-KR", { hour12: false });
 				if (quiet) {
 					setAutoState({ s: "saved", at });
@@ -365,8 +404,16 @@ export function EditorView_({
 			} catch (e) {
 				const x = asSshError(e);
 				const conflict = x.code === "CONFLICT" || /바뀌었습니다/.test(x.message);
-				if (quiet) setAutoState({ s: "failed", msg: conflict ? "그사이 서버 파일이 바뀌어 자동 저장을 멈췄습니다 — 비교한 뒤 저장하세요" : x.message });
-				setStatus({ text: conflict && quiet ? `자동 저장 멈춤 — ${x.message}` : x.message, tone: "err", conflict });
+				// 쓴 뒤 크기가 기대와 다르다 — 서버 파일이 이미 바뀌었을 수 있어 내 본문은 그대로 두고 다시 저장(덮어쓰기)을 권한다
+				const sizeBad = x.code === "SIZE_MISMATCH";
+				if (quiet) setAutoState({ s: "failed", msg: conflict ? "그사이 서버 파일이 바뀌어 자동 저장을 멈췄습니다 — 비교한 뒤 저장하세요" : sizeBad ? "저장한 파일의 크기가 달라 자동 저장을 멈췄습니다 — 다시 저장하세요" : x.message });
+				// 본문·초안은 건드리지 않는다(저장 실패 시 지워지는 일 없음). 충돌이 아니면 "다시 저장"
+				setStatus({
+					text: conflict && quiet ? `자동 저장 멈춤 — ${x.message}` : sizeBad ? `저장 뒤 파일 크기가 다릅니다(${x.message}) — 내 내용은 그대로 있습니다` : x.message,
+					tone: "err",
+					conflict,
+					retry: conflict ? undefined : sizeBad ? "force" : "plain",
+				});
 			} finally {
 				saving.current = false;
 			}
@@ -566,6 +613,17 @@ export function EditorView_({
 				<span className={status.tone === "ok" ? "ok" : status.tone === "err" ? "err" : status.tone === "warn" ? "warn" : undefined} title={status.text}>
 					{status.text}
 				</span>
+				{status.retry && (
+					<button
+						type="button"
+						className="btn ghost"
+						style={{ height: 20 }}
+						title={status.retry === "force" ? "방금 쓴 파일의 크기가 달라 서버 파일이 이미 바뀌었을 수 있습니다 — 내 내용으로 다시 씁니다" : "저장에 실패했습니다 — 내 내용은 그대로입니다. 다시 시도"}
+						onClick={() => saveRef.current(status.retry === "force")}
+					>
+						<Save size={12} /> 다시 저장
+					</button>
+				)}
 				{status.conflict && (
 					<>
 						<button type="button" className="btn ghost" style={{ height: 20 }} onClick={() => void compareServer()}>
