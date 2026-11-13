@@ -796,3 +796,7 @@
 .qa-layer > .panel-fill {
 	height: 100%;
 }
+
+/* 쿼리 분석 칸 — 다듬기 탭 빈 상태 */
+.qa-empty { padding: 20px 16px; color: var(--text-2, var(--muted)); font-size: 12.5px; }
+.qa-layer.qa-cleanup { overflow: auto; }

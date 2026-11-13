@@ -192,6 +192,14 @@ function metaFor(conn: number, epoch: number): Meta {
 	return m;
 }
 
+/** 다듬기 탭이 쓰는 표 메타(열·인덱스) — 분석기와 같은 캐시를 쓴다(같은 연결의 뒤 조회 한 줄) */
+export async function tableMetaFor(deps: Pick<AnalyzeDeps, "conn" | "engine" | "epoch" | "defaultSchema">, schema: string | null, table: string): Promise<{ cols: ColMeta[] | null; indexes: IndexInfo[] | null }> {
+	const m = metaFor(deps.conn, deps.epoch);
+	const sch = schema ?? deps.defaultSchema ?? "(기본)";
+	const [cols, indexes] = await Promise.all([m.columns(sch, table, true) ?? Promise.resolve(null), m.indexes(deps.engine, sch, table, true) ?? Promise.resolve(null)]);
+	return { cols, indexes };
+}
+
 /** 위치를 뺀 구조 — 그리기 판단용 */
 function shapeOf(map: QueryMap, r: Resolved | null): string {
 	const strip = (o: object) => JSON.stringify(o, (k, v) => (k === "pos" ? undefined : v));

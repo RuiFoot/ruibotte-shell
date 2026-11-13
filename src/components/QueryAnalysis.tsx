@@ -1,16 +1,19 @@
 import { RefreshCw } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "../styles/querymap.css";
-import { type AnalyzeDeps, useAnalysis } from "../lib/queryAnalysis";
+import { type AnalyzeDeps, tableMetaFor, useAnalysis } from "../lib/queryAnalysis";
+import { currentView, markEditor } from "../lib/queryWatch";
+import { QueryCleanup } from "./QueryCleanup";
 import { QueryMapPanel } from "./QueryMap";
 import { QueryTuningPanel, type TuningActions } from "./QueryTuning";
 
-export type AnalysisTab = "map" | "diag" | "index";
+export type AnalysisTab = "map" | "diag" | "index" | "cleanup";
 
 const TABS: { id: AnalysisTab; label: string; tip: string }[] = [
 	{ id: "map", label: "구조", tip: "쿼리 지도 — 표·조인·조건 열을 그림으로" },
 	{ id: "diag", label: "진단", tip: "구조·정적 검사·실행 계획 규칙의 지적 목록" },
 	{ id: "index", label: "인덱스", tip: "WHERE·JOIN·ORDER 열에 맞춘 인덱스 초안(실행하지 않음)" },
+	{ id: "cleanup", label: "다듬기", tip: "지저분한 쿼리를 구조째 정리 — 쉼표 조인·(+)·중첩 서브쿼리·중복 조건 등, 바꾼 곳마다 켜고 끄기·결과 같은지 확인" },
 ];
 
 /**
@@ -28,7 +31,7 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 	shapeRef.current = snap?.shape ?? null;
 
 	// 한 번 연 탭은 계속 붙여 둔다(비교 화면·지도 확대가 탭을 오가도 남게)
-	const [mounted, setMounted] = useState<Record<AnalysisTab, boolean>>(() => ({ map: tab === "map", diag: tab !== "map", index: false }));
+	const [mounted, setMounted] = useState<Record<AnalysisTab, boolean>>(() => ({ map: tab === "map", diag: tab === "diag" || tab === "index", index: false, cleanup: tab === "cleanup" }));
 	useEffect(() => {
 		const k = tab === "index" ? "diag" : tab;
 		setMounted((m) => (m[k] ? m : { ...m, [k]: true }));
@@ -91,6 +94,29 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 		return { diag: diag.length, diagWarn: diag.some((x) => x.level === "warn"), index: idx.length };
 	}, [snap?.findings]);
 
+	// 다듬기 — 커서 문장을 바꿔 넣고(트랜잭션 하나, Ctrl+Z 로 되돌림) 원문 범위를 편집기에 칠한다
+	const stmt = snap?.stmt ?? null;
+	const stmtRef = useRef(stmt);
+	stmtRef.current = stmt;
+	const applyCleanup = useCallback(
+		(text: string) => {
+			const v = currentView(deps.conn);
+			const s = stmtRef.current;
+			if (!v || !s || v.state.sliceDoc(s.from, s.to) !== s.text) return;
+			v.dispatch({ changes: { from: s.from, to: s.to, insert: text }, userEvent: "input.cleanup", scrollIntoView: true });
+			v.focus();
+		},
+		[deps.conn],
+	);
+	const highlightCleanup = useCallback(
+		(r: [number, number] | null) => {
+			const s = stmtRef.current;
+			markEditor(deps.conn, r && s ? [{ from: s.from + r[0], to: s.from + r[1] }] : [], !!r);
+		},
+		[deps.conn],
+	);
+	const getMeta = useCallback((schema: string | null, table: string) => tableMetaFor(deps, schema, table), [deps]);
+
 	const dbLabel = database || (meta?.schemas.length === 1 ? meta.schemas[0] : meta?.schemas.length ? `${meta.schemas[0]} 외 ${meta.schemas.length - 1}` : "");
 	const metaText = [dbLabel || null, meta ? `표 ${meta.tables}` : null, meta?.indexes != null ? `인덱스 ${meta.indexes}` : null].filter(Boolean).join(" · ");
 
@@ -130,8 +156,17 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 					</div>
 				)}
 				{mounted.diag && (
-					<div className={`qa-layer${tab !== "map" ? " on" : ""}`} aria-hidden={tab === "map"}>
-						<QueryTuningPanel deps={deps} visible={visible && tab !== "map"} actions={actions} view={tab === "index" ? "index" : "diag"} />
+					<div className={`qa-layer${tab === "diag" || tab === "index" ? " on" : ""}`} aria-hidden={tab !== "diag" && tab !== "index"}>
+						<QueryTuningPanel deps={deps} visible={visible && (tab === "diag" || tab === "index")} actions={actions} view={tab === "index" ? "index" : "diag"} />
+					</div>
+				)}
+				{mounted.cleanup && (
+					<div className={`qa-layer qa-cleanup${tab === "cleanup" ? " on" : ""}`} aria-hidden={tab !== "cleanup"}>
+						{stmt ? (
+							<QueryCleanup sql={stmt.text} engine={deps.engine} conn={deps.conn} getMeta={getMeta} onApply={applyCleanup} onHighlight={highlightCleanup} />
+						) : (
+							<div className="qa-empty">SQL 편집기에서 다듬을 문장에 커서를 두세요.</div>
+						)}
 					</div>
 				)}
 			</div>
