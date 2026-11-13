@@ -1460,9 +1460,15 @@ export function QueryMapPanel({ deps, visible, onTuning }: { deps: AnalyzeDeps; 
 		const hz = d.key.startsWith("h");
 		// 결과 노드는 반드시 통째로 — 칸이 아주 작으면 그만큼 더 줄인다
 		const zr = Math.max(0.12, Math.min(MINZ, (W - pad * 2) / Math.max(1, r.w), (H - pad * 2) / Math.max(1, r.h)));
+		// 축마다 따로: 그 축으로 그래프가 다 들어가면 가운데, 안 들어갈 때만 결과 쪽을 붙잡되
+		// 그래프 바깥 빈 곳이 칸 안으로 들어오지 않게(세로 흐름에서 위가 크게 비던 것)
+		const axis = (V: number, c0: number, len: number, want: number) => {
+			if (len * zr <= V - pad * 2) return (V - len * zr) / 2 - c0 * zr;
+			return Math.min(pad - c0 * zr, Math.max(V - pad - (c0 + len) * zr, want));
+		};
 		// 가로 흐름이면 결과를 오른쪽 끝 안쪽에, 세로면 아래쪽 안쪽에 — 다른 축은 결과 가운데
-		const x = hz ? W - pad - (r.x + r.w) * zr : W / 2 - (r.x + r.w / 2) * zr;
-		const y = hz ? H / 2 - (r.y + r.h / 2) * zr : H - pad - (r.y + r.h) * zr;
+		const x = axis(W, b.x, b.w, hz ? W - pad - (r.x + r.w) * zr : W / 2 - (r.x + r.w / 2) * zr);
+		const y = axis(H, b.y, b.h, hz ? H / 2 - (r.y + r.h / 2) * zr : H - pad - (r.y + r.h) * zr);
 		void inst.setViewport({ zoom: zr, x, y });
 	}, []);
 
