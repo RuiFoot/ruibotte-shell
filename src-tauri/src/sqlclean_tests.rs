@@ -232,6 +232,26 @@ fn derived_with_group_by_is_kept() {
 }
 
 #[test]
+fn derived_with_order_by_and_rownum_is_kept() {
+    // Oracle 상위 N개 — 안쪽 ORDER BY 를 버리면 다른 10행이 나온다
+    let r = run("SELECT * FROM (SELECT id, title FROM board ORDER BY reg_dt DESC) v WHERE ROWNUM <= 10", "oracle");
+    assert!(!has(&r, "flattenDerived"), "{:?}", kinds(&r));
+    reparses(&r, "oracle");
+    // 안쪽 WHERE 의 ROWNUM 도 바깥 조건과 섞으면 세는 행이 바뀐다
+    let r = run("SELECT v.id FROM (SELECT id FROM board WHERE ROWNUM <= 5) v WHERE v.id > 3", "oracle");
+    assert!(!has(&r, "flattenDerived"), "{:?}", kinds(&r));
+}
+
+#[test]
+fn derived_with_order_by_limit_is_kept() {
+    let r = run("SELECT * FROM (SELECT id, title FROM board ORDER BY hit DESC LIMIT 5) d", "mysql");
+    assert!(!has(&r, "flattenDerived"), "{:?}", kinds(&r));
+    reparses(&r, "mysql");
+    let r = run("SELECT d.id FROM (SELECT id FROM board ORDER BY hit) d", "mysql");
+    assert!(!has(&r, "flattenDerived"), "{:?}", kinds(&r));
+}
+
+#[test]
 fn repeated_subquery_to_cte() {
     let sql = "SELECT o.id FROM orders o WHERE o.cust_id IN (SELECT c.id FROM customer c WHERE c.grade = 'VIP') OR o.ref_id IN (SELECT c.id FROM customer c WHERE c.grade = 'VIP')";
     let r = run(sql, "postgres");

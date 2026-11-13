@@ -1821,11 +1821,17 @@ impl<'a> Cx<'a> {
             return;
         }
         let q = subquery.as_ref();
-        if q.with.is_some() || q.limit_clause.is_some() || q.fetch.is_some() || !q.locks.is_empty() || q.for_clause.is_some() {
+        // 안쪽 ORDER BY 는 바깥 ROWNUM·LIMIT(상위 N개)과 함께 뜻이 있다 — 펼치면 정렬이 사라져 다른 행이 나온다
+        if q.with.is_some() || q.order_by.is_some() || q.limit_clause.is_some() || q.fetch.is_some() || !q.locks.is_empty() || q.for_clause.is_some() || q.settings.is_some() || q.format_clause.is_some() || !q.pipe_operators.is_empty() {
             return;
         }
         let SetExpr::Select(inner) = q.body.as_ref() else { return };
         if inner.from.len() != 1 || !inner.from[0].joins.is_empty() || inner.distinct.is_some() || inner.top.is_some() || inner.having.is_some() || inner.into.is_some() {
+            return;
+        }
+        // 안쪽의 ROWNUM(Oracle 행 번호·상위 N개)은 바깥 조건과 섞이면 세는 행이 바뀐다
+        let rownum = |r: &CRef| r.parts.len() == 1 && lc(&r.parts[0].value) == "rownum";
+        if inner.selection.as_ref().is_some_and(|w| scan(w).refs.iter().any(rownum)) || inner.projection.iter().any(|p| scan(p).refs.iter().any(rownum)) {
             return;
         }
         if !matches!(&inner.group_by, GroupByExpr::Expressions(v, m) if v.is_empty() && m.is_empty()) || !inner.named_window.is_empty() || inner.qualify.is_some() || !inner.lateral_views.is_empty() || inner.prewhere.is_some() || !inner.connect_by.is_empty() {
