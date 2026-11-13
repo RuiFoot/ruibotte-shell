@@ -33,6 +33,9 @@ export type AnalyzeDeps = {
 /** 뒤 조회 — 연결마다 한 줄로(같은 연결 BUSY 방지), 짧은 시간 상한(queryWatch) */
 const bgRows = (conn: number, sql: string, max: number) => backgroundRows(conn, sql, max);
 
+/** 메타데이터를 새로 물어도 되는지 — 실행 중에는 아무것도(같은 연결), PG 트랜잭션 중에는 캐시에 없는 것을 모두 미룬다(오류 하나가 트랜잭션을 깨뜨린다) */
+const metaAllowed = (d: Pick<AnalyzeDeps, "running" | "inTx" | "engine">) => !d.running && !(d.inTx && d.engine === "postgres");
+
 export type Snapshot = {
 	/** 문장(편집기 위치) */
 	stmt: Stmt;
@@ -60,7 +63,26 @@ class Meta {
 	private cols = new Map<string, Promise<ColMeta[] | null>>();
 	private idx = new Map<string, Promise<IndexInfo[] | null>>();
 	private fkMap = new Map<string, Promise<Fk[] | null>>();
+	/** PostgreSQL search_path 의 첫 스키마(current_schema()) — 한정 없는 표 이름을 먼저 찾을 곳 */
+	private cur: Promise<string | null> | null = null;
 	constructor(private conn: number) {}
+
+	/** 한정 없는 표를 먼저 찾을 스키마 — PG 는 search_path 첫 스키마, 그 밖은 지금 데이터베이스(MySQL)·없음 */
+	async prefer(d: Pick<AnalyzeDeps, "engine" | "defaultSchema">, allow: boolean): Promise<string | null> {
+		if (d.engine !== "postgres") return d.defaultSchema;
+		if (!this.cur) {
+			if (!allow) return null;
+			const p = bgRows(this.conn, "SELECT current_schema()", 1)
+				.then((r) => r[0]?.[0] ?? null)
+				.catch(() => {
+					// 못 읽었으면(BUSY 등) 잊고 다음에 다시
+					if (this.cur === p) this.cur = null;
+					return null;
+				});
+			this.cur = p;
+		}
+		return this.cur;
+	}
 
 	private retry<K, V>(m: Map<K, Promise<V>>, k: K) {
 		this.failed = true;
@@ -179,11 +201,21 @@ function metaFor(conn: number, epoch: number): Meta {
 	return m;
 }
 
-/** 다듬기 탭이 쓰는 표 메타(열·인덱스) — 분석기와 같은 캐시를 쓴다(같은 연결의 뒤 조회 한 줄) */
-export async function tableMetaFor(deps: Pick<AnalyzeDeps, "conn" | "engine" | "epoch" | "defaultSchema">, schema: string | null, table: string): Promise<{ cols: ColMeta[] | null; indexes: IndexInfo[] | null }> {
+/**
+ * 다듬기 탭이 쓰는 표 메타(열·인덱스) — 분석기와 같은 캐시·같은 규칙(같은 연결의 뒤 조회 한 줄).
+ * 실행 중·PG 트랜잭션 중이면 캐시에 있는 것만 쓰고 새로 묻지 않는다. 한정 없는 표는 분석기처럼 찾는다(PG 는 search_path 첫 스키마부터)
+ */
+export async function tableMetaFor(deps: AnalyzeDeps, schema: string | null, table: string): Promise<{ cols: ColMeta[] | null; indexes: IndexInfo[] | null } | null> {
 	const m = metaFor(deps.conn, deps.epoch);
-	const sch = schema ?? deps.defaultSchema ?? "(기본)";
-	const [cols, indexes] = await Promise.all([m.columns(sch, table, true) ?? Promise.resolve(null), m.indexes(deps.engine, sch, table, true) ?? Promise.resolve(null)]);
+	const allow = metaAllowed(deps);
+	const mysql = deps.engine === "mysql" || deps.engine === "mariadb";
+	const found = await m.find(schema, table, await m.prefer(deps, allow), mysql, allow);
+	if (found === "wait") return null;
+	const [hit] = found;
+	// 트리에서 못 찾으면(스키마 목록이 없는 엔진 등) 이름 그대로 한 번
+	const sch = hit?.schema ?? schema ?? (mysql ? deps.defaultSchema : null) ?? "(기본)";
+	const name = hit?.name ?? table;
+	const [cols, indexes] = await Promise.all([m.columns(sch, name, allow) ?? Promise.resolve(null), m.indexes(deps.engine, sch, name, allow) ?? Promise.resolve(null)]);
 	return { cols, indexes };
 }
 
@@ -345,7 +377,7 @@ class Analyzer {
 		const m = metaFor(d.conn, d.epoch);
 		m.failed = false;
 		// 실행 중에는 아무것도 묻지 않는다(같은 연결). PG 트랜잭션 중에는 캐시에 없는 것을 모두 미룬다 — 오류 하나가 트랜잭션을 깨뜨린다
-		const allowTree = !d.running && !(d.inTx && d.engine === "postgres");
+		const allowTree = metaAllowed(d);
 		const allowSql = allowTree;
 		const mysql = d.engine === "mysql" || d.engine === "mariadb";
 		const meta: (TableMeta | null | undefined)[] = map.tables.map(() => undefined);
@@ -353,10 +385,11 @@ class Analyzer {
 		let pending = false;
 		const noIndex = !indexColsSql(d.engine, null, "x");
 		const fks = new Map<string, Fk[]>();
+		const prefer = await m.prefer(d, allowSql);
 		await Promise.all(
 			map.tables.map(async (t) => {
 				if (t.virt || t.cte !== null || t.derived !== null) return;
-				const found = await m.find(t.schema, t.name, d.defaultSchema, mysql, allowTree);
+				const found = await m.find(t.schema, t.name, prefer, mysql, allowTree);
 				if (found === "wait") {
 					pending = true;
 					return;

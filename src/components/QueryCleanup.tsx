@@ -76,6 +76,8 @@ export type QueryCleanupProps = {
 	queryFirstRow?: (sql: string, timeoutMs: number) => Promise<(string | null)[] | null>;
 	/** 비교 문장 시간 상한(ms, 기본 15초) */
 	timeoutMs?: number;
+	/** 서버에 묻지 못하는 까닭(PostgreSQL 트랜잭션 중 등) — 있으면 결과 확인·EXPLAIN 을 끄고 이 글을 툴팁으로 */
+	serverBlocked?: string | null;
 };
 
 /** 화면에서만 붙이는 항목 — 정렬은 sql-formatter(Shift+Alt+F 와 같은 규칙) */
@@ -121,7 +123,7 @@ type Res = CleanResult & { src: string };
 
 const fmtNum = (n?: number) => (n === undefined ? "—" : n >= 100 ? Math.round(n).toLocaleString() : n.toLocaleString(undefined, { maximumFractionDigits: 2 }));
 
-export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight, serverVersion, keywordCase = "upper", explain, queryFirstRow, timeoutMs = 15000 }: QueryCleanupProps) {
+export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight, serverVersion, keywordCase = "upper", explain, queryFirstRow, timeoutMs = 15000, serverBlocked }: QueryCleanupProps) {
 	const [res, setRes] = useState<Res | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [off, setOff] = useState<string[]>([]);
@@ -311,7 +313,7 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 	};
 
 	const runVerify = async () => {
-		if (!isSelect || !output) return;
+		if (!isSelect || !output || serverBlocked) return;
 		const src = sql;
 		setVerify({ state: "busy", note: "비교 SQL 만드는 중…" });
 		try {
@@ -355,7 +357,7 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 	};
 
 	const runPlans = async () => {
-		if (!output) return;
+		if (!output || serverBlocked) return;
 		setPlans({ state: "busy" });
 		const ex = explain ?? ((q: string) => runBackground(conn, () => invoke<ExplainOk>("db_explain", { conn, sql: q, analyze: false })));
 		try {
@@ -518,10 +520,16 @@ export function QueryCleanup({ sql, engine, conn, getMeta, onApply, onHighlight,
 			)}
 
 			<div className="statusbar qc-bar">
-				<button type="button" className="btn ghost qc-btn" disabled={!isSelect || !dirty || verify?.state === "busy"} onClick={() => void runVerify()} title={isSelect ? `원문과 정리본을 각각 읽어 행 수·차이 행을 셉니다(읽기만, ${Math.round(timeoutMs / 1000)}초 상한)` : "SELECT 문장만 결과를 비교합니다"}>
+				<button
+					type="button"
+					className="btn ghost qc-btn"
+					disabled={!isSelect || !dirty || verify?.state === "busy" || !!serverBlocked}
+					onClick={() => void runVerify()}
+					title={serverBlocked || (isSelect ? `원문과 정리본을 각각 읽어 행 수·차이 행을 셉니다(읽기만, ${Math.round(timeoutMs / 1000)}초 상한)` : "SELECT 문장만 결과를 비교합니다")}
+				>
 					<Check size={12} /> 결과 같은지 확인
 				</button>
-				<button type="button" className="btn ghost qc-btn" disabled={!dirty || plans?.state === "busy"} onClick={() => void runPlans()} title="두 문장의 예상 계획을 차례로 봅니다(실행하지 않음)">
+				<button type="button" className="btn ghost qc-btn" disabled={!dirty || plans?.state === "busy" || !!serverBlocked} onClick={() => void runPlans()} title={serverBlocked || "두 문장의 예상 계획을 차례로 봅니다(실행하지 않음)"}>
 					<Play size={12} /> 둘 다 EXPLAIN
 				</button>
 				<span className="qc-grow" />

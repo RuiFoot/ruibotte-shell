@@ -122,6 +122,7 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 	const { conn, epoch, engine, defaultSchema } = deps;
 	// biome 없음 — conn·epoch·engine·defaultSchema 가 바뀔 때만 새 함수(running·inTx 는 depsRef 로)
 	const getMeta = useCallback((schema: string | null, table: string) => tableMetaFor(depsRef.current, schema, table), [conn, epoch, engine, defaultSchema]);
+	const serverBlocked = deps.inTx && deps.engine === "postgres" ? "열린 트랜잭션이 있어 서버에 묻지 않습니다(PostgreSQL — 오류 하나가 트랜잭션을 깨뜨립니다) — 커밋·되돌리기 뒤에 하세요" : null;
 
 	const dbLabel = database || (meta?.schemas.length === 1 ? meta.schemas[0] : meta?.schemas.length ? `${meta.schemas[0]} 외 ${meta.schemas.length - 1}` : "");
 	const metaText = [dbLabel || null, meta ? `표 ${meta.tables}` : null, meta?.indexes != null ? `인덱스 ${meta.indexes}` : null].filter(Boolean).join(" · ");
@@ -176,6 +177,7 @@ export function QueryAnalysisPanel({ deps, visible, actions, tab, onTab, databas
 								getMeta={getMeta}
 								onApply={applyCleanup}
 								onHighlight={highlightCleanup}
+								serverBlocked={serverBlocked}
 							/>
 						) : (
 							<div className="qa-empty">SQL 편집기에서 다듬을 문장에 커서를 두세요.</div>
