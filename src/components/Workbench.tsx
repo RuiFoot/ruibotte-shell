@@ -380,16 +380,18 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 	}, [props.api]);
 	const info = ctx.localShells?.find((s) => s.id === shell);
 	const kind = info ? (info.kind === "pwsh" ? "pwsh" : info.kind === "cmd" ? "cmd" : "linux") : "linux";
-	// 이 터미널이 지금 들어가 있는 컨테이너 — 경로 자동완성 목록을 그 쪽 파일로
+	// 이 터미널이 지금 들어가 있는 컨테이너 — 경로 자동완성 목록을 그 쪽 파일로(원격 SSH 도 — 컨테이너 안에서 서버 폴더를 보이지 않게)
 	const myCtr = useRef<string | null>(null);
+	const local = !!ctx.localShells;
 	const completion = useMemo(
 		() => ({
 			...ctx.completion,
-			key: `${ctx.completion.key}:${kind}`,
+			// 기록 열쇠는 그대로(원격은 ssh:이름 — 옛 기록을 잇는다)
+			key: local ? `${ctx.completion.key}:${kind}` : ctx.completion.key,
 			shellKind: kind as "linux" | "pwsh" | "cmd",
 			listDir: (dir: string) => (myCtr.current ? ctx.ctrFs(myCtr.current).list(dir) : ctx.completion.listDir(dir)),
 		}),
-		[ctx.completion, ctx.ctrFs, kind],
+		[ctx.completion, ctx.ctrFs, kind, local],
 	);
 	// 명령 입력 보조(D25) — 원격 SSH 와 내 PC 의 bash·zsh·Git Bash·WSL 만(PowerShell·cmd·그 밖은 끔)
 	const assist = !ctx.localShells || (!!info && (info.kind === "bash" || info.kind === "zsh" || info.kind === "wsl"));
@@ -413,7 +415,7 @@ function TerminalPanel(props: IDockviewPanelProps<{ n: number; cwd?: string; she
 					ctx.openCtrTree(name, props.api.id);
 				}}
 				onInput={(d) => ctx.broadcast(props.api.id, d)}
-				completion={ctx.localShells ? completion : ctx.completion}
+				completion={completion}
 				assist={assist}
 				shell={shell}
 				shellOptions={ctx.localShells?.map((s) => ({ value: s.id, label: s.label, hint: s.admin ? "관리자" : undefined }))}
