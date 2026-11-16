@@ -262,20 +262,34 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 	const cmd = dict?.c[cmdName];
 	// 1) 명령
 	if (ws.length === 1) {
-		const seen = new Set<string>();
-		const items: Candidate[] = [];
-		for (const { cmd: h } of ctx.history) {
-			if (h.startsWith(cur) && h !== cur && !seen.has(h)) {
-				seen.add(h);
-				items.push({ insert: h, label: h, kind: "hist", desc: "지난 명령" });
-				if (items.length >= 5) break;
+		// 지난 명령 — 같은 폴더 → 같은 맥락 → 최근 순으로 앞에. 다른 폴더·맥락의 경로 명령은 명령 후보 뒤로,
+		// 지금 폴더에 없는 곳으로 가는 cd 기록은 뺀다(흐린 제안과 같은 판정)
+		// 같은 줄이 여러 자리에 있으면 가장 잘 맞는 자리로 본다. 점수: 2 같은 폴더 · 1 같은 맥락 · 0 그 밖 · -1 뒤로 · -2 뺌
+		const best = new Map<string, { score: number; desc: string }>();
+		for (const e of ctx.history) {
+			const h = e.cmd;
+			if (!h.startsWith(cur) || h === cur) continue;
+			const p = placeOf(e, ctx);
+			let score: number;
+			let desc = "지난 명령";
+			if (!p.pathy || p.samePlace || (!p.ctxDiff && p.exists === true)) score = p.samePlace ? 2 : p.sameCtx ? 1 : 0;
+			else if (p.cd && p.exists === false) score = -2;
+			else {
+				score = -1;
+				desc = p.ctxDiff ? "지난 명령 · 다른 셸" : "지난 명령 · 다른 폴더";
 			}
+			const prev = best.get(h);
+			if (!prev || score > prev.score) best.set(h, { score, desc });
 		}
+		const ranked = [...best].filter(([, v]) => v.score >= -1).sort((a, b) => b[1].score - a[1].score);
+		const asCand = ([h, v]: [string, { desc: string }]): Candidate => ({ insert: h, label: h, kind: "hist", desc: v.desc });
+		const items = ranked.filter(([, v]) => v.score >= 0).slice(0, 5).map(asCand);
+		const back = ranked.filter(([, v]) => v.score === -1).slice(0, 5).map(asCand);
 		const names = new Set<string>([...Object.keys(dict?.c ?? {}), ...ctx.commands]);
 		const cmds: Candidate[] = [];
 		for (const n of Object.keys(SPECS)) names.add(n);
 		for (const n of names) cmds.push({ insert: n, label: n, desc: SPECS[n]?.desc ?? dict?.c[n]?.d, kind: "cmd" });
-		return { replace: cur.length, items: [...items, ...rank(cmds, cur)].slice(0, 60) };
+		return { replace: cur.length, items: [...items, ...rank(cmds, cur, 60 - items.length - back.length), ...back] };
 	}
 	// 2) 옵션
 	const spec = SPECS[cmdName];
