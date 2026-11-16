@@ -342,11 +342,174 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 	return { replace: rawName.length, items: rank(items, namePart, 80) };
 }
 
-/** 흐린 제안 — 지난 명령 가운데 지금 줄로 시작하는 가장 최근 것의 나머지 */
-export function ghost(line: string, history: HistEntry[]): string {
+/**
+ * 경로 인자가 가리키는 첫 마디 — 어느 폴더(dir)의 어떤 이름(name)인가.
+ * 확인할 것이 없으면(. .. ~ ~user) "none", 기준 폴더(cwd·home)를 모르면 "unknown"
+ */
+function anchorOf(arg: string, c: GhostCtx): { dir: string; name: string; needDir: boolean; abs: boolean } | "none" | "unknown" {
+	let base: string | null;
+	let rest: string;
+	let abs = false;
+	if (arg === "~" || arg.startsWith("~/")) {
+		base = c.home;
+		rest = arg.slice(2);
+		abs = true;
+	} else if (arg.startsWith("~")) return "none";
+	else if (arg.startsWith("/")) {
+		base = "/";
+		rest = arg.slice(1);
+		abs = true;
+	} else {
+		base = c.cwd;
+		rest = arg;
+	}
+	const segs = rest.split("/").filter((s) => s && s !== ".");
+	if (!base) return segs.length ? "unknown" : "none";
+	let dir = base.replace(/\/+$/, "") || "/";
+	while (segs[0] === "..") {
+		segs.shift();
+		dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+	}
+	const name = segs[0];
+	if (!name) return "none";
+	return { dir, name, needDir: segs.length > 1 || arg.endsWith("/"), abs };
+}
+
+/** 이름 맞추기 — * ? 는 셸 무늬로, 그 밖은 그대로 */
+function nameMatcher(name: string): (x: string) => boolean {
+	if (!/[*?]/.test(name)) return (x) => x === name;
+	const re = new RegExp(`^${name.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+	return (x) => re.test(x);
+}
+
+/** 기록 한 줄이 지금 자리에 맞는가 */
+export type Place = {
+	/** 경로 인자가 있는 명령 */
+	pathy: boolean;
+	/** 같은 폴더·같은 맥락에서 친 것 */
+	samePlace: boolean;
+	/** 같은 맥락(서버 셸끼리 · 같은 컨테이너끼리)에서 친 것 */
+	sameCtx: boolean;
+	/** 맥락이 다른 것이 확실하다(컨테이너 안 ↔ 서버, 다른 컨테이너) */
+	ctxDiff: boolean;
+	/** 경로 인자(첫 마디)가 지금 폴더에 있는가 — null: 목록이 캐시에 아직 없다(want 로 부탁해 둠) */
+	exists: boolean | null;
+	/** cd·pushd */
+	cd: boolean;
+};
+
+/** 기록 판정 — 경로 인자의 첫 마디를 지금 폴더 목록(캐시)에서 찾는다. 동기 계산, 없는 목록은 want 로 부탁만 */
+export function placeOf(e: HistEntry, c: GhostCtx): Place {
+	const toks = words(e.cmd.trim());
+	const idx = pathArgIndexes(toks);
+	const known = !legacy(e);
+	const sameCtx = known && (e.ctx ?? "") === (c.shellCtx ?? "");
+	const samePlace = sameCtx && e.cwd !== undefined && e.cwd === c.cwd;
+	const ctxDiff = e.ctx !== undefined && c.shellCtx !== undefined && e.ctx !== c.shellCtx;
+	const head = toks[headAt(toks)] ?? "";
+	const cd = head === "cd" || head === "pushd";
+	const p: Place = { pathy: !!idx, samePlace, sameCtx, ctxDiff, exists: true, cd };
+	if (!idx || samePlace) return p;
+	for (const i of idx) {
+		const a = anchorOf(toks[i] ?? "", c);
+		if (a === "none") continue;
+		if (a === "unknown") {
+			p.exists = null;
+			continue;
+		}
+		// 절대 경로·~ 는 폴더와 상관없다 — 같은 맥락이면 그대로
+		if (a.abs && sameCtx) continue;
+		const list = c.listDir(a.dir);
+		if (!list) {
+			c.want?.(a.dir);
+			p.exists = null;
+			continue;
+		}
+		const m = nameMatcher(a.name);
+		const needDir = a.needDir || (cd && i !== headAt(toks));
+		if (!list.some((f) => m(f.name) && (!needDir || f.kind === "dir" || f.kind === "link"))) {
+			p.exists = false;
+			return p;
+		}
+	}
+	return p;
+}
+
+/**
+ * 흐린 제안 — 지난 명령 가운데 지금 줄로 시작하는 것의 나머지. 같은 폴더 → 같은 맥락 → 최근 순.
+ * 경로 명령(cd·ls·vim·./x …)은 같은 폴더·맥락에서 친 것만 그대로, 다른 폴더에서 친 것은 그 경로가 지금 폴더에 있을 때만,
+ * 다른 맥락(컨테이너 안 ↔ 서버)에서 친 것은 쓰지 않는다. 경로 없는 명령은 어디서 쳤든.
+ * 기록에 맞는 것이 없으면 지금 폴더 목록에서 하나로 정해지는(또는 공통 앞부분이 더 긴) 이름을 — 여럿이면 띄우지 않는다(목록은 Tab)
+ */
+export function ghost(line: string, c: GhostCtx): string {
 	if (!line.trim()) return "";
-	const h = history.find((x) => x.cmd.startsWith(line) && x.cmd.length > line.length);
-	return h ? h.cmd.slice(line.length) : "";
+	const linux = (c.shellKind ?? "linux") === "linux";
+	let best: HistEntry | undefined;
+	let bestRank = -1;
+	for (const e of c.history) {
+		if (e.cmd.length <= line.length || !e.cmd.startsWith(line)) continue;
+		let r: number;
+		// PowerShell·cmd — 경로 규칙(대소문자·역슬래시)이 달라 거르지 않고 같은 폴더 것을 먼저만
+		if (!linux) r = !legacy(e) && e.cwd === c.cwd ? 2 : 0;
+		else {
+			const p = placeOf(e, c);
+			if (p.pathy && !p.samePlace && (p.ctxDiff || p.exists !== true)) continue;
+			r = p.samePlace ? 2 : p.sameCtx ? 1 : 0;
+		}
+		if (r > bestRank) {
+			best = e;
+			bestRank = r;
+			if (r === 2) break;
+		}
+	}
+	if (best) return best.cmd.slice(line.length);
+	return linux ? pathGhost(line, c) : "";
+}
+
+/** 지금 폴더 목록에서 이름 흐린 제안 — 하나로 정해지면 끝까지(폴더는 /), 여럿이면 공통 앞부분이 더 길 때만. 대소문자 구분(리눅스) */
+function pathGhost(line: string, c: GhostCtx): string {
+	if (/\s$/.test(line)) return "";
+	const all = words(line);
+	// 마지막 단순 명령만(ls && cd co)
+	let s = 0;
+	all.forEach((w, i) => {
+		if (SHELL_OPS.test(w)) s = i + 1;
+	});
+	const ws = all.slice(s);
+	const cur = ws[ws.length - 1] ?? "";
+	if (!cur || cur.startsWith("-") || rawLastWord(line) !== cur) return "";
+	if (ws.length < 2 && !/^\.{1,2}\//.test(cur)) return "";
+	if (!pathArgIndexes(ws)?.includes(ws.length - 1)) return "";
+	const head = ws[headAt(ws)] ?? "";
+	const onlyDirs = head === "cd" || head === "pushd" || dictNow()?.c[head]?.a === "dir";
+	const slash = cur.lastIndexOf("/");
+	const dirPart = slash >= 0 ? cur.slice(0, slash + 1) : "";
+	const namePart = cur.slice(slash + 1);
+	if (!namePart || esc(namePart) !== namePart) return "";
+	let base = dirPart;
+	if (base.startsWith("~")) {
+		if (!c.home || !base.startsWith("~/")) return "";
+		base = c.home + base.slice(1);
+	}
+	if (!base.startsWith("/")) {
+		if (!c.cwd) return "";
+		base = `${c.cwd}/${base}`;
+	}
+	const dir = base.replace(/\/+$/, "") || "/";
+	const list = c.listDir(dir);
+	if (!list) {
+		c.want?.(dir);
+		return "";
+	}
+	const hits = list.filter((e) => e.name.startsWith(namePart) && (namePart.startsWith(".") || !e.name.startsWith(".")) && (!onlyDirs || e.kind === "dir" || e.kind === "link"));
+	if (!hits.length) return "";
+	if (hits.length === 1) {
+		const e = hits[0] as FsEntry;
+		return esc(e.name).slice(namePart.length) + (e.kind === "dir" ? "/" : "");
+	}
+	let p = hits[0]?.name ?? "";
+	for (const e of hits) while (!e.name.startsWith(p)) p = p.slice(0, -1);
+	return p.length > namePart.length ? esc(p).slice(namePart.length) : "";
 }
 
 /** PowerShell 자주 쓰는 cmdlet·별칭(설명은 짧게) */

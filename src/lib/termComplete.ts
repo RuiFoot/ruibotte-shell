@@ -172,13 +172,49 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		return (b.getLine(b.cursorY + b.baseY)?.translateToString(true, b.cursorX) ?? "").length === 0;
 	};
 
+	/** 폴더 목록 캐시 열쇠 — 맥락별(컨테이너 안 /root 와 서버 /root 는 다른 폴더). 맥락 이름에는 | 가 없다 */
+	const dirKey = (dir: string) => `${shellCtx ?? ""}|${dir}`;
+	const DIR_TTL = 10_000;
+	const putDir = (dir: string, list: FsEntry[], key = dirKey(dir)) => {
+		dirCache.delete(key);
+		dirCache.set(key, { at: Date.now(), list });
+		// 오래된 것부터 버린다(맵은 넣은 순서)
+		if (dirCache.size > 300) dirCache.delete(dirCache.keys().next().value as string);
+	};
 	const listDirCached = (dir: string): FsEntry[] | null => {
-		const c = dirCache.get(dir);
-		if (c && Date.now() - c.at < 10_000) return c.list;
+		const c = dirCache.get(dirKey(dir));
+		if (c && Date.now() - c.at < DIR_TTL) return c.list;
 		return null;
 	};
+	/** 뒤에서 받는 중인 폴더(같은 폴더를 겹쳐 묻지 않게) */
+	const fetching = new Set<string>();
+	/** 캐시에 없는(또는 낡은) 폴더를 뒤에서 받는다 — 다 받으면 흐린 제안을 다시 그린다(줄이 그대로일 때만). 입력은 기다리지 않는다 */
+	const want = (dir: string) => {
+		const key = dirKey(dir);
+		if (fetching.has(key) || fetching.size >= 4) return;
+		fetching.add(key);
+		const line = currentInput();
+		void src
+			.listDir(dir)
+			.then(
+				(list) => putDir(dir, list, key),
+				() => putDir(dir, [], key),
+			)
+			.finally(() => {
+				fetching.delete(key);
+				if (line !== null && currentInput() === line && key === dirKey(dir)) renderGhost();
+			});
+	};
+	/** 흐린 제안용 — 낡은 목록도 그대로 쓰고(깜박이지 않게) 뒤에서 새로 받는다 */
+	const listDirStale = (dir: string): FsEntry[] | null => {
+		const c = dirCache.get(dirKey(dir));
+		if (!c) return null;
+		if (Date.now() - c.at >= DIR_TTL) want(dir);
+		return c.list;
+	};
 
-	const ctx = () => ({ commands, history: hist.list, listDir: listDirCached, cwd, home: src.home ?? null, units, containers, shellKind: src.shellKind ?? "linux" });
+	const ctx = () => ({ commands, history: hist.list, listDir: listDirCached, want, cwd, home: src.home ?? null, units, containers, shellKind: src.shellKind ?? "linux", shellCtx });
+	const ghostCtx = () => ({ history: hist.list, listDir: listDirStale, want, cwd, home: src.home ?? null, shellKind: src.shellKind ?? "linux", shellCtx });
 
 	const hideGhost = () => {
 		ghostEl.textContent = "";
@@ -205,8 +241,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const renderGhost = () => {
 		const line = currentInput();
 		if (held || ime || line === null || !pop.hidden || !atLineEnd() || mode === "tab" || mode === "off") return hideGhost();
-		// 치는 동안에는 목록을 띄우지 않는다 — 흐린 제안은 지난 명령에서만(서버에 묻지 않음), 목록은 Tab
-		const g = ghost(line, hist.list);
+		// 치는 동안에는 목록을 띄우지 않는다 — 흐린 제안은 지난 명령·받아 둔 폴더 목록에서만(기다리지 않음), 목록은 Tab
+		const g = ghost(line, ghostCtx());
 		ghostEl.textContent = g;
 		if (g) placeAtCursor(ghostEl, false);
 	};
@@ -365,11 +401,11 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		ensureLists(line);
 		let r = complete(line, ctx());
 		if (r.pending) {
+			const key = dirKey(r.pending);
 			try {
-				const list = await src.listDir(r.pending);
-				dirCache.set(r.pending, { at: Date.now(), list });
+				putDir(r.pending, await src.listDir(r.pending), key);
 			} catch {
-				dirCache.set(r.pending, { at: Date.now(), list: [] });
+				putDir(r.pending, [], key);
 			}
 			// 목록을 받아 오는 사이 사람이 더 쳤으면 이 결과는 버린다(지울 글자 수가 어긋나 엉뚱하게 고쳐 쓴다)
 			if (currentInput() !== line) return false;
@@ -542,7 +578,7 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 			}
 			if (e.key === "ArrowRight" && ghostEl.textContent && atLineEnd()) {
 				// 그려 둔 제안은 60ms 늦을 수 있다 — 지금 줄로 다시 계산해 같을 때만 받는다(어긋나면 → 는 셸로)
-				const now = ghost(currentInput() ?? "", hist.list);
+				const now = ghost(currentInput() ?? "", ghostCtx());
 				if (now !== ghostEl.textContent) {
 					hideGhost();
 					return true;
