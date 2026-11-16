@@ -790,6 +790,7 @@ export function TerminalView({
 					if (m) ctxMarks.current.push({ m, ctx: v });
 				}
 				ctxRef.current = v;
+				completer?.context(v);
 				ctxFresh = true;
 				setInCtr(ctxContainer(v));
 				inj = null;
@@ -1448,6 +1449,7 @@ export function TerminalView({
 							onClick={() => {
 								const name = foreign.name as string;
 								ctxRef.current = `docker:${name}`;
+								completerRef.current?.context(ctxRef.current);
 								const m = termRef.current?.registerMarker(0);
 								if (m) ctxMarks.current.push({ m, ctx: ctxRef.current });
 								setInCtr(name);

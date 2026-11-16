@@ -12,22 +12,160 @@ import { SPECS } from "./specs";
 
 export type Candidate = { insert: string; label: string; desc?: string; kind: "cmd" | "sub" | "opt" | "path" | "hist"; dir?: boolean };
 
-export type CompleteCtx = {
-	/** 서버(또는 내 PC) 명령 목록 — compgen -c */
-	commands: string[];
+/**
+ * 지난 명령 하나 — 어느 폴더(cwd, OSC 7)·어느 셸(ctx, OSC 6976 host · docker:이름)에서 쳤는지 함께 둔다.
+ * 옛 기록(문자열)은 cmd 만 — 어디서 쳤는지 모르는 것으로 본다
+ */
+export type HistEntry = { cmd: string; cwd?: string; ctx?: string };
+
+/** 흐린 제안·기록 판정에 쓰는 것 — 지금 자리와 경로 목록 캐시 */
+export type GhostCtx = {
 	/** 지난 명령(최근 먼저) */
-	history: string[];
+	history: HistEntry[];
 	/** 경로 목록 — 캐시에 있으면 바로, 없으면 null(받는 중) */
 	listDir: (dir: string) => FsEntry[] | null;
 	cwd: string | null;
 	home: string | null;
+	/** 지금 셸 맥락(host · docker:이름) — 셸 훅이 아직 알리지 않았으면 undefined */
+	shellCtx?: string;
+	/** 셸 종류 — PowerShell·cmd 는 리눅스 명령 사전을 쓰지 않는다 */
+	shellKind?: "linux" | "pwsh" | "cmd";
+	/** 캐시에 없는 폴더 — 뒤에서 받아 다음 계산부터 쓰게(기다리지 않는다) */
+	want?: (dir: string) => void;
+};
+
+export type CompleteCtx = GhostCtx & {
+	/** 서버(또는 내 PC) 명령 목록 — compgen -c */
+	commands: string[];
 	/** systemd 유닛 이름(systemctl·journalctl 인자) — 받아 둔 것 */
 	units?: string[];
 	/** 컨테이너 이름(docker 인자) — 받아 둔 것 */
 	containers?: string[];
-	/** 셸 종류 — PowerShell·cmd 는 리눅스 명령 사전을 쓰지 않는다 */
-	shellKind?: "linux" | "pwsh" | "cmd";
 };
+
+/** 기록 최대 개수(서버·셸별) */
+export const HIST_MAX = 500;
+
+/** 저장된 기록 → 항목 목록. 옛 문자열 목록·새 객체 목록·둘이 섞인 것 모두 읽는다(모르는 모양은 버린다) */
+export function readHistory(raw: unknown): HistEntry[] {
+	if (!Array.isArray(raw)) return [];
+	const out: HistEntry[] = [];
+	for (const x of raw) {
+		if (typeof x === "string") {
+			if (x) out.push({ cmd: x });
+		} else if (x && typeof x === "object" && typeof (x as HistEntry).cmd === "string" && (x as HistEntry).cmd) {
+			const { cmd, cwd, ctx } = x as HistEntry;
+			const e: HistEntry = { cmd };
+			if (typeof cwd === "string") e.cwd = cwd;
+			if (typeof ctx === "string") e.ctx = ctx;
+			out.push(e);
+		}
+	}
+	return out.slice(0, HIST_MAX);
+}
+
+/** 어디서 쳤는지 모르는 옛 기록 */
+const legacy = (e: HistEntry) => e.cwd === undefined && e.ctx === undefined;
+
+/**
+ * 같은 칸의 기록인가 — 경로 명령(cd conf/ 등)은 폴더·맥락까지 같아야 같은 칸(다른 폴더의 같은 줄은 따로 둔다),
+ * 경로 없는 명령은 줄만 같으면 같은 칸(마지막으로 친 자리로 옮긴다). 옛 기록은 새 기록에 자리를 내준다
+ */
+export function sameSlot(a: HistEntry, b: HistEntry): boolean {
+	if (a.cmd !== b.cmd) return false;
+	if (legacy(a) || legacy(b) || !pathArgs(a.cmd)) return true;
+	return a.cwd === b.cwd && a.ctx === b.ctx;
+}
+
+/** 기록 맨 앞에 넣기 — 같은 칸의 옛 것은 지우고 상한까지 */
+export function pushHistory(list: HistEntry[], e: HistEntry, max = HIST_MAX): HistEntry[] {
+	return [e, ...list.filter((x) => !sameSlot(x, e))].slice(0, max);
+}
+
+/** 이번 세션 기록(앞) 뒤에 저장돼 있던 기록을 잇는다 — 같은 칸이 이미 있으면 저장본은 버린다 */
+export function mergeHistory(now: HistEntry[], stored: HistEntry[], max = HIST_MAX): HistEntry[] {
+	const out = [...now];
+	for (const e of stored) {
+		if (out.length >= max) break;
+		if (!out.some((x) => sameSlot(x, e))) out.push(e);
+	}
+	return out.slice(0, max);
+}
+
+/** 상대 경로 인자를 받는 명령 — 인자가 모두 경로(옵션·숫자 빼고) */
+const PATH_CMDS = new Set([
+	"cd", "pushd", "ls", "ll", "la", "l", "dir", "tree", "cat", "tac", "less", "more", "tail", "head", "vi", "vim", "nvim", "view", "nano", "micro", "emacs",
+	"rm", "rmdir", "mkdir", "touch", "cp", "mv", "ln", "chmod", "chown", "chgrp", "grep", "egrep", "fgrep", "zgrep", "rg", "tar", "source", ".", "du", "stat", "file",
+	"wc", "sort", "uniq", "diff", "cmp", "tee", "zip", "unzip", "gzip", "gunzip", "zcat", "xz", "bzip2", "md5sum", "sha1sum", "sha256sum", "realpath", "readlink",
+	"bash", "sh", "zsh", "python", "python3", "node", "perl", "ruby", "php", "java", "find", "shred", "truncate", "dos2unix", "iconv", "xxd", "hexdump", "strings",
+]);
+/** 첫 인자가 경로가 아닌 것(무늬·권한·소유자·tar 동작 글자) */
+const FIRST_NOT_PATH = new Set(["grep", "egrep", "fgrep", "zgrep", "rg", "chmod", "chown", "chgrp"]);
+/** 인자가 경로보다 브랜치·태그인 git 하위 명령 */
+const GIT_REF_SUBS = new Set(["checkout", "switch", "branch", "merge", "rebase", "push", "pull", "fetch", "tag", "cherry-pick", "revert", "reset", "log", "show", "remote", "stash"]);
+/** 셸 연결 기호 — 첫 단순 명령까지만 본다 */
+const SHELL_OPS = /^(\||\|\||&&|;|&|[0-9]*>>?|<|<<|2>&1)$/;
+
+/** 경로처럼 보이는 낱말 — ./ ../ ~/ / 로 시작하거나 / 가 들어 있다(주소·host:경로·image:tag 는 아님) */
+function looksPath(w: string): boolean {
+	if (!w || w.startsWith("-") || w.includes("://") || /^[\w.-]+@?[\w.-]*:/.test(w)) return false;
+	return /^(\.{1,2}\/|~\/|\/)/.test(w) || w.includes("/");
+}
+
+/** 명령 머리 위치 — VAR=값·sudo(와 그 옵션)·time·env·nohup 를 건너뛴다 */
+function headAt(t: string[]): number {
+	let i = 0;
+	for (;;) {
+		const x = t[i] ?? "";
+		if (/^\w+=/.test(x) || x === "time" || x === "env" || x === "nohup" || x === "command" || x === "exec") i++;
+		else if (x === "sudo") {
+			i++;
+			while ((t[i] ?? "").startsWith("-")) i += /^-[ugpCDh]$/.test(t[i] ?? "") ? 2 : 1;
+		} else return i;
+	}
+}
+
+/**
+ * 낱말 목록에서 경로 인자 자리 — null 이면 경로 없는 명령(docker ps · systemctl status x).
+ * 상대 경로 인자를 받는 명령은 옵션·숫자가 아닌 인자 모두, 그 밖의 명령은 마지막 낱말이 경로처럼 보일 때 그것만, ./x 실행은 머리 자신
+ */
+export function pathArgIndexes(toks: string[]): number[] | null {
+	const end = toks.findIndex((x) => SHELL_OPS.test(x));
+	const t = end >= 0 ? toks.slice(0, end) : toks;
+	const h = headAt(t);
+	const head = t[h] ?? "";
+	if (!head) return null;
+	const out: number[] = [];
+	if (/^(\.{1,2}\/|~\/|\/)/.test(head)) out.push(h);
+	const name = head.slice(head.lastIndexOf("/") + 1);
+	if (PATH_CMDS.has(name) || PATH_CMDS.has(head)) {
+		let first = true;
+		for (let i = h + 1; i < t.length; i++) {
+			const w = t[i] ?? "";
+			if (w.startsWith("-")) continue;
+			if (first) {
+				first = false;
+				// grep 무늬·chmod 권한·tar 동작 글자(xzvf) 는 경로가 아니다
+				if (FIRST_NOT_PATH.has(name) || (name === "tar" && /^[A-Za-z]+$/.test(w))) continue;
+			}
+			if (/^\d+$/.test(w) || w.includes("://")) continue;
+			out.push(i);
+			// find 는 첫 인자만 경로(뒤는 -name 무늬 같은 식)
+			if (name === "find") break;
+		}
+	} else if (!(name === "git" && GIT_REF_SUBS.has(t[h + 1] ?? ""))) {
+		const last = t.length - 1;
+		if (last > h && looksPath(t[last] ?? "")) out.push(last);
+	}
+	return out.length ? out : null;
+}
+
+/** 줄의 경로 인자(셸 낱말로 나눈 값) — 없으면 null */
+export function pathArgs(cmd: string): string[] | null {
+	const toks = words(cmd.trim());
+	const idx = pathArgIndexes(toks);
+	return idx ? idx.map((i) => toks[i] ?? "").filter(Boolean) : null;
+}
 
 /** 셸 낱말 나누기 — 따옴표·역슬래시 존중, 마지막 낱말은 끝까지(빈 낱말 포함) */
 export function words(line: string): string[] {
@@ -126,7 +264,7 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 	if (ws.length === 1) {
 		const seen = new Set<string>();
 		const items: Candidate[] = [];
-		for (const h of ctx.history) {
+		for (const { cmd: h } of ctx.history) {
 			if (h.startsWith(cur) && h !== cur && !seen.has(h)) {
 				seen.add(h);
 				items.push({ insert: h, label: h, kind: "hist", desc: "지난 명령" });
@@ -205,10 +343,10 @@ export function complete(line: string, ctx: CompleteCtx): { replace: number; ite
 }
 
 /** 흐린 제안 — 지난 명령 가운데 지금 줄로 시작하는 가장 최근 것의 나머지 */
-export function ghost(line: string, history: string[]): string {
+export function ghost(line: string, history: HistEntry[]): string {
 	if (!line.trim()) return "";
-	const h = history.find((x) => x.startsWith(line) && x.length > line.length);
-	return h ? h.slice(line.length) : "";
+	const h = history.find((x) => x.cmd.startsWith(line) && x.cmd.length > line.length);
+	return h ? h.cmd.slice(line.length) : "";
 }
 
 /** PowerShell 자주 쓰는 cmdlet·별칭(설명은 짧게) */
@@ -244,8 +382,12 @@ function completeWin(line: string, ctx: CompleteCtx): { replace: number; items: 
 	const ps = ctx.shellKind === "pwsh";
 	if (ws.length === 1) {
 		const hist: Candidate[] = [];
-		for (const h of ctx.history) {
-			if (h.startsWith(cur) && h !== cur && hist.length < 5) hist.push({ insert: h, label: h, kind: "hist", desc: "지난 명령" });
+		const seen = new Set<string>();
+		for (const { cmd: h } of ctx.history) {
+			if (h.startsWith(cur) && h !== cur && !seen.has(h) && hist.length < 5) {
+				seen.add(h);
+				hist.push({ insert: h, label: h, kind: "hist", desc: "지난 명령" });
+			}
 		}
 		const list = (ps ? PWSH : CMD).map(([n, d]) => ({ insert: `${n} `, label: n, desc: d, kind: "cmd" as const }));
 		return { replace: cur.length, items: [...hist, ...rank(list, cur)].slice(0, 60) };

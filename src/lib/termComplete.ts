@@ -5,10 +5,10 @@
  * "치다 멈추면 목록" 방식에서 저절로 뜬 목록은 ↑↓ 로 고른 뒤에만 Enter 가 넣기다(아니면 Enter 는 명령 실행).
  * 목록이 떠 있으면 Tab·Enter 는 넣기, ↑↓ 고르기, Esc 닫기. 방식(설정): 흐린 제안+목록 / 치다 멈추면 목록 / 목록만 / 끔.
  * 키 입력 경로를 막지 않도록 React 상태 없이 DOM 을 직접 그린다. 프롬프트(OSC 133 A) 뒤 입력에서만 켜진다.
- * 목록이 비면 Tab 은 원래대로 셸(bash 완성)에 넘긴다. 지난 명령은 서버별로 앱 DB 에 500개까지.
+ * 목록이 비면 Tab 은 원래대로 셸(bash 완성)에 넘긴다. 지난 명령은 서버별로 앱 DB 에 500개까지 — 친 폴더·셸 맥락과 함께.
  */
 import type { Terminal } from "@xterm/xterm";
-import { type Candidate, complete, ghost } from "./complete";
+import { type Candidate, complete, ghost, HIST_MAX, type HistEntry, mergeHistory, pushHistory, readHistory } from "./complete";
 import { loadDict } from "./dict";
 import { api, type FsEntry } from "./ipc";
 
@@ -39,6 +39,8 @@ export type Completer = {
 	/** 사람이 입력함(프롬프트 상태에서) */
 	typed: () => void;
 	cwd: (p: string) => void;
+	/** 셸 맥락(OSC 6976 host · docker:이름) — 기록·경로 목록을 맥락별로 */
+	context: (c: string | undefined) => void;
 	/** 키 처리 — false 면 xterm 이 처리하지 않는다 */
 	key: (e: KeyboardEvent) => boolean;
 	/** 지금 입력(프롬프트 끝부터 커서까지, 한 줄일 때만) — 프롬프트가 아니면 null */
@@ -63,36 +65,39 @@ export type Completer = {
 	dispose: () => void;
 };
 
-/** 서버(키)별 지난 명령 — 같은 서버 터미널 여러 개가 한 목록을 함께 쓴다(각자 들고 있다가 통째로 덮어쓰면 서로 지운다) */
-const histories = new Map<string, { list: string[]; add: (c: string) => void }>();
+/**
+ * 서버(키)별 지난 명령 — 같은 서버 터미널 여러 개가 한 목록을 함께 쓴다(각자 들고 있다가 통째로 덮어쓰면 서로 지운다).
+ * 저장 모양: [{ cmd, cwd?, ctx? }] — 옛 문자열 목록도 그대로 읽는다(어디서 쳤는지 모르는 기록)
+ */
+const histories = new Map<string, { list: HistEntry[]; add: (e: HistEntry) => void }>();
 function sharedHistory(key: string) {
 	let h = histories.get(key);
 	if (h) return h;
 	let loaded = false;
-	const pending: string[] = [];
+	let pending = false;
 	const store = () => void api.settingSet(`hist.${key}`, JSON.stringify(h?.list ?? []));
 	h = {
 		list: [],
-		add(c) {
-			const self = h as { list: string[] };
-			self.list = [c, ...self.list.filter((x) => x !== c)].slice(0, 500);
+		add(e) {
+			const self = h as { list: HistEntry[] };
+			self.list = pushHistory(self.list, e);
 			// 불러오기 전에 친 명령은 불러온 뒤 합친다(빈 목록으로 저장해 옛 기록을 지우지 않게)
 			if (loaded) store();
-			else pending.push(c);
+			else pending = true;
 		},
 	};
 	histories.set(key, h);
 	void api.settingGet(`hist.${key}`).then((v) => {
-		let old: string[] = [];
+		let old: HistEntry[] = [];
 		try {
-			old = v ? (JSON.parse(v) as string[]) : [];
+			old = v ? readHistory(JSON.parse(v)) : [];
 		} catch {
 			old = [];
 		}
-		const self = h as { list: string[] };
-		self.list = [...self.list, ...old.filter((x) => !self.list.includes(x))].slice(0, 500);
+		const self = h as { list: HistEntry[] };
+		self.list = mergeHistory(self.list, old, HIST_MAX);
 		loaded = true;
-		if (pending.length) store();
+		if (pending) store();
 	});
 	return h;
 }
@@ -115,6 +120,8 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	let drilling = false;
 	const dirCache = new Map<string, { at: number; list: FsEntry[] }>();
 	let cwd: string | null = null;
+	/** 셸 맥락(host · docker:이름) — 셸 훅이 알리기 전에는 undefined */
+	let shellCtx: string | undefined;
 	let inputStart: { x: number; y: number } | null = null;
 	let promptOn = false;
 	let items: Candidate[] = [];
@@ -426,7 +433,11 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 	const remember = (cmd: string) => {
 		const c = cmd.trim();
 		if (!c || c.startsWith(" ")) return;
-		hist.add(c);
+		// 친 자리(폴더·셸) 와 함께 — cd 같은 경로 명령은 그 자리에서만 그대로 제안한다
+		const e: HistEntry = { cmd: c };
+		if (cwd) e.cwd = cwd;
+		if (shellCtx) e.ctx = shellCtx;
+		hist.add(e);
 	};
 
 	/**
@@ -480,6 +491,9 @@ export function attachCompletion(term: Terminal, host: HTMLElement, src: Complet
 		},
 		cwd: (p) => {
 			cwd = p;
+		},
+		context: (c) => {
+			shellCtx = c;
 		},
 		key: (e) => {
 			if (e.type === "keydown" && promptOn && !["Shift", "Control", "Alt", "Meta"].includes(e.key)) keyed = true;
